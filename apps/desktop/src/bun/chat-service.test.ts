@@ -55,6 +55,7 @@ describe("DesktopChatService", () => {
 			]);
 			expect(restored.messages[1]?.status).toBe("complete");
 			expect(restored.runs[0]?.status).toBe("completed");
+			expect(runtime.inputs[0]?.threadId).toBe(session.id);
 			expect(runtime.inputs[0]?.messages).toEqual([{ role: "user", content: "Say hello" }]);
 			expect(publishedEvents.map((event) => event.type)).toEqual([
 				"run.status",

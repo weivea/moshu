@@ -104,7 +104,7 @@ flowchart LR
 - [ ] 签名或准签名 package 可直接加载 Deep Agents/Provider、`bun:sqlite`、Keychain 和 BrowserView Preview。
 - [ ] WebView 无 API Key、application runtime、文件或 Shell 直接访问。
 - [ ] Deep Agents 在 Electrobun application worker 内通过真实 Provider stream、HITL、取消、同步 subagent、`AsyncLocalStorage` 和 3 Run 并发矩阵。
-- [ ] `BunSqliteSaver` 通过 checkpointer contract、旧 fixture、WAL 崩溃和删除 thread 测试。
+- [ ] `BunSqliteSaver` 通过 checkpointer contract、当前 schema fixture、WAL 崩溃和删除 thread 测试；不要求兼容旧 checkpoint 数据。
 - [ ] Agent 不能绕过 Broker 写文件或执行命令。
 - [ ] Run event 落库后再显示，窗口刷新可重建轨迹。
 - [ ] application 强退/重启后 Run 进入恢复流程；WebView reload 不丢 Run/interrupt，退出会清理命令进程树且不重复写操作。

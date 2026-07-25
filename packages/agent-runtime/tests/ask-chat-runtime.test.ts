@@ -1,18 +1,23 @@
 import { describe, expect, test } from "bun:test";
-import { FakeListChatModel } from "@langchain/core/utils/testing";
+import { FakeListChatModel, FakeStreamingChatModel } from "@langchain/core/utils/testing";
 import { AIMessage, AIMessageChunk, HumanMessage } from "@langchain/core/messages";
-import { createAgent } from "langchain";
+import { AsyncLocalStorage } from "node:async_hooks";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
 	AskChatCancelledError,
 	AskChatRuntimeError,
-	InMemoryAskChatRuntime,
+	BunSqliteSaver,
+	DeepAgentsAskChatRuntime,
 	InMemoryAskProviderConfigStore,
 	type AskAgentFactory,
 	type AskAgentStreamInput,
 	type AskAgentStreamOptions,
+	type AskModelFactory,
 } from "../src";
 
-describe("InMemoryAskChatRuntime", () => {
+describe("DeepAgentsAskChatRuntime", () => {
 	test("streams normalized deltas in order and returns final text with usage", async () => {
 		const callbackEvents: string[] = [];
 		const runtime = createRuntime(async () => ({
@@ -69,6 +74,7 @@ describe("InMemoryAskChatRuntime", () => {
 
 		const result = await runtime.run({
 			runId: "history-run",
+			threadId: "history-thread",
 			messages: [
 				{ role: "user", content: "Hello" },
 				{ role: "assistant", content: "Hi there" },
@@ -82,6 +88,11 @@ describe("InMemoryAskChatRuntime", () => {
 		});
 		expect(capturedOptions).toMatchObject({ streamMode: "messages" });
 		expect(capturedOptions?.signal).toBeInstanceOf(AbortSignal);
+		expect(capturedOptions?.configurable).toEqual({
+			thread_id: "ask:history-thread:history-run",
+			checkpoint_ns: "",
+			run_id: "history-run",
+		});
 		expect(capturedInput?.messages).toHaveLength(3);
 		expect(HumanMessage.isInstance(capturedInput?.messages[0])).toBe(true);
 		expect(AIMessage.isInstance(capturedInput?.messages[1])).toBe(true);
@@ -148,40 +159,67 @@ describe("InMemoryAskChatRuntime", () => {
 		});
 	});
 
-	test("supports offline LangChain createAgent streaming with a fake model", async () => {
-		const runtime = createRuntime(async () => {
-			const agent = createAgent({
-				model: new FakeListChatModel({
-					responses: ["Hi!"],
-				}),
-				tools: [],
-			});
+	test("executes the default adapter through Deep Agents and persists graph checkpoints", async () => {
+		await withTempDirectory(async (directoryPath) => {
+			const databasePath = join(directoryPath, "deep-agent-checkpoints.db");
+			const checkpointThreadId = "ask:fake-model-thread:fake-model-run";
+			const saver = new BunSqliteSaver(databasePath);
+			const runtime = createDeepAgentsRuntime(
+				() =>
+					new FakeListChatModel({
+						responses: ["Hi!"],
+					}),
+				saver,
+			);
+			let latestCheckpointId: string | undefined;
 
-			return {
-				stream: (input, options) =>
-					agent.stream(
-						{
-							messages: [...input.messages],
+			try {
+				const run = runtime.stream({
+					runId: "fake-model-run",
+					threadId: "fake-model-thread",
+					messages: [{ role: "user", content: "Hi" }],
+				});
+
+				const deltas: string[] = [];
+				for await (const event of run) {
+					deltas.push(event.delta);
+				}
+
+				expect(deltas.join("")).toBe("Hi!");
+				await expect(run.result).resolves.toMatchObject({
+					runId: "fake-model-run",
+					text: "Hi!",
+				});
+				const checkpoints = await collectAsync(
+					saver.list({
+						configurable: {
+							thread_id: checkpointThreadId,
+							checkpoint_ns: "",
 						},
-						options,
-					),
-			};
-		});
+					}),
+				);
+				expect(checkpoints.length).toBeGreaterThan(0);
+				latestCheckpointId = checkpoints[0]?.checkpoint.id;
+			} finally {
+				await runtime.shutdown();
+				saver.close();
+			}
 
-		const run = runtime.stream({
-			runId: "fake-model-run",
-			messages: [{ role: "user", content: "Hi" }],
-		});
-
-		const deltas: string[] = [];
-		for await (const event of run) {
-			deltas.push(event.delta);
-		}
-
-		expect(deltas.join("")).toBe("Hi!");
-		await expect(run.result).resolves.toMatchObject({
-			runId: "fake-model-run",
-			text: "Hi!",
+			expect(latestCheckpointId).toBeDefined();
+			const reopened = new BunSqliteSaver(databasePath);
+			try {
+				const restored = await reopened.getTuple({
+					configurable: {
+						thread_id: checkpointThreadId,
+						checkpoint_ns: "",
+						checkpoint_id: latestCheckpointId,
+					},
+				});
+				expect(JSON.stringify(restored?.checkpoint.channel_values)).toContain("Hi!");
+				expect(JSON.stringify(restored)).not.toContain("sk-test");
+			} finally {
+				reopened.close();
+			}
 		});
 	});
 
@@ -205,7 +243,7 @@ describe("InMemoryAskChatRuntime", () => {
 				observedRequest.authorizationHeader = request.headers.get("authorization");
 				observedRequest.body = await request.json();
 				const chunks = [
-					createOpenAiChunk("Hello", null),
+					createOpenAiChunk("Hello", null, "assistant"),
 					createOpenAiChunk(" from Moshu", null),
 					createOpenAiChunk("", "stop"),
 				];
@@ -225,7 +263,7 @@ describe("InMemoryAskChatRuntime", () => {
 			baseUrl: `http://127.0.0.1:${server.port}/v1`,
 			model: "moshu-smoke",
 		});
-		const runtime = new InMemoryAskChatRuntime({
+		const runtime = new DeepAgentsAskChatRuntime({
 			providerConfigStore: store,
 		});
 
@@ -240,13 +278,60 @@ describe("InMemoryAskChatRuntime", () => {
 			expect(observedRequest.body).toMatchObject({
 				model: "moshu-smoke",
 				stream: true,
-				messages: [{ role: "user", content: "Say hello" }],
+				messages: [{ role: "system" }, { role: "user", content: "Say hello" }],
 			});
 			expect(JSON.stringify(observedRequest.body)).not.toContain('"tools"');
 		} finally {
 			await runtime.shutdown();
 			server.stop(true);
 		}
+	});
+
+	test("rejects model-requested tools at the Deep Agents execution boundary", async () => {
+		await withTempDirectory(async (directoryPath) => {
+			const targetPath = join(directoryPath, "must-not-exist.txt");
+			const saver = new BunSqliteSaver(":memory:");
+			const runtime = createDeepAgentsRuntime(
+				() =>
+					new FakeStreamingChatModel({
+						chunks: [
+							new AIMessageChunk({
+								content: "",
+								tool_calls: [
+									{
+										id: "unauthorized-write",
+										name: "write_file",
+										args: {
+											path: targetPath,
+											content: "forbidden",
+										},
+										type: "tool_call",
+									},
+								],
+							}),
+						],
+					}),
+				saver,
+			);
+
+			try {
+				await expect(
+					runtime.run({
+						runId: "unauthorized-tool-run",
+						threadId: "unauthorized-tool-thread",
+						messages: [{ role: "user", content: "Write a file" }],
+					}),
+				).rejects.toMatchObject({
+					kind: "provider_failure",
+					message: "Provider request failed.",
+					retryable: false,
+				});
+				expect(await Bun.file(targetPath).exists()).toBe(false);
+			} finally {
+				await runtime.shutdown();
+				saver.close();
+			}
+		});
 	});
 
 	test("propagates cancellation and rejects duplicate active run ids", async () => {
@@ -271,9 +356,145 @@ describe("InMemoryAskChatRuntime", () => {
 		expect(runtime.cancel("active-run")).toBe(false);
 	});
 
+	test("cancels an active Deep Agents graph after streaming has started", async () => {
+		const saver = new BunSqliteSaver(":memory:");
+		const runtime = createDeepAgentsRuntime(
+			() =>
+				new FakeListChatModel({
+					responses: ["This response should be cancelled before it finishes."],
+					sleep: 2,
+				}),
+			saver,
+		);
+		let resolveFirstDelta: () => void = () => {};
+		const firstDelta = new Promise<void>((resolve) => {
+			resolveFirstDelta = resolve;
+		});
+
+		try {
+			const result = runtime.run({
+				runId: "deep-cancel-run",
+				threadId: "deep-cancel-thread",
+				messages: [{ role: "user", content: "Keep talking" }],
+				onEvent: () => {
+					resolveFirstDelta();
+				},
+			});
+
+			await firstDelta;
+			expect(runtime.cancel("deep-cancel-run", "user_cancelled")).toBe(true);
+			await expect(result).rejects.toBeInstanceOf(AskChatCancelledError);
+			expect(runtime.cancel("deep-cancel-run")).toBe(false);
+		} finally {
+			await runtime.shutdown();
+			saver.close();
+		}
+	});
+
+	test("isolates three concurrent Deep Agents runs and AsyncLocalStorage contexts", async () => {
+		interface RunContext {
+			runId: string;
+		}
+
+		const contextStorage = new AsyncLocalStorage<RunContext>();
+		const observations: Array<{
+			source: "factory" | "model" | "event";
+			expected: string;
+			actual: string | undefined;
+		}> = [];
+		const boundToolNames: string[][] = [];
+		const saver = new BunSqliteSaver(":memory:");
+		const runtime = createDeepAgentsRuntime(() => {
+			const context = contextStorage.getStore();
+			if (context === undefined) {
+				throw new Error("Expected a run context while creating the model.");
+			}
+
+			observations.push({
+				source: "factory",
+				expected: context.runId,
+				actual: context.runId,
+			});
+			return new ContextRecordingFakeModel({
+				response: `reply:${context.runId}`,
+				recordContext: () => {
+					observations.push({
+						source: "model",
+						expected: context.runId,
+						actual: contextStorage.getStore()?.runId,
+					});
+				},
+				recordBoundTools: (names) => {
+					boundToolNames.push(names);
+				},
+			});
+		}, saver);
+		const runIds = ["concurrent-a", "concurrent-b", "concurrent-c"] as const;
+
+		try {
+			const results = await Promise.all(
+				runIds.map((runId) =>
+					contextStorage.run({ runId }, () =>
+						runtime.run({
+							runId,
+							threadId: `session-${runId}`,
+							messages: [{ role: "user", content: `prompt:${runId}` }],
+							onEvent: () => {
+								observations.push({
+									source: "event",
+									expected: runId,
+									actual: contextStorage.getStore()?.runId,
+								});
+							},
+						}),
+					),
+				),
+			);
+
+			expect(results.map((result) => result.text)).toEqual(runIds.map((runId) => `reply:${runId}`));
+			expect(observations.length).toBeGreaterThan(runIds.length);
+			expect(observations.every((entry) => entry.actual === entry.expected)).toBe(true);
+			expect(boundToolNames.every((names) => names.length === 0)).toBe(true);
+
+			for (const runId of runIds) {
+				expect(observations).toContainEqual({
+					source: "model",
+					expected: runId,
+					actual: runId,
+				});
+				expect(observations).toContainEqual({
+					source: "event",
+					expected: runId,
+					actual: runId,
+				});
+				const checkpoints = await collectAsync(
+					saver.list({
+						configurable: {
+							thread_id: `ask:session-${runId}:${runId}`,
+							checkpoint_ns: "",
+						},
+					}),
+				);
+				const channelValues = JSON.stringify(
+					checkpoints.map((tuple) => tuple.checkpoint.channel_values),
+				);
+				expect(checkpoints.length).toBeGreaterThan(0);
+				expect(channelValues).toContain(`prompt:${runId}`);
+				for (const otherRunId of runIds) {
+					if (otherRunId !== runId) {
+						expect(channelValues).not.toContain(`prompt:${otherRunId}`);
+					}
+				}
+			}
+		} finally {
+			await runtime.shutdown();
+			saver.close();
+		}
+	});
+
 	test("rejects when the provider is not configured", async () => {
 		const store = new InMemoryAskProviderConfigStore();
-		const runtime = new InMemoryAskChatRuntime({
+		const runtime = new DeepAgentsAskChatRuntime({
 			providerConfigStore: store,
 			agentFactory: async () => ({
 				stream: async () => createAsyncIterable([]),
@@ -396,7 +617,7 @@ describe("InMemoryAskChatRuntime", () => {
 	});
 });
 
-function createOpenAiChunk(content: string, finishReason: "stop" | null) {
+function createOpenAiChunk(content: string, finishReason: "stop" | null, role?: "assistant") {
 	return {
 		id: "chatcmpl-moshu-smoke",
 		object: "chat.completion.chunk",
@@ -405,14 +626,17 @@ function createOpenAiChunk(content: string, finishReason: "stop" | null) {
 		choices: [
 			{
 				index: 0,
-				delta: content.length === 0 ? {} : { content },
+				delta: {
+					...(role === undefined ? {} : { role }),
+					...(content.length === 0 ? {} : { content }),
+				},
 				finish_reason: finishReason,
 			},
 		],
 	};
 }
 
-function createRuntime(agentFactory: AskAgentFactory): InMemoryAskChatRuntime {
+function createRuntime(agentFactory: AskAgentFactory): DeepAgentsAskChatRuntime {
 	const store = new InMemoryAskProviderConfigStore();
 	store.set({
 		provider: "openai-compatible",
@@ -421,9 +645,28 @@ function createRuntime(agentFactory: AskAgentFactory): InMemoryAskChatRuntime {
 		baseUrl: "https://example.com/v1",
 	});
 
-	return new InMemoryAskChatRuntime({
+	return new DeepAgentsAskChatRuntime({
 		providerConfigStore: store,
 		agentFactory,
+	});
+}
+
+function createDeepAgentsRuntime(
+	modelFactory: AskModelFactory,
+	checkpointer: BunSqliteSaver,
+): DeepAgentsAskChatRuntime {
+	const store = new InMemoryAskProviderConfigStore();
+	store.set({
+		provider: "openai-compatible",
+		apiKey: "sk-test",
+		model: "test-model",
+		baseUrl: "https://example.com/v1",
+	});
+
+	return new DeepAgentsAskChatRuntime({
+		providerConfigStore: store,
+		modelFactory,
+		checkpointer,
 	});
 }
 
@@ -473,5 +716,52 @@ async function captureRejection(promise: Promise<unknown>): Promise<unknown> {
 		throw new Error("Expected promise to reject.");
 	} catch (error) {
 		return error;
+	}
+}
+
+async function collectAsync<T>(iterable: AsyncIterable<T>): Promise<T[]> {
+	const values: T[] = [];
+	for await (const value of iterable) {
+		values.push(value);
+	}
+	return values;
+}
+
+class ContextRecordingFakeModel extends FakeListChatModel {
+	readonly #recordContext: () => void;
+	readonly #recordBoundTools: (names: string[]) => void;
+
+	constructor(options: {
+		response: string;
+		recordContext: () => void;
+		recordBoundTools: (names: string[]) => void;
+	}) {
+		super({
+			responses: [options.response],
+			sleep: 1,
+		});
+		this.#recordContext = options.recordContext;
+		this.#recordBoundTools = options.recordBoundTools;
+	}
+
+	override bindTools(
+		tools: Parameters<FakeListChatModel["bindTools"]>[0],
+	): ReturnType<FakeListChatModel["bindTools"]> {
+		this.#recordBoundTools(tools.map((tool) => tool.name));
+		return this;
+	}
+
+	override async _sleep(): Promise<void> {
+		this.#recordContext();
+		await Bun.sleep(1);
+	}
+}
+
+async function withTempDirectory(run: (directoryPath: string) => Promise<void>): Promise<void> {
+	const directoryPath = mkdtempSync(join(tmpdir(), "moshu-deep-agent-"));
+	try {
+		await run(directoryPath);
+	} finally {
+		rmSync(directoryPath, { force: true, recursive: true });
 	}
 }

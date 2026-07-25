@@ -1,6 +1,9 @@
 import { ChatOpenAI } from "@langchain/openai";
 import { AIMessage, AIMessageChunk, BaseMessage, HumanMessage } from "@langchain/core/messages";
-import { createAgent } from "langchain";
+import type { BaseLanguageModel } from "@langchain/core/language_models/base";
+import type { BaseCheckpointSaver } from "@langchain/langgraph-checkpoint";
+import { createDeepAgent } from "deepagents/browser";
+import { createMiddleware } from "langchain";
 import type { AskProviderConfigStore, AskProviderConfiguration } from "./ask-provider-config";
 
 export interface AskChatMessage {
@@ -22,6 +25,7 @@ export interface AskChatMessageDeltaEvent {
 
 export interface AskChatRunInput {
 	runId: string;
+	threadId?: string;
 	messages: readonly AskChatMessage[];
 	signal?: AbortSignal;
 	onEvent?: (event: AskChatMessageDeltaEvent) => void | Promise<void>;
@@ -46,6 +50,11 @@ export interface AskAgentStreamInput {
 export interface AskAgentStreamOptions {
 	streamMode: "messages";
 	signal: AbortSignal;
+	configurable: {
+		thread_id: string;
+		checkpoint_ns: string;
+		run_id: string;
+	};
 }
 
 export interface AskAgent {
@@ -59,6 +68,10 @@ export type AskAgentFactory = (
 	configuration: AskProviderConfiguration,
 ) => AskAgent | Promise<AskAgent>;
 
+export type AskModelFactory = (
+	configuration: AskProviderConfiguration,
+) => BaseLanguageModel | Promise<BaseLanguageModel>;
+
 export interface AskChatRuntime {
 	run(input: AskChatRunInput): Promise<AskChatRunResult>;
 	stream(input: AskChatRunInput): AskChatRunStream;
@@ -68,7 +81,9 @@ export interface AskChatRuntime {
 
 export interface AskChatRuntimeOptions {
 	providerConfigStore: AskProviderConfigStore;
+	checkpointer?: BaseCheckpointSaver;
 	agentFactory?: AskAgentFactory;
+	modelFactory?: AskModelFactory;
 }
 
 export type AskChatErrorKind =
@@ -126,14 +141,21 @@ export class AskChatCancelledError extends AskChatRuntimeError {
 	}
 }
 
-export class InMemoryAskChatRuntime implements AskChatRuntime {
+export class DeepAgentsAskChatRuntime implements AskChatRuntime {
 	readonly #providerConfigStore: AskProviderConfigStore;
 	readonly #agentFactory: AskAgentFactory;
 	readonly #activeRuns = new Map<string, ActiveRun>();
 
 	constructor(options: AskChatRuntimeOptions) {
 		this.#providerConfigStore = options.providerConfigStore;
-		this.#agentFactory = options.agentFactory ?? createDefaultAskAgent;
+		this.#agentFactory =
+			options.agentFactory ??
+			((configuration) =>
+				createDefaultAskAgent(
+					configuration,
+					options.checkpointer,
+					options.modelFactory ?? createOpenAiCompatibleModel,
+				));
 	}
 
 	run(input: AskChatRunInput): Promise<AskChatRunResult> {
@@ -237,7 +259,15 @@ export class InMemoryAskChatRuntime implements AskChatRuntime {
 			const messageHistory = toLangChainMessages(input.messages);
 			const stream = await agent.stream(
 				{ messages: messageHistory },
-				{ streamMode: "messages", signal },
+				{
+					streamMode: "messages",
+					signal,
+					configurable: {
+						thread_id: createCheckpointThreadId(input.threadId ?? input.runId, input.runId),
+						checkpoint_ns: "",
+						run_id: input.runId,
+					},
+				},
 			);
 
 			const state: StreamAggregationState = {
@@ -263,24 +293,37 @@ export class InMemoryAskChatRuntime implements AskChatRuntime {
 	}
 }
 
-export function createAskChatRuntime(options: AskChatRuntimeOptions): InMemoryAskChatRuntime {
-	return new InMemoryAskChatRuntime(options);
+export { DeepAgentsAskChatRuntime as InMemoryAskChatRuntime };
+
+export function createAskChatRuntime(options: AskChatRuntimeOptions): DeepAgentsAskChatRuntime {
+	return new DeepAgentsAskChatRuntime(options);
 }
 
-async function createDefaultAskAgent(configuration: AskProviderConfiguration): Promise<AskAgent> {
-	const model = new ChatOpenAI({
-		apiKey: configuration.apiKey,
-		model: configuration.model,
-		maxRetries: 0,
-		useResponsesApi: false,
-		...(configuration.baseUrl === undefined
-			? {}
-			: { configuration: { baseURL: configuration.baseUrl } }),
-	});
+function createCheckpointThreadId(threadId: string, runId: string): string {
+	return `ask:${encodeURIComponent(threadId)}:${encodeURIComponent(runId)}`;
+}
 
-	const agent = createAgent({
+async function createDefaultAskAgent(
+	configuration: AskProviderConfiguration,
+	checkpointer: BaseCheckpointSaver | undefined,
+	modelFactory: AskModelFactory,
+): Promise<AskAgent> {
+	const model = await modelFactory(configuration);
+	const agent = createDeepAgent({
 		model,
 		tools: [],
+		subagents: [],
+		systemPrompt: {
+			base: "You are Moshu's Ask assistant. Answer the user directly using the supplied conversation. You do not have access to external tools, commands, or the host filesystem.",
+		},
+		middleware: [
+			createMiddleware({ name: "todoListMiddleware" }),
+			createMiddleware({ name: "FilesystemMiddleware" }),
+			createMiddleware({ name: "subAgentMiddleware" }),
+			createAskToolPolicyMiddleware(),
+		],
+		...(checkpointer === undefined ? {} : { checkpointer }),
+		name: "moshu-ask",
 	});
 
 	return {
@@ -292,6 +335,32 @@ async function createDefaultAskAgent(configuration: AskProviderConfiguration): P
 				options,
 			),
 	};
+}
+
+function createOpenAiCompatibleModel(configuration: AskProviderConfiguration): ChatOpenAI {
+	return new ChatOpenAI({
+		apiKey: configuration.apiKey,
+		model: configuration.model,
+		maxRetries: 0,
+		useResponsesApi: false,
+		...(configuration.baseUrl === undefined
+			? {}
+			: { configuration: { baseURL: configuration.baseUrl } }),
+	});
+}
+
+function createAskToolPolicyMiddleware() {
+	return createMiddleware({
+		name: "MoshuAskToolPolicyMiddleware",
+		wrapModelCall: (request, handler) =>
+			handler({
+				...request,
+				tools: [],
+			}),
+		wrapToolCall: async (request) => {
+			throw new Error(`Ask mode rejected tool "${request.toolCall.name}".`);
+		},
+	});
 }
 
 async function consumeStreamItem(

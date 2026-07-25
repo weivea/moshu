@@ -1,4 +1,4 @@
-import { createAskChatRuntime } from "@moshu/agent-runtime";
+import { BunSqliteSaver, createAskChatRuntime } from "@moshu/agent-runtime";
 import { openAppDatabase } from "@moshu/database";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
@@ -31,10 +31,14 @@ async function getMainViewUrl(): Promise<string> {
 
 mkdirSync(Utils.paths.userData, { recursive: true });
 const database = openAppDatabase(join(Utils.paths.userData, "moshu.db"));
+const checkpointSaver = new BunSqliteSaver(join(Utils.paths.userData, "moshu-checkpoints.db"));
 const providerConfigStore = new FileAskProviderConfigStore(
 	join(Utils.paths.userData, "provider.json"),
 );
-const chatRuntime = createAskChatRuntime({ providerConfigStore });
+const chatRuntime = createAskChatRuntime({
+	providerConfigStore,
+	checkpointer: checkpointSaver,
+});
 const chatService = new DesktopChatService({
 	repository: database.chat,
 	providerConfigStore,
@@ -67,8 +71,15 @@ function shutdown(): Promise<void> {
 
 	shutdownPromise = (async () => {
 		unsubscribeChatEvents();
-		await chatService.shutdown();
-		database.close();
+		try {
+			await chatService.shutdown();
+		} finally {
+			try {
+				checkpointSaver.close();
+			} finally {
+				database.close();
+			}
+		}
 	})();
 	return shutdownPromise;
 }

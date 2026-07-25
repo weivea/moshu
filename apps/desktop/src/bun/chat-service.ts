@@ -379,6 +379,7 @@ export class DesktopChatService {
 
 			const result = await this.#runtime.run({
 				runId: activeRun.runId,
+				threadId: activeRun.sessionId,
 				messages: activeRun.messages,
 				onEvent: async (event) => {
 					const mutation = this.#repository.appendAssistantMessageDelta({
