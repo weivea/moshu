@@ -10,6 +10,10 @@
         "typescript": "6.0.3",
       },
     },
+    "apps/agents-server": {
+      "name": "@moshu/agents-server",
+      "version": "0.0.1",
+    },
     "apps/desktop": {
       "name": "@moshu/desktop",
       "version": "0.0.1",
@@ -39,6 +43,10 @@
         "vite": "6.4.3",
         "vitest": "3.2.7",
       },
+    },
+    "apps/executor": {
+      "name": "@moshu/executor",
+      "version": "0.0.1",
     },
     "packages/action-broker": {
       "name": "@moshu/action-broker",
@@ -307,6 +315,8 @@
 
     "@moshu/agent-runtime": ["@moshu/agent-runtime@workspace:packages/agent-runtime"],
 
+    "@moshu/agents-server": ["@moshu/agents-server@workspace:apps/agents-server"],
+
     "@moshu/contracts": ["@moshu/contracts@workspace:packages/contracts"],
 
     "@moshu/database": ["@moshu/database@workspace:packages/database"],
@@ -316,6 +326,8 @@
     "@moshu/desktop": ["@moshu/desktop@workspace:apps/desktop"],
 
     "@moshu/domain": ["@moshu/domain@workspace:packages/domain"],
+
+    "@moshu/executor": ["@moshu/executor@workspace:apps/executor"],
 
     "@moshu/ui": ["@moshu/ui@workspace:packages/ui"],
 
