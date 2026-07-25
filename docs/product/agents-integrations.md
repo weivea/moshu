@@ -7,6 +7,7 @@
 ```text
 Agent
 ├── Identity：名称、图标、描述
+├── Executor binding：实际 Tool/MCP/Skill 所在 Executor
 ├── Instructions：系统提示词与行为规则
 ├── Model policy：Provider、模型、参数与回退策略
 ├── Built-in tools：文件、命令、网页、Canvas 等
@@ -18,6 +19,15 @@ Agent
 ```
 
 应用必须在运行前将以上配置解析为一份“有效配置”，并展示冲突、缺失凭证、不兼容模型或失效扩展。不得在运行时静默丢弃配置。
+
+### 1.1 三角色映射
+
+- agents server 保存 Provider/model 配置与 credential、Agent definitions/versions、Session/Run/event、Policy/approval/Action；MCP/Skill 只保存 Agent resource reference 和非权威、可丢弃 inventory cache。
+- 每个 executor 是自身 MCP config/credential/OAuth/lifecycle、Skill installation/immutable version/content/hash/resources 和相关 private local data 的唯一 source of truth。
+- 每次 executor 注册/重连时 server 先 full sync redacted inventory；运行期以 revision hint + 60 秒 ±20% jitter poll 拉取 delta，cache 可丢弃且不构成授权。
+- Agent 只可引用 assigned executor 的资源，reference 为 `executorId + stable resourceId + version/hash`；server 按 ref 获取 Skill metadata 与 `SKILL.md` 构造 prompt，resources/scripts 仍由 executor 读取或执行。
+- server 决定并持久化 Policy/approval，随后签发一次性 execution grant；executor 验证后才执行。
+- 当前 desktop 由 client 监管一个 host-backed local executor，多个 Agent 绑定它，关系为 Agent N:1 Executor。
 
 ## 2. 自定义 Agent
 
@@ -37,6 +47,7 @@ Agent
 | 分组 | 字段 |
 | --- | --- |
 | 基本信息 | 名称、图标、颜色、描述、适用场景 |
+| Executor | 当前 desktop 默认 local executor；未来从 server registry 选择已注册 Executor |
 | 指令 | 系统提示词、回答风格、输出约束 |
 | 模型 | 继承会话模型或固定模型、参数、最低能力要求 |
 | 内置工具 | 网页搜索、URL 读取、文件、终端、Git、Canvas |
@@ -53,6 +64,8 @@ Agent
 - 名称唯一性和必填字段。
 - 所选模型是否支持工具调用、流式和需要的输入类型。
 - MCP、Skills、知识源和 Provider 是否可用。
+- 绑定 executor 是否已完成当前 connection 的 full inventory sync 并 online，live capability 是否覆盖所选 Tool/MCP/Skill。
+- 所选 MCP/Skill 是否属于绑定 executor，stable resource version/hash 是否仍匹配。
 - 权限是否与工具能力冲突。
 - 固定模型不可用时，不得静默切换到其他模型。
 - Agent 在普通 Chat 中不能通过配置获得任意宿主机文件或终端权限。
@@ -63,6 +76,7 @@ Agent
 - Session 保存使用时的 Agent 配置快照；之后编辑 Agent 不改变历史 Run。
 - 新 Run 默认使用最新已保存版本，并在消息头显示版本。
 - 删除仍被 Session 引用的 Agent 时保留只读快照。
+- Executor syncing/offline 时保留 Agent 配置和历史 Run，但相关 Agent 不能启动新 Run。
 
 ### 2.5 导入导出
 
@@ -71,6 +85,19 @@ Agent
 - API Key、OAuth Token、MCP Secret、本地绝对路径和知识索引不得进入导出包。
 - 导入时展示将新增/覆盖的 Agent、Skills 和权限；冲突由用户决定。
 - 缺失的本地文件、MCP 或 Provider 显示为待修复依赖，不伪造成功状态。
+- 导入包不携带本机 `executorId`；导入后由用户或当前 desktop default 重新绑定。
+- “连同 Skills”导出由 assigned executor 按 immutable version/hash 生成，server 不缓存内容；executor offline 时明确失败。
+- 导入先由 selected executor 原子安装资源，再由 server 保存 Agent refs；任一步失败都不能留下成功形状的 Agent 配置。
+
+### 2.6 Executor 注册与选择
+
+- 当前 desktop client 启动并监管一个 local executor，并通过 agents server registry 展示其状态。
+- `executorId` 跨重连/重启稳定；每次启动/连接使用新的 `instanceId` 和 `generation`。
+- 每次 connection/registration/reconnect 后状态先为 syncing；server full inventory sync 成功后才显示 online/runnable。
+- 一个 executor 可承载多个 Agent；Agent version 保存绑定的 `executorId`。
+- Agent version 的 MCP/Skill 项只保存该 executor 的 stable resource ID 与 version/hash，不复制 config、credential 或 Skill content。
+- client 只能通过 agents server 列出 executor，不直接连接或探测 executor。
+- 未来 client/executor 可独立启动并向 agents server 注册；Docker、cloud VM、remote-server transport、配对和网络信任不属于当前范围。
 
 ## 3. LLM Provider
 
@@ -83,6 +110,8 @@ Provider 配置分为三层：
 3. **Model profile**：模型 ID、能力、上下文、参数、费率和连接选择。
 
 同一 Provider 允许创建多个 Connection profile，例如个人与公司账号。
+
+Provider adapter、连接测试、模型调用、用量和长期 Provider Secret 都位于 agents server。executor 不代替 server 调用模型，也不会收到 Provider Key。
 
 ### 3.2 首版 Provider 矩阵
 
@@ -182,13 +211,23 @@ Kimi 和智谱必须作为独立品牌入口提供默认值和帮助文案，而
 
 测试连接不得自动调用有副作用 Tool。
 
+client 提供完整 MCP 配置 UI，但不直连 executor。query/command 先由 agents server 校验 client/executor identity、Agent binding 与产品授权，再路由到 selected executor；executor 是 connection config、credential/OAuth、lifecycle 和 Tool inventory 的唯一 source of truth。Agent resource selection 保存为 server 的 stable refs，Tool risk override 仍属于 server Policy。
+
+- executor 只有在原子持久化成功后才返回 redacted result 与新的 inventory epoch/revision；server 随即拉取到该 revision，再向后续 inventory read 展示新状态。
+- executor offline、版本冲突或存储失败时明确失败；server 不排队并伪装成功。
+- server 可保存 replaceable、non-authoritative、disposable redacted inventory cache 供 stale 概览，但不能用来恢复或编辑 MCP config。若 mutation 已持久化而 cache 同步暂时失败，UI 显示“已保存，清单同步中”，不能伪造 descriptor。
+
 ### 4.3 认证
 
-- stdio 凭证通过受控环境变量注入，不使用远程 OAuth 流程。
+- stdio credential 由 executor 自己的 `ExecutorSecretStore` 解析；启动 MCP process 时只注入目标 child 的最小环境，并可在 process 生命周期内驻留 executor 内存，不使用远程 OAuth 流程。
 - 远程连接支持静态 Header、Bearer/API Key。
 - 支持符合 MCP 规范的 OAuth 2.1、PKCE、资源服务器发现和浏览器授权。
 - 动态客户端注册不可用时，允许用户填写 Client ID；Client Secret 安全存储。
-- Access/Refresh Token 写入系统安全存储，不进入 MCP JSON、日志或 WebView。
+- Access/Refresh Token 和其他 MCP Secret 只写入 owning executor 的 `ExecutorSecretStore`，不进入 server DB/checkpoint/backup/snapshot、MCP query result、日志或 WebView。
+- local desktop 首个 `ExecutorSecretStore` 可使用 private files；future executor 可改用 Keychain、Docker Secret 或 cloud secret manager。
+- executor 可在 connection/process 生命周期内把 credential 加载到内存；不得进入模型/UI/prompt、query RPC、diagnostic/export、executor 全局环境或无关 child/Agent。
+- revocation、expiry 或 MCP shutdown 会关闭对应连接/进程并释放 runtime reference；JavaScript 不承诺可靠清零 string memory。
+- HTTP transport 可在可行时按 request 注入 credential，但这只是优化。
 - 撤销连接时同时提供清理本地 Token 的选项。
 
 ### 4.4 作用域
@@ -199,7 +238,7 @@ MCP Server 可设为：
 - 仅指定 Project 可用。
 - 仅指定 Agent 可用。
 
-最终 Tool 集合取以上范围的交集，并叠加权限策略。Agent 选择某 Tool 不代表该 Tool 已预授权执行。
+最终 Tool 集合取以上范围的交集，并叠加权限策略；解析结果只在 Agent version 中保存 assigned executor stable refs，不复制 MCP config。Agent 选择某 Tool 不代表该 Tool 已预授权执行。
 
 ### 4.5 运行与错误
 
@@ -207,6 +246,17 @@ MCP Server 可设为：
 - 连接断开、Schema 变化或 Tool 被移除时明确报错并允许重连。
 - stdio 进程退出后按配置重启，连续失败进入停用状态，避免无限重启。
 - MCP 返回 `isError` 或协议错误时按失败处理，不包装为成功结果。
+- MCP 已连接不代表 Tool 已预授权；每次调用仍由 server Policy/approval/intent 和一次性 grant 约束。
+
+### 4.6 Inventory 同步
+
+- executor 持久化 `inventoryEpoch`、单调递增 `inventoryRevision` 和带 deletion tombstone 的有界 change log；普通 restart 不换 epoch，inventory reset 才换。
+- 每次 MCP/Skill/config/Tool-schema/capability change commit 后发送 `inventory.changed`；hint 只含 epoch/revision/category，不含 credential、config、Tool schema body 或 Skill content。
+- server 对 hint 去抖并调用 `inventory.getChanges(sinceRevision, cursor)`；另按每次 48–72 秒的随机间隔主动增量 reconciliation。
+- revision gap、compacted history、epoch reset 或 invalid cursor 触发 `inventory.getSnapshot()` 和 atomic cache replacement。
+- cache 只含 stable resource ID、version/hash、MCP Tool schema、health/capability 和 redacted credential-configured 状态；不含 token、sensitive env、recoverable MCP config、完整 `SKILL.md`/resources。
+- executor offline 时 cache 标为 stale；failed poll 不解释为删除。reconnect full sync 完成前 assigned Agent 不 runnable。
+- Run start/restore 始终向 live executor 验证 referenced owner/version/hash/schema；polling 只做 discovery/reconciliation，不是 authorization。
 
 ## 5. Agent Skills
 
@@ -233,11 +283,14 @@ skill-name/
 - 展示来源、版本、内容哈希和最近使用时间。
 - 后续支持从 Git URL 安装与更新。
 
+Skill installation、immutable versions/content/hash、metadata、实际目录、校验、读取和卸载都由 selected executor 管理。client 管理 UI 使用与 MCP 相同的 server-routed command：executor 持久化后返回 redacted result/inventory epoch/revision，server 立即 read-own-write；offline 时不伪装成功。server 只在 Agent version 中保存 assigned executor 的 stable Skill ref，并可缓存 replaceable inventory descriptor。
+
 ### 5.3 渐进加载
 
-- Agent 启动时只加载 Skill 名称和描述。
-- 任务匹配时读取 `SKILL.md`。
-- 脚本、引用和资源仅在需要时读取或执行。
+- Agent 构建或恢复前，agents server 按 `executorId + stableSkillId + version + contentHash` 通过 executor RPC 获取 Skill metadata 和 `SKILL.md`。
+- server 验证 owner、version 与 hash 后构造有效 Agent prompt；offline、missing 或 mismatch 时 fail closed，不使用 snapshot/旧内容。
+- fetched content 只用于当次内存 prompt assembly，不写入 Agent/Run snapshot、checkpoint、event、backup、diagnostic 或 export；恢复时重新按 ref 获取。
+- 脚本、引用和资源仅在需要时通过 executor 读取或执行。
 - UI 在执行轨迹中显示“激活了哪个 Skill”，但不把全部 Skill 内容塞入消息流。
 
 ### 5.4 作用域与冲突
@@ -253,6 +306,7 @@ skill-name/
 - Skill 是不可信扩展，安装不等于授权其脚本执行。
 - `allowed-tools` 仅作为建议，不能越过应用权限与审批策略。
 - 脚本执行展示实际命令、工作目录、环境和风险。
+- scripts/resources 只能通过 executor invocation 使用；脚本仍需 server 签发 execution grant。
 - 导出时默认不包含本地密钥、生成缓存和知识索引。
 
 ## 6. 知识库
@@ -328,3 +382,8 @@ skill-name/
 | EXT-012 | Ollama、LM Studio 和本地 Embedding | P0 |
 | EXT-013 | MCP Resources/Prompts | P1 |
 | EXT-014 | 自定义子 Agent 编排 | P2 |
+| EXT-015 | Agent 绑定已注册 Executor；Executor syncing/offline 时不能启动新 Run | P0 |
+| EXT-016 | executor 独占 MCP config/credential/OAuth/lifecycle；client UI 经 server 校验路由，offline/持久化失败不返回成功，Tool 仍逐次走 grant | P0 |
+| EXT-017 | executor 独占 immutable Skill versions/content；Agent 只保存 assigned executor stable ref，server 按 version/hash 获取 `SKILL.md`，missing/mismatch fail closed | P0 |
+| EXT-018 | server 不保存 recoverable MCP/Skill config/content/credential；inventory cache 明确为 replaceable、non-authoritative、disposable | P0 |
+| EXT-019 | executor inventory 使用 registration full sync、persisted epoch/revision、hint + jittered poll、delta/tombstone 与 snapshot fallback；Run 仍 live 验证 | P0 |

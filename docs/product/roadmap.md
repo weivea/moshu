@@ -5,40 +5,65 @@
 - 每个阶段以可验证能力门槛结束，不以页面数量或日历时间结束。
 - P0/P1/P2 是需求在其所属阶段内的优先级，不代表产品阶段编号。
 - 阶段 1 优先完成用户确认的首个可用闭环。
-- 自定义 Agent、MCP、Skills、知识库和 Canvas 可并行开发，但必须复用同一套权限、事件和持久化模型。
+- 自定义 Agent、MCP、Skills、知识库和 Canvas 可并行开发，但必须复用同一套权限和事件模型，并遵守 server/executor 各自唯一持久化所有者。
+- 架构交付固定按 RPC/binary POC -> agents-server extraction -> Executor/Agent registry -> Tool Bridge/Action Broker -> MCP/Skills -> recovery/release hardening 推进。
 - 团队规模、目标日期和发布渠道未确定，本路线图不提供工期承诺。
 
 ## 2. 阶段 0：技术底座与高风险验证
 
-**目标：** 在前 2–3 周完成 Electrobun application runtime Go/No-Go，并证明桌面架构能够安全、稳定地承载 Deep Agents 长任务。
+**目标：** 建立 Electrobun client、agents server、executor 三应用角色的可打包基础，并把当前单进程 Ask slice 迁移到正确所有者。
 
-### 范围
+### 2.1 架构交付主线
+
+| 阶段 | 出口 |
+| --- | --- |
+| A0 RPC / binary POC | 两个 TypeScript + Bun compiled companion 可由 client 启停、注册、RPC、关闭和打包 |
+| A1 agents-server extraction | Provider、Ask runtime、业务 DB/checkpoint 和 Run 状态迁入 server，当前 Chat 行为等价 |
+| A2 Executor / Agent registry | 一个 local executor、多个 Agent、stable identity、注册 full capability sync、syncing/offline Run gate |
+| A3 Tool Bridge / Action Broker | server Policy/approval/intent/grant，executor Tool/process tree，result 回到 server |
+| A4 MCP / Skills | executor-owned persistence/secret/lifecycle，epoch/revision inventory reconciliation、routed UI、resource refs/prompt fetch |
+| A5 recovery/release hardening | capped restart、重连对账、协作退出、故障矩阵和签名 package |
+
+旧的 in-process/conditional-sidecar Go/No-Go 与 F0-16 不再适用。三角色是批准基线；当前代码尚未实现 companion/RPC/registry。
+
+### 2.2 范围
 
 - Electrobun `1.18.1` + React + React Router + Vite 应用骨架；开发期使用 Bun，发行包使用框架内置 runtime。
 - HeroUI 主题、浅色/深色、中英文框架和 Gravity Icon 包装层。
-- Application Host/WebView/in-process DeepAgentService 的边界；Electrobun typed RPC 与稳定 service contract。
-- `bun:sqlite` 业务数据库、事件模型、`BunSqliteSaver` 和 store 原型。
-- Deep Agents 在 Electrobun application worker 内的 import/bundle、真实 Provider 流式、待办、同步子 Agent、审批、取消、`AsyncLocalStorage`、并发和恢复 POC。
+- Electrobun client、agents server、executor companion skeleton；WebSocket + versioned JSON RPC。
+- 动态 loopback bootstrap、client/executor registration、stable ID、instance ID/generation 和注册后 full inventory sync。
+- client 对两个 companion 的 cooperative shutdown、capped backoff 和 recovery UX。
+- agents server 单写 `bun:sqlite` 业务数据库、事件、`BunSqliteSaver` 和 store。
+- Deep Agents/Provider/Run/Policy 位于 agents server；实际 Tool/进程树位于 executor。
+- 当前 host-backed local executor 与 Agent N:1 binding；offline 时相关 Agent 不能启动 Run。
 - 一个 OpenAI 或 Anthropic Provider 端到端 POC。
-- Project 文件读取、受控 Patch 写入和命令策略 POC。
-- macOS Keychain FFI/native adapter POC，不允许明文回退。
+- server Policy/approval/Action intent -> one-time execution grant -> executor 文件/命令 Tool -> typed result POC。
+- server Provider `SecretVault` 的 macOS Keychain FFI/native adapter POC，以及 local executor `ExecutorSecretStore` private-file adapter POC。
 - sandbox `BrowserView` 的 RPC、本地文件和子资源默认断网 POC。
-- macOS 自解压/安装、签名、公证、Updater 和 packaged E2E 流水线 POC。
+- 两个 Bun compiled companion 随 desktop 的签名、公证、Updater 和 packaged E2E POC。
 
-### 出口条件
+### 2.3 出口条件
 
-- Provider/graph/Tool 错误不影响其他 Run；application 强退后重启可从检查点恢复且命令进程树被清理。
-- WebView 无法直接读取 API Key、application runtime 或任意文件。
-- 未经策略层的命令无法执行。
-- 一个带文件修改与审批的 Run 可完整持久化和回放。
-- in-process Deep Agents 的 stream/HITL/subagent/取消/上下文传播和 3 Run 并发 contract 全部通过。
-- `BunSqliteSaver` 通过行为、WAL、崩溃恢复和旧 fixture 测试。
+- package 可启动 client、agents server、executor；终端用户无需安装 Bun/Node。
+- server 只绑定动态 loopback；未认证本机进程不能注册。
+- `client <-> server <-> executor` 是唯一应用 RPC 拓扑，旧 generation 的消息被拒绝。
+- Provider/graph/Tool 错误不影响其他 Run；server/executor 分别强退后状态可对账。
+- WebView/client 无法直接读取 API Key、业务 DB、任意文件或 executor API。
+- 未经 server Policy/approval/intent 和一次性 grant，executor 不执行。
+- 一个带文件修改与审批的 Run 可完整持久化和回放，命令进程树可取消/清理。
+- `BunSqliteSaver` 通过当前 schema、WAL、关闭重开和 server restart 测试。
+- executor offline 时绑定 Agent 不能启动新 Run。
+- executor 注册/重连后 full snapshot 原子替换完成前保持 syncing，绑定 Agent 不 runnable。
+- MCP/Skill command 只有 owning executor 持久化后成功；server 产品数据无 recoverable config/content/credential copy。
+- persisted epoch/revision、hint、60 秒 ±20% poll、delta/tombstone 和 gap/compaction/epoch/cursor snapshot fallback 可收敛；failed poll 不误删。
+- local executor root/credential file 的 `0700`/`0600`、owner、atomic replace、symlink/no-follow gate 通过。
 - Web Canvas 无法访问 Electrobun RPC、Bun/Node、任意本地文件或默认网络。
-- 外部 E2E harness 可验证签名 package 中的 Deep Agents/Provider、packaged runtime、Keychain 和 BrowserView；stable 产物不包含 test driver。
+- 外部 E2E harness 可验证签名 package 中的两个 companion、Provider、Keychain 和 BrowserView；stable 产物不包含 test driver。
+- 当前开发数据可明确 reset；本阶段不声称迁移旧单进程 DB/checkpoint。
 
 ## 3. 阶段 1：核心 MVP
 
-**目标：** 交付“配置模型 → Chat/Project → Ask/Plan/Agent → 审批执行 → Diff/撤销 → 后台与恢复”的完整闭环。
+**目标：** 在至少完成 A0–A3 的三角色基础上，交付“配置模型 -> Chat/Project -> Ask/Plan/Agent -> 审批执行 -> Diff/撤销 -> 后台与恢复”的完整闭环；外部发布前完成 A5。
 
 ### 3.1 基础与设置
 
@@ -63,6 +88,7 @@
 
 - Project 内文件读取、Patch 写入、创建、移动和删除。
 - 受控命令执行、风险分类和审批。
+- 每个实际 Tool 由 server 签发一次性 grant，executor 验证后执行。
 - Session 级 Allow all；高风险仍确认。
 - Git status、Diff、文件/变更块撤销。
 - 非 Git 项目变更日志和撤销。
@@ -77,7 +103,7 @@
 ### 阶段 1 不包含
 
 - 自定义 Agent 完整编辑器。
-- MCP/Skills 管理页。
+- 面向用户的 MCP/Skills 管理页和公开功能；A4 backend gate 可提前完成但保持 feature flag 关闭。
 - 知识库。
 - 正式 Canvas 功能。
 - 本地模型。
@@ -96,10 +122,14 @@
 ### 4.1 工作流 A：Agent 与扩展
 
 - 自定义 Agent 可视化配置、版本快照、复制、停用和导入导出。
+- Agent 绑定已注册 executor；当前 desktop 默认一个 local executor，未来可从 registry 选择。
 - MCP stdio、Streamable HTTP、SSE。
 - MCP Bearer/API Key、OAuth 2.1、连接测试和配置导入。
 - MCP Server/Tool 的全局、Project 和 Agent 作用域。
 - Agent Skills 本地安装、验证、启停、冲突处理、导入导出。
+- MCP config/credential/OAuth/lifecycle 和 Skill installations/immutable content 都由 selected executor 持久化；client UI command 经 server 校验后路由，offline 不伪装成功。
+- server 只保存 assigned executor stable resource refs 与 replaceable/disposable redacted inventory cache；registration full sync、hint + jittered poll 和 delta/snapshot fallback 保持对账。
+- cache 只含 ID/version/hash、Tool schema、health/capability 和 credential-configured boolean；Run start/restore 仍向 live executor 验证。
 - 文件/目录知识库、本地索引、云端 Embedding 和来源引用。
 - Ollama Provider 与 LM Studio 兼容 Endpoint。
 - 本地 Embedding。
@@ -158,7 +188,7 @@
 
 1. 新用户首次启动，无需登录。
 2. 添加任一首版 Provider，有效凭证测试成功。
-3. 选择一个支持工具的模型并完成流式回复。
+3. 选择一个模型，经 agents server Provider adapter 完成流式回复。
 4. WebView、日志和导出中不存在凭证明文。
 
 ### E2E-02：普通 Chat
@@ -179,7 +209,7 @@
 
 1. Agent 请求修改文件并运行测试。
 2. 审批卡显示 Diff、命令、工作目录和风险。
-3. 用户允许后执行，结果进入轨迹。
+3. 用户允许后，server 持久化决定/intent 并签发一次性 grant；executor 验证后执行，结果回到 server 轨迹。
 4. Git 与非 Git 项目都能识别本 Run 变更。
 5. 用户撤销一项变更，不覆盖外部并发修改。
 
@@ -196,34 +226,42 @@
 2. 第 4 个 Run 进入队列并显示原因。
 3. 一个 Run 结束后自动启动队首任务。
 4. 等待审批的任务发送不含敏感内容的通知。
+5. local executor 离线后，绑定 Agent 的新 Run 被阻止；恢复注册后才可继续启动。
 
 ### E2E-07：崩溃恢复
 
-1. Run 完成部分文件操作后强制结束 Electrobun application runtime。
-2. 重启应用显示最后安全检查点和已完成动作。
-3. 恢复不重复已成功的副作用工具。
-4. 状态不确定的动作要求人工确认。
+1. Run 完成部分文件操作后分别强制结束 agents server 与 executor。
+2. client 按 capped backoff 监管重启；达到上限时停止 crash loop 并显示恢复 UX。
+3. 重连后显示最后安全检查点、已完成动作和 executor registry 状态。
+4. 恢复不重复已成功的副作用工具；旧 instance/generation 的结果被拒绝。
+5. 状态不确定的动作要求人工确认。
 
 ### E2E-08：自定义 Agent
 
-1. 创建包含固定模型、MCP、Skill、知识和权限的 Agent。
+1. 创建包含固定模型、assigned executor MCP/Skill stable refs、知识、权限和 executor binding 的 Agent。
 2. 不兼容模型或缺失依赖在保存/运行前可见。
-3. 导出后不含密钥和本地绝对路径。
-4. 在另一安装中导入并修复依赖后可运行。
+3. owning executor 生成可选 Skill bundle；导出不含密钥、本地绝对路径或 server-side Skill copy。
+4. 在另一安装中先把资源导入 selected executor、再保存 Agent refs，修复依赖后可运行。
 
 ### E2E-09：MCP
 
 1. 导入并连接一个 stdio MCP。
 2. 通过 OAuth 连接一个远程 MCP。
 3. 查看并按 Tool 启停。
-4. 有副作用 Tool 遵守审批；错误不被包装为成功。
+4. client command 经 server 校验后由 selected executor 持久化并返回 epoch/revision；server 立即 read-own-write，offline/冲突/写入失败保持失败语义。
+5. 丢失 `inventory.changed` 后，48–72 秒 poll 拉到 delta；revision gap/compaction/epoch reset/invalid cursor 自动 full snapshot。
+6. executor offline 时 cache 标 stale 且不误删；reconnect full sync 完成前 Agent 不能运行。
+7. server DB/backup/cache 无 recoverable config/credential/Skill body；MCP credential 只在 executor private store 与目标 connection/process 可达。
+8. Run start live 验证 resource/version/hash/schema；有副作用 Tool 仍逐次使用 execution grant。
 
 ### E2E-10：Skill
 
 1. 安装符合 Agent Skills 规范的本地 Skill。
 2. 应用展示元数据、脚本和权限声明并通过校验。
-3. Agent 在相关任务中按需激活。
-4. Skill 脚本仍需遵守命令权限。
+3. executor 保存 immutable version/content/hash；Agent 只引用 assigned executor stable resource version。
+4. server 按 ref 获取并校验 metadata/`SKILL.md`；missing/mismatch fail closed。
+5. install/update/delete 产生 inventory revision/change/tombstone，server cache 收敛但不保存 Skill body。
+6. resources/scripts 仍通过 executor，Skill 脚本遵守命令权限和 execution grant。
 
 ### E2E-11：知识库
 
@@ -248,6 +286,7 @@
 - 完成状态只在所有必需步骤持久化后写入。
 - Provider/MCP 错误保持失败语义。
 - 文件冲突不静默覆盖。
+- inventory failed poll 不解释为 deletion；registration full sync 前 Agent 不 runnable，Run 不只信 cache。
 
 ### 8.2 性能
 
@@ -259,7 +298,10 @@
 ### 8.3 安全
 
 - API Key、OAuth Token 和敏感环境变量不进入 WebView。
-- 所有特权 RPC 有 View 身份、参数和权限校验；DeepAgentService callback 有 run/execution/app-instance 校验。
+- 所有特权 RPC 有角色、stable ID、instance/generation、参数和权限校验。
+- server 持久化 Policy/approval/intent；executor 拒绝过期、重复、篡改或目标不匹配的 grant。
+- Provider/model credential 不进入 executor；MCP credential 只在 owning executor private store 与目标 connection/process 可达，不进入 server copy、query/UI/log/export、全局环境或无关 child/Agent。
+- inventory hint/snapshot/delta/cache 只允许 redacted allowlist，不能包含 token、sensitive env、recoverable config 或完整 Skill content。
 - Allow all 的强制边界有自动化测试。
 - Canvas、Markdown、网页内容和 MCP 返回经过对应隔离或清理。
 
@@ -280,7 +322,7 @@
 
 | 功能 | 阶段 0 | 阶段 1 | 阶段 2 | 阶段 3+ |
 | --- | --- | --- | --- | --- |
-| Electrobun/runtime/React/Router/UI 基线 | Go/No-Go POC | 完整 | 优化 | 跨平台 |
+| Client/server/executor、RPC、registry、supervisor | A0–A2 | A3 + A5 完整 | A4 扩展 | 远程/跨平台 |
 | 普通/Project Chat | POC | 完整 | 增强 | 协作 |
 | Ask/Plan/Agent | POC | 完整 | 增强 | 自定义模式候选 |
 | 文件/命令/审批/Allow all | POC | 完整 | 扩展到 MCP/Skill | 企业策略 |
@@ -288,8 +330,8 @@
 | 并行/后台/恢复 | POC | 完整 | 子任务增强 | 定时任务 |
 | Git | Diff POC | 状态/Diff/撤销 | 优化 | 分支/提交/Worktree/PR |
 | 自定义 Agent | 数据模型 | 内置 Agent | 完整编辑与导入导出 | 编排/市场 |
-| MCP | 连接 POC | 无正式 UI | 完整 | Resources/Prompts/企业 |
-| Skills | 加载 POC | 无正式 UI | 完整 | Git 更新/市场 |
+| MCP | executor ownership/RPC/private-secret POC | 无正式 UI | routed UI + epoch/revision reconciliation + executor config/auth/lifecycle | Resources/Prompts/企业 |
+| Skills | immutable executor store/ref POC | 无正式 UI | routed UI + inventory delta/tombstone + prompt fetch/resources/scripts | Git 更新/市场 |
 | 知识库 | 索引 POC | 无 | 云端 + 本地 Embedding | 高级检索 |
 | Canvas | 隔离 POC | 无正式功能 | 四类型完整闭环 | 插件/依赖 |
 | Browser automation | 无 | 无 | 无 | 受控支持 |
@@ -302,9 +344,11 @@
 | 事项 | 最晚决策点 |
 | --- | --- |
 | 品牌视觉和第三方 NOTICE 策略（正式名称“墨枢”、MIT 许可证已确定） | 阶段 1 |
-| `BunSqliteSaver` Schema、迁移和 LangGraph 升级策略 | 阶段 0 |
+| `BunSqliteSaver` 当前 schema/reset、LangGraph 升级及首次发布后的 migration 策略 | 阶段 0 |
 | Electrobun 版本、实际 packaged runtime 和跨 runtime 升级策略 | 阶段 0 |
-| in-process/sidecar 隔离 ADR；默认 in-process，只有实测触发才实施 sidecar | 阶段 0 |
+| Desktop bootstrap、本机注册认证和 protocol version policy | A0 |
+| stable ID、instance/generation 和 executor lease 细节 | A0–A2 |
+| execution grant 的 proof、TTL 和 single-use 存储实现 | A3 |
 | Canvas 默认断网和桌面 E2E 的可行实现 | 阶段 0 |
 | 首个 Web Search BYOK Provider | 阶段 1 |
 | macOS 发布渠道与自动更新源 | 阶段 1 |
@@ -315,3 +359,4 @@
 | Agent 导出包扩展名和最终 Schema | 阶段 2 |
 | 是否建立 opt-in 遥测服务 | 阶段 2 |
 | 市场签名、审核和信任模型 | 阶段 4 |
+| remote/Docker/cloud executor 的配对、TLS、租户和 transport | 当前范围外，独立立项前 |

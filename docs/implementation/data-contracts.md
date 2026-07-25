@@ -1,26 +1,34 @@
 # 数据与接口契约
 
+> 状态：批准的目标契约；尚未完全实现
+> 当前单进程 Ask 合同见[实施进度](./progress.md)
+
 ## 1. 目标
 
-- Electrobun Host、in-process DeepAgentService 和 WebView UI 可按稳定模块契约独立开发。
-- 上游 Deep Agents/LangChain 类型不进入数据库和 UI 公共接口。
-- 所有状态变化可恢复、可审计、可按稳定 ID 关联。
-- 副作用在崩溃后不会被盲目重复。
-- Schema 和 RPC 可以版本化迁移。
+- Electrobun client、agents server 和 executor 可按稳定协议独立演进。
+- 每个持久实体、连接实例、Run、Tool、Action 和 invocation 可明确关联。
+- server 决策与持久化授权，executor 在实际执行前验证一次性 grant。
+- 断线、重连、进程重启和迟到消息不会覆盖新实例状态。
+- Deep Agents、Provider、MCP 和 Skill SDK 类型不进入公共 RPC 或 UI 契约。
+- 本次开发期重构可重置旧数据，不把迁移工作误写为已实现。
 
 ## 2. 通用约定
 
 | 项目 | 约定 |
 | --- | --- |
-| ID | UUIDv7 字符串；不使用数据库自增 ID 作为跨进程标识 |
-| 时间 | 数据库使用 UTC epoch milliseconds；API 返回 ISO 8601 |
-| 金额 | 整数最小货币单位或 decimal string，禁止 JS 浮点直接累计 |
-| Token | 非负整数；缺失与 0 分开 |
-| JSON | 写入前用 Zod 校验；存储时包含 `schemaVersion` |
-| Revision | 从 1 开始的单调整数，更新使用 compare-and-swap |
-| 删除 | 默认软删除，使用 `deletedAt`；物理清理由维护任务完成 |
-| Secret | 公共契约只传 `secretRef` 或掩码，禁止传明文 |
-| Path | Host 内保存规范化绝对路径；WebView 默认只接收展示路径 |
+| 业务 ID | UUIDv7 字符串；跨角色不得使用数据库自增 ID |
+| 稳定角色 ID | `clientId`、`executorId` 跨重连/重启保留 |
+| 实例 ID | 每次进程启动/连接注册生成新的 `instanceId` |
+| Generation | 稳定身份下单调递增；server 只接受最高有效 generation |
+| Connection ID | 每条 WebSocket 唯一；只用于连接观测和背压 |
+| 时间 | 数据库使用 UTC epoch milliseconds；RPC 返回 ISO 8601 |
+| JSON | 写入或发送前由共享 Zod schema 校验，并包含版本 |
+| Revision | 从 1 开始单调递增；更新使用 compare-and-swap |
+| Secret | 公共 RPC 只返回掩码；server DB 只保存 Provider/model `secretRef`，executor 私有 store 持有 MCP credential/OAuth state |
+| Path | server 保存产品范围；executor 执行前解析 canonical path 并验证 scope |
+| Error | 失败使用 error response/result，不包装成 success |
+
+`instanceId`、`generation` 和 `connectionId` 不能替代业务 ID。Run、Action 或 Tool 结果必须同时匹配业务 identity 和当前角色实例。
 
 ## 3. 错误契约
 
@@ -31,12 +39,14 @@ interface AppError {
     | "validation"
     | "permission"
     | "authentication"
+    | "availability"
     | "rate_limit"
     | "network"
     | "provider"
     | "tool"
     | "conflict"
     | "storage"
+    | "protocol"
     | "runtime"
     | "unknown";
   messageKey: string;
@@ -47,301 +57,259 @@ interface AppError {
 }
 ```
 
-- `safeMessage` 可进入 WebView 和导出。
-- 原始错误、Header、请求体和堆栈只进入脱敏本地日志。
-- UI 根据 `code` 和 `messageKey` 渲染，不解析 SDK 错误文本。
-- 失败不得用成功形态返回；Tool、MCP、Provider 均遵守该规则。
+稳定错误至少包含：
 
-## 4. Phase 1 领域实体
+- `PROTOCOL_VERSION_UNSUPPORTED`
+- `ROLE_NOT_ALLOWED`
+- `INSTANCE_SUPERSEDED`
+- `EXECUTOR_OFFLINE`
+- `EXECUTOR_CAPABILITY_MISSING`
+- `EXECUTION_GRANT_INVALID`
+- `EXECUTION_GRANT_EXPIRED`
+- `EXECUTION_GRANT_ALREADY_USED`
+- `INVOCATION_OUTCOME_UNKNOWN`
+- `INVENTORY_SYNC_REQUIRED`
+- `INVENTORY_CURSOR_INVALID`
+- `INVENTORY_RESYNC_REQUIRED`
 
-### 4.1 配置与项目
+原始 Header、凭证、堆栈和未脱敏 Tool 输出只能进入受控本地日志。UI 不解析 SDK 错误文本。
+
+## 4. 数据所有权
+
+### 4.1 角色边界
+
+| 数据/资源 | 唯一所有者 | 禁止 |
+| --- | --- | --- |
+| 业务 DB、checkpoint、migration、backup | agents server | client/executor 直接打开或写入 |
+| Provider/model config/credential、Agent definitions/versions | agents server | executor 读取 Provider secret 或自行修改 Agent |
+| Session/Run/event、Provider access、Agent runtime | agents server | client/executor 直接调用 Provider/graph |
+| Policy、approval、Action intent/result、grant audit | agents server | executor 自行批准 Action |
+| MCP config/credential/OAuth/lifecycle、Skill install/version/content/resource | owning executor | server 保存 recoverable copy 或 client 绕过 server 路由 |
+| redacted executor inventory cache | agents server projection | 当作 MCP/Skill 恢复源、授权依据或权威状态 |
+| Tool/MCP invocation、Skill scripts、进程树 | executor | server/client 直接执行 |
+| UI state、窗口、Updater、companion supervisor | client | server/executor 操作桌面框架 |
+| Provider/model Secret | agents server `SecretVault` | client/WebView/executor 读取 |
+| MCP Secret | executor `ExecutorSecretStore` | server DB/checkpoint/snapshot/backup 保存副本 |
+
+### 4.2 业务表
 
 | 表 | 关键字段 | 说明 |
 | --- | --- | --- |
-| `app_settings` | key, value_json, revision | 语言、主题、并发、通知等 |
-| `provider_connections` | id, type, name, endpoint, secret_ref, status | Provider 连接；不存明文 Key |
-| `model_profiles` | id, provider_connection_id, model_id, capabilities_json, pricing_json | 模型能力与价格 |
-| `projects` | id, name, canonical_path, real_path, git_root, status, revision | 本地 Project |
-| `project_settings` | project_id, default_agent_version_id, default_model_profile_id, exclusions_json | Project 覆盖 |
-| `project_env_vars` | id, project_id, name, secret_ref, is_secret | 命令环境变量引用 |
-| `agent_definitions` | id, builtin_key, name, current_version_id, disabled_at | 内置/自定义 Agent 容器 |
-| `agent_versions` | id, agent_id, version, config_json, config_hash, created_at | 不可变版本 |
+| `clients` | id, label, created_at, last_seen_at | 稳定 `clientId` |
+| `executors` | id, name, kind, availability, last_seen_at | 稳定 `executorId`；availability 包含 syncing/online/offline |
+| `role_instances` | stable_id, role, instance_id, generation, connected_at, disconnected_at | 注册历史；不保存 socket 对象 |
+| `agent_definitions` | id, name, executor_id, current_version_id, disabled_at | 多个 Agent 可绑定同一 executor |
+| `agent_versions` | id, agent_id, version, config_json, config_hash | 不可变配置快照 |
+| `agent_resource_refs` | agent_version_id, executor_id, kind, resource_id, resource_version, content_hash | 只保存 assigned executor 的稳定 MCP/Skill 引用 |
+| `provider_connections` | id, type, endpoint, secret_ref, status | Provider connection config |
+| `executor_inventory_snapshots` | executor_id, generation, inventory_epoch, inventory_revision, stale, redacted_json, observed_at | 原子替换、可丢弃、非权威的 capability/inventory cache |
+| `sessions` | id, project_id, agent_version_id, mode, title, status, revision | 产品会话目录 |
+| `runs` | id, session_id, executor_id, mode, status, config_snapshot_json | 一次 Agent 执行；snapshot 只含 resource refs/hashes，不含 Skill 正文 |
+| `run_events` | id, run_id, seq, type, payload_json, created_at | durable append-only 轨迹 |
+| `approval_requests` | id, run_id, tool_call_id, state, action_snapshot_json | server 的不可变审批请求 |
+| `approval_decisions` | id, approval_request_id, decision, decided_at | server 持久化决定 |
+| `action_executions` | id, run_id, tool_call_id, executor_id, state, intent_json, result_json | server 的 Action 事实 |
+| `execution_grants` | id, action_id, invocation_id, executor_id, instance_id, generation, digest, state, expires_at | 只存 grant 元数据/使用状态 |
+| `invocation_results` | invocation_id, action_id, state, result_json, received_at | executor typed result 的 server 投影 |
 
-Phase 1 只提供内置 Agent，但从一开始使用 `agent_versions` 快照，以免 Phase 2 迁移历史 Session。
+agents server 不保存 recoverable MCP/Skill config、MCP credential/OAuth state、Skill content/resource 或 executor secret handle。inventory cache 可随时丢弃并从 executor 重建，不能作为 executor 恢复输入。
 
-### 4.2 会话目录与 Transcript
+### 4.3 executor-owned local data
 
-| 表 | 关键字段 | 说明 |
-| --- | --- | --- |
-| `sessions` | id, kind, project_id, title, mode, agent_version_id, model_profile_id, status, revision | 普通或 Project Session 的产品目录；与 LangGraph thread 一对一映射 |
-| `session_drafts` | session_id, content_json, revision | 输入草稿 |
-| `attachments` | id, session_id, original_name, stored_path, mime, size, sha256 | 会话只读副本 |
-| `session_tombstones` | session_id, deleted_at, purge_after | 删除与恢复 |
+每个 executor 是自身 MCP/Skill 数据的唯一 source of truth。local desktop executor 建议使用：
 
-约束：
-
-- `kind=normal` 时 `project_id` 必须为空。
-- Session ID 稳定映射到 Deep Agents/LangGraph `thread_id`，但 Session 列表、标题、搜索和归档只由 SessionCatalog 管理。
-- conversation transcript 的事实来源是 checkpoint state 中的 messages，不建立业务 `messages` 表。
-- UI message ID、状态与顺序由 checkpoint messages 和 RunJournal correlation ID 组合得到；运行中、失败和取消投影可从 active run 与 durable Run event 重建。
-- Session 只保存下一次提交默认 mode；每个 Run 另存实际 mode。
-
-### 4.3 Run、事件与用量
-
-| 表 | 关键字段 | 说明 |
-| --- | --- | --- |
-| `runs` | id, session_id, parent_run_id, mode, status, queue_priority, agent_snapshot_json, model_snapshot_json | 一次执行 |
-| `run_recovery` | run_id, thread_id, checkpoint_id, durable_event_seq, recovery_status | checkpoint 引用与对账 |
-| `run_events` | id, run_id, seq, type, visibility, payload_json, created_at | 规范化 append-only 轨迹 |
-| `usage_events` | id, run_id, subagent_run_id, source_namespace, provider, model, kind, input_tokens, output_tokens, cost_json | 模型/Embedding 用量，可归属子 Agent |
-| `run_artifacts` | id, run_id, kind, uri, metadata_json | 文件、导出、Canvas 等产物引用 |
-| `subagent_runs` | id, run_id, parent_subagent_id, name, namespace, status | 子 Agent 可视状态 |
-
-索引：
-
-- `runs(session_id, created_at desc)`。
-- `runs(status, queue_priority, queued_at)`。
-- `run_events(run_id, seq)` 唯一。
-- `usage_events(run_id, created_at)`。
-- `usage_events(subagent_run_id, created_at)`。
-- `subagent_runs(run_id, namespace)`。
-
-`run_events` 用于 UI 轨迹和恢复诊断，但不替代规范化业务表；审批、Tool 和文件变更仍有独立表。
-
-### 4.4 Tool、审批与副作用
-
-| 表 | 关键字段 | 说明 |
-| --- | --- | --- |
-| `tool_calls` | id, run_id, subagent_run_id, tool_name, state, args_redacted_json, risk, idempotency_class | Tool 生命周期 |
-| `approval_requests` | id, run_id, tool_call_id, state, action_snapshot_json, risk_reason, expires_at | 不可变审批请求 |
-| `approval_decisions` | id, approval_request_id, decision, edited_action_json, feedback, decided_at | 用户决定 |
-| `action_executions` | id, tool_call_id, idempotency_key, state, intent_json, result_json, started_at, finished_at | 实际副作用 |
-| `file_changes` | id, action_execution_id, project_id, path, operation, before_hash, after_hash, patch_uri | 变更日志 |
-| `command_executions` | id, action_execution_id, executable, args_redacted_json, cwd, exit_code, output_uri | 命令结果 |
-| `permission_audit` | id, run_id, action_type, decision, policy_rule, scope_json | Policy Engine 决策 |
-| `session_grants` | id, session_id, app_instance_id, type, enabled_at, revoked_at | Allow all 审计 |
-
-`session_grants` 可持久记录，但有效性必须同时满足 `app_instance_id` 等于当前启动实例。应用启动生成新实例 ID，因此不会恢复 Allow all。
-
-## 5. Phase 2 实体
-
-| 表 | 说明 |
+| 存储 | 权威内容 |
 | --- | --- |
-| `mcp_servers` / `mcp_tools` | MCP 连接、作用域、能力、风险覆盖和内容哈希 |
-| `oauth_accounts` | OAuth 元数据和 Secret Ref，不存 Token 明文 |
-| `skills` / `skill_versions` / `skill_bindings` | Skill 来源、版本、校验结果、作用域和绑定 |
-| `knowledge_bases` / `knowledge_sources` / `index_jobs` | 知识源、索引状态、Embedding 配置 |
-| `canvases` / `canvas_files` / `canvas_versions` | Canvas 草稿、文件和不可变版本 |
-| `agent_dependencies` | Agent 版本引用的 MCP、Skill、Knowledge 和子 Agent |
+| `executor.db:mcp_configs` | stable resource ID、transport、非敏感 config、config version/hash、lifecycle intent |
+| `executor.db:mcp_inventory` | connection/Tool descriptor、health 和 Tool schema |
+| `executor.db:skill_installations`、`skill_versions` | stable resource ID、immutable version、metadata、content hash 和 local locator |
+| `executor.db:inventory_state` | persisted opaque `inventoryEpoch` 和该 epoch 内单调递增的 `inventoryRevision` |
+| `executor.db:inventory_changes` | 有界 change log；连续 revision、category、redacted upsert 和 deletion tombstone |
+| private `skills/` | immutable `SKILL.md`、resources、scripts 和其他内容 |
+| `ExecutorSecretStore` | MCP credential、token、OAuth state；DB 最多保存 executor-internal opaque locator |
 
-向量数据由 `KnowledgeIndexStore` 管理，不把特定向量引擎内部 Schema 暴露到 `app.db`。
+这些数据不属于产品 DB、server backup 或 client export。local private root 必须 `0700`，credential file 必须 `0600`，写入使用 owner check、atomic replacement、symlink rejection 和可用时的 no-follow。其他 executor 可通过 Port 使用不同 secret backend。
 
-## 6. Run 状态机
+## 5. Agent、Executor 与可用性
 
-```mermaid
-stateDiagram-v2
-    [*] --> created
-    created --> queued
-    queued --> preparing
-    preparing --> running
-    running --> waiting_approval
-    running --> waiting_user
-    waiting_approval --> running
-    waiting_user --> running
-    waiting_approval --> stopping
-    waiting_user --> stopping
-    waiting_approval --> interrupted
-    waiting_user --> interrupted
-    running --> stopping
-    stopping --> cancelled
-    running --> completed
-    running --> failed
-    preparing --> failed
-    preparing --> interrupted
-    running --> interrupted
-    stopping --> interrupted
-    interrupted --> recovery_required
-    recovery_required --> queued
-    recovery_required --> cancelled
-    recovery_required --> failed
+### 5.1 N:1 关系
+
+- `agent_definitions.executor_id` 必填。
+- 当前 desktop 创建一个 `kind=local_host` executor，多个 Agent 绑定它。
+- 一个 Agent 同一版本只绑定一个 executor；未来切换 executor 产生新 Agent version 或显式配置 revision。
+- Agent version 的每个 MCP/Skill ref 都必须是 `executorId + stableResourceId + version + contentHash`，且 `executorId` 等于 Agent assignment。
+- client 通过 server 查询 registry，不硬编码 executor 在线。
+- executor 新连接先处于 `syncing`；只有 full inventory sync 原子替换成功后才进入 online/runnable。
+
+### 5.2 启动 Run
+
+`runs.start` 在创建可执行 Run 前验证：
+
+1. Agent version 存在且未停用。
+2. 绑定 executor 已注册、当前 connection 的 full inventory sync 已完成且 online。
+3. server 通过 live executor RPC 验证 capability、所有 resource owner/version/hash 和当前 MCP Tool schema；不能只信 cache。
+4. server 从 executor 按稳定 ref 获取 Skill metadata/`SKILL.md`，version/hash 完全一致。
+5. Provider、Policy 和 Session 状态有效。
+
+executor syncing 时返回 `INVENTORY_SYNC_REQUIRED`；offline、resource missing 或 version/hash mismatch 时 fail closed。不能创建一个看似运行中的 Run、把 inventory polling 当授权，或用 snapshot/旧内容回退。若 executor 在 Run 中途离线，server 将 Run 转为 `interrupted`/`recovery_required`，并对未完成 Action 做结果对账。
+
+## 6. Run、Tool 与 Action 状态
+
+### 6.1 Run
+
+```text
+created -> queued -> preparing -> running
+running -> waiting_approval | waiting_user
+waiting_approval | waiting_user -> running
+preparing | running | waiting_* -> stopping -> cancelled
+preparing | running | waiting_* | stopping -> interrupted
+interrupted -> recovery_required
+recovery_required -> queued | cancelled | failed
+running -> completed | failed
 ```
 
-规则：
-
 - `completed`、`failed`、`cancelled` 为终态。
-- 进程异常后，非终态 Run 不直接变 `failed`，先变 `interrupted`。
-- `waiting_approval` 和 `waiting_user` 具有 durable checkpoint。
-- 用户可以从 `waiting_approval`/`waiting_user` 停止；Runtime 异常时二者进入 `interrupted`，不得永久悬挂。
-- 恢复前必须经过 Tool Recovery Resolver。
-- 每次状态转换与对应 `run.status_changed` 事件在同一业务 DB transaction 内完成。
+- server/exec connection loss 不直接推断 Tool 成败。
+- 状态转换与 `run.status_changed` 在同一 server DB transaction 内提交。
+- 新执行记录目标 executor stable ID、instance ID 和 generation；恢复时不能复用旧 instance lease。
 
-## 7. Tool 与 Action 状态机
-
-### 7.1 ToolCall
+### 6.2 ToolCall
 
 ```text
 proposed
-  → policy_check
-  → denied
-  → waiting_approval → rejected
-                     → approved
-  → executing
-  → succeeded | failed | cancelled | outcome_unknown
+  -> policy_check
+  -> denied
+  -> waiting_approval -> rejected | approved
+  -> grant_issued
+  -> executing
+  -> succeeded | failed | cancelled | outcome_unknown
 ```
 
-### 7.2 ActionExecution
+### 6.3 ActionExecution
 
 ```text
 intent_persisted
-  → executing
-  → succeeded | failed | cancelled | outcome_unknown
+  -> grant_issued
+  -> executing
+  -> succeeded | failed | cancelled | outcome_unknown
 ```
 
-`outcome_unknown` 用于以下情况：
+`outcome_unknown` 永远不自动重放 non-idempotent Action。
 
-- 外部 MCP/HTTP 操作可能已成功，但结果落库前进程退出。
-- 命令创建后台子进程后失去跟踪。
-- 文件系统返回异常，无法确认原子替换是否完成。
+## 7. 注册与连接契约
 
-`outcome_unknown` 永远不自动重放非幂等动作。
+### 7.1 Bootstrap
 
-## 8. 审批契约
+desktop agents server 绑定 `127.0.0.1`/`::1` 的动态端口。client 通过受控父子进程 bootstrap 获取：
 
 ```ts
-interface ApprovalRequest {
-  id: string;
-  runId: string;
-  toolCallId: string;
-  action: RedactedActionSnapshot;
-  risk: "low" | "medium" | "high";
-  reasonCodes: string[];
-  allowedDecisions: Array<"approve" | "edit" | "reject" | "respond">;
-  preview?: ApprovalPreview;
-  policyVersion: string;
-  createdAt: string;
-}
-```
-
-规则：
-
-- Request 创建后不可修改；参数变化产生新 Request 并 supersede 原请求。
-- Decision 与 Request 一一对应。
-- `edit` 后重新经过 Schema 和 Policy Engine 校验。
-- 拒绝反馈明确告诉 Agent 动作未发生。
-- 高风险动作不提供“本 Session 始终允许”。
-- 批量 UI 仍逐项提交 Decision，顺序与 interrupt action request 一致。
-
-## 9. Run Event 契约
-
-```ts
-interface AppRunEvent<T extends RunEventType = RunEventType> {
-  schemaVersion: 1;
-  id: string;
-  runId: string;
-  sessionId: string;
-  seq: number;
-  type: T;
-  source: {
-    kind: "main_agent" | "subagent" | "tool" | "system" | "user";
-    id?: string;
-    namespace?: string[];
+interface DesktopBootstrap {
+  endpoint: string;
+  serverInstanceId: string;
+  supportedProtocolVersions: number[];
+  registrationTokens: {
+    client: string;
+    executor: string;
   };
-  visibility: "user" | "debug";
-  payload: RunEventPayloadMap[T];
-  createdAt: string;
+  expiresAt: string;
 }
 ```
 
-### 9.1 Phase 1 事件类型
+两个 token 分别绑定角色、一次性且短时有效，不进入日志或命令行参数。每次重新注册都需要受控 bootstrap/control channel 签发的新 proof；具体刷新机制在 A0 ADR 冻结。bootstrap 不承载业务调用。
 
-```text
-run.queued
-run.started
-run.status_changed
-run.completed
-run.failed
-run.interrupted
-run.recovery_required
+### 7.2 注册请求
 
-message.started
-message.delta
-message.completed
+```ts
+interface RegisterRoleRequest {
+  role: "client" | "executor";
+  stableId: string;
+  instanceId: string;
+  generation: number;
+  build: {
+    appVersion: string;
+    binaryVersion: string;
+    protocolVersions: number[];
+  };
+  capabilities: Record<string, JsonValue>;
+  registrationProof: string;
+}
 
-plan.submitted
-plan.revised
-plan.approved
-todo.updated
-
-subagent.started
-subagent.progress
-subagent.completed
-subagent.failed
-
-tool.proposed
-tool.waiting_approval
-tool.started
-tool.completed
-tool.failed
-tool.outcome_unknown
-
-approval.requested
-approval.decided
-
-file.changed
-command.output
-command.completed
-
-context.summarized
-usage.recorded
-artifact.created
-warning.raised
+interface RegisterRoleResult {
+  connectionId: string;
+  protocolVersion: number;
+  serverInstanceId: string;
+  acceptedGeneration: number;
+  lease: {
+    heartbeatIntervalMs: number;
+    expiresAfterMs: number;
+  };
+  inventorySync?: {
+    mode: "full";
+    requiredBeforeRunnable: true;
+  };
+}
 ```
 
-### 9.2 Delta 与最终消息
+server 拒绝：
 
-- `message.delta` 可高频到达，落库前按 20–50 ms 或字符阈值合并为 chunk event。
-- `message.completed` 保存完整内容和校验哈希。
-- UI 优先用 delta 实时展示，刷新后可以用完整消息快速加载。
-- Debug-only 原始事件不默认进入导出。
+- 非 client/executor 角色。
+- 无共同 protocol version。
+- 重复或过期 proof。
+- generation 低于当前已接受值。
+- 同 stable ID、同 generation 但不同 instance ID 的竞争注册。
+- 不兼容 build/capability。
 
-## 10. Host ↔ WebView RPC 契约
+每次进程启动和重新注册都使用新 `instanceId` 与新 generation。每条 WebSocket 另有新 `connectionId`。executor 注册成功只表示连接已认证；server 随即调用 `inventory.getSnapshot()`，原子替换成功前 registry 保持 `syncing`，assigned Agent 不 runnable。每次 reconnect 都重复 full sync，不能因 cached epoch/revision 相同而跳过。
 
-### 10.1 三类接口
+## 8. Versioned JSON RPC
 
-| 类型 | 语义 | 示例 |
-| --- | --- | --- |
-| Command | 修改状态，返回确认或业务结果 | `run.start`、`approval.decide` |
-| Query | 读取快照，可分页 | `session.get`、`run.events.list` |
-| Subscription | 推送增量，支持断线补齐 | `run.events.subscribe`、`tasks.subscribe` |
-
-### 10.2 请求信封
+### 8.1 信封
 
 ```ts
 interface RpcRequest<T> {
-  apiVersion: 1;
-  requestId: string;
-  clientInstanceId: string;
+  jsonrpc: "2.0";
+  protocolVersion: number;
+  id: string;
   method: string;
-  payload: T;
+  sender: {
+    role: "client" | "agents_server" | "executor";
+    stableId: string;
+    instanceId: string;
+    generation: number;
+    connectionId: string;
+  };
+  correlation?: {
+    sessionId?: string;
+    runId?: string;
+    toolCallId?: string;
+    actionId?: string;
+    invocationId?: string;
+  };
+  params: T;
 }
 
 type RpcResponse<T> =
-  | { requestId: string; ok: true; data: T }
-  | { requestId: string; ok: false; error: AppError };
+  | { jsonrpc: "2.0"; protocolVersion: number; id: string; result: T }
+  | { jsonrpc: "2.0"; protocolVersion: number; id: string; error: AppError };
 ```
 
-Electrobun RPC Schema 提供编译期类型，Host 仍必须执行以下运行时验证：
+### 8.2 Transport 规则
 
-- 请求来自已登记的主 WebView ID、窗口角色和预期 `views://` origin；Canvas BrowserView 不注册该 RPC。
-- `apiVersion`、method 和 payload Schema。
-- 当前页面不作为授权依据；权限基于 Session/Run/Project 数据。
-- Request ID 和可重试 Command 的 idempotency key。
-- payload、响应和事件的大小上限；大文件和二进制只传受控 handle，不内联 RPC。
-- Command/Query 有有限 deadline；`runs.start/resume` 返回 accepted 后通过事件跟踪，禁止用无限 RPC timeout 等待整个 Agent Run。
+- 只有 `client <-> agents server` 和 `agents server <-> executor` 两类连接。
+- 所有 method 按角色 allowlist 校验；client 无 executor method，executor 无 UI/Provider/DB method。
+- frame、payload、in-flight request、event buffer 和 deadline 有上限。
+- 长 Run/invocation 快速返回 accepted，进度通过 notification/event 推送。
+- 可重试 command 携带 idempotency key；server/executor 去重。
+- 断线重连后 client 按 durable cursor 补事件；executor 按 invocation reconciliation 合并状态。
+- `inventory.changed` 只是 revision/category hint；server 通过 pull RPC 获取 redacted data，hint 不能携带 resource body、credential 或 Skill content。
+- 未知 method/version、Schema 失败和超限明确返回错误并计入安全日志。
 
-### 10.3 Phase 1 API 面
+### 8.3 Client <-> agents server API
 
 ```text
+registry.clients.get
+registry.executors.list / registry.executors.get
+agents.list / agents.get
 settings.get / settings.update
 providers.list / providers.save / providers.test / models.list
 projects.list / projects.add / projects.get / projects.update / projects.remove
@@ -353,86 +321,69 @@ runs.events.list / runs.events.subscribe
 approvals.listPending / approvals.decide
 tasks.list / tasks.reorder / tasks.subscribe
 files.preview / files.diff / files.revert
-git.status / git.diff
-attachments.add / attachments.remove
+mcp.list / mcp.get / mcp.create / mcp.update / mcp.remove / mcp.import
+mcp.test / mcp.start / mcp.stop / mcp.authorize / mcp.revoke
+skills.list / skills.get / skills.install / skills.update / skills.remove / skills.import
 usage.summary
 diagnostics.export
 ```
 
-WebView client 暴露具体方法，不暴露通用 `request(method, payload)`；生成的底层 RPC client 只在 adapter 内使用。
+client 只暴露领域方法，不提供通用 method forwarding。MCP/Skill query/command 先由 server 校验 client/executor identity、Agent binding 和产品授权，再路由到 selected executor：
 
-### 10.4 订阅与补齐
+- mutation 使用 `commandId` 和 expected resource version；server 可持久化 redacted Action intent/audit，但不能持久化 recoverable config、Skill content 或 credential。
+- 只有 executor 持久化成功后，server 才转发 redacted result 与 `inventoryEpoch + inventoryRevision`。
+- server 收到 mutation result 后立即调用 `inventory.getChanges` 拉取到返回的 revision；epoch/gap/cursor 异常时改用 snapshot，实现 read-own-write。
+- executor offline、version conflict 或 storage failure 返回 typed failure；server 不排队伪成功。
+- server 可返回明确标记 stale 的 inventory snapshot，但不能用它提供完整 config 编辑、secret query 或恢复。
 
-```ts
-subscribeRunEvents({
-  runId,
-  afterSeq
-}, onEvent): Unsubscribe
+### 8.4 agents server <-> executor API
+
+```text
+executor.register / executor.heartbeat / executor.describe
+inventory.getSnapshot / inventory.getChanges
+inventory.changed
+resources.validate
+invocations.start / invocations.cancel / invocations.reconcile
+invocations.events
+mcp.list / mcp.get / mcp.create / mcp.update / mcp.remove / mcp.import
+mcp.test / mcp.start / mcp.stop / mcp.authorize / mcp.revoke / mcp.tools.list
+skills.list / skills.get / skills.install / skills.update / skills.remove / skills.import
+skills.readPrompt / skills.readResource
+executor.shutdown
 ```
 
-- Host 先查询 `seq > afterSeq` 的 durable events，再切换 Electrobun message stream。
-- 切换过程使用当前 high-water mark，避免丢失或重复。
-- WebView 按 `(runId, seq)` 去重。
-- 慢消费者触发批量发送；超过缓冲上限时要求重新 Query，不无限占内存。
+executor 不接受 `policy.allow`、`approval.decide`、`database.query`、`provider.invoke` 等越权方法。
+MCP/Skill 方法操作 executor-owned state，不应用 server 侧配置副本。所有 query/result/inventory 都必须 redacted；secret、OAuth state、executor secret locator 和完整 Skill content 只能走用途受限的 command/resource RPC，不能进入普通列表或诊断。
 
-## 11. DeepAgentService 应用契约
+`inventory.changed` 是 executor -> server notification；其余 inventory 方法是 server -> executor request。server 对 hint 去抖，并独立对每个 online executor 每 60 秒 ±20% jitter（48–72 秒）调用增量 API。RPC failure 只把 cache 标记 stale，不生成 deletion。
 
-Deep Agents JS 默认直接运行在 Electrobun application worker。该边界是可测试的 TypeScript application service，不是跨进程 RPC。
-
-### 11.1 命令
+## 9. Run Event
 
 ```ts
-interface DeepAgentService {
-  start(input: StartRunInput): Promise<RunAccepted>;
-  resume(input: ResumeRunInput): Promise<RunAccepted>;
-  cancel(input: CancelRunInput): Promise<void>;
-  disposeSession(sessionId: string): Promise<void>;
-  shutdown(reason: ShutdownReason): Promise<void>;
-}
-
-interface RunAccepted {
+interface AppRunEvent<T extends RunEventType = RunEventType> {
+  schemaVersion: 1;
+  id: string;
   runId: string;
-  threadId: string;
-  executionId: string;
-  acceptedAt: string;
+  sessionId: string;
+  executorId?: string;
+  seq: number;
+  type: T;
+  source: {
+    role: "agents_server" | "executor";
+    kind: "main_agent" | "subagent" | "tool" | "system" | "user";
+    id?: string;
+  };
+  visibility: "user" | "debug";
+  payload: RunEventPayloadMap[T];
+  createdAt: string;
 }
 ```
 
-- `start/resume` 只完成校验、持久化初始状态和注册执行，必须快速返回；模型输出通过 `AppRunEvent` 异步发布。
-- 输入显式包含 Session/Project/Agent/Model identity，不读取 WebView 的 active selection。
-- `cancel` 通过当前 execution 的 `AbortController` 传播到 graph、Provider、subagent 和 Tool；完成取消前保持 Run 为 `stopping`。
+server 分配 durable `seq` 并先落库。executor notification 只有在 server 验证当前 instance/generation、关联 invocation 和 Schema 后，才转换为 `AppRunEvent`。
 
-### 11.2 Run Registry
+## 10. Policy、Approval 与 Execution Grant
 
-```ts
-interface ActiveRun {
-  runId: string;
-  threadId: string;
-  executionId: string;
-  appInstanceId: string;
-  abortController: AbortController;
-  pendingInterruptIds: Set<string>;
-  startedAt: string;
-}
-```
-
-- Registry 只保存活动对象，不保存到数据库；checkpoint、Run 状态、事件和 interrupt 才是可恢复事实来源。
-- 同一 Session 同时最多一个副作用 Run；同步 subagent 属于父 Run，但仍计入 Provider/资源信号量。
-- 每个异步 callback 在写状态前校验 `runId + executionId + appInstanceId`，取消或恢复后的迟到 callback 不得污染新执行。
-- 终态、Session 删除和应用 shutdown 都必须删除 Registry entry 并释放 Provider、stream、临时文件和进程句柄。
-
-### 11.3 HITL 与事件
-
-- Deep Agents stream 先转换为稳定 `AppRunEvent`，写入 `app.db` 后再通过 Electrobun message 推送。
-- LangGraph interrupt 先保存 checkpoint、`approval_requests` 和 `interruptId`；不能用只存在内存的 pending Promise 等待 UI。
-- 审批恢复使用同一 `threadId`、graph config 和 `Command({ resume })`，支持 batched action requests 的 approve/edit/reject/respond。
-- WebView reload 只会断开订阅；重新连接后按 `afterSeq` 补齐，Run 与 interrupt 不依赖原页面存活。
-
-### 11.4 可选 sidecar adapter
-
-只有隔离 ADR 明确选择 sidecar 时，才把同一 `DeepAgentService` interface 映射为进程协议。该 adapter 必须补充长度分帧、协议/runtime 版本握手、随机启动凭证、Schema、generation、背压、超时、heartbeat、crash loop、Secret channel、协作式 shutdown、process-tree kill 和 checkpoint writer ownership；不能把这些复杂度加入默认实现。
-
-## 12. Action Request 契约
+### 10.1 ActionRequest
 
 ```ts
 interface ActionRequest<TAction extends ActionType = ActionType> {
@@ -441,6 +392,7 @@ interface ActionRequest<TAction extends ActionType = ActionType> {
   runId: string;
   sessionId: string;
   toolCallId: string;
+  executorId: string;
   actionType: TAction;
   args: ActionArgsMap[TAction];
   idempotencyKey: string;
@@ -452,154 +404,274 @@ interface ActionRequest<TAction extends ActionType = ActionType> {
 }
 ```
 
-Policy Engine 不信任模型或 Tool wrapper 提供的 `risk`、路径范围或是否需要审批；这些全部根据 action 和持久配置重新计算。
+server 不信任模型、Tool wrapper 或 executor 提供的 risk/approval 结论；Policy Engine 根据持久配置重新计算并持久化。
 
-## 13. 幂等与恢复
-
-### 13.1 分类
-
-| 分类 | 示例 | 恢复 |
-| --- | --- | --- |
-| pure | 读文件、Git status | 可安全重试 |
-| idempotent | 按目标哈希写固定内容 | 验证后重试 |
-| conditionally_idempotent | 应用 Patch、移动文件 | 检查 before/after 状态 |
-| non_idempotent | 发消息、部署、远程创建记录 | 状态不明时人工处理 |
-
-### 13.2 Write-ahead intent
-
-副作用执行顺序：
-
-1. 校验授权和参数。
-2. 在 `action_executions` 写入 `intent_persisted`。
-3. 执行动作。
-4. 写结果、文件日志和 Tool 状态。
-5. 返回 DeepAgentService。
-
-DeepAgentService 不可自行假设 Tool 成功；只接受 Action Broker 返回的 typed result。
-
-### 13.3 启动恢复器
-
-应用启动时：
-
-1. 找出非终态 Run。
-2. 将旧 app instance 的 Allow all grant 失效。
-3. 失效旧 `appInstanceId` 的 active execution lease，并清空内存 Registry。
-4. 对 `executing` Action 运行 Recovery Resolver。
-5. 对照 checkpoint id 和 durable event seq。
-6. 标记 `recovery_required` 并给出安全选项。
-
-## 14. Checkpoint 契约
-
-- 一个 Session 使用稳定 LangGraph `thread_id`；每个执行分支使用 `checkpoint_ns` 或独立 thread 策略，Phase 0 POC 后冻结。
-- `run_recovery` 保存当前可恢复 checkpoint。
-- `BunSqliteSaver` 实现 `BaseCheckpointSaver` 的 `getTuple`、`list`、`put`、`putWrites` 和 `deleteThread`，并复用 LangGraph serializer。
-- saver 的私有 Schema 单独版本化；每次 LangGraph 升级运行 `BaseCheckpointSaver` 行为 contract 与项目的 WAL/崩溃 fixture。
-- checkpoint 数据不直接供 WebView 查询或导出。
-- 业务数据库不建立 conversation message 表；Host 从 checkpoint state 读取 transcript，并与 RunJournal 的状态和 durable delivery event 合并为 WebView snapshot。Event 可携带实时投递所需的 delta/terminal payload，但不得作为完成态 conversation 的事实来源。
-- Agent/Tool 配置快照保存在业务 DB，恢复时不使用已被编辑的最新配置。
-- 删除 Session 时调用 saver 的 `deleteThread`，并在失败时保留清理任务。
-- 项目只保证当前锁定版本和当前 checkpoint schema；不迁移或兼容旧版 checkpoint 数据。
-
-## 15. 文件变更与撤销
-
-### 15.1 变更记录
-
-每项写动作记录：
-
-- Project ID 和相对路径。
-- 操作类型：create/update/delete/move。
-- before/after hash、size、mode。
-- unified patch（适合文本时）。
-- before/after blob URI（必要且在大小限制内）。
-- Action、Tool、Run 和审批 ID。
-- 外部变更检测时间。
-
-### 15.2 撤销规则
-
-- 当前 hash 等于 `after_hash`：可直接应用反向 Patch/恢复 before blob。
-- 当前 hash 等于 `before_hash`：视为已经撤销，幂等成功。
-- 其他 hash：进入 conflict，不覆盖；展示三方 Diff。
-- 删除恢复时目标路径已存在：必须选择新路径或手工合并。
-- 多文件撤销先生成完整计划，逐项执行并报告部分成功。
-
-### 15.3 Project 锁
-
-- 读不加独占锁。
-- 写按 canonical path 加锁。
-- move 同时锁定源和目标，按稳定排序获取，避免死锁。
-- Git reverse patch 与多文件操作获取 Project transaction lock。
-- 锁只在进程内提供并发协调，外部编辑依靠 hash 检测。
-
-## 16. Secret Vault
-
-`secret_records` 只在 Host 使用；Secret 值由 `SecretVault` Port 保存到操作系统存储，不写入 `app.db`：
-
-| 字段 | 说明 |
-| --- | --- |
-| id | Secret Ref |
-| kind | provider_key / oauth_token / env / header |
-| vault_handle | 不含 Secret 值的 Keychain item handle |
-| metadata_json | 掩码、Provider、更新时间，不含值 |
-| created_at / updated_at | 审计 |
-
-规则：
-
-- WebView Schema 中不存在读取、解密或枚举 vault handle 的 API。
-- 首发 macOS adapter 通过经审查的 Bun FFI/native bridge 调用 Keychain；service/account 命名包含应用 ID 和 Secret Ref。
-- DeepAgentService 只按 Run scope 读取当前 Provider 需要的 Secret；值不得进入 WebView RPC、事件总线或调试 trace。
-- Secret 不进入 Agent prompt、checkpoint、事件或错误。
-- 导出配置只包含缺失凭证占位符。
-- Keychain 或 adapter 不可用时连接进入 blocked，并返回明确错误；不使用明文、可逆本地密钥或弱加密回退。
-- 删除连接时同步删除 Keychain item；失败则保留可重试清理任务和不含值的审计记录。
-
-## 17. 数据库迁移
-
-- Drizzle 生成版本化 SQL migration，发布包只执行已审查 migration。
-- 启动顺序：获取单实例锁 → 备份 app.db/WAL → integrity check → migration → 启动窗口服务。
-- 大迁移分为 expand/backfill/contract，避免长时间阻塞首次窗口。
-- 迁移失败时保留原 DB 和备份，应用进入只读恢复页。
-- `checkpoints.db` 使用项目维护的 `BunSqliteSaver` Schema；应用管理版本检测、WAL 备份、当前 schema 恢复测试和 thread 清理。当前不迁移旧 checkpoint schema，不支持时拒绝启动并进入恢复流程。
-- 不在同一发布中同时进行不可逆业务 DB 迁移和 Deep Agents 大版本升级。
-
-## 18. 导出契约
-
-### Markdown
-
-- 用户/Agent 可见消息、计划、引用和产物链接。
-- 默认不含 debug 事件、完整 Tool 输出、绝对路径和 Secret。
-
-### JSON
+### 10.2 ApprovalRequest
 
 ```ts
-interface SessionExportV1 {
-  schemaVersion: 1;
-  exportedAt: string;
-  session: ExportedSession;
-  messages: ExportedMessage[];
-  runs: ExportedRun[];
-  events: ExportedEvent[];
-  artifacts: ExportedArtifact[];
-  redactionReport: RedactionSummary;
+interface ApprovalRequest {
+  id: string;
+  runId: string;
+  toolCallId: string;
+  executorId: string;
+  action: RedactedActionSnapshot;
+  risk: "low" | "medium" | "high";
+  allowedDecisions: Array<"approve" | "edit" | "reject" | "respond">;
+  policyVersion: string;
+  createdAt: string;
 }
 ```
 
-- 只导出 `visibility=user` 的事件，除非用户显式选择诊断导出。
-- 所有路径经过 Project 相对化或掩码处理。
-- 导出前运行中央 Secret Redactor。
+编辑后的 Action 重新经过 Schema、Policy 和 intent 持久化，不能复用旧 grant。
 
-## 19. 契约验收
+### 10.3 ExecutionGrant
+
+```ts
+interface ExecutionGrant {
+  schemaVersion: 1;
+  grantId: string;
+  actionId: string;
+  invocationId: string;
+  runId: string;
+  toolCallId: string;
+  target: {
+    executorId: string;
+    instanceId: string;
+    generation: number;
+  };
+  authorization: {
+    actionType: string;
+    argsDigest: string;
+    capabilities: string[];
+    scopeDigest: string;
+    policyVersion: string;
+    approvalDecisionId?: string;
+  };
+  issuedAt: string;
+  expiresAt: string;
+  nonce: string;
+  proof: string;
+}
+```
+
+executor 验证：
+
+1. grant 来自当前已认证 agents server connection。
+2. target stable ID、instance ID、generation 与自身一致。
+3. grant 未过期、未使用、未撤销。
+4. invocation 的 action/args/scope digest 完全匹配。
+5. 所需 capability 在当前 executor 注册能力内。
+
+grant 单次使用。executor 先原子标记 nonce 已消费，再执行；旧连接或 restart 后的 grant 不再有效。
+
+### 10.4 executor-owned MCP credential
+
+- Provider/model credential 只存在于 agents server `SecretVault`，供 Provider adapter 使用，永不发送 executor。
+- MCP credential、token 和 OAuth state 只由 owning executor 的 `ExecutorSecretStore` 持久化和解析；server 无 Secret Ref 或 recoverable copy。
+- client 的设置 command 经 server 授权后路由到 selected executor；secret 只可存在于不落盘、强制脱敏且 relay 后释放的 command payload，不能进入 server DB/checkpoint/event/audit payload、snapshot、backup 或 log。
+- executor query/result/inventory 永不返回 secret、secret handle 或 recoverable auth config，只返回 redacted 状态。
+- executor 可在 connection/process lifetime 将 credential 加载到内存；stdio MCP 只向目标 child 注入最小环境，不修改 executor 全局环境，也不传给无关 child/Agent。
+- HTTP MCP 可在可行时按 request 注入 credential，但不是 universal requirement。
+- revocation、expiry 或 MCP shutdown 必须关闭对应 connection/process 并释放 runtime references；不宣称 JavaScript 可可靠清零 string memory。
+- credential 只认证 MCP connection；每个 MCP Tool invocation 仍需要新的 `ExecutionGrant`。
+
+## 11. Tool 幂等与恢复
+
+| 分类 | 示例 | 断线后处理 |
+| --- | --- | --- |
+| pure | 读文件、Git status | 可重新签发 grant 并重试 |
+| idempotent | 按目标哈希写固定内容 | 验证状态后重试 |
+| conditionally_idempotent | Patch、move | 对照 before/after 状态 |
+| non_idempotent | 发送消息、部署、远程创建 | unknown，人工确认 |
+
+顺序固定为：
+
+1. server 持久化 Policy/approval。
+2. server 持久化 Action intent。
+3. server 签发 grant 并创建 invocation。
+4. executor 验证 grant，执行并返回 typed result。
+5. server 持久化 result 或 `outcome_unknown`。
+6. server 才向 Agent runtime 返回 Tool result。
+
+executor 不得自行假设 server 已收到结果；重连时使用 `invocations.reconcile` 按 `invocationId` 对账。
+
+## 12. MCP 与 Skill 契约
+
+### 12.1 stable executor resource reference
+
+Agent version 不复制 executor config 或 content，只保存：
+
+```ts
+interface ExecutorResourceRef {
+  executorId: string;
+  resourceKind: "mcp" | "skill";
+  stableResourceId: string;
+  version: string;
+  contentHash: string;
+}
+```
+
+`executorId` 必须等于 Agent assignment。server 构建或恢复 Agent 时向该 executor 解析引用；offline、missing、wrong owner、version/hash mismatch 都 fail closed，不得用 inventory snapshot 或旧 prompt payload 回退。
+
+### 12.2 executor inventory projection
+
+```ts
+interface ExecutorInventoryResource {
+  resourceKind: "mcp" | "skill";
+  stableResourceId: string;
+  version: string;
+  contentHash: string;
+  health: "ready" | "stopped" | "error";
+  credentialConfigured?: boolean;
+  mcpTools?: Array<{
+    stableToolId: string;
+    name: string;
+    schemaHash: string;
+    inputSchema: JsonValue;
+    outputSchema?: JsonValue;
+  }>;
+}
+
+interface ExecutorInventorySnapshot {
+  executorId: string;
+  executorGeneration: number;
+  inventoryEpoch: string;
+  inventoryRevision: number;
+  generatedAt: string;
+  capabilities: string[];
+  resources: ExecutorInventoryResource[];
+}
+
+interface InventoryChangedHint {
+  inventoryEpoch: string;
+  inventoryRevision: number;
+  categories: Array<"capability" | "mcp" | "mcp_tool_schema" | "skill">;
+}
+
+interface ExecutorInventoryChange {
+  revision: number;
+  category: "capability" | "mcp" | "mcp_tool_schema" | "skill";
+  operation: "upsert" | "delete";
+  stableResourceId?: string;
+  descriptor?: ExecutorInventoryResource;
+  capabilities?: string[];
+  tombstone?: {
+    resourceKind: "mcp" | "skill";
+    stableResourceId: string;
+    deletedVersion?: string;
+  };
+}
+
+interface ExecutorInventoryChangesPage {
+  inventoryEpoch: string;
+  fromRevisionExclusive: number;
+  throughRevision: number;
+  oldestAvailableRevision: number;
+  changes: ExecutorInventoryChange[];
+  nextCursor?: string;
+}
+```
+
+executor 持久化 opaque `inventoryEpoch`、该 epoch 内严格单调递增的 `inventoryRevision` 和有界 change log。每个权威 MCP/Skill/config/Tool-schema/capability mutation 在同一 transaction 内更新状态、递增 revision 并追加 change；删除追加 tombstone。普通 restart 保留 epoch/revision，inventory store reset/recreate 才更换 epoch。log 可按数量/时间压缩，但必须返回 `oldestAvailableRevision`。
+
+同步规则：
+
+1. 每次 executor connection/registration/reconnect 后，server 立即调用 `inventory.getSnapshot()`；成功原子替换 cache 前 executor 保持 `syncing`。
+2. commit 后 executor 发送 `inventory.changed`。hint 只允许 epoch/revision/categories；server 去抖后调用 `inventory.getChanges(sinceRevision, cursor)`。
+3. cursor 是 executor 签发、绑定 epoch/fromRevision/high-water mark 的 opaque pagination token。server 拉完所有 page 后才原子提交一批连续 changes。
+4. server 还要独立执行 60 秒 ±20% jitter 的增量 poll；hint 丢失不能让 cache 永久停留。
+5. revision gap、`sinceRevision < oldestAvailableRevision`、epoch mismatch/reset、invalid cursor 或任何无法证明连续的 page 都返回/映射为 `INVENTORY_RESYNC_REQUIRED`，随后 full snapshot。
+6. offline/RPC failure 只把 cache 标记 stale；失败不能解释为 deletion。删除只接受同 epoch 连续 change 中的 tombstone，或成功 full snapshot 原子替换后的缺失项。
+
+snapshot/change/cache 只允许 stable resource ID、version/hash、MCP Tool schema、health、executor capability 和 redacted `credentialConfigured` boolean。endpoint/command/args、sensitive env、credential/token/OAuth state、recoverable MCP config、完整 `SKILL.md`/resources 或 executor secret locator 一律禁止。cache 是 disposable、non-authoritative projection，只用于 discovery/reconciliation/stale UI，不能作为 executor 恢复输入、Run resource validation 或授权依据。
+
+### 12.3 MCP
+
+MCP config、auth state、connection/process 和 Tool inventory 都由 executor 持久化/管理。client 的完整配置 UI 使用第 8 节 routed API；mutation 必须带 `commandId` 与 expected version，executor 原子持久化后返回：
+
+```ts
+interface ExecutorResourceMutationResult {
+  stableResourceId: string;
+  version: string;
+  contentHash: string;
+  inventoryEpoch: string;
+  inventoryRevision: number;
+  redactedSummary: Record<string, JsonValue>;
+}
+```
+
+server 收到 mutation result 后立即增量同步到返回的 epoch/revision；若同步暂时失败，已持久化 mutation 保持成功，但 cache 标记 stale，后续 inventory read 不得伪造新 descriptor。server 只把稳定 ref 写入 Agent version，并把 redacted inventory 作为非权威 cache。MCP Tool descriptor 可供 discovery；Run start/restore 仍用 `resources.validate` 对 live executor 验证 owner/version/hash/schema，invocation 仍使用普通 `ActionRequest` + `ExecutionGrant`。ready/authenticated 或 poll success 都不等于预授权。
+
+### 12.4 Skill
+
+- executor 保存 Skill installation、immutable version、metadata、`SKILL.md`、references、assets、scripts 和 content hash。
+- server 只保存 `ExecutorResourceRef`，构造或恢复 Agent 时按完整 ref 向 assigned executor 获取 metadata 和 `SKILL.md`。
+- executor 返回的 prompt payload 包含 stable resource ID、version、hash；server 验证后才构造 Agent prompt。
+- prompt payload 只在 server memory 中使用，不写入 Agent/Run config snapshot、checkpoint、event、backup、inventory、diagnostic 或 export；恢复时重新获取。
+- hash/version 不匹配、Skill missing、wrong executor 或 executor offline 时 fail closed；不能使用 snapshot 或过期内容启动。
+- server 不把 executor local path 写入 Agent config 或 client payload。
+- `allowed-tools` 只是声明；references/assets/scripts 的读取和执行仍创建 Action 并由 executor 校验 grant。
+
+## 13. Checkpoint 与 Transcript
+
+- 一个 Session 使用稳定 LangGraph `threadId`。
+- checkpoint DB 只有 agents server 的 `BunSqliteSaver` 写入。
+- `runs` 保存 effective Agent/executor/config snapshot 和可恢复 checkpoint 引用。
+- conversation transcript 的事实来源是 checkpoint messages；Session 标题、搜索、归档和 RunJournal 属于业务 DB。
+- client/executor 不直接查询 checkpoint。
+- executor restart 不改变 thread ownership；Tool outcome 先由 Action recovery 对账，再恢复 graph。
+- 删除 Session 由 server 调用 `deleteThread`。
+
+## 14. Secret Ports
+
+### 14.1 agents server `SecretVault`
+
+- 只长期保存 Provider/model credential；业务 DB 只保存 `SecretRef`。
+- client/WebView 只读取掩码和配置状态，Provider Key 不发送 executor。
+- Provider secret 不进入 checkpoint、Run event、grant、日志、诊断或导出。
+- 首发 macOS adapter 通过经审查的 Bun FFI/native bridge 调用 Keychain；不可用时显式 blocked，不回退到明文。
+
+### 14.2 executor `ExecutorSecretStore`
+
+```ts
+interface ExecutorSecretStore {
+  putMcpSecret(resourceId: string, kind: string, value: string): Promise<void>;
+  resolveMcpSecret(resourceId: string, kind: string): Promise<string>;
+  deleteMcpSecret(resourceId: string, kind: string): Promise<void>;
+}
+```
+
+- Port 只在 executor process 内可用；secret locator/value 不进入普通 RPC DTO。
+- local adapter 可使用 private files：root `0700`、credential file `0600`、owner check、atomic replacement、reject symlink/no-follow where available。
+- 这些权限只防其他普通本机用户，不防同账户 malware、root、disk snapshot 或 backup；future executor 可改用 Keychain、Docker Secret 或 cloud secret manager。
+- 删除 MCP、OAuth revoke、expiry 和 local reset 必须定义 credential cleanup 与 connection/process teardown。
+
+## 15. 数据库版本与开发期重置
+
+本次三角色重构发生在开发阶段：
+
+- 不要求把现有单进程 `app.db`、checkpoint 或 Provider 开发配置迁移到目标 schema。
+- server 检测不兼容开发 schema 时可提供明确的 reset 流程；不得静默解释旧字段。
+- 自动化 fixture 只要求当前目标 schema 的创建、关闭重开、backup 和恢复。
+- 首次对外发布冻结 schema 后，才启用正式 expand/backfill/contract migration 和跨版本 gate。
+
+## 16. 契约验收
 
 | ID | 验收 |
 | --- | --- |
-| CON-001 | 所有 Electrobun RPC 和 DeepAgentService 边界输入通过共享 Schema 校验 |
-| CON-002 | 每个 Run event 的 seq 唯一、连续或能明确识别缺口 |
-| CON-003 | 重复提交同一可重试 Command 不产生重复副作用 |
-| CON-004 | 取消、恢复或应用重启后的迟到 callback 不会写入新 execution/app instance |
-| CON-005 | 非幂等 Action 结果不明时不会自动重放 |
-| CON-006 | 文件被外部修改后撤销不会覆盖当前内容 |
-| CON-007 | Allow all grant 在新 app instance 中无效 |
-| CON-008 | 所有已发布业务 DB fixture 可迁移；当前 checkpoint schema fixture 可在关闭重开后读取并继续 |
-| CON-009 | Secret 不出现在 WebView payload、事件、checkpoint、日志或导出 |
-| CON-010 | WebView reload 或应用重启不会丢失 durable interrupt；恢复使用同一 thread/config 与显式 resume command |
-| CON-011 | `BunSqliteSaver` 与锁定 LangGraph 版本的 checkpoint 行为契约一致 |
-| CON-012 | Run 终态、Session 删除和应用退出都会 abort/dispose 活动资源；Registry 不无限增长 |
+| CON-001 | 所有跨角色请求、响应和 notification 通过版本化 Schema 与 method/role allowlist |
+| CON-002 | client/executor 稳定 ID 跨重启保留；每次注册产生新 instance/generation，旧实例消息被拒绝 |
+| CON-003 | client 无 executor 直连 API；executor 无 DB、Provider、Policy 或 approval API |
+| CON-004 | executor syncing/offline 时绑定 Agent 的新 Run 分别返回 `INVENTORY_SYNC_REQUIRED`/`EXECUTOR_OFFLINE` |
+| CON-005 | Policy/approval/intent 在 grant 前持久化，executor 拒绝过期、重复、篡改或错误目标 grant |
+| CON-006 | Provider/model credential 从不进入 executor；server DB/checkpoint/backup/snapshot 不含 recoverable MCP/Skill config/content/credential/OAuth 或 executor secret locator |
+| CON-007 | Action result 只由 server 持久化；断线后 non-idempotent Action 不自动重放 |
+| CON-008 | Agent 只能引用 assigned executor 的稳定 MCP/Skill version/hash；Skill metadata/`SKILL.md` missing/mismatch 时 fail closed |
+| CON-009 | MCP/Skill mutation 只有 owning executor 原子持久化后才成功；offline/冲突/失败保持 typed failure |
+| CON-010 | DB/checkpoint 只有 server writer；executor kill/restart 不造成 SQLite 多写 |
+| CON-011 | client 重连可按 event seq 补齐；executor 重连可按 invocation ID 对账 |
+| CON-012 | 当前开发 schema 可明确重置；文档和测试不声称迁移旧单进程数据 |
+| CON-013 | local executor root/secret file 权限、owner、atomic replace 和 symlink/no-follow 规则通过测试，产品说明真实披露其威胁边界 |
+| CON-014 | 每次 executor 注册/重连立即 full sync；成功前不 runnable，snapshot 原子替换且 cache 明确 non-authoritative/disposable |
+| CON-015 | persisted epoch/revision、bounded delta/tombstone、hint debounce、60 秒 ±20% poll 和 gap/compaction/epoch/cursor snapshot fallback 可确定收敛 |
+| CON-016 | failed poll/offline 只标 stale、不生成 deletion；mutation revision 触发 read-own-write，Run start/restore 始终 live 验证且 inventory 不构成授权 |

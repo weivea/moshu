@@ -122,7 +122,7 @@ Web/Diagram 渲染必须满足：
 - 独立 Electrobun `BrowserView`、partition 和 `sandbox: true`，不与主 WebView 共用应用 RPC。
 - 禁用 Bun/Node、Electrobun RPC、应用特权 `views://` 页面和同源主应用访问。
 - 默认禁用网络；真实测试必须覆盖 iframe、fetch、WebSocket、EventSource、图片、字体、CSS、媒体、service worker、localhost、私网和 DNS rebinding。
-- Electrobun 当前没有已文档化的 `webRequest` 等价子资源拦截能力。默认断网门未通过时，不执行任意用户 HTML/JavaScript；网络临时授权必须经 Host 的显式 capability 与受控代理，不能只靠导航规则。
+- Electrobun 当前没有已文档化的 `webRequest` 等价子资源拦截能力。默认断网门未通过时，不执行任意用户 HTML/JavaScript；网络临时授权必须由 agents server 持久化决定，并由 client Preview 的显式 capability 与受控代理执行，不能只靠导航规则。
 - 禁止直接访问 `file://`、Project 路径、剪贴板、摄像头、麦克风和位置。
 - 通过受控 `views://` wrapper 设置不可被用户内容覆盖的严格 CSP，限制脚本、连接、字体、图片和 frame。
 - 限制 CPU、内存、日志、存储和渲染时间；失控时可终止预览。

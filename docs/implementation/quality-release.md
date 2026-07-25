@@ -1,522 +1,464 @@
 # 质量与发布计划
 
+> 本文验证批准的三应用角色目标架构。
+> 当前单进程 Ask 测试是迁移输入，不能替代 client/agents-server/executor 的目标 gate。
+
 ## 1. 质量目标
 
 | 目标 | 发布要求 |
 | --- | --- |
-| 正确性 | 状态机、事件、审批和副作用关联无歧义 |
-| 可恢复 | DeepAgentService、窗口或应用异常后不盲目重复副作用 |
-| 安全 | WebView、Canvas、网页、MCP 和 Skill 无越权路径 |
-| 兼容 | 支持的 Provider 在声明能力范围内行为一致 |
-| 性能 | 长会话、流式事件和 3 个并发 Run 下 UI 可交互 |
-| 可迁移 | 数据库和 checkpoint 升级失败有备份与恢复路径 |
-| 可发布 | macOS 签名、公证、安装、升级和回滚可复现 |
+| 所有权 | server 产品状态与 executor-owned MCP/Skill config/secret/content 没有双 owner 或 recoverable shadow copy |
+| 协议 | 版本、角色、身份、Schema、错误、取消、背压和重连行为确定 |
+| 可恢复 | client、server、executor 或 Tool 异常后不盲目重复副作用 |
+| 授权 | server 先持久化 Policy/approval；executor 只执行有效一次性 grant |
+| Secret | Provider/model credential 不进入 executor；MCP credential 只在 executor private store 与目标 connection/process 可达 |
+| 性能 | 三个应用角色和 3 个并发 Run 下 UI、RPC、取消保持可交互 |
+| 可发布 | 两个 Bun companion 随 Electrobun client 正确构建、签名、公证和更新 |
 
 ## 2. 测试分层
 
-```mermaid
-flowchart TB
-    E2E[E2E / packaged app]
-    CONTRACT[Provider / RPC / Tool contract]
-    INTEGRATION[Application service / DB / runtime integration]
-    UNIT[Domain / policy / adapters unit]
+| 层 | 运行频率 | 重点 |
+| --- | --- | --- |
+| Unit | 每次提交 | 状态机、Policy、grant、identity、路径、脱敏 |
+| Protocol contract | 每个 PR | JSON RPC、Schema、版本、role allowlist、错误、背压 |
+| Role integration | 每个 PR | server DB/runtime、executor Tool/MCP/Skill、client adapter |
+| Three-role E2E | 每个 PR 核心集，nightly 全集 | 启动、注册、Run、Action、重连、退出 |
+| Package smoke | 主分支/nightly/release | compiled companions、权限、签名、无系统 Bun |
+| Security/chaos | nightly/发布前 | 未授权连接、旧实例、grant、kill points、Secret |
+| Live compatibility | nightly/发布前 | Provider API 和发布支持的远程 MCP |
 
-    E2E --> CONTRACT
-    CONTRACT --> INTEGRATION
-    INTEGRATION --> UNIT
-```
+测试必须区分：
 
-| 层 | 运行频率 | 工具 | 重点 |
-| --- | --- | --- | --- |
-| Unit | 每次提交 | `bun test`/Vitest | 状态机、Policy、路径、费用、脱敏 |
-| Integration | 每个 PR | Bun test runner + 真实 `bun:sqlite`/子进程 | DB、BunSqliteSaver、DeepAgentService、Broker |
-| Contract | 每个 PR + nightly | 本地 fake server/fixture | Provider、Electrobun RPC、DeepAgentService、Tool、MCP |
-| WebView | 每个 PR | Vitest + React Testing Library | 路由、焦点、表单、状态 |
-| Desktop E2E | 每个 PR 核心集，nightly 全集 | Phase 0 冻结的 typed-RPC test driver + UI automation | Host/WebView/in-process Deep Agents 完整流程 |
-| Package smoke | 主分支/nightly/release | Electrobun artifact + 外部启动/探针脚本 | 自解压、ASAR 可选项、bundled runtime、签名产物 |
-| Live compatibility | nightly/发布前 | 低预算真实账号 | Provider API 漂移 |
-| Security/Chaos | nightly/发布前 | 专项 harness | 越权、崩溃、恢复、恶意内容 |
+- **当前实现测试**：证明现有 Ask slice 没有回归。
+- **目标架构测试**：必须真的启动独立 agents server/executor，并经 WebSocket RPC 通过。
 
-## 3. Unit 测试清单
+禁止用 in-memory adapter 或同进程 service call 给跨角色 gate 记为通过。
 
-### 3.1 Domain
+## 3. A0–A5 质量门
 
-- Run、Tool、Approval 状态机只接受合法转换。
-- Session/Canvas revision compare-and-swap。
-- Queue 优先级、并发槽和同 Session 写锁。
-- Allow all grant 必须匹配当前 app instance。
-- Plan 批准前不能转换为执行状态。
-
-### 3.2 Policy Engine
-
-- Ask/Plan/Agent 有效工具集。
-- 文件路径、Project 边界、排除规则和敏感路径。
-- `..`、Unicode、大小写、软链接和不存在目标路径。
-- 命令 direct exec、复杂 Shell、网络、删除、权限提升。
-- Allow all 可放行与不可放行矩阵。
-- MCP/Skill 声明不能提高应用权限。
-
-使用 property-based tests 生成路径、参数和状态转换边界；高风险策略不只靠固定样例。
-
-### 3.3 数据与事件
-
-- AppRunEvent Schema 和 payload mapping。
-- sequence 分配、重复事件去重和缺口识别。
-- Provider 用量、缓存 Token、费用 decimal 累计。
-- Secret、Header、路径和命令输出脱敏。
-- 导出只包含允许字段。
-
-## 4. Integration 测试
-
-### 4.1 SQLite
-
-- 新数据库建库和所有 migration。
-- 每一个已发布 Schema 版本升级到当前版本。
-- WAL、并发读、单写和 busy timeout。
-- 事务中断、磁盘满、只读目录和损坏数据库。
-- 迁移前备份和失败恢复页。
-- Tombstone 清理不删除 Project 原文件。
-
-### 4.2 Checkpoint
-
-- `BunSqliteSaver` 的 `getTuple/list/put/putWrites/deleteThread` 行为 contract。
-- interrupt → app restart → resume。
-- todo、subagent 和 message state 恢复。
-- checkpoint 领先业务事件。
-- 业务事件领先 checkpoint。
-- 当前 checkpoint schema fixture 在关闭、重开和应用重启后读取并继续。
-- 不支持的 checkpoint schema 明确拒绝启动并进入恢复流程，不静默迁移。
-- 删除 Session 后 thread 清理。
-
-### 4.3 RPC
-
-- 每个 Host/WebView method 的请求/响应 Schema。
-- 未登记 View ID、错误窗口角色/origin 和销毁窗口调用被拒绝。
-- WebView 不能调用未在领域 client 暴露的方法；Canvas BrowserView 没有应用 RPC。
-- Subscription 从 `afterSeq` 补齐、实时切换、去重和慢消费者。
-- DeepAgentService 的 start 快速接受、事件发布、cancel、dispose 和 shutdown。
-- 旧 execution/app instance 的迟到 callback 被丢弃。
-- durable interrupt 在 WebView reload 后可补齐，并用同一 thread/config 恢复。
-- Run 完成、Session 删除和 shutdown 后 Registry 归零；重复打开/关闭会话不持续增长 heap、订阅或 Provider client。
-- 仅 sidecar ADR 被采用时增加握手、协议版本、frame、背压、heartbeat 和 crash-loop suite。
-
-### 4.4 Action Broker
-
-- 文件读写、原子替换、hash CAS、冲突和撤销。
-- 命令 cwd、环境、超时、输出截断和取消进程树。
-- Action intent 在副作用前落库。
-- Broker 返回错误后 DeepAgentService 不生成成功 ToolMessage。
-- 同一路径写锁和 move 双锁无死锁。
-
-## 5. Provider Contract Suite
-
-每个 Chat Provider Adapter 必须通过统一测试：
-
-| 能力 | 测试 |
+| Gate | 必须通过 |
 | --- | --- |
-| Authentication | 有效、无效、缺失和撤销 Key |
-| Basic invoke | 文本请求和最终响应 |
-| Streaming | delta 顺序、取消和连接断开 |
-| Tool call | Schema、参数、多个 Tool、无效 Tool |
-| Usage | input/output/cache/reasoning 字段归一化 |
-| Error | 401、403、404 model、429、5xx、timeout |
-| Capability | 不支持 Tool/图片/参数时在运行前拒绝 |
-| Endpoint | Base URL、版本、Header 和代理字段 |
-| Redaction | 请求/错误/日志不含 Key |
+| QG-A0 RPC/binary | 两 companion compile/package、dynamic loopback、registration、version、role allowlist、shutdown/restart cap |
+| QG-A1 server extraction | Ask parity、server 单写 DB/checkpoint、Provider/graph 不在 client、event replay |
+| QG-A2 registry | stable ID、instance/generation、Agent N:1、注册 full capability sync、syncing/offline Run gate |
+| QG-A3 execution | policy/approval/intent/grant 顺序、grant negative suite、Tool process tree、Action recovery |
+| QG-A4 MCP/Skills | executor-owned persistence、epoch/revision delta reconciliation、routed UI、stable resource ref、private secret store、逐 Tool grant、fail-closed restore |
+| QG-A5 release | kill matrix、capped recovery UX、cooperative quit、signed/notarized package、Updater atomicity |
 
-### 5.1 本地 Fake Provider
+前一 gate 未通过时，后一阶段可以做 isolated spike，但不得把产品能力默认开启。
 
-维护 OpenAI-compatible 和 Anthropic-compatible fake HTTP Server：
+## 4. Unit 测试
 
-- 可脚本化返回 streaming、Tool、usage 和错误。
-- PR 测试不依赖外网或真实费用。
-- Kimi、智谱和自定义 Endpoint 复用兼容协议 suite，再增加品牌默认值测试。
+### 4.1 Identity 与 registry
 
-### 5.2 Live Smoke
+- stable `clientId`/`executorId` 序列化和恢复。
+- 每次启动/注册生成新 `instanceId` 与递增 generation。
+- 低 generation、同 generation 不同 instance、旧 connection event 被拒绝。
+- heartbeat/lease 的 online、offline、superseded 转换。
+- persisted `inventoryEpoch`/monotonic revision 的 restart 保留和 store reset 换 epoch。
+- syncing -> online、offline -> stale，以及 full snapshot 未完成时 Agent 不 runnable。
+- 多 Agent 绑定同 executor；删除/停用 executor 的引用规则。
+- offline executor 的 `runs.start` 返回 `EXECUTOR_OFFLINE`。
 
-- 只在受保护 CI 环境和低预算账号运行。
-- 每个正式支持 Provider 至少测试一次文本、stream 和 Tool call。
-- 失败阻止 release，不阻止普通社区 PR。
-- 日志只保留 Provider、模型、状态、耗时和用量，不保留内容/Key。
-- 模型下线时先在能力目录标记，不静默替换用户模型。
+### 4.2 Protocol
 
-## 6. Electrobun 桌面 E2E
+- method/role allowlist。
+- protocol version negotiation、无交集和 downgrade 拒绝。
+- request ID/idempotency key 去重。
+- frame/payload/in-flight/event buffer 上限。
+- timeout、cancel、late response 和 disconnect。
+- `AppError` 保持失败语义。
 
-Electrobun 当前没有 Playwright Electron 的等价官方入口。Phase 0 必须冻结可长期维护的测试驱动：
+### 4.3 Policy 与 grant
 
-- test 构建可启用最小 typed-RPC driver，用随机启动 token 和仅限本机的 pipe/socket 驱动假 Provider、故障注入和状态查询。
-- driver 通过编译时条件完全排除在 stable release；CI 扫描产物确认无测试 method、监听端口或固定 token。
-- 用户可见交互由 React Testing Library 和目标平台 UI automation 覆盖；CDP/Playwright 只有在 packaged POC 证明稳定时才可作为实现。
-- release package smoke 只能依赖正式入口、外部进程状态和公开诊断结果，不依赖测试后门。
+- Ask/Plan/Agent 有效 Tool 集。
+- Allow all 可放行与不可放行矩阵。
+- Policy、approval、Action intent 的合法状态转换。
+- grant target、TTL、nonce、args digest、scope digest、capability 和 generation。
+- duplicate/tampered/expired/revoked/wrong-executor grant 全部拒绝。
+- grant consumed 与 Tool start 的原子边界。
 
-### 6.1 核心 PR 集
+### 4.4 数据与恢复
 
-- 首次启动和空状态。
-- 保存 fake Provider 并开始普通 Chat。
-- 添加临时 Project 并运行 Ask。
-- Plan 生成、批准和执行。
-- 文件写审批、拒绝和允许。
-- 窗口 reload 后轨迹恢复。
-- Session 搜索、归档和导出。
+- Run、Tool、Action、invocation 状态机。
+- event sequence、duplicate 和缺口识别。
+- bounded inventory change log、连续 revision、deletion tombstone、compaction 和 invalid cursor。
+- pure/idempotent/conditional/non-idempotent 恢复分类。
+- Secret、Header、路径、命令输出和诊断脱敏。
 
-### 6.2 Nightly 全集
+## 5. Protocol Contract Suite
 
-- PRD E2E-01 至 E2E-07。
-- 3 个并发 Session 和第 4 个排队。
-- application runtime 强制退出并重启恢复。
-- WebView reload/关闭后后台 Run 与 durable interrupt 行为。
-- 关闭最后窗口后按策略继续/取消，重新打开可恢复任务中心且无永久 pending approval。
-- 文件外部并发修改与撤销冲突。
-- 语言/主题切换和键盘核心流程。
-- package artifact 安装后的相同流程。
+### 5.1 Bootstrap 与注册
 
-### 6.3 Phase 2
+- server 绑定 `127.0.0.1`/`::1` 动态端口，不监听公网接口。
+- role-bound bootstrap token 不出现在 argv、普通日志或固定配置。
+- token 过期、重放、client/executor 互换和未知 binary 被拒绝。
+- 未注册连接不能调用业务 method。
+- client/executor 注册返回协商版本、server instance 和 lease。
+- executor 注册/重连后 server 立即 `inventory.getSnapshot`；原子 cache replace 前 registry 保持 syncing。
 
-- PRD E2E-08 至 E2E-12。
-- MCP stdio/HTTP/OAuth fake servers。
-- 恶意 Skill fixture。
-- 知识索引中断、增量和引用。
-- Canvas revision 冲突和恶意 Preview。
+### 5.2 Client <-> agents server
 
-## 7. 故障注入与恢复
+- 每个领域 method 的请求/响应 Schema。
+- client 无通用 request forwarder、executor method、文件、Shell、Secret 或 DB API。
+- Run start 快速 accepted；event 可按 `afterSeq` 补齐和去重。
+- WebView reload/client reconnect 不影响 server Run 所有权。
+- registry list 只返回允许 client 查看且已脱敏的信息。
 
-### 7.1 Kill points
+### 5.3 agents server <-> executor
 
-对每类副作用自动注入以下中断点：
+- executor 只暴露 register/heartbeat/inventory/resource-validation/invocation/MCP/Skill/shutdown 方法。
+- server 不能用 RPC 执行未建 Action/grant 的任意 Shell。
+- invocation event/result 必须匹配当前 executor instance/generation 和 invocation ID。
+- executor reconnect 使用 reconcile，不重复报告或执行已终态 invocation。
+- `inventory.changed` Schema 只允许 epoch/revision/category；snapshot/change page/cursor 有大小、epoch、连续性和分页上限。
+- 慢/恶意 executor 不能无限占用 server memory 或 event queue。
 
-1. Tool proposed 后。
-2. Approval 决定后。
-3. Action intent 落库后、执行前。
-4. 副作用完成后、result 落库前。
-5. result 落库后、DeepAgentService 收到 typed result 前。
-6. checkpoint 更新前后。
-7. Run 标记 completed 前。
+## 6. Role Integration
 
-### 7.2 预期
+### 6.1 agents server
+
+- 新业务 DB/checkpoint 建库、当前 schema、WAL、关闭重开和 backup。
+- SessionCatalog/RunJournal、Provider 设置、stream、cancel 和 error parity。
+- `BunSqliteSaver` 的 `getTuple/list/put/putWrites/deleteThread` contract。
+- event 先落库再发布；checkpoint/Event 偏差可识别。
+- server 不导入 client UI 或 executor implementation。
+- 当前开发期不兼容 schema 进入明确 reset，不运行伪迁移。
+
+### 6.2 executor
+
+- 不打开业务 DB/checkpoint，不持有 Provider adapter。
+- 文件路径、软链接、TOCTOU、hash CAS、原子替换和撤销。
+- 命令 cwd、最小 env、timeout、输出截断、进程组和取消。
+- executor shutdown 清理所有受管进程树。
+- invocation registry 在终态/取消/断线对账后回收。
+
+### 6.3 client
+
+- companion 启动顺序、健康状态和 cooperative shutdown。
+- 两个角色各自独立 restart budget 与 capped backoff。
+- 达到 cap 后停止重启并展示 recovery UX。
+- client 不打开业务 DB/checkpoint，不调用 Provider/Deep Agents。
+- WebView 只通过 client adapter 访问 server。
+
+## 7. Action Broker 与 Tool Bridge
+
+### 7.1 正向场景
+
+1. Agent 提议 Action。
+2. server 持久化 Policy decision。
+3. 需要时持久化 approval request/decision。
+4. server 持久化 intent。
+5. server 签发 grant。
+6. executor 验证并执行。
+7. server 持久化 result，才向 Agent 返回 Tool result。
+
+测试对每一步断言 DB、event、RPC 和角色日志的 correlation ID。
+
+### 7.2 Kill points
+
+对文件、命令、Git、MCP 和 Skill script 自动注入：
+
+1. Policy 决定前后。
+2. Approval 决定前后。
+3. Action intent 前后。
+4. grant 签发前后。
+5. executor 消费 grant 前后。
+6. 副作用完成后、result 发送前。
+7. result 到达 server 后、持久化前。
+8. result 持久化后、Agent 收到前。
+
+### 7.3 预期
 
 | Action | 恢复预期 |
 | --- | --- |
-| 读文件/搜索 | 可重试 |
-| 固定内容写入 | 根据 after hash 判定成功或重试 |
-| Patch | 检查 before/after hash，否则冲突 |
-| 命令 | 无法确认时显示 unknown，不自动重跑 |
-| 远程副作用 MCP | unknown，要求人工验证 |
-| Agent 消息 stream | 使用 completed message 或 durable delta 重建 |
+| 读文件/搜索 | 可重新签发 grant 后重试 |
+| 固定内容写入 | 根据 before/after hash 验证 |
+| Patch/move | 状态不匹配进入 conflict |
+| 命令 | 无法确认时 `outcome_unknown`，不自动重跑 |
+| 远程 MCP 副作用 | `outcome_unknown`，人工验证 |
+| Skill script | 按实际命令幂等类别处理，不因“来自 Skill”放宽 |
 
-### 7.3 进程故障
+## 8. MCP 与 Skill
 
-- WebView crash/reload。
-- DeepAgentService 在 stream、Tool、checkpoint 或 `waiting_approval`/`waiting_user` 时抛错/取消。
-- Electrobun application worker/原生 launcher 正常退出和强制退出。
-- 关闭最后窗口但 Host 按后台策略继续运行，再重新打开窗口。
-- application 退出后仍存活的命令进程树。
-- 设备休眠/唤醒。
-- 网络中断与恢复。
-- 磁盘空间不足。
-- Keychain/SecretVault adapter 暂时不可用或返回交互拒绝。
+### 8.1 MCP
 
-## 8. 安全测试
+- executor DB 是 config/lifecycle/inventory 的 source of truth；restart 后从自身数据恢复，不依赖 server snapshot。
+- client command 经 server identity/auth 校验并路由；offline、expected-version conflict、disk failure 不返回 success，成功带 redacted result 与 inventory epoch/revision。
+- mutation result 触发 server 立即拉取到该 revision；失败时 cache 明确 stale，不伪造 read-own-write descriptor。
+- server 产品 DB、checkpoint、backup 和 inventory snapshot 不含 recoverable config、credential/OAuth state 或 executor secret locator。
+- stdio start/stop/restart cap、进程树和最小 env；credential 只注入目标 MCP child，不进入 executor 全局环境或无关 child。
+- HTTP/SSE disconnect、Schema hash 变化和 typed error。
+- Tool invocation 必须持有效 grant；MCP ready 不等于预授权。
+- Provider/model credential 从不发送 executor。
+- MCP credential/token/OAuth state 由 executor `ExecutorSecretStore` 持久化；query/result/UI/prompt/log/diagnostic/export 都不能读取原值或 locator。
+- revocation、expiry 或 MCP shutdown 会关闭对应资源并释放 runtime reference；不宣称 JavaScript 可可靠清零 string memory。
+- HTTP MCP 可按 request 注入 credential，但 suite 不把它设为所有 transport 的统一要求。
 
-### 8.1 WebView 与 RPC
+### 8.2 Skills
 
-- XSS payload 放入模型消息、Markdown、文件名、Tool 结果和错误。
-- CSP 违规、任意导航、新窗口和外部协议。
-- 直接构造 RPC、伪造 View ID/role 和越权 Project/Session ID。
-- WebView client 枚举确认无通用 request、fs、shell、secret 方法。
-- 伪造 Session/Run/execution ID、过期 callback、事件洪泛和无界订阅。
+- executor 安装、immutable version、压缩包穿越、frontmatter、内容 hash、atomic publish 和卸载。
+- Agent resource ref 必须属于 assigned executor；server 只能按 stable ID/version/hash 获取 metadata/`SKILL.md`，不能直接读 Skill 目录。
+- server inventory snapshot 不能恢复 Skill；产品 DB/checkpoint/Run snapshot/backup/event/diagnostic/export 不含 fetched `SKILL.md` 或其他 Skill content。
+- descriptor missing/hash mismatch/wrong owner 使 Agent build/restore fail closed。
+- references/assets/scripts 通过 executor；script 必须重新经过 Policy/grant。
+- executor offline 或 Skill 缺失时 Agent start 明确失败，不静默省略 Skill。
 
-### 8.2 文件
+### 8.3 inventory reconciliation
 
-- 路径穿越、绝对路径、NUL、Unicode normalization。
-- 软链接指向 Project 外。
-- 先校验后替换软链接的 TOCTOU 场景。
-- 大文件、特殊文件、FIFO、socket 和设备文件。
-- `.env`、SSH、浏览器 Profile 和应用数据目录。
-- Case-insensitive filesystem 的别名路径。
+- 每个 connection/registration/reconnect 都先 full snapshot；即使 cached epoch/revision 相同也不能跳过。
+- executor transaction 同时更新权威数据、递增 persisted revision、追加 change/tombstone；commit 后才发 hint。
+- hint debounce 合并 burst，但最终拉到最高 hinted revision；hint 丢失由 60 秒 ±20% jitter（48–72 秒）poll 补齐。
+- gap、compacted history、epoch change/reset、invalid/expired cursor 和非连续 page 都触发 full snapshot atomic replacement。
+- offline/timeout/malformed response 只把 cache 标 stale；不得删除任何 resource。删除只来自有效 tombstone 或成功 snapshot。
+- cache allowlist 只有 stable ID、version/hash、Tool schema、health、capability 和 `credentialConfigured` boolean；禁止 token、sensitive env、recoverable config、完整 `SKILL.md`/resources 和 secret locator。
+- reconnect full sync 前 Agent 不 runnable；Run start/restore 仍对 live executor 验证 resource/version/hash/schema，poll success 不算授权。
 
-### 8.3 命令
+### 8.4 local executor storage
 
-- 参数注入、`--` 边界、恶意文件名。
-- 管道、重定向、命令替换、变量展开和子 Shell。
-- `sudo`、权限修改、系统配置、磁盘工具。
-- 背景进程、daemon、fork bomb 和大量输出。
-- Secret 通过 env、stdout/stderr 和错误泄露。
-- Allow all 无法绕过高风险策略。
-
-### 8.4 Web
-
-- URL Reader SSRF：localhost、私网、link-local、云 metadata、IPv6、DNS rebinding。
-- 重定向从公网跳转私网。
-- 超大响应、压缩炸弹、非文本和慢速响应。
-- Prompt injection 不改变工具权限。
-
-### 8.5 Canvas
-
-- 尝试读取 Electrobun RPC、Bun/Node 对象和父窗口。
-- `file://`、`views://` 特权页面、localhost 和未授权域名。
-- 导航、popup、下载、clipboard、camera、microphone。
-- 通过 iframe、图片、CSS、字体、fetch、WebSocket、EventSource、DNS rebinding 和 service worker 外联。
-- 无限循环、内存增长和日志洪泛。
-- HTML/SVG/Markdown/Mermaid 注入。
-
-### 8.6 Phase 2 扩展
-
-- MCP Tool 名称/Schema/结果注入。
-- OAuth redirect/state/PKCE、Token 隔离和撤销。
-- stdio Server 环境变量与 cwd 泄露。
-- Skill 路径、压缩包穿越、脚本和更新内容变化。
-- 知识文档中的 prompt injection 和伪造引用。
+- private root 新建/重开权限为 `0700`，credential file 为 `0600`；错误 owner/mode 阻止读取。
+- 写入使用同目录临时文件、fsync/适用的 durability step 和 atomic replace。
+- symlink 被拒绝；平台支持时 open 使用 no-follow，TOCTOU suite 覆盖交换攻击。
+- 测试和产品文案明确：这些措施防其他普通本机用户，不防同账户 malware、root、disk snapshot 或 backup。
+- `ExecutorSecretStore` contract suite 可复用于 Keychain、Docker Secret 和 cloud secret manager adapter。
 
 ## 9. Secret 泄露验证
 
-测试使用唯一 canary secret，自动扫描：
+测试使用唯一 canary，扫描：
 
-- WebView RPC payload 和 state dump。
-- `app.db` 非 Secret Vault 字段。
-- `checkpoints.db`。
-- Run events/messages。
-- 日志和崩溃报告。
-- Session/Agent/诊断导出。
-- Canvas 与附件目录。
-- 命令审批卡和输出。
+- WebView/client state 和 client-server RPC。
+- server-executor RPC、grant、invocation result、inventory hint/snapshot/change page。
+- server business DB、checkpoint、reset backup 和 inventory cache。
+- client/server/executor 日志、崩溃报告和诊断包。
+- server command/audit/event payload、client state 和命令环境快照。
+- Session/Agent/Canvas 导出。
 
-canary 只允许存在于测试 Provider 和 macOS Keychain item data。`app.db` 仅可出现不含值的 `secretRef/vaultHandle`；其他任意命中均为发布阻塞。
+Provider/model canary 只允许存在于测试 server `SecretVault`，进入 executor 即失败。MCP canary 只允许存在于 owning executor 的测试 `ExecutorSecretStore`、目标 connection/process 内存和最小 child environment；出现在 server 持久化/backup/inventory hint/snapshot/change/cache、普通 executor DB 字段、日志、模型/UI、query/result、diagnostic/export、全局环境或无关 child 即阻止发布。inventory 只允许 redacted `credentialConfigured` boolean。revocation、expiry 或 MCP shutdown 后验证资源关闭且 runtime reference 不再可用；不声称 JavaScript 能可靠清零 string memory。
 
-## 10. 性能预算
+## 10. 安全测试
 
-基线设备：Apple Silicon、16 GB RAM、release build、无调试工具。Phase 0 记录 M1/M2 实测并冻结最终阈值。
+### 10.1 本机 RPC
+
+- 端口扫描后伪造 client/executor。
+- bootstrap token 重放、窃取后延迟使用和角色互换。
+- stable ID 冲突、generation 回退、旧 connection 注入。
+- request/event 洪泛、超大 JSON、深层对象和慢消费者。
+- client 尝试调用 executor-only method；executor 尝试调用 DB/Provider/approval method。
+
+### 10.2 Grant
+
+- 修改 action、args、scope、executor、instance、generation、expiry 或 nonce。
+- 同一 grant 并发提交。
+- executor restart 后重放旧 grant。
+- server connection 被替换后使用旧 grant。
+- approval edit 后复用编辑前 grant。
+
+### 10.3 文件、命令与扩展
+
+- 路径穿越、软链接、TOCTOU、大小写和特殊文件。
+- Shell 注入、权限提升、后台 daemon、fork bomb 和大量输出。
+- MCP Tool Schema/结果注入、stdio env 泄露和 OAuth scope。
+- 伪造/回退 epoch/revision、gap、重复/乱序 tombstone、invalid cursor、超大 change page 和 hint flood。
+- MCP credential 不进入 server copy、query/UI/prompt/log/diagnostic/export、executor 全局环境、无关 child process 或其他 Agent；teardown 条件全部覆盖。
+- executor root/file mode、owner、atomic replacement、symlink/no-follow 和同账户/root/snapshot 威胁边界全部覆盖。
+- 已认证 MCP connection 上每次 Tool 缺少/复用/篡改 grant 都被拒绝。
+- Skill 压缩包穿越、脚本、资源路径和更新 hash 变化。
+- Prompt injection 不能改变 Policy 或 grant。
+
+### 10.4 WebView 与 Canvas
+
+- WebView XSS 后仍无 server bootstrap、Secret 或 executor API。
+- Canvas 无应用 RPC、本地文件、未授权网络、下载或系统权限。
+- Canvas 需要本机能力时必须走 client -> server Policy -> executor grant。
+
+## 11. 故障矩阵
+
+| 故障 | 必须验证 |
+| --- | --- |
+| WebView reload | 只重建订阅；Run 不丢失 |
+| client connection drop | server Run 继续；重连按 cursor 补齐 |
+| client process exit | supervisor 执行 cooperative shutdown；超时升级 |
+| agents server kill | client capped restart；DB/checkpoint 恢复；executor 重注册并 full inventory sync |
+| executor kill | cache stale；新 Run 被拒绝；活动 invocation 对账；重连 full sync 前不 runnable |
+| MCP process kill | executor inventory 更新；按 executor-owned config 受限重启 |
+| hint 丢失/change log compact | 48–72 秒 poll 发现 revision；gap/compaction 改用 full snapshot，不误删 |
+| Tool child process hang | cancel/timeout 清理完整进程树 |
+| sleep/wake | lease/reconnect/generation 和 timeout 重算 |
+| network loss | Provider/MCP 错误保持失败，可重试范围明确 |
+| disk full/DB error | server 不发布未持久化成功；进入 recovery UX |
+
+每种 companion 故障都要覆盖一次 crash 和连续 crash 达 cap 两种情况。
+
+## 12. Three-role Desktop E2E
+
+### 12.1 核心 PR 集
+
+- client 启动两个 companion 并显示 online。
+- 保存 fake Provider，经 server 完成普通 Chat。
+- client reload/reconnect 后恢复同 Session 与 event cursor。
+- registry 显示一个 local executor 和多个 Agent。
+- 停止 executor 后 cache 标 stale、相关 Agent 无法启动新 Run；重启 full sync 完成后才恢复可用。
+- 一次低风险 Tool 经 intent/grant/executor/result 完成。
+- client 正常退出后 companion 和 Tool 子进程均退出。
+
+### 12.2 Nightly
+
+- 3 个并发 Session 和队列。
+- 分别 kill server、executor、client/WebView。
+- grant 全部 negative cases。
+- Action kill-point matrix。
+- MCP/Skill fake fixtures、inventory hint/drop/gap/epoch-reset/read-own-write matrix（A4 后）。
+- restart cap/recovery UX。
+- signed/package artifact 的同一流程。
+
+### 12.3 测试驱动
+
+- 测试构建可启用最小本地 driver，但必须有随机启动凭证和编译时排除。
+- stable package 扫描确认无 test method、固定 token、调试 listener。
+- release smoke 优先使用正式入口和公开诊断，不依赖测试后门。
+
+## 13. Provider、Checkpoint 与产品回归
+
+- 每个 Provider adapter 继续覆盖认证、stream、Tool call、usage、error、capability 和 redaction。
+- Provider 调用只在 server 测试进程中发生；client/executor 测试中出现 Provider Key 即失败。
+- checkpoint contract、thread 删除、interrupt 和 transcript 查询继续由 server integration 覆盖。
+- 现有 Provider/Chat/Session/WebView 测试在 A1 迁移期间保持；完成后删除永久旧 transport 路径。
+
+## 14. 性能预算
+
+基线设备为 Apple Silicon、16 GB RAM、release build。
 
 | 指标 | 初始预算 |
 | --- | --- |
-| 冷启动到窗口可交互 | p95 ≤ 3 秒 |
-| 已有数据库启动 | p95 ≤ 4 秒 |
-| 路由切换/本地 Query | p95 ≤ 150 ms |
-| 流式 delta 到 UI | p95 ≤ 100 ms（不含网络） |
-| 10,000 条轨迹初次可见 | ≤ 500 ms，使用分页/虚拟化 |
-| 持续 30 event/s | 无 >100 ms WebView long task |
-| application worker 响应 | 3 Run 并发时 typed RPC ping p95 ≤ 100 ms，无 >500 ms 非预期阻塞 |
-| 空闲内存 | 记录并控制回归，初始目标 <350 MB |
-| 3 个活跃 Run | 应用自身内存初始目标 <1.2 GB，不含外部命令 |
-| 100 次 Session 打开/关闭 | Registry、订阅、Provider client 回到基线；heap 无持续线性增长 |
-| 模型调用并发 | 主 Agent 与同步子 Agent 均受全局/per-Provider 上限约束 |
-| App DB 常用 Query | p95 ≤ 100 ms |
-| 停止命令到进程终止 | p95 ≤ 2 秒；顽固进程有升级终止 |
+| 冷启动到窗口可交互 | p95 <= 3 秒 |
+| 两 companion 注册 online | p95 <= 2 秒，另记录 DB 恢复耗时 |
+| client-server 本地 RPC | p95 <= 50 ms（不含业务处理） |
+| server-executor 本地 RPC | p95 <= 50 ms（不含 Tool） |
+| 流式 delta 到 UI | p95 <= 100 ms（不含 Provider 网络） |
+| 3 Run 并发 RPC ping | p95 <= 100 ms |
+| executor cancel 到进程树退出 | p95 <= 2 秒；顽固进程有升级终止 |
+| 100 次 reconnect | registry/socket/subscription 无线性增长 |
+| 空闲内存 | 分角色记录并设置回归预算，不用合计掩盖单角色泄漏 |
 
-预算不以牺牲正确性和安全为代价。超标必须有 profile 和修复计划，不能只提高阈值。
+达到 restart cap、无限 event queue 或未受控子进程均为正确性问题，不能只调整性能阈值。
 
-## 11. 可访问性与 i18n
-
-### 自动化
-
-- 组件级 axe 检查。
-- 路由、Modal、审批卡和 Canvas 的焦点顺序。
-- 缺失翻译 key 和硬编码用户文案扫描。
-- 中英文截图和溢出检查。
-
-### 人工
-
-- 仅键盘完成 Provider → Chat → Project → Approval → Diff。
-- VoiceOver 验证消息新增、任务状态和审批。
-- Reduced motion、缩放 200%、高对比度。
-- 中英文日期、Token、价格和复数。
-
-## 12. CI 流水线
+## 15. CI 流水线
 
 ### Pull Request
 
 ```text
 bun install --frozen-lockfile
-  → format/lint
-  → typecheck
-  → unit
-  → integration
-  → provider fake contract
-  → WebView tests
-  → core desktop E2E
-  → dependency/license checks
+  -> format/lint/typecheck
+  -> unit
+  -> protocol contract
+  -> server/executor/client role integration
+  -> provider fake contract
+  -> WebView tests
+  -> core three-role E2E
+  -> dependency/license checks
 ```
 
 ### Default branch / Nightly
 
 ```text
 all PR checks
-  → full desktop E2E
-  → chaos/recovery
-  → security fixtures
-  → performance smoke
-  → package arm64
-  → package smoke
-  → live Provider smoke
+  -> full three-role E2E
+  -> kill-point and restart-cap chaos
+  -> security / secret canary
+  -> performance smoke
+  -> compile/package companions
+  -> package smoke
+  -> live Provider/MCP smoke
 ```
 
 ### Release
 
 ```text
 clean tagged commit
-  → reproducible install
-  → tests
-  → version/migration checks
-  → package target architectures
-  → sign
-  → notarize
-  → verify signature/notarization/runtime/updater metadata
-  → install/upgrade smoke
-  → generate SBOM/checksums/NOTICE
-  → publish draft
-  → manual approval
-  → release/update metadata
+  -> reproducible install and all gates
+  -> compile client + agents-server + executor
+  -> verify protocol/build matrix
+  -> sign and notarize complete app
+  -> install/package three-role smoke
+  -> verify cooperative quit and updater atomicity
+  -> SBOM/checksums/NOTICE
+  -> manual approval
 ```
 
-## 13. 供应链
+## 16. 打包、签名与更新
 
-- lockfile 必须提交，CI 使用 frozen install。
-- 生产依赖许可证必须与项目许可证兼容。
-- 生成 SBOM、第三方 NOTICE 和 artifact checksum。
-- Secret scanning、dependency audit 和恶意包检查。
-- install scripts 只允许已审查依赖；Bun native/FFI 模块和动态库清单固定。
-- Release 只来自受保护 tag/commit 和受保护 CI environment。
-- Apple 证书、notary credentials 和 Provider live-test Key 彼此隔离。
+- 两个 companion 与 client 来自同一 release；不能独立下载或混用未知版本。
+- package 必须保留 companion 可执行权限，并验证目标架构、动态库和签名链。
+- terminal user 无 Bun/Node 时所有 E2E 仍通过。
+- 更新要么整体切换 client/server/executor，要么保持旧完整版本；不允许部分 binary 更新。
+- 有活动 Run/Action 时不强制更新退出。
+- stable package 不含源 Secret、bootstrap token、测试 driver 或开发 endpoint。
 
-## 14. macOS 打包与发布
+## 17. 数据 reset 与未来 migration
 
-### 14.1 Artifact
+当前重构阶段：
 
-- Electrobun 自解压分发/更新产物：正式更新链的事实来源。
-- Electrobun 自动生成包含自解压应用的 DMG；CI 同时验证 DMG 安装和展开后的 `.app`。
-- arm64 为首发必需；x64/Universal 是否同步发布由 Phase 0 的 Electrobun application runtime、Deep Agents/Provider、Keychain 和用户调研决定。
+- 不要求旧单进程业务 DB/checkpoint/Provider 开发配置迁移。
+- 测试只要求“不兼容时明确 reset、旧数据不被误读、当前 schema 可 backup/restore”。
+- 文案必须告诉开发用户 reset 会删除哪些本地数据。
 
-### 14.2 签名与公证
+首次外部发布冻结 schema 后，正式 release gate 再要求每个已发布版本的 migration、rollback 和 fixture。不得把当前 reset 例外推广到已发布用户数据。
 
-- Hardened Runtime 和 entitlements 最小化。
-- 签名后验证原生 launcher、Electrobun `1.18.1` 包内 application runtime、编译后的 Deep Agents entry/dependencies 和 Keychain bridge。
-- 提交 Apple notarization 并 staple。
-- CI 安装产物后执行 Gatekeeper 和启动 smoke。
+## 18. 本地可观察性
 
-### 14.3 更新
+每条结构化日志包含：
 
-使用 Electrobun `Updater` 与其 stable/canary metadata/差分产物协议；发布源可选 GitHub Releases 或受控静态源，但不能切换到与客户端校验不兼容的通用文件下载器。
+- `role`、binary/app/protocol version。
+- stable ID、instance ID、generation、connection ID。
+- session/run/tool/action/invocation/grant correlation（存在时）。
+- error code 和安全状态，不含 Secret/raw Tool args。
 
-无论实现：
+诊断包汇总 client/server/executor 日志、registry snapshot、restart counters、DB integrity、binary signatures 和 redaction report。用户主动导出，默认不含 prompt、文件内容或凭证。
 
-- Beta/Stable 分通道。
-- 只接受来源、完整性和版本规则均通过校验的签名更新。
-- Host、原生 launcher、application runtime 和 Deep Agents bundle 必须来自同一 release；启动时记录实际 runtime 版本，未知组合拒绝恢复 Run。
-- 下载失败不影响本地数据和当前版本。
-- 更新前完成 DB 备份。
-- 有运行中 Run 或待审批时不强制重启。
-- Release notes 明确 migration 和已知问题。
+## 19. 发布阻塞条件
 
-## 15. 数据迁移与回滚
+任一项成立即阻止对应阶段发布：
 
-### 15.1 升级
+- client 可直连 executor，或任一角色存在通用 RPC forwarder。
+- server 监听非 loopback，或未认证本机进程可注册。
+- 旧 instance/generation 的 event/result/grant 被接受。
+- executor offline 时仍能启动绑定 Agent 的 Run。
+- executor 未验证 grant 即执行，或重复/篡改 grant 成功。
+- executor 写业务 DB/checkpoint，或 client 持有 Provider/Agent runtime。
+- non-idempotent Action 在 unknown outcome 后自动重放。
+- Provider/model credential 进入 executor，或 MCP credential 出现在 server copy、普通 DB 字段、query/UI/prompt/log/diagnostic/export、全局环境或无关 child/Agent。
+- server 保存 recoverable MCP/Skill config/content，或 executor offline/持久化失败时配置 command 返回成功。
+- executor 注册/重连未 full sync 即 runnable，或 inventory gap/compaction/epoch/cursor 异常未回退 snapshot。
+- failed poll/offline 被解释为 deletion，或 cache 含 credential/sensitive env/recoverable config/完整 Skill content。
+- Run start/restore 仅信 cache、未 live 验证 resource/version/hash/schema，或 inventory 状态被当作 Tool 授权。
+- local executor private root/credential file mode、owner、atomic replacement 或 symlink/no-follow gate 失败。
+- companion crash loop 无上限，或正常退出遗留受管进程树。
+- package 缺少/无法启动 companion，依赖系统 Bun/Node，或三者版本不兼容。
+- 签名、公证、Updater 原子性或 stable test-backdoor scan 失败。
+- MCP/Skill 启用阶段存在绕过 Policy/grant 的执行路径。
 
-1. 检查剩余磁盘空间。
-2. 关闭新 Run 调度。
-3. 备份 `app.db`、checkpoint DB 和关键配置。
-4. integrity check。
-5. 执行业务 migration。
-6. 启动 DeepAgentService，探测 application runtime 并验证 checkpoint compatibility。
-7. 标记升级完成。
+## 20. 发布检查表
 
-### 15.2 失败
+### 架构
 
-- 不删除备份。
-- 启动只读恢复页，显示安全错误和日志导出。
-- 支持恢复备份后运行旧版本。
-- 不自动把新 Schema DB 交给旧版本。
+- [ ] 对应 A0–A5 gate 通过。
+- [ ] 角色 ownership assertion 和依赖扫描通过。
+- [ ] stable/instance/generation、registry、full inventory sync 和 syncing/offline UX 验收完成。
 
-### 15.3 回滚
+### 安全与恢复
 
-- 每个 Stable Release 保留前一版本 artifact。
-- 不可逆 migration 必须延迟到至少一个稳定版本后 contract。
-- 若 checkpoint 格式不兼容，Release 不得上线。
-- 自动更新服务可撤回 update metadata，但不能假设已安装用户自动降级。
+- [ ] grant negative suite、Secret canary 和 Action kill matrix 通过。
+- [ ] server/executor kill、restart cap、reconnect/reconcile 通过。
+- [ ] hint debounce、60 秒 ±20% poll、delta/tombstone、snapshot fallback 和 mutation read-own-write matrix 通过。
+- [ ] cooperative shutdown 无遗留进程树。
 
-## 16. 本地可观察性
+### Package
 
-### 16.1 日志
-
-- JSON line，包含 timestamp、level、process、component、correlation IDs 和 error code。
-- 默认不记录 prompt、文件内容、完整 URL query、Tool raw args 或 Secret。
-- 日志轮转和保留期在 Phase 1 冻结。
-- Debug 模式需要用户主动开启，并在 UI 持续提示。
-
-### 16.2 指标
-
-默认仅本地记录：
-
-- 启动、崩溃、application restart 和 Run 恢复。
-- Run 状态、耗时、队列等待和恢复结果。
-- Provider 错误类别和 latency。
-- Tool/Approval 数量，不含内容。
-- DB migration 和 integrity。
-- WebView long task 和 Application Host/DeepAgentService heap/event-loop 采样。
-
-遥测上传默认关闭；开启前展示字段清单。
-
-### 16.3 诊断包
-
-用户主动导出：
-
-- 应用/OS/架构版本。
-- 脱敏配置摘要。
-- 指定时间范围日志。
-- DB integrity 和 migration 版本。
-- Run/Event ID，不含消息正文。
-- Secret redaction report。
-
-## 17. 发布阻塞条件
-
-任一项成立即阻止发布：
-
-- P0 自动化失败或 flaky 未归因。
-- Secret canary 泄露。
-- Ask/Plan/Allow all 越权。
-- DeepAgentService/application crash 后重复非幂等副作用。
-- 文件撤销覆盖外部修改。
-- 数据库 migration 无备份或不可恢复。
-- package 中 Deep Agents/Provider、`bun:sqlite`、Keychain bridge 或 BrowserView 在目标架构失败。
-- Electrobun application worker 内 Deep Agents stream/HITL/subagent/取消/上下文传播 contract 失败。
-- `BunSqliteSaver` contract、WAL 崩溃恢复、当前 schema fixture 重开/继续或不支持 schema 拒绝行为失败。
-- 签名、公证、Updater 完整性、application runtime 探测或回滚校验失败。
-- test driver、固定 token 或调试监听入口出现在 stable release。
-- 正式声明支持的 Provider 核心 live smoke 失败且无明确下线决策。
-- Canvas/MCP/Skill（启用阶段）存在已知高危越权。
-
-## 18. 发布检查表
-
-### 功能
-
-- [ ] 对应阶段全部 E2E 场景通过。
-- [ ] 功能 Flag 默认状态确认。
-- [ ] 中英文和无障碍验收完成。
+- [ ] client、agents-server、executor 版本和 protocol matrix 一致。
+- [ ] 签名、公证、Gatekeeper、无系统 runtime smoke 通过。
+- [ ] 整体更新、失败保留旧版本和回滚 metadata 验证完成。
 
 ### 数据
 
-- [ ] 所有已发布 DB fixture 迁移通过。
-- [ ] checkpoint 当前 schema 校验、关闭重开和应用重启恢复通过。
-- [ ] 备份/恢复/磁盘满演练完成。
-
-### 安全
-
-- [ ] Threat model 更新。
-- [ ] Secret canary 扫描无命中。
-- [ ] RPC、DeepAgentService、Path、Command、SSRF、Canvas/扩展测试通过。
-- [ ] 依赖审计、SBOM 和 NOTICE 完成。
-
-### 发布
-
-- [ ] Version、changelog、许可证和源码 tag。
-- [ ] 签名、公证、staple、Gatekeeper。
-- [ ] 干净设备安装与上版本升级。
-- [ ] Update channel 和回滚元数据。
-- [ ] 诊断、支持和已知问题文档。
-
-## 19. 质量责任
-
-- 功能作者负责 Unit/Integration 和错误/取消路径。
-- QA/SDET 维护跨模块 E2E、chaos 和 package smoke。
-- Desktop/Security 负责人批准 Electrobun RPC、Application Host、Action Broker、Canvas 和 release 安全变更。
-- Runtime 负责人批准 Deep Agents/LangChain 升级、checkpoint contract 和当前 schema 恢复行为。
-- Data 负责人批准 migration、备份和 Provider contract。
-- 发布负责人拥有最终 checklist；任何负责人可因安全或数据风险阻止发布。
+- [ ] 当前开发期 reset 行为明确且已测试；没有迁移旧数据的错误承诺。
+- [ ] 当前 schema backup/restore、DB integrity 和 checkpoint contract 通过。

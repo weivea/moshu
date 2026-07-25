@@ -1,8 +1,9 @@
 # 墨枢
 
-墨枢是一款 Local-first 的桌面 Agent 应用。当前仓库已完成 Phase 0 工程基线和最小
-Ask Chat POC，正在推进 Provider 设置页与普通 Chat Session 管理。详见
-[实施进度](./docs/implementation/progress.md)。
+墨枢是一款 Local-first 的桌面 Agent 应用。当前仓库已实现单 Electrobun
+Application Host 内的最小 Ask Chat 切片；已批准的 Electrobun client、agents
+server、executor 三应用角色架构尚在迁移，A0 RPC / companion binary POC
+尚未开始。详见[实施进度](./docs/implementation/progress.md)。
 
 ## 环境
 
