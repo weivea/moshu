@@ -1,4 +1,4 @@
-import { createDeepAgent } from "deepagents";
+import { createDeepAgent } from "deepagents/browser";
 
 export const DEEP_AGENTS_VERSION = "1.11.0";
 

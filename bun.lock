@@ -54,6 +54,7 @@
         "@langchain/langgraph": "1.4.8",
         "@langchain/langgraph-checkpoint": "1.1.3",
         "@langchain/langgraph-sdk": "1.9.27",
+        "@langchain/openai": "1.5.3",
         "@moshu/contracts": "workspace:*",
         "deepagents": "1.11.0",
         "langchain": "1.5.3",
@@ -274,6 +275,8 @@
     "@langchain/langgraph-checkpoint": ["@langchain/langgraph-checkpoint@1.1.3", "https://ms-feed-2.pkgs.visualstudio.com/1es-public/_packaging/npm-public/npm/registry/@langchain/langgraph-checkpoint/-/langgraph-checkpoint-1.1.3.tgz", { "peerDependencies": { "@langchain/core": "^1.1.48" } }, "sha1-iR8vmi6Wzyqwkg+SQPmtHgqGpKs="],
 
     "@langchain/langgraph-sdk": ["@langchain/langgraph-sdk@1.9.27", "https://ms-feed-25.pkgs.visualstudio.com/1es-public/_packaging/npm-public/npm/registry/@langchain/langgraph-sdk/-/langgraph-sdk-1.9.27.tgz", { "dependencies": { "@langchain/protocol": "^0.0.18", "@types/json-schema": "^7.0.15", "p-queue": "^9.0.1", "p-retry": "^7.1.1" }, "peerDependencies": { "@langchain/core": "^1.1.48", "react": "^18 || ^19", "react-dom": "^18 || ^19", "svelte": "^4.0.0 || ^5.0.0", "vue": "^3.0.0" }, "optionalPeers": ["react", "react-dom", "svelte", "vue"] }, "sha1-BYRRhhBZLuq9v5XUzBgk5/VOdvs="],
+
+    "@langchain/openai": ["@langchain/openai@1.5.3", "https://ms-feed-25.pkgs.visualstudio.com/1es-public/_packaging/npm-public/npm/registry/@langchain/openai/-/openai-1.5.3.tgz", { "dependencies": { "js-tiktoken": "^1.0.12", "openai": "^6.41.0", "zod": "^3.25.76 || ^4" }, "peerDependencies": { "@langchain/core": "^1.2.1" } }, "sha1-SbmhzyU1StPd5wkFl4p/baYCck0="],
 
     "@langchain/protocol": ["@langchain/protocol@0.0.18", "https://ms-feed-12.pkgs.visualstudio.com/1es-public/_packaging/npm-public/npm/registry/@langchain/protocol/-/protocol-0.0.18.tgz", {}, "sha1-bZYVXnJjyVj7zm1LckG0clty+60="],
 
@@ -724,6 +727,8 @@
     "nwsapi": ["nwsapi@2.2.24", "https://ms-feed-12.pkgs.visualstudio.com/1es-public/_packaging/npm-public/npm/registry/nwsapi/-/nwsapi-2.2.24.tgz", {}, "sha1-+JJwQ9TJtRar3r6ASjLI0flITR8="],
 
     "object-assign": ["object-assign@4.1.1", "https://ms-feed-12.pkgs.visualstudio.com/1es-public/_packaging/npm-public/npm/registry/object-assign/-/object-assign-4.1.1.tgz", {}, "sha1-IQmtx5ZYh8/AXLvUQsrIv7s2CGM="],
+
+    "openai": ["openai@6.48.0", "https://ms-feed-25.pkgs.visualstudio.com/1es-public/_packaging/npm-public/npm/registry/openai/-/openai-6.48.0.tgz", { "peerDependencies": { "@aws-sdk/credential-provider-node": ">=3.972.0 <4", "@smithy/hash-node": ">=4.3.0 <5", "@smithy/signature-v4": ">=5.4.0 <6", "ws": "^8.18.0", "zod": "^3.25 || ^4.0" }, "optionalPeers": ["@aws-sdk/credential-provider-node", "@smithy/hash-node", "@smithy/signature-v4", "ws", "zod"] }, "sha1-TKvSpooSPBssLW+sWf0Zwyeqt60="],
 
     "p-finally": ["p-finally@1.0.0", "https://ms-feed-25.pkgs.visualstudio.com/1es-public/_packaging/npm-public/npm/registry/p-finally/-/p-finally-1.0.0.tgz", {}, "sha1-P7z7FbiZpEEjs0ttzBi3JDNqLK4="],
 

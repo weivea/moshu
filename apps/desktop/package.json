@@ -10,11 +10,14 @@
 		"build:web": "vite build",
 		"package:canary": "bun run build:web && electrobun build --env=canary",
 		"typecheck": "tsc --noEmit -p tsconfig.bun.json && tsc --noEmit -p tsconfig.web.json && tsc --noEmit -p tsconfig.config.json",
-		"test": "vitest run"
+		"test:bun": "bun test src/bun",
+		"test:web": "vitest run",
+		"test": "bun run test:bun && bun run test:web"
 	},
 	"dependencies": {
 		"@moshu/agent-runtime": "workspace:*",
 		"@moshu/contracts": "workspace:*",
+		"@moshu/database": "workspace:*",
 		"@moshu/ui": "workspace:*",
 		"@heroui/react": "3.2.2",
 		"@heroui/styles": "3.2.2",

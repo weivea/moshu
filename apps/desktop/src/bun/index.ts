@@ -1,5 +1,11 @@
-import { BrowserWindow, Updater } from "electrobun/bun";
-import { desktopRpc } from "./rpc";
+import { createAskChatRuntime, InMemoryAskProviderConfigStore } from "@moshu/agent-runtime";
+import { openAppDatabase } from "@moshu/database";
+import { mkdirSync } from "node:fs";
+import { join } from "node:path";
+import { BrowserWindow, Updater, Utils } from "electrobun/bun";
+import { logChatRpcDiagnostic } from "../shared/chat-rpc-diagnostics";
+import { DesktopChatService } from "./chat-service";
+import { createDesktopRpc } from "./rpc";
 
 const DEV_SERVER_URL = "http://127.0.0.1:5173";
 
@@ -22,6 +28,21 @@ async function getMainViewUrl(): Promise<string> {
 	return "views://mainview/index.html";
 }
 
+mkdirSync(Utils.paths.userData, { recursive: true });
+const database = openAppDatabase(join(Utils.paths.userData, "moshu.db"));
+const providerConfigStore = new InMemoryAskProviderConfigStore();
+const chatRuntime = createAskChatRuntime({ providerConfigStore });
+const chatService = new DesktopChatService({
+	repository: database.chat,
+	providerConfigStore,
+	runtime: chatRuntime,
+});
+const desktopRpc = createDesktopRpc({ chatService });
+const unsubscribeChatEvents = chatService.subscribe((event) => {
+	logChatRpcDiagnostic("bun", "send", "chatEvent", event);
+	desktopRpc.send.chatEvent(event);
+});
+
 const mainWindow = new BrowserWindow({
 	title: "墨枢",
 	url: await getMainViewUrl(),
@@ -34,8 +55,26 @@ const mainWindow = new BrowserWindow({
 	},
 });
 
+let shutdownPromise: Promise<void> | undefined;
+
+function shutdown(): Promise<void> {
+	if (shutdownPromise !== undefined) {
+		return shutdownPromise;
+	}
+
+	shutdownPromise = (async () => {
+		unsubscribeChatEvents();
+		await chatService.shutdown();
+		database.close();
+	})();
+	return shutdownPromise;
+}
+
 mainWindow.on("close", () => {
 	console.info("墨枢 main window closed.");
+	void shutdown().catch((error: unknown) => {
+		console.error("Failed to shut down the chat runtime cleanly.", error);
+	});
 });
 
 console.info(`墨枢 started with Bun ${Bun.version}.`);

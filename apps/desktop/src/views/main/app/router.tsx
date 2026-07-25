@@ -1,5 +1,5 @@
 import { createHashRouter, Navigate } from "react-router-dom";
-import { NewChatPage, PlaceholderPage } from "./pages";
+import { ChatSessionPage, NewChatPage, PlaceholderPage } from "./pages";
 import { AppShell } from "./shell";
 
 export const router = createHashRouter([
@@ -11,7 +11,7 @@ export const router = createHashRouter([
 			{ path: "chat/new", element: <NewChatPage /> },
 			{
 				path: "chat/:sessionId",
-				element: <PlaceholderPage titleKey="page.chats.title" icon="chat" />,
+				element: <ChatSessionPage />,
 			},
 			{
 				path: "chats",
