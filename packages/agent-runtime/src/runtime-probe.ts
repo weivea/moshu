@@ -1,6 +1,6 @@
-import { createDeepAgent } from "deepagents/browser";
+import { createDeepAgent } from "@moshu/deepagents/browser";
 
-export const DEEP_AGENTS_VERSION = "1.11.0";
+export const DEEP_AGENTS_VERSION = "1.12.0-rc.0-moshu.0+1225a7f";
 
 export interface AgentRuntimeProbe {
 	loaded: boolean;

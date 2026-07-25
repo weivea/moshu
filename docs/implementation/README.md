@@ -69,7 +69,7 @@ Phase 2 在同一套运行时、权限和事件模型上增加自定义 Agent、
 | Build | Electrobun CLI、Bun workspace、Vite（React WebView） |
 | UI | React 19、React Router、HeroUI v3、Tailwind CSS v4 |
 | Icon | `@gravity-ui/icons` + 应用级 Icon 包装组件 |
-| Agent | `deepagents`、LangChain、LangGraph；由 in-process `DeepAgentService` 封装 |
+| Agent | 仓内 `@moshu/deepagents`、LangChain、LangGraph；由 in-process `DeepAgentService` 封装 |
 | Validation | Zod 4 |
 | App DB | `bun:sqlite` + Drizzle ORM |
 | Checkpoint | 项目维护的 `BunSqliteSaver`（实现 LangGraph `BaseCheckpointSaver`），独立数据库 |
@@ -82,6 +82,8 @@ Phase 2 在同一套运行时、权限和事件模型上增加自定义 Agent、
 Electrobun `1.18.1` 的 launcher 会启动包内 Bun，并由框架创建 application worker 执行 `src/bun/index.ts`；终端用户不需要安装 Bun。开发者仍使用 Bun 完成依赖安装、脚本和 Electrobun CLI 构建。上游 `main` 已出现 Cottontail/JSC runtime 路线，因此不得把“Electrobun 永远使用 Bun”写成框架不变量，也不得在未重跑 Deep Agents runtime 矩阵时跨 runtime 升级。
 
 参考实现 `wind-chasers/oh-your-pi` 在 Electrobun `1.18.1` 中直接 import Pi Agent SDK，没有应用级 sidecar、heartbeat 或 supervisor。这只能证明 Electrobun 支持“Agent SDK in-process + typed RPC”的拓扑，不能证明 Deep Agents JS、LangGraph checkpoint/HITL/subagent 或 Provider SDK 已兼容；本项目必须用 `deepagents` 独立验证，不能引入 Pi SDK 作为替代。
+
+Deep Agents 实现以私有 workspace 包 `packages/deepagents` 维护，不再直接解析 npm `deepagents`。当前源码同步自 `langchain-ai/deepagentsjs` revision `1225a7ff8673686c2a3c0411636a9511b7d8d0d0`，保留上游 MIT 许可证；后续定制和上游同步都必须经过本仓库的 runtime、checkpoint 与 package contract matrix。
 
 ## 6. 交付阶段摘要
 

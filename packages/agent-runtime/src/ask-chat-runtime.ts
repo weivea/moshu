@@ -2,7 +2,7 @@ import { ChatOpenAI } from "@langchain/openai";
 import { AIMessage, AIMessageChunk, BaseMessage, HumanMessage } from "@langchain/core/messages";
 import type { BaseLanguageModel } from "@langchain/core/language_models/base";
 import type { BaseCheckpointSaver } from "@langchain/langgraph-checkpoint";
-import { createDeepAgent } from "deepagents/browser";
+import { createDeepAgent } from "@moshu/deepagents/browser";
 import { createMiddleware } from "langchain";
 import type { AskProviderConfigStore, AskProviderConfiguration } from "./ask-provider-config";
 

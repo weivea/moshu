@@ -161,6 +161,7 @@ HITL 不能复制参考实现的 pending Promise：approval/interrupt 必须先�
 │   ├── contracts/          # Zod schemas, IDs, RPC and event contracts
 │   ├── domain/             # Pure state machines and policies
 │   ├── database/           # Drizzle schema, repositories and migrations
+│   ├── deepagents/         # In-repository Deep Agents implementation
 │   ├── agent-runtime/      # Deep Agents wrapper and stream normalization
 │   ├── action-broker/      # filesystem, command, git and web actions
 │   ├── providers/          # model/embedding adapters and capabilities

@@ -38,5 +38,39 @@
 		"parser": {
 			"tailwindDirectives": true
 		}
-	}
+	},
+	"overrides": [
+		{
+			"includes": ["packages/deepagents/src/**/*.ts"],
+			"linter": {
+				"rules": {
+					"complexity": {
+						"noUselessContinue": "off",
+						"noUselessUndefinedInitialization": "off",
+						"useLiteralKeys": "off",
+						"useOptionalChain": "off"
+					},
+					"correctness": {
+						"noUnusedImports": "off"
+					},
+					"style": {
+						"noNonNullAssertion": "off",
+						"useExportType": "off",
+						"useImportType": "off",
+						"useTemplate": "off"
+					},
+					"suspicious": {
+						"noExplicitAny": "off",
+						"noGlobalIsNan": "off"
+					}
+				}
+			}
+		},
+		{
+			"includes": ["packages/deepagents/types/**/*.d.ts"],
+			"linter": {
+				"enabled": false
+			}
+		}
+	]
 }

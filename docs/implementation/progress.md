@@ -43,6 +43,7 @@ React Chat UI
 - 路由恢复：`/chat/new` 与 `/chat/:sessionId` 是选择事实来源；启动时会验证并恢复最近 Session 提示。
 - 真实 Provider Adapter：通过 LangChain `ChatOpenAI` 接入 OpenAI-compatible HTTP/SSE，不只依赖前端模拟。
 - 默认 Ask 路径实际通过 Deep Agents `createDeepAgent` 执行，不再调用 LangChain `createAgent`；Provider、Session、RPC 和 Renderer 边界保持不变。
+- Deep Agents 运行实现已迁入私有 workspace 包 `@moshu/deepagents`，固定上游 revision `1225a7ff8673686c2a3c0411636a9511b7d8d0d0` 并保留 MIT 许可证；runtime 不再解析 npm `deepagents` 包。
 - `BunSqliteSaver` 实现锁定版本的 `BaseCheckpointSaver` 合同，使用独立 `moshu-checkpoints.db`、WAL 和当前 schema；已覆盖 checkpoint/pending writes/list/filter/delete、关闭后重开和未知 schema 拒绝。
 - Ask graph 当前不暴露 Tool；默认 filesystem、todo 和 subagent middleware 已替换，模型请求会清空 Tool 列表，任何模型主动产生的 Tool call 会在执行边界失败，不会绕过 Action Broker 写文件或执行命令。
 - 每个 Ask Run 使用由 Session/Run 共同派生的独立 checkpoint thread；已用三个并发 graph Run 验证消息和 checkpoint 不串线，并验证 model 与 stream callback 的 `AsyncLocalStorage` 上下文隔离。
@@ -82,7 +83,7 @@ React Chat UI
 | F0-04 Contracts 与 RPC | 部分完成 | Chat typed RPC 与 Zod 已落地；View capability、通用订阅和 stale callback 边界待完成 |
 | F0-05 业务 SQLite | 部分完成 | Chat schema、迁移、WAL 和 Repository 已落地；备份、完整性恢复和完整领域覆盖待完成 |
 | F0-06 LangGraph checkpoint | 已完成 | `BunSqliteSaver`、独立 WAL 数据库、当前 schema fixture、thread/delete 和关闭重开合同已落地；不兼容旧 checkpoint 数据 |
-| F0-07 Deep Agents in-process POC | 部分完成 | 默认 Ask 已通过 `createDeepAgent`；Bun execute、真实 Provider adapter、stream/cancel、`AsyncLocalStorage` 和 3 Run 并发已验证；todo、同步 subagent、HITL 与 packaged application smoke 待完成 |
+| F0-07 Deep Agents in-process POC | 部分完成 | 仓内 `@moshu/deepagents` 已接入默认 Ask；Bun execute、真实 Provider adapter、stream/cancel、`AsyncLocalStorage` 和 3 Run 并发已验证；todo、同步 subagent、HITL 与 packaged application smoke 待完成 |
 | F0-08 Provider POC | 部分完成 | 单个 OpenAI-compatible 流式 Adapter、持久化设置页和连接测试已落地；Tool call、用量、能力合同和 live/package smoke 待完成 |
 | F0-09 Secret Vault | 延后 | 功能稳定前先使用 Application Host 管理的本地配置；Keychain、Secret Ref 和迁移在外部分发前补齐 |
 | F0-10 Action Broker POC | 未开始 | 文件、命令、Policy 和审批合同待实现 |

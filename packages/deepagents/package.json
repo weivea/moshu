@@ -1,0 +1,47 @@
+{
+	"name": "@moshu/deepagents",
+	"version": "1.12.0-rc.0-moshu.0",
+	"private": true,
+	"description": "Moshu's in-repository Deep Agents implementation",
+	"type": "module",
+	"license": "MIT",
+	"exports": {
+		".": {
+			"types": "./types/index.d.ts",
+			"default": "./src/index.ts"
+		},
+		"./browser": {
+			"types": "./types/browser.d.ts",
+			"default": "./src/browser.ts"
+		},
+		"./node": {
+			"types": "./types/node.d.ts",
+			"default": "./src/node.ts"
+		}
+	},
+	"scripts": {
+		"build:types": "bun -e 'import { rmSync } from \"node:fs\"; rmSync(\"types\", { recursive: true, force: true });' && tsc -p tsconfig.types.json && biome format --write types",
+		"typecheck": "tsc --noEmit -p tsconfig.json"
+	},
+	"dependencies": {
+		"@langchain/core": "1.2.3",
+		"@langchain/langgraph": "1.4.8",
+		"@langchain/langgraph-checkpoint": "1.1.3",
+		"@langchain/langgraph-sdk": "1.9.27",
+		"fast-glob": "3.3.3",
+		"langchain": "1.5.3",
+		"langsmith": "0.7.17",
+		"micromatch": "4.0.8",
+		"yaml": "2.9.0",
+		"zod": "4.4.3"
+	},
+	"devDependencies": {
+		"@types/micromatch": "4.0.10"
+	},
+	"moshuUpstream": {
+		"repository": "https://github.com/langchain-ai/deepagentsjs.git",
+		"sourcePath": "libs/deepagents",
+		"version": "1.12.0-rc.0",
+		"revision": "1225a7ff8673686c2a3c0411636a9511b7d8d0d0"
+	}
+}
