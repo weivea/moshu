@@ -100,6 +100,7 @@
 - 若 sidecar 被选中，它必须随应用打包 runtime，并增加协议、监管、Secret、checkpoint ownership、签名和更新矩阵；不能要求终端用户安装 Bun/Node，也不能作为隐式 fallback。
 - Electrobun 没有 Electron `utilityProcess`、`safeStorage`、`webRequest`、Fuses 或 Playwright Electron 的等价基线；Keychain、Canvas 子资源隔离、应用生命周期和桌面 E2E 需要项目实现并在 Phase 0 验证。
 - `createDeepAgent` 已提供 model、tools、subagents、checkpointer、store、backend、interrupt、memory、skills 和 filesystem permissions 等扩展点。
+- `checkpointer` 持久化单个 LangGraph thread 的 Agent state 和 conversation；`store` 面向跨 thread 长期记忆，不提供产品 Chat Session 的标题、搜索、归档或列表管理。
 - 内建待办、文件系统、同步/异步子 Agent、上下文总结、Skills、Memory 与人工审批中间件，可直接映射到执行轨迹 UI。
 - Deep Agents 尚未声明 Electrobun application worker 为官方认证 runtime；import/bundle、stream、HITL、同步 subagent、取消、Provider SDK 和 `AsyncLocalStorage` 上下文传播必须用真实负载验证。
 - LangGraph checkpointer 可用于线程恢复，但官方 SQLite saver 依赖 `better-sqlite3`，不能作为 Bun 生产基线；产品需实现 `BaseCheckpointSaver` adapter，并补充任务幂等、崩溃恢复和本地数据库生命周期。

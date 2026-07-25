@@ -9,6 +9,7 @@ import type { AskProviderConfigStore, AskProviderConfiguration } from "./ask-pro
 export interface AskChatMessage {
 	role: "user" | "assistant";
 	content: string;
+	id?: string;
 }
 
 export interface AskChatUsage {
@@ -76,6 +77,8 @@ export interface AskChatRuntime {
 	run(input: AskChatRunInput): Promise<AskChatRunResult>;
 	stream(input: AskChatRunInput): AskChatRunStream;
 	cancel(runId: string, reason?: string): boolean;
+	getThreadMessages(threadId: string): Promise<AskChatMessage[]>;
+	deleteThread(threadId: string): Promise<void>;
 	shutdown(): Promise<void>;
 }
 
@@ -144,10 +147,12 @@ export class AskChatCancelledError extends AskChatRuntimeError {
 export class DeepAgentsAskChatRuntime implements AskChatRuntime {
 	readonly #providerConfigStore: AskProviderConfigStore;
 	readonly #agentFactory: AskAgentFactory;
+	readonly #checkpointer: BaseCheckpointSaver | undefined;
 	readonly #activeRuns = new Map<string, ActiveRun>();
 
 	constructor(options: AskChatRuntimeOptions) {
 		this.#providerConfigStore = options.providerConfigStore;
+		this.#checkpointer = options.checkpointer;
 		this.#agentFactory =
 			options.agentFactory ??
 			((configuration) =>
@@ -197,6 +202,40 @@ export class DeepAgentsAskChatRuntime implements AskChatRuntime {
 
 		activeRun.controller.abort(new AskChatCancelledError(runId, reason));
 		return true;
+	}
+
+	async deleteThread(threadId: string): Promise<void> {
+		await this.#checkpointer?.deleteThread(createCheckpointThreadId(threadId));
+	}
+
+	async getThreadMessages(threadId: string): Promise<AskChatMessage[]> {
+		const checkpoint = await this.#checkpointer?.getTuple({
+			configurable: {
+				thread_id: createCheckpointThreadId(threadId),
+				checkpoint_ns: "",
+			},
+		});
+		const values = checkpoint?.checkpoint.channel_values;
+		if (!isRecord(values) || !Array.isArray(values.messages)) {
+			return [];
+		}
+
+		return values.messages.flatMap((message): AskChatMessage[] => {
+			if (!BaseMessage.isInstance(message)) {
+				return [];
+			}
+
+			const content = extractTextContent(message.content);
+			const id = typeof message.id === "string" ? message.id : undefined;
+			if (HumanMessage.isInstance(message)) {
+				return [{ role: "user", content, ...(id === undefined ? {} : { id }) }];
+			}
+			if (AIMessage.isInstance(message) || AIMessageChunk.isInstance(message)) {
+				return [{ role: "assistant", content, ...(id === undefined ? {} : { id }) }];
+			}
+
+			return [];
+		});
 	}
 
 	async shutdown(): Promise<void> {
@@ -263,7 +302,7 @@ export class DeepAgentsAskChatRuntime implements AskChatRuntime {
 					streamMode: "messages",
 					signal,
 					configurable: {
-						thread_id: createCheckpointThreadId(input.threadId ?? input.runId, input.runId),
+						thread_id: createCheckpointThreadId(input.threadId ?? input.runId),
 						checkpoint_ns: "",
 						run_id: input.runId,
 					},
@@ -299,8 +338,8 @@ export function createAskChatRuntime(options: AskChatRuntimeOptions): DeepAgents
 	return new DeepAgentsAskChatRuntime(options);
 }
 
-function createCheckpointThreadId(threadId: string, runId: string): string {
-	return `ask:${encodeURIComponent(threadId)}:${encodeURIComponent(runId)}`;
+function createCheckpointThreadId(threadId: string): string {
+	return `ask:${encodeURIComponent(threadId)}`;
 }
 
 async function createDefaultAskAgent(
@@ -469,7 +508,15 @@ function extractTextContent(content: BaseMessage["content"]): string {
 
 function toLangChainMessages(messages: readonly AskChatMessage[]): BaseMessage[] {
 	return messages.map((message) =>
-		message.role === "user" ? new HumanMessage(message.content) : new AIMessage(message.content),
+		message.role === "user"
+			? new HumanMessage({
+					content: message.content,
+					...(message.id === undefined ? {} : { id: message.id }),
+				})
+			: new AIMessage({
+					content: message.content,
+					...(message.id === undefined ? {} : { id: message.id }),
+				}),
 	);
 }
 

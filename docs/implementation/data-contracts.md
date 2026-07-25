@@ -69,21 +69,21 @@ interface AppError {
 
 Phase 1 只提供内置 Agent，但从一开始使用 `agent_versions` 快照，以免 Phase 2 迁移历史 Session。
 
-### 4.2 会话与消息
+### 4.2 会话目录与 Transcript
 
 | 表 | 关键字段 | 说明 |
 | --- | --- | --- |
-| `sessions` | id, kind, project_id, title, mode, agent_version_id, model_profile_id, status, revision | 普通或 Project Session |
+| `sessions` | id, kind, project_id, title, mode, agent_version_id, model_profile_id, status, revision | 普通或 Project Session 的产品目录；与 LangGraph thread 一对一映射 |
 | `session_drafts` | session_id, content_json, revision | 输入草稿 |
-| `messages` | id, session_id, run_id, role, content_json, sequence, status | 用户/Agent/Tool 可展示消息 |
 | `attachments` | id, session_id, original_name, stored_path, mime, size, sha256 | 会话只读副本 |
 | `session_tombstones` | session_id, deleted_at, purge_after | 删除与恢复 |
 
 约束：
 
 - `kind=normal` 时 `project_id` 必须为空。
-- 消息 `sequence` 在 Session 内单调递增。
-- Agent 消息可先以 `streaming` 创建，结束后转为 `complete`；刷新时未完成消息从 Run event 重建。
+- Session ID 稳定映射到 Deep Agents/LangGraph `thread_id`，但 Session 列表、标题、搜索和归档只由 SessionCatalog 管理。
+- conversation transcript 的事实来源是 checkpoint state 中的 messages，不建立业务 `messages` 表。
+- UI message ID、状态与顺序由 checkpoint messages 和 RunJournal correlation ID 组合得到；运行中、失败和取消投影可从 active run 与 durable Run event 重建。
 - Session 只保存下一次提交默认 mode；每个 Run 另存实际 mode。
 
 ### 4.3 Run、事件与用量
@@ -495,9 +495,10 @@ DeepAgentService 不可自行假设 Tool 成功；只接受 Action Broker 返回
 - `BunSqliteSaver` 实现 `BaseCheckpointSaver` 的 `getTuple`、`list`、`put`、`putWrites` 和 `deleteThread`，并复用 LangGraph serializer。
 - saver 的私有 Schema 单独版本化；每次 LangGraph 升级运行 `BaseCheckpointSaver` 行为 contract 与项目的 WAL/崩溃 fixture。
 - checkpoint 数据不直接供 WebView 查询或导出。
+- 业务数据库不建立 conversation message 表；Host 从 checkpoint state 读取 transcript，并与 RunJournal 的状态和 durable delivery event 合并为 WebView snapshot。Event 可携带实时投递所需的 delta/terminal payload，但不得作为完成态 conversation 的事实来源。
 - Agent/Tool 配置快照保存在业务 DB，恢复时不使用已被编辑的最新配置。
 - 删除 Session 时调用 saver 的 `deleteThread`，并在失败时保留清理任务。
-- Deep Agents/LangGraph 升级前，用真实旧版 checkpoint fixture 验证读取和继续执行。
+- 项目只保证当前锁定版本和当前 checkpoint schema；不迁移或兼容旧版 checkpoint 数据。
 
 ## 15. 文件变更与撤销
 
@@ -557,7 +558,7 @@ DeepAgentService 不可自行假设 Tool 成功；只接受 Action Broker 返回
 - 启动顺序：获取单实例锁 → 备份 app.db/WAL → integrity check → migration → 启动窗口服务。
 - 大迁移分为 expand/backfill/contract，避免长时间阻塞首次窗口。
 - 迁移失败时保留原 DB 和备份，应用进入只读恢复页。
-- `checkpoints.db` 使用项目维护的 `BunSqliteSaver` Schema；应用管理其 migration、WAL 备份、兼容测试和 thread 清理。
+- `checkpoints.db` 使用项目维护的 `BunSqliteSaver` Schema；应用管理版本检测、WAL 备份、当前 schema 恢复测试和 thread 清理。当前不迁移旧 checkpoint schema，不支持时拒绝启动并进入恢复流程。
 - 不在同一发布中同时进行不可逆业务 DB 迁移和 Deep Agents 大版本升级。
 
 ## 18. 导出契约
@@ -597,7 +598,7 @@ interface SessionExportV1 {
 | CON-005 | 非幂等 Action 结果不明时不会自动重放 |
 | CON-006 | 文件被外部修改后撤销不会覆盖当前内容 |
 | CON-007 | Allow all grant 在新 app instance 中无效 |
-| CON-008 | 旧版 DB 和 checkpoint fixture 可迁移并恢复 |
+| CON-008 | 所有已发布业务 DB fixture 可迁移；当前 checkpoint schema fixture 可在关闭重开后读取并继续 |
 | CON-009 | Secret 不出现在 WebView payload、事件、checkpoint、日志或导出 |
 | CON-010 | WebView reload 或应用重启不会丢失 durable interrupt；恢复使用同一 thread/config 与显式 resume command |
 | CON-011 | `BunSqliteSaver` 与锁定 LangGraph 版本的 checkpoint 行为契约一致 |

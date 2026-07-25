@@ -41,7 +41,7 @@ Phase 2 在同一套运行时、权限和事件模型上增加自定义 Agent、
 | DEC-003 | WebView UI、Electrobun Application Host、DeepAgentService、Canvas Preview 按模块分层；WebView 永远不直接拥有应用 runtime、文件、命令或密钥能力 |
 | DEC-004 | 首选在锁定 Electrobun 的 application worker 内直接运行 Deep Agents JS；只有兼容性、硬崩溃隔离、资源限制或独立生命周期 POC 明确要求时才引入 sidecar |
 | DEC-005 | 不向模型暴露 `LocalShellBackend.execute`；文件、命令和 Git 全部经 Action Broker |
-| DEC-006 | 业务数据库使用 `bun:sqlite` + Drizzle；checkpoint 使用独立 SQLite 文件和基于 `BaseCheckpointSaver` 的项目适配器，不使用依赖 `better-sqlite3` 的官方 SQLite saver |
+| DEC-006 | 业务数据库使用 `bun:sqlite` + Drizzle，仅保存 SessionCatalog/RunJournal 等产品状态；conversation transcript 由独立 SQLite 中基于 `BaseCheckpointSaver` 的项目适配器持久化，不使用依赖 `better-sqlite3` 的官方 SQLite saver |
 | DEC-007 | UI 轨迹读取规范化的持久事件，不直接依赖 Deep Agents 内部事件结构 |
 | DEC-008 | Ask、Plan、Agent 通过有效工具集和 Policy Engine 强制区分，不只靠系统提示词 |
 | DEC-009 | 本地 Run Scheduler 管理 1–5 个并发 Session；Phase 1 不依赖远程 Agent Protocol |

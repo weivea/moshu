@@ -89,7 +89,7 @@ describe("DeepAgentsAskChatRuntime", () => {
 		expect(capturedOptions).toMatchObject({ streamMode: "messages" });
 		expect(capturedOptions?.signal).toBeInstanceOf(AbortSignal);
 		expect(capturedOptions?.configurable).toEqual({
-			thread_id: "ask:history-thread:history-run",
+			thread_id: "ask:history-thread",
 			checkpoint_ns: "",
 			run_id: "history-run",
 		});
@@ -162,7 +162,7 @@ describe("DeepAgentsAskChatRuntime", () => {
 	test("executes the default adapter through Deep Agents and persists graph checkpoints", async () => {
 		await withTempDirectory(async (directoryPath) => {
 			const databasePath = join(directoryPath, "deep-agent-checkpoints.db");
-			const checkpointThreadId = "ask:fake-model-thread:fake-model-run";
+			const checkpointThreadId = "ask:fake-model-thread";
 			const saver = new BunSqliteSaver(databasePath);
 			const runtime = createDeepAgentsRuntime(
 				() =>
@@ -219,6 +219,137 @@ describe("DeepAgentsAskChatRuntime", () => {
 				expect(JSON.stringify(restored)).not.toContain("sk-test");
 			} finally {
 				reopened.close();
+			}
+		});
+	});
+
+	test("restores conversation history from the Deep Agents checkpoint thread", async () => {
+		const saver = new BunSqliteSaver(":memory:");
+		let modelCount = 0;
+		const runtime = createDeepAgentsRuntime(
+			() =>
+				new FakeListChatModel({
+					responses: [modelCount++ === 0 ? "First reply" : "Second reply"],
+				}),
+			saver,
+		);
+
+		try {
+			await runtime.run({
+				runId: "first-run",
+				threadId: "persistent-thread",
+				messages: [{ role: "user", content: "First question", id: "first-message" }],
+			});
+			await runtime.run({
+				runId: "second-run",
+				threadId: "persistent-thread",
+				messages: [{ role: "user", content: "Second question" }],
+			});
+
+			const latest = await saver.getTuple({
+				configurable: {
+					thread_id: "ask:persistent-thread",
+					checkpoint_ns: "",
+				},
+			});
+			const state = JSON.stringify(latest?.checkpoint.channel_values);
+			expect(state).toContain("First question");
+			expect(state).toContain("First reply");
+			expect(state).toContain("Second question");
+			expect(state).toContain("Second reply");
+			const messages = await runtime.getThreadMessages("persistent-thread");
+			expect(messages.map(({ role, content }) => ({ role, content }))).toEqual([
+				{ role: "user", content: "First question" },
+				{ role: "assistant", content: "First reply" },
+				{ role: "user", content: "Second question" },
+				{ role: "assistant", content: "Second reply" },
+			]);
+			expect(messages[0]?.id).toBe("first-message");
+		} finally {
+			await runtime.shutdown();
+			saver.close();
+		}
+	});
+
+	test("deletes the persistent Deep Agents checkpoint thread", async () => {
+		const saver = new BunSqliteSaver(":memory:");
+		const runtime = createDeepAgentsRuntime(
+			() => new FakeListChatModel({ responses: ["Reply"] }),
+			saver,
+		);
+
+		try {
+			await runtime.run({
+				runId: "delete-run",
+				threadId: "delete-thread",
+				messages: [{ role: "user", content: "Delete this conversation" }],
+			});
+			expect(
+				await saver.getTuple({
+					configurable: { thread_id: "ask:delete-thread", checkpoint_ns: "" },
+				}),
+			).toBeDefined();
+
+			await runtime.deleteThread("delete-thread");
+
+			expect(
+				await saver.getTuple({
+					configurable: { thread_id: "ask:delete-thread", checkpoint_ns: "" },
+				}),
+			).toBeUndefined();
+		} finally {
+			await runtime.shutdown();
+			saver.close();
+		}
+	});
+
+	test("reads checkpoint-owned transcript after reopening the saver", async () => {
+		await withTempDirectory(async (directoryPath) => {
+			const databasePath = join(directoryPath, "reopened-transcript.db");
+			const firstSaver = new BunSqliteSaver(databasePath);
+			const firstRuntime = createDeepAgentsRuntime(
+				() => new FakeListChatModel({ responses: ["Persisted reply"] }),
+				firstSaver,
+			);
+
+			try {
+				await firstRuntime.run({
+					runId: "persisted-run",
+					threadId: "persisted-thread",
+					messages: [
+						{
+							role: "user",
+							content: "Persisted question",
+							id: "persisted-message",
+						},
+					],
+				});
+			} finally {
+				await firstRuntime.shutdown();
+				firstSaver.close();
+			}
+
+			const reopenedSaver = new BunSqliteSaver(databasePath);
+			const reopenedRuntime = createDeepAgentsRuntime(
+				() => new FakeListChatModel({ responses: [] }),
+				reopenedSaver,
+			);
+			try {
+				const messages = await reopenedRuntime.getThreadMessages("persisted-thread");
+				expect(messages.map(({ role, content, id }) => ({ role, content, id }))).toEqual([
+					{
+						role: "user",
+						content: "Persisted question",
+						id: "persisted-message",
+					},
+					expect.objectContaining({
+						role: "assistant",
+						content: "Persisted reply",
+					}),
+				]);
+			} finally {
+				await reopenedRuntime.shutdown();
+				reopenedSaver.close();
 			}
 		});
 	});
@@ -470,7 +601,7 @@ describe("DeepAgentsAskChatRuntime", () => {
 				const checkpoints = await collectAsync(
 					saver.list({
 						configurable: {
-							thread_id: `ask:session-${runId}:${runId}`,
+							thread_id: `ask:session-${runId}`,
 							checkpoint_ns: "",
 						},
 					}),

@@ -54,7 +54,7 @@ describe("Application Host Deep Agents runtime", () => {
 			expect(
 				await saver.getTuple({
 					configurable: {
-						thread_id: "ask:host-smoke-session:host-smoke-run",
+						thread_id: "ask:host-smoke-session",
 						checkpoint_ns: "",
 					},
 				}),

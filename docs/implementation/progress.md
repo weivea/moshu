@@ -29,7 +29,7 @@ React Chat UI
   → Application Host ChatService
   → Deep Agents Ask runtime
   → OpenAI-compatible Provider
-  → SQLite Session / Message / Run / Event + 独立 LangGraph checkpoint
+  → SQLite SessionCatalog / RunJournal + 独立 LangGraph conversation checkpoint
   → RPC event stream
   → UI reconciliation
 ```
@@ -46,10 +46,11 @@ React Chat UI
 - Deep Agents 运行实现已迁入私有 workspace 包 `@moshu/deepagents`，固定上游 revision `1225a7ff8673686c2a3c0411636a9511b7d8d0d0` 并保留 MIT 许可证；runtime 不再解析 npm `deepagents` 包。
 - `BunSqliteSaver` 实现锁定版本的 `BaseCheckpointSaver` 合同，使用独立 `moshu-checkpoints.db`、WAL 和当前 schema；已覆盖 checkpoint/pending writes/list/filter/delete、关闭后重开和未知 schema 拒绝。
 - Ask graph 当前不暴露 Tool；默认 filesystem、todo 和 subagent middleware 已替换，模型请求会清空 Tool 列表，任何模型主动产生的 Tool call 会在执行边界失败，不会绕过 Action Broker 写文件或执行命令。
-- 每个 Ask Run 使用由 Session/Run 共同派生的独立 checkpoint thread；已用三个并发 graph Run 验证消息和 checkpoint 不串线，并验证 model 与 stream callback 的 `AsyncLocalStorage` 上下文隔离。
+- 每个 Ask Session 使用稳定 checkpoint thread，每次 Run 仅提交当前用户 turn；Deep Agents 从 checkpoint 恢复并提供 conversation transcript，应用数据库不再包含 Message 表。ChatService 只把 checkpoint messages 与 RunJournal 的运行中/失败/取消投影合并。已覆盖同 Session 多轮恢复、跨 Session 并发隔离，以及 model/stream callback 的 `AsyncLocalStorage` 上下文隔离。
+- 删除 Session 会先通过 runtime 调用 saver 的 `deleteThread`，再删除产品 Session；`store` 保留给跨 thread 长期记忆，不用于标题、搜索、归档等产品 Session 管理。
 - Deep Agents fake model 和 OpenAI-compatible 本地 SSE 均已在锁定 Bun runtime 中完成 stream/complete/cancel 验证；desktop Application Host 包也有默认 graph 执行 smoke，graph checkpoint 已验证关闭数据库后重新打开可读。
 - typed RPC 与 Zod 边界：Chat command、query、snapshot 和 event 使用共享契约。
-- SQLite 持久化：Session、Message、Run 和 Run Event 具备迁移、WAL、Repository 与状态转换。
+- SQLite 持久化：SessionCatalog 和 RunJournal 具备当前 schema、WAL、Repository 与状态转换；旧应用数据按当前产品决策直接重置，不做兼容迁移。
 - 事件先持久化再发布；UI 可使用 snapshot、event cursor 和 message reconciliation 处理重放与竞态。
 - 取消链路覆盖 UI、RPC、Application Host、`AbortController` 和持久化 Run 状态。
 - 应用重启后遗留的 `queued` / `running` / `cancelling` Run 会收敛为已取消，不会永久阻塞 Session 归档或删除。
@@ -161,7 +162,7 @@ Provider Command:
 - Chat 页面已拆分为 Session sidebar、Header、Transcript 和 Composer；Model Selector 尚未实现。
 - Transcript 已支持基本消息与运行状态；Markdown、GFM、代码高亮和复制尚未实现。
 - Composer 已支持草稿、发送、停止和失败重试；Provider/模型切换通过设置页完成。
-- persisted Session/Message 继续通过 typed query/RPC 读取；独立 query cache 与 active-run reducer/store 尚未引入。
+- persisted SessionCatalog/RunJournal 继续通过 typed query/RPC 读取；transcript 由 Host 从 checkpoint state 查询并合并运行投影，独立 query cache 与 active-run reducer/store 尚未引入。
 - streaming event 保持 `sessionId + runId + messageId` 身份，settled 后与持久化 snapshot 对账。
 
 基础 Session DTO 至少包含：
@@ -209,7 +210,7 @@ activeRunState
 - 未配置 Provider、凭证失效和连接测试失败均有明确入口与错误状态。
 - 用户可以创建多个普通 Chat，在列表中搜索、重命名、归档/恢复和删除。
 - 打开 Session URL 或重启应用可恢复相同会话，不依赖仅存在于 React 内存的选择状态。
-- 流式消息、停止和失败重试不会串到其他 Session；最终 UI 与持久化消息一致。
+- 流式消息、停止和失败重试不会串到其他 Session；最终 UI 与 checkpoint transcript + RunJournal 投影一致。
 - Session 列表、Chat 空状态、加载、错误和运行状态均完成中英文基本体验。
 
 W1 余下工作是 live/package smoke、富文本 transcript、Model Selector、并发 Session 验收和状态层收敛。完成后再进入附件与 **Project Ask（只读）**。checkpoint 基础已落地，但 graph resume、Policy、Action Broker 与副作用恢复仍必须在开放 Agent 写操作前完成；Keychain 在功能稳定后的发布加固阶段补齐。

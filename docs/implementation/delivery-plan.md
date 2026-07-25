@@ -136,7 +136,7 @@ flowchart LR
 
 | ID | 工作包 | 产出 | 依赖 | 尺寸 |
 | --- | --- | --- | --- | --- |
-| P1-B01 | Session Domain | Session/Message/Run Repository、分页和 revision | F0-05 | L |
+| P1-B01 | Session Domain | SessionCatalog、RunJournal、checkpoint transcript query、分页和 revision | F0-05,F0-06 | L |
 | P1-B02 | 普通 Chat | 新建、流式消息、Markdown、代码、停止 | P1-B01,F0-07 | XL |
 | P1-B03 | 附件 | 安全复制、类型/大小校验、上下文引用 | P1-B02 | M |
 | P1-B04 | Project 管理 | 选择目录、真实路径、Git 检测、失效状态 | F0-10,P1-B01 | L |

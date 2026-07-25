@@ -88,9 +88,9 @@ export function createDesktopRpc({ chatService }: DesktopRpcDependencies) {
 						side: "bun",
 						operation: "getChatSession",
 						input: params,
-						execute: () =>
+						execute: async () =>
 							getChatSessionSnapshotOutputSchema.parse(
-								chatService.getSessionSnapshot(getChatSessionInputSchema.parse(params)),
+								await chatService.getSessionSnapshot(getChatSessionInputSchema.parse(params)),
 							),
 					}),
 				listChatSessions: async (params) =>
@@ -107,7 +107,7 @@ export function createDesktopRpc({ chatService }: DesktopRpcDependencies) {
 					),
 				deleteChatSession: async (params) =>
 					deleteChatSessionOutputSchema.parse(
-						chatService.deleteSession(deleteChatSessionInputSchema.parse(params)),
+						await chatService.deleteSession(deleteChatSessionInputSchema.parse(params)),
 					),
 				sendChatMessage: async (params: SendDesktopChatMessageInput) =>
 					traceChatRpcRequest({

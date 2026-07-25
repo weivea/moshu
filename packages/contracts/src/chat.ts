@@ -424,15 +424,6 @@ export const sendChatMessageInputSchema = z
 	})
 	.strict();
 
-export const sendChatMessageOutputSchema = z
-	.object({
-		session: chatSessionSchema,
-		userMessage: userChatMessageSchema,
-		run: chatRunSchema,
-		events: z.array(chatRunEventSchema),
-	})
-	.strict();
-
 export const chatSendAcceptedOutputSchema = z
 	.object({
 		run: chatRunSchema,
@@ -486,7 +477,6 @@ export type GetChatSessionOutput = z.infer<typeof getChatSessionOutputSchema>;
 export type ChatRunEventCursor = z.infer<typeof chatRunEventCursorSchema>;
 export type GetChatSessionSnapshotOutput = z.infer<typeof getChatSessionSnapshotOutputSchema>;
 export type SendChatMessageInput = z.infer<typeof sendChatMessageInputSchema>;
-export type SendChatMessageOutput = z.infer<typeof sendChatMessageOutputSchema>;
 export type ChatSendAcceptedOutput = z.infer<typeof chatSendAcceptedOutputSchema>;
 export type CancelChatRunInput = z.infer<typeof cancelChatRunInputSchema>;
 export type CancelChatRunOutput = z.infer<typeof cancelChatRunOutputSchema>;

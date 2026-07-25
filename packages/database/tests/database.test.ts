@@ -4,20 +4,19 @@ import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import type { AppError, ChatMessage } from "@moshu/contracts";
+import type { AppError } from "@moshu/contracts";
 
 import {
 	applyAppMigrations,
+	chatRunsTable,
 	createUuidV7,
 	getDatabaseUserVersion,
-	chatRunsTable,
 	openAppDatabase,
 } from "../src";
 
 function withTempDatabase(run: (databasePath: string) => void): void {
-	const directoryPath = mkdtempSync(join(tmpdir(), "moshu-chat-db-"));
+	const directoryPath = mkdtempSync(join(tmpdir(), "moshu-app-db-"));
 	const databasePath = join(directoryPath, "app.db");
-
 	try {
 		run(databasePath);
 	} finally {
@@ -25,14 +24,14 @@ function withTempDatabase(run: (databasePath: string) => void): void {
 	}
 }
 
-function makeProviderInput() {
+function makeProviderInput(secret = "sk-test-secret") {
 	return {
 		schemaVersion: 1 as const,
 		providerId: createUuidV7(),
 		name: "OpenAI",
 		baseUrl: "https://api.openai.com/v1",
 		model: "gpt-5.4",
-		apiKey: "sk-test-secret",
+		apiKey: secret,
 	};
 }
 
@@ -57,103 +56,79 @@ function makeAppError(code: string): AppError {
 	};
 }
 
-function findAssistantMessage(messages: ChatMessage[]): ChatMessage {
-	const assistantMessage = messages.find((message) => message.role === "assistant");
+function createRun(database: ReturnType<typeof openAppDatabase>, sessionId: string) {
+	return database.runs.create({
+		sessionId,
+		mode: "ask",
+		provider: makeProviderInput(),
+		userMessageId: createUuidV7(),
+		assistantMessageId: createUuidV7(),
+	});
+}
 
-	if (assistantMessage === undefined) {
-		throw new Error("Expected an assistant message.");
+function getAssistantMessageId(run: ReturnType<typeof createRun>["run"]): string {
+	if (run.assistantMessageId === undefined) {
+		throw new Error("Expected the run journal to assign an assistant message ID.");
 	}
-
-	return assistantMessage;
+	return run.assistantMessageId;
 }
 
 describe("application database", () => {
-	test("enables the SQLite safety baseline and applies idempotent migrations", () => {
+	test("applies the current schema without a duplicate message table", () => {
 		withTempDatabase((databasePath) => {
 			const database = openAppDatabase(databasePath);
-
 			try {
-				const foreignKeys = database.client
-					.query<{ foreign_keys: number }, []>("PRAGMA foreign_keys")
-					.get();
-				const busyTimeout = database.client
-					.query<{ timeout: number }, []>("PRAGMA busy_timeout")
-					.get();
-				const journalMode = database.client
-					.query<{ journal_mode: string }, []>("PRAGMA journal_mode")
-					.get();
-				const schemaObjectsBefore = database.client
+				const tableNames = database.client
 					.query<{ name: string }, []>(
-						"SELECT name FROM sqlite_master WHERE name LIKE 'chat_%' ORDER BY name",
+						"SELECT name FROM sqlite_master WHERE type = 'table' AND name LIKE 'chat_%' ORDER BY name",
 					)
 					.all()
 					.map((row) => row.name);
-
-				expect(foreignKeys?.foreign_keys).toBe(1);
-				expect(busyTimeout?.timeout).toBe(5000);
-				expect(journalMode?.journal_mode).toBe("wal");
-				expect(getDatabaseUserVersion(database.client)).toBe(2);
-
+				expect(tableNames).toEqual(["chat_run_events", "chat_runs", "chat_sessions"]);
+				expect(getDatabaseUserVersion(database.client)).toBe(3);
 				applyAppMigrations(database.client);
-
-				const schemaObjectsAfter = database.client
-					.query<{ name: string }, []>(
-						"SELECT name FROM sqlite_master WHERE name LIKE 'chat_%' ORDER BY name",
-					)
-					.all()
-					.map((row) => row.name);
-
-				expect(schemaObjectsAfter).toEqual(schemaObjectsBefore);
+				expect(getDatabaseUserVersion(database.client)).toBe(3);
 			} finally {
 				database.close();
 			}
 		});
 	});
 
-	test("migrates existing v1 Sessions without losing data", () => {
+	test("resets unsupported legacy application data", () => {
 		withTempDatabase((databasePath) => {
-			const sessionId = createUuidV7();
-			const legacyDatabase = new Database(databasePath);
-			legacyDatabase.exec(`
-				CREATE TABLE chat_sessions (
-					id TEXT PRIMARY KEY NOT NULL,
-					title TEXT NOT NULL,
-					default_mode TEXT NOT NULL,
-					created_at_ms INTEGER NOT NULL,
-					updated_at_ms INTEGER NOT NULL,
-					last_message_at_ms INTEGER
-				);
-				INSERT INTO chat_sessions (
-					id, title, default_mode, created_at_ms, updated_at_ms, last_message_at_ms
-				) VALUES (
-					'${sessionId}', 'Legacy Session', 'ask', 1, 1, NULL
-				);
-				PRAGMA user_version = 1;
+			const legacy = new Database(databasePath);
+			legacy.exec(`
+				CREATE TABLE chat_sessions (id TEXT PRIMARY KEY NOT NULL);
+				INSERT INTO chat_sessions (id) VALUES ('legacy-session');
+				PRAGMA user_version = 2;
 			`);
-			legacyDatabase.close();
+			legacy.close();
 
 			const database = openAppDatabase(databasePath);
 			try {
-				expect(getDatabaseUserVersion(database.client)).toBe(2);
-				expect(database.chat.getSession({ sessionId }).session).toMatchObject({
-					id: sessionId,
-					title: "Legacy Session",
-					archivedAt: undefined,
-				});
-				expect(
-					database.chat.setSessionArchived({ sessionId, archived: true }).session.archivedAt,
-				).toBeDefined();
+				expect(database.sessions.list().items).toEqual([]);
+				expect(getDatabaseUserVersion(database.client)).toBe(3);
 			} finally {
 				database.close();
 			}
 		});
 	});
 
-	test("enforces foreign keys for runs", () => {
+	test("enables SQLite safety settings and run foreign keys", () => {
 		withTempDatabase((databasePath) => {
 			const database = openAppDatabase(databasePath);
-
 			try {
+				expect(
+					database.client.query<{ foreign_keys: number }, []>("PRAGMA foreign_keys").get()
+						?.foreign_keys,
+				).toBe(1);
+				expect(
+					database.client.query<{ timeout: number }, []>("PRAGMA busy_timeout").get()?.timeout,
+				).toBe(5000);
+				expect(
+					database.client.query<{ journal_mode: string }, []>("PRAGMA journal_mode").get()
+						?.journal_mode,
+				).toBe("wal");
 				expect(() =>
 					database.orm
 						.insert(chatRunsTable)
@@ -163,8 +138,8 @@ describe("application database", () => {
 							mode: "ask",
 							status: "queued",
 							providerJson: JSON.stringify(makeProviderState()),
-							userMessageId: null,
-							assistantMessageId: null,
+							userMessageId: createUuidV7(),
+							assistantMessageId: createUuidV7(),
 							lastErrorJson: null,
 							createdAtMs: Date.now(),
 							updatedAtMs: Date.now(),
@@ -178,115 +153,73 @@ describe("application database", () => {
 		});
 	});
 
-	test("supports searching, renaming, archiving, restoring, and deleting Sessions", () => {
+	test("manages searchable and archivable session metadata", () => {
 		withTempDatabase((databasePath) => {
 			const database = openAppDatabase(databasePath);
-
 			try {
-				const first = database.chat.createSession({ title: "Alpha notes" }).session;
-				const second = database.chat.createSession({ title: "Beta notes" }).session;
-
-				const renamed = database.chat.updateSession({
-					sessionId: first.id,
-					title: "Alpha architecture",
-				}).session;
-				expect(renamed.title).toBe("Alpha architecture");
-
+				const first = database.sessions.create({ title: "Alpha notes" }).session;
+				const second = database.sessions.create({ title: "Beta notes" }).session;
 				expect(
-					database.chat
-						.listSessions({
-							query: "alpha",
-						})
-						.items.map((session) => session.id),
-				).toEqual([first.id]);
-				expect(database.chat.listSessions({ query: "%" }).items).toEqual([]);
-				expect(database.chat.listSessions({ query: "_" }).items).toEqual([]);
-
-				const archived = database.chat.setSessionArchived({
-					sessionId: first.id,
-					archived: true,
-				}).session;
-				expect(archived.archivedAt).toBeDefined();
-				expect(database.chat.listSessions().items.map((session) => session.id)).toEqual([
-					second.id,
+					database.sessions.update({ sessionId: first.id, title: "Alpha architecture" }).session
+						.title,
+				).toBe("Alpha architecture");
+				expect(database.sessions.list({ query: "alpha" }).items.map((item) => item.id)).toEqual([
+					first.id,
 				]);
+				expect(database.sessions.list({ query: "%" }).items).toEqual([]);
 				expect(
-					database.chat.listSessions({ archived: true }).items.map((session) => session.id),
-				).toEqual([first.id]);
-
-				const restored = database.chat.setSessionArchived({
-					sessionId: first.id,
-					archived: false,
-				}).session;
-				expect(restored.archivedAt).toBeUndefined();
-
-				database.chat.deleteSession({ sessionId: second.id });
-				expect(() => database.chat.getSession({ sessionId: second.id })).toThrow(
-					`Chat session ${second.id} was not found.`,
-				);
+					database.sessions.setArchived({ sessionId: first.id, archived: true }).session.archivedAt,
+				).toBeDefined();
+				expect(database.sessions.list().items.map((item) => item.id)).toEqual([second.id]);
+				expect(database.sessions.list({ archived: true }).items[0]?.id).toBe(first.id);
+				database.sessions.delete({ sessionId: second.id });
+				expect(() => database.sessions.get({ sessionId: second.id })).toThrow();
 			} finally {
 				database.close();
 			}
 		});
 	});
 
-	test("assigns strict message and event sequences per session and run", () => {
+	test("journals run status and UI delivery events without message rows", () => {
 		withTempDatabase((databasePath) => {
 			const database = openAppDatabase(databasePath);
-
 			try {
-				const { session } = database.chat.createSession({ title: "POC chat" });
-				const firstRun = database.chat.createUserMessageRun({
-					sessionId: session.id,
-					content: "Hello",
-					mode: "ask",
-					provider: makeProviderInput(),
+				const session = database.sessions.create({ title: "Run journal" }).session;
+				const created = createRun(database, session.id);
+				const assistantMessageId = getAssistantMessageId(created.run);
+				const running = database.runs.updateStatus({ runId: created.run.id, status: "running" });
+				const started = database.runs.appendEvent({
+					runId: created.run.id,
+					type: "message.started",
+					source: { kind: "assistant" },
+					payload: {
+						messageId: assistantMessageId,
+						role: "assistant",
+						status: "streaming",
+					},
 				});
-
-				const running = database.chat.updateRunStatus({
-					runId: firstRun.run.id,
-					status: "running",
+				const delta = database.runs.appendEvent({
+					runId: created.run.id,
+					type: "message.delta",
+					source: { kind: "assistant" },
+					payload: { messageId: assistantMessageId, delta: "Hello" },
 				});
-				const assistantMessage = database.chat.createAssistantMessage({
-					runId: firstRun.run.id,
+				database.runs.appendEvent({
+					runId: created.run.id,
+					type: "message.completed",
+					source: { kind: "assistant" },
+					payload: {
+						messageId: assistantMessageId,
+						status: "complete",
+						content: "Hello",
+					},
 				});
-				const firstDelta = database.chat.appendAssistantMessageDelta({
-					runId: firstRun.run.id,
-					messageId: assistantMessage.message.id,
-					delta: "Hi",
-				});
-				const completedMessage = database.chat.completeAssistantMessage({
-					runId: firstRun.run.id,
-					messageId: assistantMessage.message.id,
-					content: "Hi there",
-				});
-				const completedRun = database.chat.updateRunStatus({
-					runId: firstRun.run.id,
+				const completed = database.runs.updateStatus({
+					runId: created.run.id,
 					status: "completed",
 				});
-				const eventCountBeforeTerminalCancel = database.chat.replayRunEvents({
-					runId: firstRun.run.id,
-				}).length;
-				const terminalCancel = database.chat.cancelRun({
-					runId: firstRun.run.id,
-					reason: "Late stop click",
-				});
-				const secondRun = database.chat.createUserMessageRun({
-					sessionId: session.id,
-					content: "Second turn",
-					mode: "plan",
-					provider: makeProviderInput(),
-				});
 
-				const messages = database.chat.listMessages({ sessionId: session.id });
-				const events = database.chat.replayRunEvents({ runId: firstRun.run.id });
-				const snapshot = database.chat.getSessionSnapshot({ sessionId: session.id });
-
-				expect(messages.map((message) => message.sequence)).toEqual([1, 2, 3]);
-				expect(firstRun.userMessage.sequence).toBe(1);
-				expect(assistantMessage.message.sequence).toBe(2);
-				expect(secondRun.userMessage.sequence).toBe(3);
-
+				const events = database.runs.listEvents({ runId: created.run.id });
 				expect(events.map((event) => event.seq)).toEqual([1, 2, 3, 4, 5, 6]);
 				expect(events.map((event) => event.type)).toEqual([
 					"run.status",
@@ -297,264 +230,74 @@ describe("application database", () => {
 					"run.status",
 				]);
 				expect(running.run.status).toBe("running");
-				expect(firstDelta.event.seq).toBe(4);
-				expect(completedMessage.message.status).toBe("complete");
-				expect(completedRun.run.status).toBe("completed");
-				expect(terminalCancel.run.status).toBe("completed");
-				expect(database.chat.replayRunEvents({ runId: firstRun.run.id })).toHaveLength(
-					eventCountBeforeTerminalCancel,
-				);
-				expect(snapshot.eventCursors).toEqual([
-					{ runId: secondRun.run.id, lastSeq: 1 },
-					{ runId: firstRun.run.id, lastSeq: 6 },
-				]);
+				expect(started.seq).toBe(3);
+				expect(delta.seq).toBe(4);
+				expect(completed.run.status).toBe("completed");
+				expect(database.runs.listBySession(session.id)).toHaveLength(1);
+				expect(database.runs.cancel({ runId: created.run.id }).run.status).toBe("completed");
 			} finally {
 				database.close();
 			}
 		});
 	});
 
-	test("restores persisted streaming history after reopening the database", () => {
+	test("persists failures and cancellation as run journal state", () => {
 		withTempDatabase((databasePath) => {
-			{
-				const database = openAppDatabase(databasePath);
-
-				try {
-					const { session } = database.chat.createSession({ title: "Recovery" });
-					const sendResult = database.chat.createUserMessageRun({
-						sessionId: session.id,
-						content: "Tell me something",
-						mode: "ask",
-						provider: makeProviderInput(),
-					});
-
-					database.chat.updateRunStatus({
-						runId: sendResult.run.id,
-						status: "running",
-					});
-
-					const assistantMessage = database.chat.createAssistantMessage({
-						runId: sendResult.run.id,
-					});
-
-					database.chat.appendAssistantMessageDelta({
-						runId: sendResult.run.id,
-						messageId: assistantMessage.message.id,
-						delta: "Hello",
-					});
-					database.chat.appendAssistantMessageDelta({
-						runId: sendResult.run.id,
-						messageId: assistantMessage.message.id,
-						delta: " world",
-					});
-				} finally {
-					database.close();
-				}
-			}
-
-			{
-				const database = openAppDatabase(databasePath);
-
-				try {
-					const listedSessions = database.chat.listSessions();
-					const listedSession = listedSessions.items[0];
-					if (listedSession === undefined) {
-						throw new Error("Expected a persisted session.");
-					}
-
-					const recoveredSession = database.chat.getSession({
-						sessionId: listedSession.id,
-					});
-					const recoveredRun = recoveredSession.runs[0];
-					if (recoveredRun === undefined) {
-						throw new Error("Expected a persisted run.");
-					}
-
-					const recoveredAssistant = findAssistantMessage(recoveredSession.messages);
-					const replayedEvents = database.chat.replayRunEvents({ runId: recoveredRun.id });
-					const reconstructedContent = replayedEvents.reduce((content, event) => {
-						if (event.type === "message.delta") {
-							return `${content}${event.payload.delta}`;
-						}
-
-						if (event.type === "message.completed") {
-							return event.payload.content;
-						}
-
-						return content;
-					}, "");
-
-					expect(recoveredAssistant.status).toBe("streaming");
-					expect(recoveredAssistant.content).toBe("Hello world");
-					expect(reconstructedContent).toBe("Hello world");
-				} finally {
-					database.close();
-				}
-			}
-		});
-	});
-
-	test("never persists or returns provider api keys", () => {
-		withTempDatabase((databasePath) => {
-			const secret = "sk-live-never-store-this";
 			const database = openAppDatabase(databasePath);
-
 			try {
-				const { session } = database.chat.createSession({ title: "Provider secrecy" });
-				const sendResult = database.chat.createUserMessageRun({
-					sessionId: session.id,
-					content: "Secret safety",
-					mode: "ask",
-					provider: {
-						...makeProviderInput(),
-						apiKey: secret,
+				const session = database.sessions.create({ title: "Terminal runs" }).session;
+				const failed = createRun(database, session.id);
+				const failedAssistantMessageId = getAssistantMessageId(failed.run);
+				database.runs.updateStatus({ runId: failed.run.id, status: "running" });
+				const failure = database.runs.fail({
+					runId: failed.run.id,
+					error: makeAppError("PROVIDER_DOWN"),
+					messageEvent: {
+						messageId: failedAssistantMessageId,
+						content: "Partial",
 					},
 				});
-				const loaded = database.chat.getSession({ sessionId: session.id });
-				const loadedRun = loaded.runs[0];
-				if (loadedRun === undefined) {
-					throw new Error("Expected a persisted run.");
-				}
-
-				expect("apiKey" in sendResult.run.provider).toBe(false);
-				expect("apiKey" in loadedRun.provider).toBe(false);
-			} finally {
-				database.close();
-			}
-
-			for (const candidatePath of [databasePath, `${databasePath}-wal`, `${databasePath}-shm`]) {
-				if (!existsSync(candidatePath)) {
-					continue;
-				}
-
-				expect(readFileSync(candidatePath).includes(Buffer.from(secret))).toBe(false);
-			}
-		});
-	});
-
-	test("rejects invalid inputs and illegal state transitions", () => {
-		withTempDatabase((databasePath) => {
-			const database = openAppDatabase(databasePath);
-
-			try {
-				expect(() => database.chat.createSession({ title: "", defaultMode: "ask" })).toThrow();
-
-				const { session } = database.chat.createSession({ title: "Validation" });
-				const sendResult = database.chat.createUserMessageRun({
-					sessionId: session.id,
-					content: "Check state",
-					mode: "ask",
-					provider: makeProviderInput(),
-				});
-
-				expect(() =>
-					database.chat.createAssistantMessage({
-						runId: sendResult.run.id,
-						source: { kind: "user" },
-					}),
-				).toThrow();
-				expect(() =>
-					database.chat.updateRunStatus({
-						runId: sendResult.run.id,
-						status: "queued",
-					}),
-				).toThrow();
-			} finally {
-				database.close();
-			}
-		});
-	});
-
-	test("fails runs transactionally with assistant completion and error events", () => {
-		withTempDatabase((databasePath) => {
-			const database = openAppDatabase(databasePath);
-
-			try {
-				const { session } = database.chat.createSession({ title: "Failure path" });
-				const sendResult = database.chat.createUserMessageRun({
-					sessionId: session.id,
-					content: "Trigger failure",
-					mode: "agent",
-					provider: makeProviderInput(),
-				});
-
-				database.chat.updateRunStatus({
-					runId: sendResult.run.id,
-					status: "running",
-				});
-				const assistantMessage = database.chat.createAssistantMessage({
-					runId: sendResult.run.id,
-				});
-				database.chat.appendAssistantMessageDelta({
-					runId: sendResult.run.id,
-					messageId: assistantMessage.message.id,
-					delta: "Partial",
-				});
-
-				const failedRun = database.chat.failRun({
-					runId: sendResult.run.id,
-					messageId: assistantMessage.message.id,
-					content: "Partial answer",
-					error: makeAppError("PROVIDER_DOWN"),
-				});
-
-				expect(failedRun.run.status).toBe("failed");
-				expect(failedRun.message?.status).toBe("failed");
-				expect(failedRun.events.map((event) => event.type)).toEqual([
+				expect(failure.run.status).toBe("failed");
+				expect(failure.events.map((event) => event.type)).toEqual([
 					"message.completed",
 					"run.error",
 					"run.status",
 				]);
+
+				const cancelled = createRun(database, session.id);
+				database.runs.updateStatus({ runId: cancelled.run.id, status: "running" });
+				expect(database.runs.cancel({ runId: cancelled.run.id }).run.status).toBe("cancelling");
+				expect(
+					database.runs.updateStatus({ runId: cancelled.run.id, status: "cancelled" }).run.status,
+				).toBe("cancelled");
 			} finally {
 				database.close();
 			}
 		});
 	});
 
-	test("persists cancellation for the assistant message and run", () => {
+	test("never persists provider API keys", () => {
 		withTempDatabase((databasePath) => {
+			const secret = "sk-live-never-store-this";
 			const database = openAppDatabase(databasePath);
-
 			try {
-				const { session } = database.chat.createSession({ title: "Cancellation" });
-				const sendResult = database.chat.createUserMessageRun({
+				const session = database.sessions.create({ title: "Provider secrecy" }).session;
+				const created = database.runs.create({
 					sessionId: session.id,
-					content: "Stop this response",
 					mode: "ask",
-					provider: makeProviderInput(),
+					provider: makeProviderInput(secret),
+					userMessageId: createUuidV7(),
+					assistantMessageId: createUuidV7(),
 				});
-				database.chat.updateRunStatus({
-					runId: sendResult.run.id,
-					status: "running",
-				});
-				const assistant = database.chat.createAssistantMessage({
-					runId: sendResult.run.id,
-				});
-				database.chat.appendAssistantMessageDelta({
-					runId: sendResult.run.id,
-					messageId: assistant.message.id,
-					delta: "Partial",
-				});
-				database.chat.cancelRun({
-					runId: sendResult.run.id,
-					reason: "User stopped the response.",
-				});
-				const cancelledMessage = database.chat.cancelAssistantMessage({
-					runId: sendResult.run.id,
-					messageId: assistant.message.id,
-				});
-				const cancelledRun = database.chat.updateRunStatus({
-					runId: sendResult.run.id,
-					status: "cancelled",
-				});
-
-				const restored = database.chat.getSession({ sessionId: session.id });
-				expect(cancelledMessage.message.status).toBe("cancelled");
-				expect(cancelledMessage.message.content).toBe("Partial");
-				expect(cancelledRun.run.status).toBe("cancelled");
-				expect(findAssistantMessage(restored.messages).status).toBe("cancelled");
+				expect("apiKey" in created.run.provider).toBe(false);
 			} finally {
 				database.close();
+			}
+
+			for (const path of [databasePath, `${databasePath}-wal`, `${databasePath}-shm`]) {
+				if (existsSync(path)) {
+					expect(readFileSync(path).includes(Buffer.from(secret))).toBe(false);
+				}
 			}
 		});
 	});

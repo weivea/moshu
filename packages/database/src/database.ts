@@ -1,16 +1,18 @@
 import Database from "bun:sqlite";
 import { drizzle } from "drizzle-orm/bun-sqlite";
 
-import { createChatRepository, type ChatRepository } from "./chat-repository";
 import { applyAppMigrations } from "./migrations";
+import { createRunJournalRepository, type RunJournalRepository } from "./run-journal-repository";
 import { appSchema } from "./schema";
+import { createSessionRepository, type SessionRepository } from "./session-repository";
 
 export type AppDrizzleDatabase = ReturnType<typeof drizzle>;
 
 export interface AppDatabase {
 	client: Database;
 	orm: AppDrizzleDatabase;
-	chat: ChatRepository;
+	sessions: SessionRepository;
+	runs: RunJournalRepository;
 	close(): void;
 }
 
@@ -42,7 +44,8 @@ export function openAppDatabase(filename: string): AppDatabase {
 	return {
 		client,
 		orm,
-		chat: createChatRepository({ client, orm }),
+		sessions: createSessionRepository({ orm }),
+		runs: createRunJournalRepository({ client, orm }),
 		close: () => client.close(),
 	};
 }

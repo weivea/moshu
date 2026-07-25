@@ -40,7 +40,8 @@ const chatRuntime = createAskChatRuntime({
 	checkpointer: checkpointSaver,
 });
 const chatService = new DesktopChatService({
-	repository: database.chat,
+	sessions: database.sessions,
+	runs: database.runs,
 	providerConfigStore,
 	runtime: chatRuntime,
 });

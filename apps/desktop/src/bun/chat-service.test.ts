@@ -3,6 +3,7 @@ import { describe, expect, test } from "bun:test";
 import {
 	AskChatCancelledError,
 	AskChatRuntimeError,
+	type AskChatMessage,
 	type AskChatRunInput,
 	type AskChatRunResult,
 	type AskChatRunStream,
@@ -23,15 +24,15 @@ describe("DesktopChatService", () => {
 		const runtime = new FakeAskChatRuntime({
 			deltas: ["Hello", " world"],
 		});
-		const service = createService(database.chat, runtime, scheduler);
+		const service = createService(database, runtime, scheduler);
 		const publishedEvents: ChatRunEvent[] = [];
 
 		try {
 			configureProvider(service);
 			const { session } = service.createSession();
 			service.subscribe((event) => {
-				const persistedIds = database.chat
-					.replayRunEvents({ runId: event.runId })
+				const persistedIds = database.runs
+					.listEvents({ runId: event.runId })
 					.map((persistedEvent) => persistedEvent.id);
 				expect(persistedIds).toContain(event.id);
 				publishedEvents.push(event);
@@ -47,7 +48,7 @@ describe("DesktopChatService", () => {
 			scheduler.runAll();
 			await service.waitForIdle();
 
-			const restored = service.getSession({ sessionId: session.id });
+			const restored = await service.getSession({ sessionId: session.id });
 			expect(restored.session.title).toBe("Say hello");
 			expect(restored.messages.map((message) => message.content)).toEqual([
 				"Say hello",
@@ -56,7 +57,12 @@ describe("DesktopChatService", () => {
 			expect(restored.messages[1]?.status).toBe("complete");
 			expect(restored.runs[0]?.status).toBe("completed");
 			expect(runtime.inputs[0]?.threadId).toBe(session.id);
-			expect(runtime.inputs[0]?.messages).toEqual([{ role: "user", content: "Say hello" }]);
+			expect(
+				runtime.inputs[0]?.messages.map(({ role, content }) => ({
+					role,
+					content,
+				})),
+			).toEqual([{ role: "user", content: "Say hello" }]);
 			expect(publishedEvents.map((event) => event.type)).toEqual([
 				"run.status",
 				"message.delta",
@@ -78,11 +84,46 @@ describe("DesktopChatService", () => {
 		}
 	});
 
+	test("submits only the current turn and lets Deep Agents restore prior messages", async () => {
+		const database = openAppDatabase(":memory:");
+		const scheduler = new ManualScheduler();
+		const runtime = new FakeAskChatRuntime({ deltas: ["Reply"] });
+		const service = createService(database, runtime, scheduler);
+
+		try {
+			configureProvider(service);
+			const { session } = service.createSession();
+
+			service.sendMessage({ sessionId: session.id, content: "First question" });
+			scheduler.runAll();
+			await service.waitForIdle();
+			service.sendMessage({
+				sessionId: session.id,
+				content: "Second question",
+			});
+			scheduler.runAll();
+			await service.waitForIdle();
+
+			expect(
+				runtime.inputs.map((input) =>
+					input.messages.map(({ role, content }) => ({ role, content })),
+				),
+			).toEqual([
+				[{ role: "user", content: "First question" }],
+				[{ role: "user", content: "Second question" }],
+			]);
+			expect(runtime.inputs.map((input) => input.threadId)).toEqual([session.id, session.id]);
+		} finally {
+			await service.shutdown();
+			database.close();
+		}
+	});
+
 	test("cancels the runtime and persists partial assistant content", async () => {
 		const database = openAppDatabase(":memory:");
 		const scheduler = new ManualScheduler();
 		const runtime = new FakeAskChatRuntime({ pending: true });
-		const service = createService(database.chat, runtime, scheduler);
+		const service = createService(database, runtime, scheduler);
 
 		try {
 			configureProvider(service);
@@ -101,7 +142,7 @@ describe("DesktopChatService", () => {
 			expect(cancelResult.run.status).toBe("cancelling");
 			await service.waitForIdle();
 
-			const restored = service.getSession({ sessionId: session.id });
+			const restored = await service.getSession({ sessionId: session.id });
 			expect(restored.messages[1]?.status).toBe("cancelled");
 			expect(restored.runs[0]?.status).toBe("cancelled");
 			expect(runtime.cancelledRunIds).toEqual([accepted.run.id]);
@@ -122,7 +163,7 @@ describe("DesktopChatService", () => {
 				statusCode: 401,
 			}),
 		});
-		const service = createService(database.chat, runtime, scheduler);
+		const service = createService(database, runtime, scheduler);
 
 		try {
 			configureProvider(service);
@@ -144,7 +185,7 @@ describe("DesktopChatService", () => {
 			scheduler.runAll();
 			await service.waitForIdle();
 
-			const restored = service.getSession({ sessionId: session.id });
+			const restored = await service.getSession({ sessionId: session.id });
 			const assistant = restored.messages[1];
 			expect(assistant?.status).toBe("failed");
 			if (assistant?.status !== "failed") {
@@ -162,7 +203,7 @@ describe("DesktopChatService", () => {
 		const database = openAppDatabase(":memory:");
 		const scheduler = new ManualScheduler();
 		const store = new InMemoryAskProviderConfigStore();
-		const service = createService(database.chat, new FakeAskChatRuntime({}), scheduler, {
+		const service = createService(database, new FakeAskChatRuntime({}), scheduler, {
 			providerConfigStore: store,
 		});
 
@@ -190,7 +231,7 @@ describe("DesktopChatService", () => {
 		const database = openAppDatabase(":memory:");
 		const scheduler = new ManualScheduler();
 		const testedConfigurations: AskProviderConfiguration[] = [];
-		const service = createService(database.chat, new FakeAskChatRuntime({}), scheduler, {
+		const service = createService(database, new FakeAskChatRuntime({}), scheduler, {
 			testProviderConnection: async (configuration) => {
 				testedConfigurations.push(configuration);
 			},
@@ -224,7 +265,7 @@ describe("DesktopChatService", () => {
 		const database = openAppDatabase(":memory:");
 		const scheduler = new ManualScheduler();
 		const testedConfigurations: AskProviderConfiguration[] = [];
-		const service = createService(database.chat, new FakeAskChatRuntime({}), scheduler, {
+		const service = createService(database, new FakeAskChatRuntime({}), scheduler, {
 			testProviderConnection: async (configuration) => {
 				testedConfigurations.push(configuration);
 			},
@@ -250,7 +291,7 @@ describe("DesktopChatService", () => {
 	test("maps Provider connection failures to safe errors", async () => {
 		const database = openAppDatabase(":memory:");
 		const scheduler = new ManualScheduler();
-		const service = createService(database.chat, new FakeAskChatRuntime({}), scheduler, {
+		const service = createService(database, new FakeAskChatRuntime({}), scheduler, {
 			testProviderConnection: async () => {
 				throw new AskChatRuntimeError({
 					kind: "provider_authentication",
@@ -282,7 +323,7 @@ describe("DesktopChatService", () => {
 		const database = openAppDatabase(":memory:");
 		const scheduler = new ManualScheduler();
 		const store = new InMemoryAskProviderConfigStore();
-		const service = createService(database.chat, new FakeAskChatRuntime({}), scheduler, {
+		const service = createService(database, new FakeAskChatRuntime({}), scheduler, {
 			providerConfigStore: store,
 		});
 
@@ -301,11 +342,8 @@ describe("DesktopChatService", () => {
 	test("lists, renames, archives, restores, and deletes Sessions", async () => {
 		const database = openAppDatabase(":memory:");
 		const scheduler = new ManualScheduler();
-		const service = createService(
-			database.chat,
-			new FakeAskChatRuntime({ deltas: ["Done"] }),
-			scheduler,
-		);
+		const runtime = new FakeAskChatRuntime({ deltas: ["Done"] });
+		const service = createService(database, runtime, scheduler);
 
 		try {
 			configureProvider(service);
@@ -325,9 +363,10 @@ describe("DesktopChatService", () => {
 			expect(
 				service.setSessionArchived({ sessionId: session.id, archived: false }).session.archivedAt,
 			).toBeUndefined();
-			expect(service.deleteSession({ sessionId: session.id })).toEqual({
+			expect(await service.deleteSession({ sessionId: session.id })).toEqual({
 				sessionId: session.id,
 			});
+			expect(runtime.deletedThreadIds).toEqual([session.id]);
 			expect(service.listSessions().items).toEqual([]);
 		} finally {
 			await service.shutdown();
@@ -338,11 +377,7 @@ describe("DesktopChatService", () => {
 	test("blocks archiving and deleting a Session with an active response", async () => {
 		const database = openAppDatabase(":memory:");
 		const scheduler = new ManualScheduler();
-		const service = createService(
-			database.chat,
-			new FakeAskChatRuntime({ pending: true }),
-			scheduler,
-		);
+		const service = createService(database, new FakeAskChatRuntime({ pending: true }), scheduler);
 
 		try {
 			configureProvider(service);
@@ -373,16 +408,16 @@ describe("DesktopChatService", () => {
 	test("finalizes orphaned Runs after an application restart", async () => {
 		const database = openAppDatabase(":memory:");
 		const scheduler = new ManualScheduler();
-		const service = createService(database.chat, new FakeAskChatRuntime({}), scheduler);
-		const cancelling = createOrphanedRun(database.chat, "cancelling");
-		const running = createOrphanedRun(database.chat, "running");
-		const deleting = createOrphanedRun(database.chat, "running");
+		const service = createService(database, new FakeAskChatRuntime({}), scheduler);
+		const cancelling = createOrphanedRun(database, "cancelling");
+		const running = createOrphanedRun(database, "running");
+		const deleting = createOrphanedRun(database, "running");
 
 		try {
 			expect(service.cancel({ runId: cancelling.runId }).run.status).toBe("cancelled");
-			expect(service.getSession({ sessionId: cancelling.sessionId }).messages.at(-1)?.status).toBe(
-				"cancelled",
-			);
+			expect(
+				(await service.getSession({ sessionId: cancelling.sessionId })).messages.at(-1)?.status,
+			).toBe("cancelled");
 
 			expect(
 				service.setSessionArchived({
@@ -390,12 +425,14 @@ describe("DesktopChatService", () => {
 					archived: true,
 				}).session.archivedAt,
 			).toBeDefined();
-			const recovered = service.getSession({ sessionId: running.sessionId });
+			const recovered = await service.getSession({
+				sessionId: running.sessionId,
+			});
 			expect(recovered.runs[0]?.status).toBe("cancelled");
 			expect(recovered.messages.at(-1)?.status).toBe("cancelled");
 
-			service.deleteSession({ sessionId: deleting.sessionId });
-			expect(() => service.getSession({ sessionId: deleting.sessionId })).toThrow();
+			await service.deleteSession({ sessionId: deleting.sessionId });
+			await expect(service.getSession({ sessionId: deleting.sessionId })).rejects.toThrow();
 		} finally {
 			await service.shutdown();
 			database.close();
@@ -404,13 +441,12 @@ describe("DesktopChatService", () => {
 });
 
 function createOrphanedRun(
-	repository: ReturnType<typeof openAppDatabase>["chat"],
+	database: ReturnType<typeof openAppDatabase>,
 	status: "running" | "cancelling",
 ) {
-	const { session } = repository.createSession({ title: "Interrupted chat" });
-	const created = repository.createUserMessageRun({
+	const { session } = database.sessions.create({ title: "Interrupted chat" });
+	const created = database.runs.create({
 		sessionId: session.id,
-		content: "Continue after restart",
 		mode: "ask",
 		provider: {
 			schemaVersion: 1,
@@ -420,17 +456,18 @@ function createOrphanedRun(
 			model: "gpt-4.1-mini",
 			apiKey: "sk-test-secret",
 		},
+		userMessageId: createUuidV7(),
+		assistantMessageId: createUuidV7(),
 	});
-	repository.createAssistantMessage({ runId: created.run.id });
-	repository.updateRunStatus({ runId: created.run.id, status: "running" });
+	database.runs.updateStatus({ runId: created.run.id, status: "running" });
 	if (status === "cancelling") {
-		repository.updateRunStatus({ runId: created.run.id, status: "cancelling" });
+		database.runs.updateStatus({ runId: created.run.id, status: "cancelling" });
 	}
 	return { sessionId: session.id, runId: created.run.id };
 }
 
 function createService(
-	repository: ReturnType<typeof openAppDatabase>["chat"],
+	database: ReturnType<typeof openAppDatabase>,
 	runtime: AskChatRuntime,
 	scheduler: ManualScheduler,
 	options: {
@@ -439,7 +476,8 @@ function createService(
 	} = {},
 ) {
 	return new DesktopChatService({
-		repository,
+		sessions: database.sessions,
+		runs: database.runs,
 		providerConfigStore: options.providerConfigStore ?? new InMemoryAskProviderConfigStore(),
 		runtime,
 		schedule: scheduler.schedule,
@@ -474,11 +512,13 @@ class ManualScheduler {
 class FakeAskChatRuntime implements AskChatRuntime {
 	readonly inputs: AskChatRunInput[] = [];
 	readonly cancelledRunIds: string[] = [];
+	readonly deletedThreadIds: string[] = [];
 	readonly started: Promise<void>;
 	readonly #deltas: string[];
 	readonly #pending: boolean;
 	readonly #error?: AskChatRuntimeError;
 	readonly #pendingRuns = new Map<string, { reject(error: AskChatCancelledError): void }>();
+	readonly #threadMessages = new Map<string, AskChatMessage[]>();
 	#resolveStarted: () => void = () => {};
 
 	constructor(options: {
@@ -497,6 +537,10 @@ class FakeAskChatRuntime implements AskChatRuntime {
 	async run(input: AskChatRunInput): Promise<AskChatRunResult> {
 		this.inputs.push(input);
 		this.#resolveStarted();
+		const threadId = input.threadId ?? input.runId;
+		const messages = this.#threadMessages.get(threadId) ?? [];
+		messages.push(...input.messages.map((message) => ({ ...message })));
+		this.#threadMessages.set(threadId, messages);
 
 		if (this.#error !== undefined) {
 			throw this.#error;
@@ -515,6 +559,7 @@ class FakeAskChatRuntime implements AskChatRuntime {
 				delta,
 			});
 		}
+		messages.push({ role: "assistant", content: this.#deltas.join("") });
 
 		return {
 			runId: input.runId,
@@ -536,6 +581,17 @@ class FakeAskChatRuntime implements AskChatRuntime {
 		this.#pendingRuns.delete(runId);
 		pending.reject(new AskChatCancelledError(runId, reason));
 		return true;
+	}
+
+	async deleteThread(threadId: string): Promise<void> {
+		this.deletedThreadIds.push(threadId);
+		this.#threadMessages.delete(threadId);
+	}
+
+	async getThreadMessages(threadId: string): Promise<AskChatMessage[]> {
+		return (this.#threadMessages.get(threadId) ?? []).map((message) => ({
+			...message,
+		}));
 	}
 
 	async shutdown(): Promise<void> {

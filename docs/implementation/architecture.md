@@ -103,7 +103,9 @@ Phase 1 默认直接运行在 Electrobun application worker。它不是 Pi SDK �
 - 共享不可变 graph definition/compiled graph cache。
 - `threadId` 对应可持久 LangGraph thread，`runId` 对应一次应用执行。
 - `RunRegistry` 只保存活动 Run 的 `AbortController`、stream task、pending interrupt IDs 和资源句柄。
-- checkpoint/store 是持久事实来源；Registry、Provider client 和 stream iterator 不持久化。
+- checkpointer 是 thread 内 Agent state（包括 conversation messages）的持久事实来源；`store` 仅用于跨 thread 的长期记忆和 StoreBackend 文件，不承担 Chat Session 目录管理。
+- `app.db` 保存 Session 标题、归档、搜索、Run 状态和 UI/event 投影；这些产品投影不得重新拼装后回灌 Agent context。
+- Registry、Provider client 和 stream iterator 不持久化。
 - start 命令快速返回 accepted/run ID，后续 delta、Tool、interrupt 和完成状态通过规范化事件流发送。
 
 职责：
@@ -439,6 +441,10 @@ appData/
 
 - `app.db` 只由 Host 的 Repository 层通过 `bun:sqlite` 写入。
 - `checkpoints.db` 只由同一 application worker 内的 `BunSqliteSaver` adapter 写入。
+- 一个产品 Session 映射一个稳定 LangGraph `thread_id`；每次 Run 只设置独立 `run_id`，并仅提交当前用户 turn，由 Deep Agents 从 checkpoint 恢复先前 messages。
+- `app.db` 只保存 SessionCatalog 与 RunJournal。Run/Event 提供稳定 correlation ID、运行状态、安全错误和 event cursor，不保存 conversation message row。
+- SessionCatalog 是产品 Session 列表的事实来源；不得从 checkpointer `list()` 反推列表，因为未发送消息的 Session 没有 checkpoint，且标题、搜索、归档和产品排序不属于 Deep Agents thread state。
+- transcript 查询由 Host 通过 Deep Agents checkpoint state 构造；运行中、失败和取消状态再与 RunJournal event 投影合并，WebView 不直接读取 checkpoint。
 - 两者都使用 WAL，但不尝试跨库事务。
 - Run 状态与 checkpoint 通过 `threadId/checkpointId` 引用；恢复时进行一致性核对。
 - Phase 1 保持单 application worker、每个 DB 独立连接所有权。只有未来 sidecar/Runtime Pool ADR 通过后，才重新设计 checkpoint writer ownership，并完成 `SQLITE_BUSY`、WAL 备份和清理测试。

@@ -1,6 +1,6 @@
 import type Database from "bun:sqlite";
 
-const CURRENT_USER_VERSION = 2;
+const CURRENT_USER_VERSION = 3;
 
 function readUserVersion(client: Database): number {
 	const row = client.query<{ user_version: number }, []>("PRAGMA user_version").get();
@@ -29,28 +29,36 @@ export function applyAppMigrations(client: Database): void {
 
 	try {
 		client.exec(`
-			CREATE TABLE IF NOT EXISTS chat_sessions (
+			DROP TABLE IF EXISTS chat_run_events;
+			DROP TABLE IF EXISTS chat_messages;
+			DROP TABLE IF EXISTS chat_runs;
+			DROP TABLE IF EXISTS chat_sessions;
+
+			CREATE TABLE chat_sessions (
 				id TEXT PRIMARY KEY NOT NULL,
 				title TEXT NOT NULL,
 				default_mode TEXT NOT NULL,
 				created_at_ms INTEGER NOT NULL,
 				updated_at_ms INTEGER NOT NULL,
-				last_message_at_ms INTEGER
+				last_message_at_ms INTEGER,
+				archived_at_ms INTEGER
 			);
 
 			CREATE INDEX IF NOT EXISTS chat_sessions_updated_at_idx
 				ON chat_sessions(updated_at_ms);
 			CREATE INDEX IF NOT EXISTS chat_sessions_last_message_at_idx
 				ON chat_sessions(last_message_at_ms);
+			CREATE INDEX IF NOT EXISTS chat_sessions_archived_updated_at_idx
+				ON chat_sessions(archived_at_ms, updated_at_ms);
 
-			CREATE TABLE IF NOT EXISTS chat_runs (
+			CREATE TABLE chat_runs (
 				id TEXT PRIMARY KEY NOT NULL,
 				session_id TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
 				mode TEXT NOT NULL,
 				status TEXT NOT NULL,
 				provider_json TEXT NOT NULL,
-				user_message_id TEXT UNIQUE,
-				assistant_message_id TEXT UNIQUE,
+				user_message_id TEXT NOT NULL UNIQUE,
+				assistant_message_id TEXT NOT NULL UNIQUE,
 				last_error_json TEXT,
 				created_at_ms INTEGER NOT NULL,
 				updated_at_ms INTEGER NOT NULL,
@@ -60,29 +68,7 @@ export function applyAppMigrations(client: Database): void {
 			CREATE INDEX IF NOT EXISTS chat_runs_session_created_at_idx
 				ON chat_runs(session_id, created_at_ms);
 
-			CREATE TABLE IF NOT EXISTS chat_messages (
-				id TEXT PRIMARY KEY NOT NULL,
-				session_id TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
-				run_id TEXT REFERENCES chat_runs(id) ON DELETE CASCADE,
-				role TEXT NOT NULL,
-				status TEXT NOT NULL,
-				content_json TEXT NOT NULL,
-				error_json TEXT,
-				sequence INTEGER NOT NULL,
-				created_at_ms INTEGER NOT NULL,
-				updated_at_ms INTEGER NOT NULL
-			);
-
-			CREATE UNIQUE INDEX IF NOT EXISTS chat_messages_session_sequence_unique
-				ON chat_messages(session_id, sequence);
-			CREATE UNIQUE INDEX IF NOT EXISTS chat_messages_run_role_unique
-				ON chat_messages(run_id, role);
-			CREATE INDEX IF NOT EXISTS chat_messages_session_sequence_idx
-				ON chat_messages(session_id, sequence);
-			CREATE INDEX IF NOT EXISTS chat_messages_run_idx
-				ON chat_messages(run_id);
-
-			CREATE TABLE IF NOT EXISTS chat_run_events (
+			CREATE TABLE chat_run_events (
 				id TEXT PRIMARY KEY NOT NULL,
 				run_id TEXT NOT NULL REFERENCES chat_runs(id) ON DELETE CASCADE,
 				session_id TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
@@ -102,14 +88,6 @@ export function applyAppMigrations(client: Database): void {
 			CREATE INDEX IF NOT EXISTS chat_run_events_session_created_at_idx
 				ON chat_run_events(session_id, created_at_ms);
 		`);
-
-		if (currentUserVersion < 2) {
-			client.exec(`
-				ALTER TABLE chat_sessions ADD COLUMN archived_at_ms INTEGER;
-				CREATE INDEX IF NOT EXISTS chat_sessions_archived_updated_at_idx
-					ON chat_sessions(archived_at_ms, updated_at_ms);
-			`);
-		}
 
 		client.exec(`PRAGMA user_version = ${CURRENT_USER_VERSION}`);
 		client.exec("COMMIT");

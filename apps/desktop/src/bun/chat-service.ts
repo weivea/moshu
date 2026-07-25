@@ -13,6 +13,8 @@ import {
 	type CancelChatRunInput,
 	type CancelChatRunOutput,
 	type ChatProviderStatus,
+	type ChatMessage,
+	chatMessageSchema,
 	type ChatRun,
 	type ChatRunEvent,
 	type ChatSendAcceptedOutput,
@@ -43,7 +45,7 @@ import {
 	type UpdateChatSessionOutput,
 	updateChatSessionInputSchema,
 } from "@moshu/contracts";
-import { type ChatRepository, createUuidV7 } from "@moshu/database";
+import { createUuidV7, type RunJournalRepository, type SessionRepository } from "@moshu/database";
 
 const DEFAULT_PROVIDER_BASE_URL = "https://api.openai.com/v1";
 
@@ -56,7 +58,8 @@ interface ChatServiceLogger {
 }
 
 export interface DesktopChatServiceOptions {
-	repository: ChatRepository;
+	sessions: SessionRepository;
+	runs: RunJournalRepository;
 	providerConfigStore: AskProviderConfigStore;
 	runtime: AskChatRuntime;
 	schedule?: ChatTaskScheduler;
@@ -74,11 +77,13 @@ interface ActiveChatRun {
 	sessionId: string;
 	assistantMessageId: string;
 	messages: AskChatMessage[];
+	partialAssistantContent: string;
 	cancelRequested: boolean;
 }
 
 export class DesktopChatService {
-	readonly #repository: ChatRepository;
+	readonly #sessions: SessionRepository;
+	readonly #runs: RunJournalRepository;
 	readonly #providerConfigStore: AskProviderConfigStore;
 	readonly #runtime: AskChatRuntime;
 	readonly #schedule: ChatTaskScheduler;
@@ -91,7 +96,8 @@ export class DesktopChatService {
 	readonly #executions = new Set<Promise<void>>();
 
 	constructor(options: DesktopChatServiceOptions) {
-		this.#repository = options.repository;
+		this.#sessions = options.sessions;
+		this.#runs = options.runs;
 		this.#providerConfigStore = options.providerConfigStore;
 		this.#runtime = options.runtime;
 		this.#schedule = options.schedule ?? ((task) => setTimeout(task, 0));
@@ -166,18 +172,18 @@ export class DesktopChatService {
 	}
 
 	createSession(): CreateChatSessionOutput {
-		return this.#repository.createSession({
+		return this.#sessions.create({
 			title: "New chat",
 			defaultMode: "ask",
 		});
 	}
 
 	listSessions(input: ListChatSessionsInput = {}): ListChatSessionsOutput {
-		return this.#repository.listSessions(listChatSessionsInputSchema.parse(input));
+		return this.#sessions.list(listChatSessionsInputSchema.parse(input));
 	}
 
 	updateSession(input: UpdateChatSessionInput): UpdateChatSessionOutput {
-		return this.#repository.updateSession(updateChatSessionInputSchema.parse(input));
+		return this.#sessions.update(updateChatSessionInputSchema.parse(input));
 	}
 
 	setSessionArchived(input: SetChatSessionArchivedInput): SetChatSessionArchivedOutput {
@@ -185,23 +191,35 @@ export class DesktopChatService {
 		if (parsedInput.archived) {
 			this.#assertSessionCanBeRemovedFromActiveList(parsedInput.sessionId);
 		}
-		return this.#repository.setSessionArchived(parsedInput);
+		return this.#sessions.setArchived(parsedInput);
 	}
 
-	deleteSession(input: DeleteChatSessionInput): DeleteChatSessionOutput {
+	deleteSession(input: DeleteChatSessionInput): Promise<DeleteChatSessionOutput> {
 		const parsedInput = deleteChatSessionInputSchema.parse(input);
 		this.#assertSessionCanBeRemovedFromActiveList(parsedInput.sessionId);
-		return this.#repository.deleteSession(parsedInput);
+		return this.#runtime
+			.deleteThread(parsedInput.sessionId)
+			.then(() => this.#sessions.delete(parsedInput));
 	}
 
-	getSession(input: GetChatSessionInput): GetChatSessionOutput {
-		return this.#repository.getSession(getChatSessionInputSchema.parse(input));
+	async getSession(input: GetChatSessionInput): Promise<GetChatSessionOutput> {
+		const parsedInput = getChatSessionInputSchema.parse(input);
+		const session = this.#sessions.get(parsedInput);
+		const runs = this.#runs.listBySession(parsedInput.sessionId);
+		const messages = await this.#buildSessionMessages(parsedInput.sessionId, runs);
+		return { session, messages, runs };
 	}
 
-	getSessionSnapshot(input: GetChatSessionInput): GetChatSessionSnapshotOutput {
-		return getChatSessionSnapshotOutputSchema.parse(
-			this.#repository.getSessionSnapshot(getChatSessionInputSchema.parse(input)),
-		);
+	async getSessionSnapshot(input: GetChatSessionInput): Promise<GetChatSessionSnapshotOutput> {
+		const parsedInput = getChatSessionInputSchema.parse(input);
+		const snapshot = await this.getSession(parsedInput);
+		return getChatSessionSnapshotOutputSchema.parse({
+			...snapshot,
+			eventCursors: snapshot.runs.map((run) => ({
+				runId: run.id,
+				lastSeq: this.#runs.listEvents({ runId: run.id }).at(-1)?.seq ?? 0,
+			})),
+		});
 	}
 
 	sendMessage(input: SendDesktopChatMessageInput): ChatSendAcceptedOutput {
@@ -222,24 +240,26 @@ export class DesktopChatService {
 			});
 		}
 
-		const currentSession = this.#repository.getSession({ sessionId: input.sessionId });
-		if (currentSession.session.archivedAt !== undefined) {
+		const currentSession = this.#sessions.get({ sessionId: input.sessionId });
+		const existingRuns = this.#runs.listBySession(input.sessionId);
+		if (currentSession.archivedAt !== undefined) {
 			throw new AskChatRuntimeError({
 				kind: "provider_failure",
 				message: "Archived chat Sessions cannot send new messages.",
 				retryable: false,
 			});
 		}
-		if (currentSession.messages.length === 0 && currentSession.session.title === "New chat") {
-			this.#repository.updateSession({
+		if (existingRuns.length === 0 && currentSession.title === "New chat") {
+			this.#sessions.update({
 				sessionId: input.sessionId,
 				title: createSessionTitle(input.content),
 			});
 		}
 
-		const sendResult = this.#repository.createUserMessageRun({
+		const userMessageId = createUuidV7();
+		const assistantMessageId = createUuidV7();
+		const created = this.#runs.create({
 			sessionId: input.sessionId,
-			content: input.content,
 			mode: "ask",
 			provider: {
 				schemaVersion: 1,
@@ -249,25 +269,25 @@ export class DesktopChatService {
 				model: provider.model,
 				apiKey: provider.apiKey,
 			},
+			userMessageId,
+			assistantMessageId,
 		});
-		const assistant = this.#repository.createAssistantMessage({
-			runId: sendResult.run.id,
+		this.#runs.appendEvent({
+			runId: created.run.id,
+			type: "message.started",
+			source: { kind: "assistant" },
+			payload: {
+				messageId: assistantMessageId,
+				role: "assistant",
+				status: "streaming",
+			},
 		});
-		const snapshot = this.#repository.getSession({ sessionId: input.sessionId });
 		const activeRun: ActiveChatRun = {
-			runId: sendResult.run.id,
+			runId: created.run.id,
 			sessionId: input.sessionId,
-			assistantMessageId: assistant.message.id,
-			messages: snapshot.messages
-				.filter(
-					(message) =>
-						message.id !== assistant.message.id &&
-						(message.role === "user" || message.status === "complete"),
-				)
-				.map((message) => ({
-					role: message.role,
-					content: message.content,
-				})),
+			assistantMessageId,
+			messages: [{ role: "user", content: input.content, id: userMessageId }],
+			partialAssistantContent: "",
 			cancelRequested: false,
 		};
 
@@ -292,10 +312,11 @@ export class DesktopChatService {
 				});
 		});
 
+		const sequence = existingRuns.length * 2 + 1;
 		return chatSendAcceptedOutputSchema.parse({
-			run: sendResult.run,
-			userMessage: sendResult.userMessage,
-			assistantMessage: assistant.message,
+			run: created.run,
+			userMessage: createUserMessage(created.run, input.content, sequence),
+			assistantMessage: createAssistantMessage(created.run, "streaming", "", sequence + 1),
 		});
 	}
 
@@ -305,7 +326,7 @@ export class DesktopChatService {
 			activeRun.cancelRequested = true;
 		}
 
-		const result = this.#repository.cancelRun(input);
+		const result = this.#runs.cancel(input);
 		if (result.run.status === "completed" || result.run.status === "failed") {
 			return result;
 		}
@@ -313,17 +334,7 @@ export class DesktopChatService {
 		if (result.run.status === "cancelled") {
 			if (activeRun !== undefined) {
 				this.#emitLatestEvent(result.run.id);
-				const message = this.#repository.getMessage({
-					sessionId: activeRun.sessionId,
-					messageId: activeRun.assistantMessageId,
-				});
-				if (message.status === "streaming") {
-					const cancelledMessage = this.#repository.cancelAssistantMessage({
-						runId: activeRun.runId,
-						messageId: activeRun.assistantMessageId,
-					});
-					this.#emit(cancelledMessage.event);
-				}
+				this.#emit(this.#appendAssistantTerminalEvent(activeRun, "cancelled"));
 				this.#releaseRun(activeRun);
 			} else {
 				this.#emitLatestEvent(result.run.id);
@@ -371,7 +382,7 @@ export class DesktopChatService {
 				return;
 			}
 
-			const running = this.#repository.updateRunStatus({
+			const running = this.#runs.updateStatus({
 				runId: activeRun.runId,
 				status: "running",
 			});
@@ -382,12 +393,17 @@ export class DesktopChatService {
 				threadId: activeRun.sessionId,
 				messages: activeRun.messages,
 				onEvent: async (event) => {
-					const mutation = this.#repository.appendAssistantMessageDelta({
+					activeRun.partialAssistantContent += event.delta;
+					const persistedEvent = this.#runs.appendEvent({
 						runId: activeRun.runId,
-						messageId: activeRun.assistantMessageId,
-						delta: event.delta,
+						type: "message.delta",
+						source: { kind: "assistant" },
+						payload: {
+							messageId: activeRun.assistantMessageId,
+							delta: event.delta,
+						},
 					});
-					this.#emit(mutation.event);
+					this.#emit(persistedEvent);
 				},
 			});
 
@@ -405,14 +421,10 @@ export class DesktopChatService {
 				});
 			}
 
-			const completedMessage = this.#repository.completeAssistantMessage({
-				runId: activeRun.runId,
-				messageId: activeRun.assistantMessageId,
-				content: result.text,
-			});
-			this.#emit(completedMessage.event);
+			activeRun.partialAssistantContent = result.text;
+			this.#emit(this.#appendAssistantTerminalEvent(activeRun, "complete"));
 
-			const completedRun = this.#repository.updateRunStatus({
+			const completedRun = this.#runs.updateStatus({
 				runId: activeRun.runId,
 				status: "completed",
 			});
@@ -423,10 +435,13 @@ export class DesktopChatService {
 				return;
 			}
 
-			const failed = this.#repository.failRun({
+			const failed = this.#runs.fail({
 				runId: activeRun.runId,
-				messageId: activeRun.assistantMessageId,
 				error: toAppError(error, activeRun.runId),
+				messageEvent: {
+					messageId: activeRun.assistantMessageId,
+					content: activeRun.partialAssistantContent,
+				},
 			});
 			for (const event of failed.events) {
 				this.#emit(event);
@@ -437,21 +452,10 @@ export class DesktopChatService {
 	}
 
 	async #finishCancelledRun(activeRun: ActiveChatRun): Promise<void> {
-		const snapshot = this.#repository.getSession({ sessionId: activeRun.sessionId });
-		const message = snapshot.messages.find(
-			(candidate) => candidate.id === activeRun.assistantMessageId,
-		);
-		if (message?.status === "streaming") {
-			const cancelledMessage = this.#repository.cancelAssistantMessage({
-				runId: activeRun.runId,
-				messageId: activeRun.assistantMessageId,
-			});
-			this.#emit(cancelledMessage.event);
-		}
-
-		let run = findRun(snapshot.runs, activeRun.runId);
+		this.#emit(this.#appendAssistantTerminalEvent(activeRun, "cancelled"));
+		let run = this.#runs.get(activeRun.runId);
 		if (run.status === "queued" || run.status === "running") {
-			run = this.#repository.cancelRun({
+			run = this.#runs.cancel({
 				runId: activeRun.runId,
 				reason: "Chat response cancelled.",
 			}).run;
@@ -459,7 +463,7 @@ export class DesktopChatService {
 		}
 
 		if (run.status === "cancelling") {
-			const cancelledRun = this.#repository.updateRunStatus({
+			const cancelledRun = this.#runs.updateStatus({
 				runId: activeRun.runId,
 				status: "cancelled",
 			});
@@ -470,11 +474,123 @@ export class DesktopChatService {
 	}
 
 	#emitLatestEvent(runId: string): void {
-		const events = this.#repository.replayRunEvents({ runId });
+		const events = this.#runs.listEvents({ runId });
 		const event = events.at(-1);
 		if (event !== undefined) {
 			this.#emit(event);
 		}
+	}
+
+	#appendAssistantTerminalEvent(
+		activeRun: ActiveChatRun,
+		status: "complete" | "cancelled",
+	): ChatRunEvent {
+		return this.#appendTerminalEvent(
+			this.#runs.get(activeRun.runId),
+			status,
+			activeRun.partialAssistantContent,
+		);
+	}
+
+	#appendTerminalEvent(
+		run: ChatRun,
+		status: "complete" | "cancelled",
+		content: string,
+	): ChatRunEvent {
+		const existing = this.#runs
+			.listEvents({ runId: run.id })
+			.find((event) => event.type === "message.completed");
+		if (existing !== undefined) {
+			return existing;
+		}
+		if (run.assistantMessageId === undefined) {
+			throw new Error(`Run ${run.id} is missing its assistant message ID.`);
+		}
+
+		return this.#runs.appendEvent({
+			runId: run.id,
+			type: "message.completed",
+			source: { kind: "assistant" },
+			payload: {
+				messageId: run.assistantMessageId,
+				status,
+				content,
+			},
+		});
+	}
+
+	async #buildSessionMessages(sessionId: string, runs: ChatRun[]): Promise<ChatMessage[]> {
+		const checkpointMessages = await this.#runtime.getThreadMessages(sessionId);
+		const orderedRuns = [...runs].sort((left, right) =>
+			left.createdAt.localeCompare(right.createdAt),
+		);
+		const messages: ChatMessage[] = [];
+
+		for (const run of orderedRuns) {
+			const activeRun = this.#activeRuns.get(run.id);
+			const userIndex = checkpointMessages.findIndex(
+				(message) => message.role === "user" && message.id === run.userMessageId,
+			);
+			const checkpointUser = userIndex < 0 ? undefined : checkpointMessages[userIndex];
+			const activeUser = activeRun?.messages.find((message) => message.role === "user");
+			const userContent = checkpointUser?.content ?? activeUser?.content;
+			const sequence = messages.length + 1;
+			if (userContent !== undefined) {
+				messages.push(createUserMessage(run, userContent, sequence));
+			}
+
+			const events = this.#runs.listEvents({ runId: run.id });
+			const terminalEvent = events.findLast((event) => event.type === "message.completed");
+			const checkpointAssistant =
+				userIndex < 0
+					? undefined
+					: checkpointMessages.slice(userIndex + 1).find((message) => message.role === "assistant");
+			const streamedContent = events.reduce((content, event) => {
+				return event.type === "message.delta" ? `${content}${event.payload.delta}` : content;
+			}, "");
+			const assistantSequence = messages.length + 1;
+
+			if (run.status === "completed") {
+				const content =
+					checkpointAssistant?.content ??
+					(terminalEvent?.type === "message.completed" ? terminalEvent.payload.content : "");
+				if (content.length > 0) {
+					messages.push(createAssistantMessage(run, "complete", content, assistantSequence));
+				}
+				continue;
+			}
+
+			if (run.status === "failed") {
+				const content =
+					terminalEvent?.type === "message.completed"
+						? terminalEvent.payload.content
+						: streamedContent;
+				messages.push(
+					createAssistantMessage(run, "failed", content, assistantSequence, run.lastError),
+				);
+				continue;
+			}
+
+			if (run.status === "cancelled") {
+				const content =
+					terminalEvent?.type === "message.completed"
+						? terminalEvent.payload.content
+						: streamedContent;
+				messages.push(createAssistantMessage(run, "cancelled", content, assistantSequence));
+				continue;
+			}
+
+			messages.push(
+				createAssistantMessage(
+					run,
+					"streaming",
+					activeRun?.partialAssistantContent ?? streamedContent,
+					assistantSequence,
+				),
+			);
+		}
+
+		return messages;
 	}
 
 	#emit(event: ChatRunEvent): void {
@@ -516,8 +632,8 @@ export class DesktopChatService {
 			});
 		}
 
-		const snapshot = this.#repository.getSession({ sessionId });
-		for (const run of snapshot.runs) {
+		const runs = this.#runs.listBySession(sessionId);
+		for (const run of runs) {
 			if (
 				(run.status === "queued" || run.status === "running" || run.status === "cancelling") &&
 				!this.#activeRuns.has(run.id)
@@ -526,9 +642,9 @@ export class DesktopChatService {
 			}
 		}
 
-		const hasRemainingActiveRun = this.#repository
-			.getSession({ sessionId })
-			.runs.some(
+		const hasRemainingActiveRun = this.#runs
+			.listBySession(sessionId)
+			.some(
 				(run) => run.status === "queued" || run.status === "running" || run.status === "cancelling",
 			);
 		if (hasRemainingActiveRun) {
@@ -543,29 +659,24 @@ export class DesktopChatService {
 	#finalizeOrphanedRun(run: ChatRun): ChatRun {
 		let currentRun = run;
 		if (currentRun.status === "queued" || currentRun.status === "running") {
-			currentRun = this.#repository.cancelRun({
+			currentRun = this.#runs.cancel({
 				runId: currentRun.id,
 				reason: "The application restarted before this response completed.",
 			}).run;
 			this.#emitLatestEvent(currentRun.id);
 		}
 
-		if (currentRun.assistantMessageId !== undefined) {
-			const message = this.#repository.getMessage({
-				sessionId: currentRun.sessionId,
-				messageId: currentRun.assistantMessageId,
-			});
-			if (message.status === "streaming") {
-				const cancelledMessage = this.#repository.cancelAssistantMessage({
-					runId: currentRun.id,
-					messageId: currentRun.assistantMessageId,
-				});
-				this.#emit(cancelledMessage.event);
-			}
-		}
+		const partialContent = this.#runs
+			.listEvents({ runId: currentRun.id })
+			.reduce(
+				(content, event) =>
+					event.type === "message.delta" ? `${content}${event.payload.delta}` : content,
+				"",
+			);
+		this.#emit(this.#appendTerminalEvent(currentRun, "cancelled", partialContent));
 
 		if (currentRun.status === "cancelling") {
-			const cancelledRun = this.#repository.updateRunStatus({
+			const cancelledRun = this.#runs.updateStatus({
 				runId: currentRun.id,
 				status: "cancelled",
 			});
@@ -611,6 +722,50 @@ export class DesktopChatService {
 function createSessionTitle(content: string): string {
 	const normalized = content.trim().replace(/\s+/g, " ");
 	return normalized.length <= 60 ? normalized : `${normalized.slice(0, 57)}...`;
+}
+
+function createUserMessage(run: ChatRun, content: string, sequence: number): ChatMessage {
+	return chatMessageSchema.parse({
+		schemaVersion: 1,
+		id: run.userMessageId,
+		sessionId: run.sessionId,
+		runId: run.id,
+		role: "user",
+		status: "complete",
+		content,
+		sequence,
+		createdAt: run.createdAt,
+		updatedAt: run.createdAt,
+	});
+}
+
+function createAssistantMessage(
+	run: ChatRun,
+	status: "streaming" | "complete" | "failed" | "cancelled",
+	content: string,
+	sequence: number,
+	error?: AppError,
+): ChatMessage {
+	if (run.assistantMessageId === undefined) {
+		throw new Error(`Run ${run.id} is missing its assistant message ID.`);
+	}
+	if (status === "failed" && error === undefined) {
+		throw new Error(`Failed run ${run.id} is missing its error projection.`);
+	}
+
+	return chatMessageSchema.parse({
+		schemaVersion: 1,
+		id: run.assistantMessageId,
+		sessionId: run.sessionId,
+		runId: run.id,
+		role: "assistant",
+		status,
+		content,
+		sequence,
+		createdAt: run.createdAt,
+		updatedAt: run.updatedAt,
+		...(error === undefined ? {} : { error }),
+	});
 }
 
 async function testOpenAiCompatibleProvider(
@@ -671,14 +826,6 @@ async function testOpenAiCompatibleProvider(
 	} finally {
 		clearTimeout(timeout);
 	}
-}
-
-function findRun(runs: ChatRun[], runId: string): ChatRun {
-	const run = runs.find((candidate) => candidate.id === runId);
-	if (run === undefined) {
-		throw new Error(`Chat run ${runId} was not found.`);
-	}
-	return run;
 }
 
 function isCancellation(error: unknown): boolean {

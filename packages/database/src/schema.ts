@@ -1,4 +1,4 @@
-import { agentModeValues, chatMessageRoleValues, chatMessageStatusValues } from "@moshu/contracts";
+import { agentModeValues } from "@moshu/contracts";
 import {
 	chatRunEventSourceKindValues,
 	chatRunEventVisibilityValues,
@@ -34,8 +34,8 @@ export const chatRunsTable = sqliteTable(
 		mode: text("mode", { enum: agentModeValues }).notNull(),
 		status: text("status", { enum: chatRunStatusValues }).notNull(),
 		providerJson: text("provider_json").notNull(),
-		userMessageId: text("user_message_id"),
-		assistantMessageId: text("assistant_message_id"),
+		userMessageId: text("user_message_id").notNull(),
+		assistantMessageId: text("assistant_message_id").notNull(),
 		lastErrorJson: text("last_error_json"),
 		createdAtMs: integer("created_at_ms").notNull(),
 		updatedAtMs: integer("updated_at_ms").notNull(),
@@ -45,30 +45,6 @@ export const chatRunsTable = sqliteTable(
 		index("chat_runs_session_created_at_idx").on(table.sessionId, table.createdAtMs),
 		uniqueIndex("chat_runs_user_message_unique").on(table.userMessageId),
 		uniqueIndex("chat_runs_assistant_message_unique").on(table.assistantMessageId),
-	],
-);
-
-export const chatMessagesTable = sqliteTable(
-	"chat_messages",
-	{
-		id: text("id").primaryKey(),
-		sessionId: text("session_id")
-			.notNull()
-			.references(() => chatSessionsTable.id, { onDelete: "cascade" }),
-		runId: text("run_id").references(() => chatRunsTable.id, { onDelete: "cascade" }),
-		role: text("role", { enum: chatMessageRoleValues }).notNull(),
-		status: text("status", { enum: chatMessageStatusValues }).notNull(),
-		contentJson: text("content_json").notNull(),
-		errorJson: text("error_json"),
-		sequence: integer("sequence").notNull(),
-		createdAtMs: integer("created_at_ms").notNull(),
-		updatedAtMs: integer("updated_at_ms").notNull(),
-	},
-	(table) => [
-		uniqueIndex("chat_messages_session_sequence_unique").on(table.sessionId, table.sequence),
-		uniqueIndex("chat_messages_run_role_unique").on(table.runId, table.role),
-		index("chat_messages_session_sequence_idx").on(table.sessionId, table.sequence),
-		index("chat_messages_run_idx").on(table.runId),
 	],
 );
 
@@ -84,9 +60,13 @@ export const chatRunEventsTable = sqliteTable(
 			.references(() => chatSessionsTable.id, { onDelete: "cascade" }),
 		seq: integer("seq").notNull(),
 		type: text("type").notNull(),
-		sourceKind: text("source_kind", { enum: chatRunEventSourceKindValues }).notNull(),
+		sourceKind: text("source_kind", {
+			enum: chatRunEventSourceKindValues,
+		}).notNull(),
 		sourceId: text("source_id"),
-		visibility: text("visibility", { enum: chatRunEventVisibilityValues }).notNull(),
+		visibility: text("visibility", {
+			enum: chatRunEventVisibilityValues,
+		}).notNull(),
 		payloadJson: text("payload_json").notNull(),
 		createdAtMs: integer("created_at_ms").notNull(),
 	},
@@ -98,7 +78,6 @@ export const chatRunEventsTable = sqliteTable(
 );
 
 export const appSchema = {
-	chatMessagesTable,
 	chatRunEventsTable,
 	chatRunsTable,
 	chatSessionsTable,

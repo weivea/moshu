@@ -84,7 +84,8 @@ flowchart TB
 - todo、subagent 和 message state 恢复。
 - checkpoint 领先业务事件。
 - 业务事件领先 checkpoint。
-- Deep Agents/LangGraph 旧版 fixture 在升级后读取。
+- 当前 checkpoint schema fixture 在关闭、重开和应用重启后读取并继续。
+- 不支持的 checkpoint schema 明确拒绝启动并进入恢复流程，不静默迁移。
 - 删除 Session 后 thread 清理。
 
 ### 4.3 RPC
@@ -476,7 +477,7 @@ clean tagged commit
 - 数据库 migration 无备份或不可恢复。
 - package 中 Deep Agents/Provider、`bun:sqlite`、Keychain bridge 或 BrowserView 在目标架构失败。
 - Electrobun application worker 内 Deep Agents stream/HITL/subagent/取消/上下文传播 contract 失败。
-- `BunSqliteSaver` contract、WAL 崩溃恢复或旧 checkpoint fixture 失败。
+- `BunSqliteSaver` contract、WAL 崩溃恢复、当前 schema fixture 重开/继续或不支持 schema 拒绝行为失败。
 - 签名、公证、Updater 完整性、application runtime 探测或回滚校验失败。
 - test driver、固定 token 或调试监听入口出现在 stable release。
 - 正式声明支持的 Provider 核心 live smoke 失败且无明确下线决策。
@@ -493,7 +494,7 @@ clean tagged commit
 ### 数据
 
 - [ ] 所有已发布 DB fixture 迁移通过。
-- [ ] checkpoint 兼容和恢复通过。
+- [ ] checkpoint 当前 schema 校验、关闭重开和应用重启恢复通过。
 - [ ] 备份/恢复/磁盘满演练完成。
 
 ### 安全
@@ -516,6 +517,6 @@ clean tagged commit
 - 功能作者负责 Unit/Integration 和错误/取消路径。
 - QA/SDET 维护跨模块 E2E、chaos 和 package smoke。
 - Desktop/Security 负责人批准 Electrobun RPC、Application Host、Action Broker、Canvas 和 release 安全变更。
-- Runtime 负责人批准 Deep Agents/LangChain 升级和 checkpoint 兼容。
+- Runtime 负责人批准 Deep Agents/LangChain 升级、checkpoint contract 和当前 schema 恢复行为。
 - Data 负责人批准 migration、备份和 Provider contract。
 - 发布负责人拥有最终 checklist；任何负责人可因安全或数据风险阻止发布。
