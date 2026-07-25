@@ -6,11 +6,21 @@ import {
 	chatSendAcceptedOutputSchema,
 	configureChatProviderInputSchema,
 	createChatSessionOutputSchema,
+	deleteChatSessionInputSchema,
+	deleteChatSessionOutputSchema,
 	emptyParamsSchema,
 	getChatSessionInputSchema,
 	getChatSessionSnapshotOutputSchema,
+	listChatSessionsInputSchema,
+	listChatSessionsOutputSchema,
 	runtimeInfoSchema,
 	sendChatMessageInputSchema,
+	setChatSessionArchivedInputSchema,
+	setChatSessionArchivedOutputSchema,
+	testChatProviderInputSchema,
+	testChatProviderOutputSchema,
+	updateChatSessionInputSchema,
+	updateChatSessionOutputSchema,
 } from "@moshu/contracts";
 import { BrowserView, Updater } from "electrobun/bun";
 import { traceChatRpcRequest } from "../shared/chat-rpc-diagnostics";
@@ -28,7 +38,7 @@ export interface DesktopRpcDependencies {
 
 export function createDesktopRpc({ chatService }: DesktopRpcDependencies) {
 	return BrowserView.defineRPC<DesktopRpc>({
-		maxRequestTime: 5000,
+		maxRequestTime: 15_000,
 		handlers: {
 			requests: {
 				getRuntimeInfo: async (params) => {
@@ -54,6 +64,14 @@ export function createDesktopRpc({ chatService }: DesktopRpcDependencies) {
 					chatProviderStatusSchema.parse(
 						chatService.configureProvider(configureChatProviderInputSchema.parse(params)),
 					),
+				testChatProvider: async (params) =>
+					testChatProviderOutputSchema.parse(
+						await chatService.testProvider(testChatProviderInputSchema.parse(params)),
+					),
+				deleteChatProvider: async (params) => {
+					emptyParamsSchema.parse(params);
+					return chatProviderStatusSchema.parse(chatService.deleteProvider());
+				},
 				createChatSession: async (params) => {
 					return traceChatRpcRequest({
 						side: "bun",
@@ -75,6 +93,22 @@ export function createDesktopRpc({ chatService }: DesktopRpcDependencies) {
 								chatService.getSessionSnapshot(getChatSessionInputSchema.parse(params)),
 							),
 					}),
+				listChatSessions: async (params) =>
+					listChatSessionsOutputSchema.parse(
+						chatService.listSessions(listChatSessionsInputSchema.parse(params)),
+					),
+				updateChatSession: async (params) =>
+					updateChatSessionOutputSchema.parse(
+						chatService.updateSession(updateChatSessionInputSchema.parse(params)),
+					),
+				setChatSessionArchived: async (params) =>
+					setChatSessionArchivedOutputSchema.parse(
+						chatService.setSessionArchived(setChatSessionArchivedInputSchema.parse(params)),
+					),
+				deleteChatSession: async (params) =>
+					deleteChatSessionOutputSchema.parse(
+						chatService.deleteSession(deleteChatSessionInputSchema.parse(params)),
+					),
 				sendChatMessage: async (params: SendDesktopChatMessageInput) =>
 					traceChatRpcRequest({
 						side: "bun",

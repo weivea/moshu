@@ -1,9 +1,11 @@
 import {
 	type ChatMessage,
 	type ChatProviderConfiguration,
+	type ChatProviderConnectionTestResult,
 	type ChatProviderStatus,
 	type ChatSendResult,
 	type ChatSession,
+	type ChatSessionSummary,
 	type ChatTransport,
 	type ChatTransportEvent,
 	type ChatTransportListener,
@@ -26,6 +28,7 @@ export function createPreviewChatTransport(): ChatTransport {
 	let nextSessionNumber = 1;
 	let nextMessageNumber = 1;
 	let nextRequestNumber = 1;
+	let providerApiKey: string | undefined;
 	const listeners = new Set<ChatTransportListener>();
 	const sessions = new Map<string, ChatSession>();
 	const pendingResponses = new Map<string, PendingPreviewResponse>();
@@ -50,6 +53,15 @@ export function createPreviewChatTransport(): ChatTransport {
 	function requireConfiguredProvider() {
 		if (!providerStatus.configured) {
 			throw new Error("Configure an OpenAI-compatible provider before sending messages.");
+		}
+	}
+
+	function requireNoPendingResponse(sessionId?: string) {
+		const hasPendingResponse = [...pendingResponses.values()].some(
+			(response) => sessionId === undefined || response.sessionId === sessionId,
+		);
+		if (hasPendingResponse) {
+			throw new Error("Stop active responses before changing this configuration.");
 		}
 	}
 
@@ -142,29 +154,87 @@ export function createPreviewChatTransport(): ChatTransport {
 			return { ...providerStatus };
 		},
 		async configureProvider(input: ChatProviderConfiguration) {
+			requireNoPendingResponse();
 			if (!input.endpoint.trim()) {
 				throw new Error("Endpoint is required.");
+			}
+			if (!URL.canParse(input.endpoint.trim())) {
+				throw new Error("Endpoint must be a valid URL.");
 			}
 			if (!input.model.trim()) {
 				throw new Error("Model is required.");
 			}
-			if (!input.apiKey.trim()) {
+			if (!input.apiKey?.trim() && providerApiKey === undefined) {
 				throw new Error("API key is required.");
 			}
+			if (
+				!input.apiKey?.trim() &&
+				providerStatus.configured &&
+				new URL(providerStatus.endpoint).origin !== new URL(input.endpoint.trim()).origin
+			) {
+				throw new Error("A new API key is required for a different Endpoint origin.");
+			}
+			providerApiKey = input.apiKey?.trim() || providerApiKey;
 
 			providerStatus = {
 				configured: true,
 				endpoint: input.endpoint.trim(),
 				model: input.model.trim(),
 				askMode: "Ask",
+				...(providerApiKey === undefined
+					? {}
+					: {
+							apiKeyMask: `********${providerApiKey.length > 4 ? providerApiKey.slice(-4) : ""}`,
+						}),
 			};
 
+			return { ...providerStatus };
+		},
+		async testProvider(
+			input: ChatProviderConfiguration,
+		): Promise<ChatProviderConnectionTestResult> {
+			if (
+				!input.endpoint.trim() ||
+				!URL.canParse(input.endpoint.trim()) ||
+				!input.model.trim() ||
+				(!input.apiKey?.trim() && providerApiKey === undefined)
+			) {
+				return {
+					ok: false,
+					latencyMs: 0,
+					errorMessage: "Endpoint, model, and API key are required.",
+				};
+			}
+			if (
+				!input.apiKey?.trim() &&
+				providerStatus.configured &&
+				new URL(providerStatus.endpoint).origin !== new URL(input.endpoint.trim()).origin
+			) {
+				return {
+					ok: false,
+					latencyMs: 0,
+					errorMessage: "A new API key is required for a different Endpoint origin.",
+				};
+			}
+			return { ok: true, latencyMs: 12 };
+		},
+		async deleteProvider() {
+			requireNoPendingResponse();
+			providerApiKey = undefined;
+			providerStatus = {
+				configured: false,
+				endpoint: DEFAULT_PROVIDER_ENDPOINT,
+				model: "",
+				askMode: "Ask",
+			};
 			return { ...providerStatus };
 		},
 		async createSession() {
 			requireConfiguredProvider();
 			const session: ChatSession = {
 				id: `preview-session-${nextSessionNumber}`,
+				title: "New chat",
+				updatedAt: new Date().toISOString(),
 				model: providerStatus.model,
 				askMode: providerStatus.askMode,
 				messages: [],
@@ -176,6 +246,40 @@ export function createPreviewChatTransport(): ChatTransport {
 		async getSession(sessionId: string) {
 			return cloneSession(getStoredSession(sessionId));
 		},
+		async listSessions(input = {}) {
+			const query = input.query?.trim().toLocaleLowerCase() ?? "";
+			return [...sessions.values()]
+				.filter((session) => (session.archivedAt !== undefined) === (input.archived ?? false))
+				.filter((session) => session.title.toLocaleLowerCase().includes(query))
+				.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+				.slice(0, input.limit ?? 50)
+				.map(toSessionSummary);
+		},
+		async renameSession(sessionId: string, title: string) {
+			const session = getStoredSession(sessionId);
+			session.title = title.trim();
+			session.updatedAt = new Date().toISOString();
+			return toSessionSummary(session);
+		},
+		async setSessionArchived(sessionId: string, archived: boolean) {
+			if (archived) {
+				requireNoPendingResponse(sessionId);
+			}
+			const session = getStoredSession(sessionId);
+			if (archived) {
+				session.archivedAt = new Date().toISOString();
+			} else {
+				delete session.archivedAt;
+			}
+			session.updatedAt = new Date().toISOString();
+			return toSessionSummary(session);
+		},
+		async deleteSession(sessionId: string) {
+			requireNoPendingResponse(sessionId);
+			if (!sessions.delete(sessionId)) {
+				throw new Error("The requested chat session could not be found.");
+			}
+		},
 		async send(input: { sessionId: string; message: string }): Promise<ChatSendResult> {
 			requireConfiguredProvider();
 			const trimmedMessage = input.message.trim();
@@ -184,6 +288,15 @@ export function createPreviewChatTransport(): ChatTransport {
 			}
 
 			const session = getStoredSession(input.sessionId);
+			if (session.archivedAt !== undefined) {
+				throw new Error("Archived chat Sessions cannot send new messages.");
+			}
+			if (session.messages.length === 0 && session.title === "New chat") {
+				const normalizedTitle = trimmedMessage.replace(/\s+/g, " ");
+				session.title =
+					normalizedTitle.length <= 60 ? normalizedTitle : `${normalizedTitle.slice(0, 57)}...`;
+			}
+			session.updatedAt = new Date().toISOString();
 			const userMessage: ChatMessage = {
 				id: `preview-user-${nextMessageNumber}`,
 				role: "user",
@@ -245,6 +358,18 @@ export function createPreviewChatTransport(): ChatTransport {
 				listeners.delete(listener);
 			};
 		},
+	};
+}
+
+function toSessionSummary(session: ChatSession): ChatSessionSummary {
+	const lastMessageAt = session.messages.at(-1)?.createdAt;
+	return {
+		id: session.id,
+		title: session.title,
+		createdAt: session.updatedAt,
+		updatedAt: session.updatedAt,
+		...(lastMessageAt === undefined ? {} : { lastMessageAt }),
+		...(session.archivedAt === undefined ? {} : { archivedAt: session.archivedAt }),
 	};
 }
 

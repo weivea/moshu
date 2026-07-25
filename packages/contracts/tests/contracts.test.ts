@@ -5,9 +5,13 @@ import {
 	chatMessageSchema,
 	chatRunErrorEventSchema,
 	createChatSessionInputSchema,
+	deleteChatSessionOutputSchema,
 	openAiCompatibleProviderStateSchema,
 	runtimeInfoSchema,
 	sendChatMessageInputSchema,
+	setChatSessionArchivedInputSchema,
+	testChatProviderOutputSchema,
+	updateChatSessionInputSchema,
 } from "../src";
 
 describe("shared contracts", () => {
@@ -87,6 +91,43 @@ describe("shared contracts", () => {
 				model: "",
 			}),
 		).toThrow();
+	});
+
+	test("accepts structured Provider connection test results", () => {
+		const result = testChatProviderOutputSchema.parse({
+			schemaVersion: 1,
+			ok: false,
+			latencyMs: 42,
+			error: {
+				code: "PROVIDER_AUTHENTICATION_FAILED",
+				category: "authentication",
+				messageKey: "errors.providerAuthenticationFailed",
+				safeMessage: "Provider authentication failed.",
+				retryable: false,
+			},
+		});
+
+		expect(result.error?.category).toBe("authentication");
+	});
+
+	test("accepts strict Session management inputs", () => {
+		expect(
+			updateChatSessionInputSchema.parse({
+				sessionId,
+				title: "Renamed chat",
+			}).title,
+		).toBe("Renamed chat");
+		expect(
+			setChatSessionArchivedInputSchema.parse({
+				sessionId,
+				archived: true,
+			}).archived,
+		).toBe(true);
+		expect(
+			deleteChatSessionOutputSchema.parse({
+				sessionId,
+			}).sessionId,
+		).toBe(sessionId);
 	});
 
 	test("requires failed assistant messages to carry structured errors", () => {

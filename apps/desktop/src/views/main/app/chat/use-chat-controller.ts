@@ -4,6 +4,7 @@ import {
 	type ChatMessage,
 	type ChatProviderStatus,
 	type ChatSession,
+	type ChatSessionSummary,
 	type ChatTransport,
 	type ChatTransportEvent,
 	DEFAULT_PROVIDER_ENDPOINT,
@@ -18,7 +19,7 @@ interface UseChatControllerOptions {
 interface ChatNotice {
 	tone: "info" | "danger";
 	message: string;
-	action?: "retry-send" | "retry-provider" | "retry-session" | "retry-stop";
+	action?: "retry-send" | "retry-session" | "retry-stop";
 }
 
 interface ActiveResponse {
@@ -35,24 +36,18 @@ export function useChatController({
 	const [providerStatus, setProviderStatus] = useState<ChatProviderStatus | null>(null);
 	const [isProviderLoading, setIsProviderLoading] = useState(true);
 	const [providerError, setProviderError] = useState<string | null>(null);
-	const [providerDraft, setProviderDraft] = useState({
-		endpoint: DEFAULT_PROVIDER_ENDPOINT,
-		model: "",
-		apiKey: "",
-	});
-	const [isConfiguring, setIsConfiguring] = useState(false);
-	const [configureError, setConfigureError] = useState<string | null>(null);
 	const [session, setSession] = useState<ChatSession | null>(null);
 	const [isSessionLoading, setIsSessionLoading] = useState(false);
-	const [sessionError, setSessionError] = useState<string | null>(null);
 	const [draft, setDraft] = useState("");
 	const [notice, setNotice] = useState<ChatNotice | null>(null);
 	const [announcement, setAnnouncement] = useState("");
 	const [activeResponse, setActiveResponse] = useState<ActiveResponse | null>(null);
+	const [isSending, setIsSending] = useState(false);
 	const [isStopping, setIsStopping] = useState(false);
-	const [lastSubmittedText, setLastSubmittedText] = useState<string | null>(null);
 	const providerLoadToken = useRef(0);
 	const sessionLoadToken = useRef(0);
+	const sendGenerationRef = useRef(0);
+	const sendInFlightRef = useRef(false);
 	const activeSessionIdRef = useRef<string | null>(null);
 	const lastSubmittedTextRef = useRef<string | null>(null);
 	const hydratedSessionIdRef = useRef<string | null>(null);
@@ -63,7 +58,21 @@ export function useChatController({
 	const terminalEventsBeforeAcceptanceRef = useRef(new Set<string>());
 
 	activeSessionIdRef.current = sessionId ?? session?.id ?? null;
-	lastSubmittedTextRef.current = lastSubmittedText;
+
+	// biome-ignore lint/correctness/useExhaustiveDependencies: sessionId invalidates pending sends.
+	useEffect(() => {
+		sendGenerationRef.current += 1;
+		sendInFlightRef.current = false;
+		lastSubmittedTextRef.current = null;
+		setIsSending(false);
+		setDraft("");
+
+		return () => {
+			sendGenerationRef.current += 1;
+			sendInFlightRef.current = false;
+			lastSubmittedTextRef.current = null;
+		};
+	}, [sessionId]);
 
 	const applyMessageUpdate = useCallback(
 		(messageId: string, updater: (message: ChatMessage) => ChatMessage) => {
@@ -147,7 +156,6 @@ export function useChatController({
 			setSession(null);
 			setActiveResponse(null);
 			setIsStopping(false);
-			setSessionError(null);
 			setNotice(null);
 			setAnnouncement(t("chat.status.loadingHistory"));
 
@@ -188,7 +196,6 @@ export function useChatController({
 				terminalEventsBeforeAcceptanceRef.current.clear();
 				setActiveResponse(null);
 				setIsStopping(false);
-				setSessionError(getErrorMessage(error, t("chat.error.history")));
 				setNotice({
 					tone: "danger",
 					message: getErrorMessage(error, t("chat.error.history")),
@@ -209,7 +216,6 @@ export function useChatController({
 		providerLoadToken.current = loadToken;
 		setIsProviderLoading(true);
 		setProviderError(null);
-		setConfigureError(null);
 		setAnnouncement(t("chat.status.loadingProvider"));
 
 		try {
@@ -219,28 +225,9 @@ export function useChatController({
 			}
 
 			setProviderStatus(nextStatus);
-			setProviderDraft((current) => ({
-				endpoint: nextStatus.configured
-					? nextStatus.endpoint
-					: current.endpoint || nextStatus.endpoint || DEFAULT_PROVIDER_ENDPOINT,
-				model: nextStatus.configured ? nextStatus.model : current.model || nextStatus.model,
-				apiKey: "",
-			}));
 			setAnnouncement(
 				nextStatus.configured ? t("chat.status.providerReady") : t("chat.status.providerNeeded"),
 			);
-			if (!nextStatus.configured) {
-				setSession(null);
-				hydratedSessionIdRef.current = null;
-				bufferedEventsRef.current = [];
-				eventCursorsRef.current = {};
-				unroutedSessionIdRef.current = null;
-				acceptedRequestIdsRef.current.clear();
-				terminalEventsBeforeAcceptanceRef.current.clear();
-				setActiveResponse(null);
-				setIsStopping(false);
-				setSessionError(null);
-			}
 		} catch (error) {
 			if (providerLoadToken.current !== loadToken) {
 				return;
@@ -261,12 +248,12 @@ export function useChatController({
 	}, [loadProviderStatus]);
 
 	useEffect(() => {
-		if (!providerStatus?.configured || !sessionId) {
+		if (!sessionId) {
 			return;
 		}
 
 		void loadSession(sessionId);
-	}, [loadSession, providerStatus?.configured, sessionId]);
+	}, [loadSession, sessionId]);
 
 	useEffect(() => {
 		return transport.subscribe((event) => {
@@ -301,66 +288,24 @@ export function useChatController({
 		[providerStatus?.askMode, providerStatus?.endpoint, providerStatus?.model, session, t],
 	);
 
-	const canSubmitProvider =
-		providerDraft.endpoint.trim().length > 0 &&
-		providerDraft.model.trim().length > 0 &&
-		providerDraft.apiKey.trim().length > 0 &&
-		!isConfiguring;
 	const canSend =
-		hasConfiguredProvider && !isSessionLoading && draft.trim().length > 0 && !activeResponse;
+		hasConfiguredProvider &&
+		!isSessionLoading &&
+		!isSending &&
+		(sessionId === undefined || session?.id === sessionId) &&
+		draft.trim().length > 0 &&
+		!activeResponse;
 	const isResponding = activeResponse !== null;
-
-	const updateProviderField = useCallback(
-		(field: "endpoint" | "model" | "apiKey", value: string) => {
-			setProviderDraft((current) => ({
-				...current,
-				[field]: value,
-			}));
-		},
-		[],
-	);
-
-	const configureProvider = useCallback(async () => {
-		if (!canSubmitProvider) {
-			return;
-		}
-
-		setIsConfiguring(true);
-		setConfigureError(null);
-		setNotice(null);
-		setAnnouncement(t("chat.status.configuringProvider"));
-
-		try {
-			const nextStatus = await transport.configureProvider({
-				endpoint: providerDraft.endpoint.trim(),
-				model: providerDraft.model.trim(),
-				apiKey: providerDraft.apiKey,
-			});
-			setProviderStatus(nextStatus);
-			setProviderDraft({
-				endpoint: nextStatus.endpoint,
-				model: nextStatus.model,
-				apiKey: "",
-			});
-			setAnnouncement(t("chat.status.providerConfigured"));
-		} catch (error) {
-			setConfigureError(getErrorMessage(error, t("chat.error.providerConfigure")));
-			setAnnouncement(t("chat.status.providerConfigureFailed"));
-		} finally {
-			setIsConfiguring(false);
-		}
-	}, [
-		canSubmitProvider,
-		providerDraft.apiKey,
-		providerDraft.endpoint,
-		providerDraft.model,
-		t,
-		transport,
-	]);
 
 	const sendMessage = useCallback(
 		async (overrideText?: string) => {
-			if (!hasConfiguredProvider || activeResponse || isSessionLoading) {
+			if (
+				!hasConfiguredProvider ||
+				activeResponse ||
+				isSessionLoading ||
+				(sessionId !== undefined && session?.id !== sessionId) ||
+				sendInFlightRef.current
+			) {
 				return;
 			}
 
@@ -369,9 +314,13 @@ export function useChatController({
 				return;
 			}
 
+			const sendGeneration = sendGenerationRef.current;
+			const startingSessionId = activeSessionIdRef.current;
+			let operationSessionId = startingSessionId;
+			sendInFlightRef.current = true;
+			setIsSending(true);
 			setNotice(null);
-			setSessionError(null);
-			setLastSubmittedText(content);
+			lastSubmittedTextRef.current = content;
 			setAnnouncement(t("chat.status.sending"));
 
 			try {
@@ -379,6 +328,13 @@ export function useChatController({
 				let createdSession = false;
 				if (!activeSession) {
 					activeSession = await transport.createSession();
+					if (
+						sendGenerationRef.current !== sendGeneration ||
+						activeSessionIdRef.current !== startingSessionId
+					) {
+						return;
+					}
+					operationSessionId = activeSession.id;
 					setSession(activeSession);
 					activeSessionIdRef.current = activeSession.id;
 					hydratedSessionIdRef.current = activeSession.id;
@@ -391,6 +347,12 @@ export function useChatController({
 					sessionId: activeSession.id,
 					message: content,
 				});
+				if (
+					sendGenerationRef.current !== sendGeneration ||
+					activeSessionIdRef.current !== operationSessionId
+				) {
+					return;
+				}
 				acceptedRequestIdsRef.current.add(result.requestId);
 				const completedBeforeAcceptance = terminalEventsBeforeAcceptanceRef.current.delete(
 					result.requestId,
@@ -407,6 +369,11 @@ export function useChatController({
 
 					return {
 						...baseSession,
+						title:
+							baseSession.messages.length === 0 && baseSession.title === "New chat"
+								? createSessionTitle(content)
+								: baseSession.title,
+						updatedAt: new Date().toISOString(),
 						messages: mergeAcceptedMessages(
 							baseSession.messages,
 							result.userMessage,
@@ -431,12 +398,23 @@ export function useChatController({
 					onSessionChange?.(activeSession.id);
 				}
 			} catch (error) {
+				if (
+					sendGenerationRef.current !== sendGeneration ||
+					activeSessionIdRef.current !== operationSessionId
+				) {
+					return;
+				}
 				setNotice({
 					tone: "danger",
 					message: getErrorMessage(error, t("chat.error.send")),
 					action: "retry-send",
 				});
 				setAnnouncement(t("chat.status.sendFailed"));
+			} finally {
+				if (sendGenerationRef.current === sendGeneration) {
+					sendInFlightRef.current = false;
+					setIsSending(false);
+				}
 			}
 		},
 		[
@@ -446,6 +424,7 @@ export function useChatController({
 			isSessionLoading,
 			onSessionChange,
 			session,
+			sessionId,
 			t,
 			transport,
 		],
@@ -456,6 +435,8 @@ export function useChatController({
 			return;
 		}
 
+		const stopGeneration = sendGenerationRef.current;
+		const stopSessionId = session.id;
 		setIsStopping(true);
 		setNotice(null);
 		setAnnouncement(t("chat.status.stopping"));
@@ -466,6 +447,12 @@ export function useChatController({
 				requestId: activeResponse.requestId,
 			});
 		} catch (error) {
+			if (
+				sendGenerationRef.current !== stopGeneration ||
+				activeSessionIdRef.current !== stopSessionId
+			) {
+				return;
+			}
 			setIsStopping(false);
 			setNotice({
 				tone: "danger",
@@ -478,9 +465,6 @@ export function useChatController({
 
 	const retryNoticeAction = useCallback(() => {
 		switch (notice?.action) {
-			case "retry-provider":
-				void loadProviderStatus();
-				break;
 			case "retry-session":
 				if (sessionId) {
 					void loadSession(sessionId);
@@ -497,40 +481,61 @@ export function useChatController({
 			default:
 				break;
 		}
-	}, [loadProviderStatus, loadSession, notice?.action, sendMessage, sessionId, stopMessage]);
+	}, [loadSession, notice?.action, sendMessage, sessionId, stopMessage]);
 
 	return {
 		announcement,
 		canSend,
-		canSubmitProvider,
-		configureError,
-		configureProvider,
 		draft,
 		hasConfiguredProvider,
-		isConfiguring,
 		isProviderLoading,
 		isResponding,
+		isSending,
 		isSessionLoading,
 		isStopping,
 		meta,
 		notice,
-		providerDraft,
 		providerError,
 		providerStatus,
 		reloadProviderStatus: loadProviderStatus,
-		reloadSession: () => {
-			if (sessionId) {
-				void loadSession(sessionId);
-			}
-		},
 		retryNoticeAction,
 		sendMessage,
 		session,
-		sessionError,
 		setDraft,
 		stopMessage,
-		updateProviderField,
+		updateSessionSummary: (updatedSession: ChatSessionSummary) => {
+			setSession((currentSession) => mergeSessionSummary(currentSession, updatedSession));
+		},
 	};
+}
+
+function mergeSessionSummary(
+	session: ChatSession | null,
+	summary: ChatSessionSummary,
+): ChatSession | null {
+	if (session?.id !== summary.id) {
+		return session;
+	}
+
+	const activeSession = { ...session };
+	delete activeSession.archivedAt;
+	return summary.archivedAt === undefined
+		? {
+				...activeSession,
+				title: summary.title,
+				updatedAt: summary.updatedAt,
+			}
+		: {
+				...activeSession,
+				title: summary.title,
+				updatedAt: summary.updatedAt,
+				archivedAt: summary.archivedAt,
+			};
+}
+
+function createSessionTitle(content: string): string {
+	const normalized = content.trim().replace(/\s+/g, " ");
+	return normalized.length <= 60 ? normalized : `${normalized.slice(0, 57)}...`;
 }
 
 function handleTransportEvent({

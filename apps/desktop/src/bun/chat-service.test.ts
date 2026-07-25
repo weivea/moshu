@@ -7,10 +7,12 @@ import {
 	type AskChatRunResult,
 	type AskChatRunStream,
 	type AskChatRuntime,
+	type AskProviderConfiguration,
+	type AskProviderConfigStore,
 	InMemoryAskProviderConfigStore,
 } from "@moshu/agent-runtime";
 import type { ChatRunEvent } from "@moshu/contracts";
-import { openAppDatabase } from "@moshu/database";
+import { createUuidV7, openAppDatabase } from "@moshu/database";
 
 import { DesktopChatService } from "./chat-service";
 
@@ -46,6 +48,7 @@ describe("DesktopChatService", () => {
 			await service.waitForIdle();
 
 			const restored = service.getSession({ sessionId: session.id });
+			expect(restored.session.title).toBe("Say hello");
 			expect(restored.messages.map((message) => message.content)).toEqual([
 				"Say hello",
 				"Hello world",
@@ -128,6 +131,7 @@ describe("DesktopChatService", () => {
 				configured: true,
 				baseUrl: "https://api.openai.com/v1",
 				model: "gpt-4.1-mini",
+				apiKeyMask: "••••••••cret",
 			});
 			expect("apiKey" in status).toBe(false);
 
@@ -152,18 +156,295 @@ describe("DesktopChatService", () => {
 			database.close();
 		}
 	});
+
+	test("keeps the saved API key when updating Provider fields on the same origin", async () => {
+		const database = openAppDatabase(":memory:");
+		const scheduler = new ManualScheduler();
+		const store = new InMemoryAskProviderConfigStore();
+		const service = createService(database.chat, new FakeAskChatRuntime({}), scheduler, {
+			providerConfigStore: store,
+		});
+
+		try {
+			configureProvider(service);
+			service.configureProvider({
+				schemaVersion: 1,
+				baseUrl: "https://api.openai.com/compatible/v1",
+				model: "updated-model",
+			});
+
+			expect(store.get()).toEqual({
+				provider: "openai-compatible",
+				baseUrl: "https://api.openai.com/compatible/v1",
+				model: "updated-model",
+				apiKey: "sk-test-secret",
+			});
+		} finally {
+			await service.shutdown();
+			database.close();
+		}
+	});
+
+	test("requires a new API key before sending credentials to another origin", async () => {
+		const database = openAppDatabase(":memory:");
+		const scheduler = new ManualScheduler();
+		const testedConfigurations: AskProviderConfiguration[] = [];
+		const service = createService(database.chat, new FakeAskChatRuntime({}), scheduler, {
+			testProviderConnection: async (configuration) => {
+				testedConfigurations.push(configuration);
+			},
+		});
+
+		try {
+			configureProvider(service);
+			expect(() =>
+				service.configureProvider({
+					schemaVersion: 1,
+					baseUrl: "https://untrusted.example/v1",
+					model: "updated-model",
+				}),
+			).toThrow("new API key");
+
+			const output = await service.testProvider({
+				schemaVersion: 1,
+				baseUrl: "https://untrusted.example/v1",
+				model: "updated-model",
+			});
+			expect(output.ok).toBe(false);
+			expect(output.error?.safeMessage).toContain("new API key");
+			expect(testedConfigurations).toEqual([]);
+		} finally {
+			await service.shutdown();
+			database.close();
+		}
+	});
+
+	test("tests Provider settings without exposing the API key", async () => {
+		const database = openAppDatabase(":memory:");
+		const scheduler = new ManualScheduler();
+		const testedConfigurations: AskProviderConfiguration[] = [];
+		const service = createService(database.chat, new FakeAskChatRuntime({}), scheduler, {
+			testProviderConnection: async (configuration) => {
+				testedConfigurations.push(configuration);
+			},
+		});
+
+		try {
+			configureProvider(service);
+			const output = await service.testProvider({
+				schemaVersion: 1,
+				baseUrl: "https://api.openai.com/v1",
+				model: "gpt-4.1-mini",
+			});
+
+			expect(output.ok).toBe(true);
+			expect(testedConfigurations[0]?.apiKey).toBe("sk-test-secret");
+			expect(JSON.stringify(output)).not.toContain("sk-test-secret");
+		} finally {
+			await service.shutdown();
+			database.close();
+		}
+	});
+
+	test("maps Provider connection failures to safe errors", async () => {
+		const database = openAppDatabase(":memory:");
+		const scheduler = new ManualScheduler();
+		const service = createService(database.chat, new FakeAskChatRuntime({}), scheduler, {
+			testProviderConnection: async () => {
+				throw new AskChatRuntimeError({
+					kind: "provider_authentication",
+					message: "Provider authentication failed.",
+					retryable: false,
+					statusCode: 401,
+				});
+			},
+		});
+
+		try {
+			const output = await service.testProvider({
+				schemaVersion: 1,
+				baseUrl: "https://api.openai.com/v1",
+				model: "gpt-4.1-mini",
+				apiKey: "sk-test-secret",
+			});
+
+			expect(output.ok).toBe(false);
+			expect(output.error?.safeMessage).toBe("Provider authentication failed.");
+			expect(JSON.stringify(output)).not.toContain("sk-test-secret");
+		} finally {
+			await service.shutdown();
+			database.close();
+		}
+	});
+
+	test("deletes the saved Provider configuration", async () => {
+		const database = openAppDatabase(":memory:");
+		const scheduler = new ManualScheduler();
+		const store = new InMemoryAskProviderConfigStore();
+		const service = createService(database.chat, new FakeAskChatRuntime({}), scheduler, {
+			providerConfigStore: store,
+		});
+
+		try {
+			configureProvider(service);
+			const status = service.deleteProvider();
+
+			expect(status.configured).toBe(false);
+			expect(store.get()).toBeNull();
+		} finally {
+			await service.shutdown();
+			database.close();
+		}
+	});
+
+	test("lists, renames, archives, restores, and deletes Sessions", async () => {
+		const database = openAppDatabase(":memory:");
+		const scheduler = new ManualScheduler();
+		const service = createService(
+			database.chat,
+			new FakeAskChatRuntime({ deltas: ["Done"] }),
+			scheduler,
+		);
+
+		try {
+			configureProvider(service);
+			const { session } = service.createSession();
+			service.sendMessage({ sessionId: session.id, content: "Plan a launch" });
+			scheduler.runAll();
+			await service.waitForIdle();
+
+			expect(service.listSessions({ query: "launch" }).items[0]?.id).toBe(session.id);
+			expect(
+				service.updateSession({ sessionId: session.id, title: "Launch plan" }).session.title,
+			).toBe("Launch plan");
+			expect(
+				service.setSessionArchived({ sessionId: session.id, archived: true }).session.archivedAt,
+			).toBeDefined();
+			expect(service.listSessions({ archived: true }).items[0]?.id).toBe(session.id);
+			expect(
+				service.setSessionArchived({ sessionId: session.id, archived: false }).session.archivedAt,
+			).toBeUndefined();
+			expect(service.deleteSession({ sessionId: session.id })).toEqual({
+				sessionId: session.id,
+			});
+			expect(service.listSessions().items).toEqual([]);
+		} finally {
+			await service.shutdown();
+			database.close();
+		}
+	});
+
+	test("blocks archiving and deleting a Session with an active response", async () => {
+		const database = openAppDatabase(":memory:");
+		const scheduler = new ManualScheduler();
+		const service = createService(
+			database.chat,
+			new FakeAskChatRuntime({ pending: true }),
+			scheduler,
+		);
+
+		try {
+			configureProvider(service);
+			const { session } = service.createSession();
+			const accepted = service.sendMessage({ sessionId: session.id, content: "Wait" });
+
+			expect(() => service.setSessionArchived({ sessionId: session.id, archived: true })).toThrow(
+				"Stop the active response",
+			);
+			expect(() => service.deleteSession({ sessionId: session.id })).toThrow(
+				"Stop the active response",
+			);
+			expect(() =>
+				service.configureProvider({
+					schemaVersion: 1,
+					baseUrl: "https://example.test/v1",
+					model: "another-model",
+				}),
+			).toThrow("Stop active responses");
+			expect(() => service.deleteProvider()).toThrow("Stop active responses");
+			service.cancel({ runId: accepted.run.id });
+		} finally {
+			await service.shutdown();
+			database.close();
+		}
+	});
+
+	test("finalizes orphaned Runs after an application restart", async () => {
+		const database = openAppDatabase(":memory:");
+		const scheduler = new ManualScheduler();
+		const service = createService(database.chat, new FakeAskChatRuntime({}), scheduler);
+		const cancelling = createOrphanedRun(database.chat, "cancelling");
+		const running = createOrphanedRun(database.chat, "running");
+		const deleting = createOrphanedRun(database.chat, "running");
+
+		try {
+			expect(service.cancel({ runId: cancelling.runId }).run.status).toBe("cancelled");
+			expect(service.getSession({ sessionId: cancelling.sessionId }).messages.at(-1)?.status).toBe(
+				"cancelled",
+			);
+
+			expect(
+				service.setSessionArchived({
+					sessionId: running.sessionId,
+					archived: true,
+				}).session.archivedAt,
+			).toBeDefined();
+			const recovered = service.getSession({ sessionId: running.sessionId });
+			expect(recovered.runs[0]?.status).toBe("cancelled");
+			expect(recovered.messages.at(-1)?.status).toBe("cancelled");
+
+			service.deleteSession({ sessionId: deleting.sessionId });
+			expect(() => service.getSession({ sessionId: deleting.sessionId })).toThrow();
+		} finally {
+			await service.shutdown();
+			database.close();
+		}
+	});
 });
+
+function createOrphanedRun(
+	repository: ReturnType<typeof openAppDatabase>["chat"],
+	status: "running" | "cancelling",
+) {
+	const { session } = repository.createSession({ title: "Interrupted chat" });
+	const created = repository.createUserMessageRun({
+		sessionId: session.id,
+		content: "Continue after restart",
+		mode: "ask",
+		provider: {
+			schemaVersion: 1,
+			providerId: createUuidV7(),
+			name: "OpenAI",
+			baseUrl: "https://api.openai.com/v1",
+			model: "gpt-4.1-mini",
+			apiKey: "sk-test-secret",
+		},
+	});
+	repository.createAssistantMessage({ runId: created.run.id });
+	repository.updateRunStatus({ runId: created.run.id, status: "running" });
+	if (status === "cancelling") {
+		repository.updateRunStatus({ runId: created.run.id, status: "cancelling" });
+	}
+	return { sessionId: session.id, runId: created.run.id };
+}
 
 function createService(
 	repository: ReturnType<typeof openAppDatabase>["chat"],
 	runtime: AskChatRuntime,
 	scheduler: ManualScheduler,
+	options: {
+		providerConfigStore?: AskProviderConfigStore;
+		testProviderConnection?: (configuration: AskProviderConfiguration) => Promise<void>;
+	} = {},
 ) {
 	return new DesktopChatService({
 		repository,
-		providerConfigStore: new InMemoryAskProviderConfigStore(),
+		providerConfigStore: options.providerConfigStore ?? new InMemoryAskProviderConfigStore(),
 		runtime,
 		schedule: scheduler.schedule,
+		...(options.testProviderConnection === undefined
+			? {}
+			: { testProviderConnection: options.testProviderConnection }),
 	});
 }
 

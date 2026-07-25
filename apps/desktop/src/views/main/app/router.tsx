@@ -1,5 +1,12 @@
 import { createHashRouter, Navigate } from "react-router-dom";
-import { ChatSessionPage, NewChatPage, PlaceholderPage } from "./pages";
+import {
+	ChatsPage,
+	ChatHomePage,
+	ChatSessionPage,
+	NewChatPage,
+	PlaceholderPage,
+	ProviderSettingsRoutePage,
+} from "./pages";
 import { AppShell } from "./shell";
 
 export const router = createHashRouter([
@@ -7,7 +14,7 @@ export const router = createHashRouter([
 		path: "/",
 		element: <AppShell />,
 		children: [
-			{ index: true, element: <Navigate to="/chat/new" replace /> },
+			{ index: true, element: <ChatHomePage /> },
 			{ path: "chat/new", element: <NewChatPage /> },
 			{
 				path: "chat/:sessionId",
@@ -15,7 +22,7 @@ export const router = createHashRouter([
 			},
 			{
 				path: "chats",
-				element: <PlaceholderPage titleKey="page.chats.title" icon="chat" />,
+				element: <ChatsPage />,
 			},
 			{
 				path: "projects",
@@ -57,7 +64,11 @@ export const router = createHashRouter([
 				path: "canvas/:canvasId",
 				element: <PlaceholderPage titleKey="page.canvasDetail.title" icon="canvas" />,
 			},
-			{ path: "settings", element: <Navigate to="/settings/general" replace /> },
+			{ path: "settings", element: <Navigate to="/settings/providers" replace /> },
+			{
+				path: "settings/providers",
+				element: <ProviderSettingsRoutePage />,
+			},
 			{
 				path: "settings/:section",
 				element: <PlaceholderPage titleKey="page.settings.title" icon="settings" />,

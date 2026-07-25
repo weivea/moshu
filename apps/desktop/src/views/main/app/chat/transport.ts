@@ -8,12 +8,19 @@ export interface ChatProviderStatus {
 	endpoint: string;
 	model: string;
 	askMode: string;
+	apiKeyMask?: string;
 }
 
 export interface ChatProviderConfiguration {
 	endpoint: string;
 	model: string;
-	apiKey: string;
+	apiKey?: string;
+}
+
+export interface ChatProviderConnectionTestResult {
+	ok: boolean;
+	latencyMs: number;
+	errorMessage?: string;
 }
 
 export interface ChatMessage {
@@ -27,6 +34,9 @@ export interface ChatMessage {
 
 export interface ChatSession {
 	id: string;
+	title: string;
+	updatedAt: string;
+	archivedAt?: string;
 	model: string;
 	askMode: string;
 	messages: ChatMessage[];
@@ -35,6 +45,21 @@ export interface ChatSession {
 		requestId: string;
 		messageId: string;
 	};
+}
+
+export interface ChatSessionSummary {
+	id: string;
+	title: string;
+	createdAt: string;
+	updatedAt: string;
+	lastMessageAt?: string;
+	archivedAt?: string;
+}
+
+export interface ListChatSessionsOptions {
+	query?: string;
+	archived?: boolean;
+	limit?: number;
 }
 
 export interface ChatSendResult {
@@ -84,8 +109,14 @@ export type ChatTransportListener = (event: ChatTransportEvent) => void;
 export interface ChatTransport {
 	getProviderStatus(): Promise<ChatProviderStatus>;
 	configureProvider(input: ChatProviderConfiguration): Promise<ChatProviderStatus>;
+	testProvider(input: ChatProviderConfiguration): Promise<ChatProviderConnectionTestResult>;
+	deleteProvider(): Promise<ChatProviderStatus>;
 	createSession(): Promise<ChatSession>;
 	getSession(sessionId: string): Promise<ChatSession>;
+	listSessions(input?: ListChatSessionsOptions): Promise<ChatSessionSummary[]>;
+	renameSession(sessionId: string, title: string): Promise<ChatSessionSummary>;
+	setSessionArchived(sessionId: string, archived: boolean): Promise<ChatSessionSummary>;
+	deleteSession(sessionId: string): Promise<void>;
 	send(input: { sessionId: string; message: string }): Promise<ChatSendResult>;
 	cancel(input: { sessionId: string; requestId: string }): Promise<void>;
 	subscribe(listener: ChatTransportListener): () => void;

@@ -21,6 +21,10 @@ import {
 	type CreateChatSessionOutput,
 	createChatSessionInputSchema,
 	createChatSessionOutputSchema,
+	type DeleteChatSessionInput,
+	type DeleteChatSessionOutput,
+	deleteChatSessionInputSchema,
+	deleteChatSessionOutputSchema,
 	type GetChatSessionInput,
 	type GetChatSessionOutput,
 	type GetChatSessionSnapshotOutput,
@@ -34,13 +38,21 @@ import {
 	type OpenAiCompatibleProviderConfigInput,
 	type OpenAiCompatibleProviderState,
 	openAiCompatibleProviderStateSchema,
+	type SetChatSessionArchivedInput,
+	type SetChatSessionArchivedOutput,
+	setChatSessionArchivedInputSchema,
+	setChatSessionArchivedOutputSchema,
 	type SendChatMessageInput,
 	type SendChatMessageOutput,
 	sendChatMessageInputSchema,
 	sendChatMessageOutputSchema,
+	type UpdateChatSessionInput,
+	type UpdateChatSessionOutput,
+	updateChatSessionInputSchema,
+	updateChatSessionOutputSchema,
 	uuidV7Schema,
 } from "@moshu/contracts";
-import { and, asc, desc, eq, gt, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, isNotNull, isNull, sql } from "drizzle-orm";
 
 import type { AppDrizzleDatabase } from "./database";
 import { createUuidV7 } from "./ids";
@@ -140,6 +152,9 @@ export interface FailRunResult {
 export interface ChatRepository {
 	createSession(input: CreateChatSessionInput): CreateChatSessionOutput;
 	listSessions(input?: ListChatSessionsInput): ListChatSessionsOutput;
+	updateSession(input: UpdateChatSessionInput): UpdateChatSessionOutput;
+	setSessionArchived(input: SetChatSessionArchivedInput): SetChatSessionArchivedOutput;
+	deleteSession(input: DeleteChatSessionInput): DeleteChatSessionOutput;
 	getSession(input: GetChatSessionInput): GetChatSessionOutput;
 	getSessionSnapshot(input: GetChatSessionInput): GetChatSessionSnapshotOutput;
 	listMessages(input: ListMessagesInput): ChatMessage[];
@@ -337,6 +352,7 @@ function buildSession(row: SessionRow): ChatSession {
 		createdAt: toIsoDateTime(row.createdAtMs),
 		updatedAt: toIsoDateTime(row.updatedAtMs),
 		lastMessageAt: row.lastMessageAtMs === null ? undefined : toIsoDateTime(row.lastMessageAtMs),
+		archivedAt: row.archivedAtMs === null ? undefined : toIsoDateTime(row.archivedAtMs),
 	});
 }
 
@@ -451,6 +467,7 @@ export class SqliteChatRepository implements ChatRepository {
 			createdAtMs: nowMs,
 			updatedAtMs: nowMs,
 			lastMessageAtMs: null,
+			archivedAtMs: null,
 		};
 
 		this.orm.insert(chatSessionsTable).values(sessionRow).run();
@@ -462,9 +479,20 @@ export class SqliteChatRepository implements ChatRepository {
 
 	listSessions(input: ListChatSessionsInput = {}): ListChatSessionsOutput {
 		const parsedInput = listChatSessionsInputSchema.parse(input);
+		const conditions = [
+			parsedInput.archived
+				? isNotNull(chatSessionsTable.archivedAtMs)
+				: isNull(chatSessionsTable.archivedAtMs),
+		];
+		if (parsedInput.query !== undefined && parsedInput.query.length > 0) {
+			conditions.push(
+				sql`instr(lower(${chatSessionsTable.title}), lower(${parsedInput.query})) > 0`,
+			);
+		}
 		const rows = this.orm
 			.select()
 			.from(chatSessionsTable)
+			.where(and(...conditions))
 			.orderBy(desc(chatSessionsTable.updatedAtMs), desc(chatSessionsTable.id))
 			.limit(parsedInput.limit ?? 50)
 			.all();
@@ -472,6 +500,51 @@ export class SqliteChatRepository implements ChatRepository {
 		return listChatSessionsOutputSchema.parse({
 			items: rows.map(buildSession),
 		});
+	}
+
+	updateSession(input: UpdateChatSessionInput): UpdateChatSessionOutput {
+		const parsedInput = updateChatSessionInputSchema.parse(input);
+		this.selectSessionRow(parsedInput.sessionId);
+		const nowMs = this.clock.now();
+
+		this.orm
+			.update(chatSessionsTable)
+			.set({
+				title: parsedInput.title,
+				updatedAtMs: nowMs,
+			})
+			.where(eq(chatSessionsTable.id, parsedInput.sessionId))
+			.run();
+
+		return updateChatSessionOutputSchema.parse({
+			session: buildSession(this.selectSessionRow(parsedInput.sessionId)),
+		});
+	}
+
+	setSessionArchived(input: SetChatSessionArchivedInput): SetChatSessionArchivedOutput {
+		const parsedInput = setChatSessionArchivedInputSchema.parse(input);
+		this.selectSessionRow(parsedInput.sessionId);
+		const nowMs = this.clock.now();
+
+		this.orm
+			.update(chatSessionsTable)
+			.set({
+				archivedAtMs: parsedInput.archived ? nowMs : null,
+				updatedAtMs: nowMs,
+			})
+			.where(eq(chatSessionsTable.id, parsedInput.sessionId))
+			.run();
+
+		return setChatSessionArchivedOutputSchema.parse({
+			session: buildSession(this.selectSessionRow(parsedInput.sessionId)),
+		});
+	}
+
+	deleteSession(input: DeleteChatSessionInput): DeleteChatSessionOutput {
+		const parsedInput = deleteChatSessionInputSchema.parse(input);
+		this.selectSessionRow(parsedInput.sessionId);
+		this.orm.delete(chatSessionsTable).where(eq(chatSessionsTable.id, parsedInput.sessionId)).run();
+		return deleteChatSessionOutputSchema.parse({ sessionId: parsedInput.sessionId });
 	}
 
 	getSession(input: GetChatSessionInput): GetChatSessionOutput {
@@ -1053,6 +1126,11 @@ export class SqliteChatRepository implements ChatRepository {
 		const parsedInput = cancelChatRunInputSchema.parse(input);
 		const runRow = this.selectRunRow(parsedInput.runId);
 		if (terminalRunStatuses.has(runRow.status)) {
+			return cancelChatRunOutputSchema.parse({
+				run: buildRun(runRow),
+			});
+		}
+		if (runRow.status === "cancelling") {
 			return cancelChatRunOutputSchema.parse({
 				run: buildRun(runRow),
 			});

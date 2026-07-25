@@ -15,7 +15,10 @@ const providerNameSchema = z.string().trim().min(1).max(120);
 const providerBaseUrlSchema = z.string().trim().url().max(2048);
 const providerModelSchema = z.string().trim().min(1).max(200);
 const providerOrganizationSchema = z.string().trim().min(1).max(200);
+const providerApiKeySchema = z.string().trim().min(1).max(4096);
+const providerApiKeyMaskSchema = z.string().trim().min(1).max(64);
 const sessionTitleSchema = z.string().trim().min(1).max(200);
+const sessionSearchQuerySchema = z.string().trim().max(200);
 const userMessageContentSchema = z.string().trim().min(1).max(20_000);
 const assistantMessageContentSchema = z.string().max(200_000);
 const deltaContentSchema = z.string().min(1).max(8_000);
@@ -29,7 +32,7 @@ export const openAiCompatibleProviderConfigInputSchema = z
 		name: providerNameSchema,
 		baseUrl: providerBaseUrlSchema,
 		model: providerModelSchema,
-		apiKey: z.string().trim().min(1).max(4096),
+		apiKey: providerApiKeySchema,
 		organization: providerOrganizationSchema.optional(),
 	})
 	.strict();
@@ -39,7 +42,7 @@ export const configureChatProviderInputSchema = z
 		schemaVersion: z.literal(contractSchemaVersion),
 		baseUrl: providerBaseUrlSchema,
 		model: providerModelSchema,
-		apiKey: z.string().trim().min(1).max(4096),
+		apiKey: providerApiKeySchema.optional(),
 	})
 	.strict();
 
@@ -49,6 +52,7 @@ export const chatProviderStatusSchema = z
 		configured: z.boolean(),
 		baseUrl: providerBaseUrlSchema,
 		model: z.string().trim().max(200),
+		apiKeyMask: providerApiKeyMaskSchema.optional(),
 	})
 	.strict()
 	.superRefine((value, context) => {
@@ -57,6 +61,33 @@ export const chatProviderStatusSchema = z
 				code: "custom",
 				message: "Configured providers require a model.",
 				path: ["model"],
+			});
+		}
+	});
+
+export const testChatProviderInputSchema = configureChatProviderInputSchema;
+
+export const testChatProviderOutputSchema = z
+	.object({
+		schemaVersion: z.literal(contractSchemaVersion),
+		ok: z.boolean(),
+		latencyMs: z.int().min(0),
+		error: appErrorSchema.optional(),
+	})
+	.strict()
+	.superRefine((value, context) => {
+		if (value.ok && value.error !== undefined) {
+			context.addIssue({
+				code: "custom",
+				message: "Successful provider tests cannot include an error.",
+				path: ["error"],
+			});
+		}
+		if (!value.ok && value.error === undefined) {
+			context.addIssue({
+				code: "custom",
+				message: "Failed provider tests require an error.",
+				path: ["error"],
 			});
 		}
 	});
@@ -170,6 +201,7 @@ export const chatSessionSchema = z
 		createdAt: isoDateTimeSchema,
 		updatedAt: isoDateTimeSchema,
 		lastMessageAt: isoDateTimeSchema.optional(),
+		archivedAt: isoDateTimeSchema.optional(),
 	})
 	.strict();
 
@@ -313,12 +345,48 @@ export const createChatSessionOutputSchema = z
 export const listChatSessionsInputSchema = z
 	.object({
 		limit: z.int().min(1).max(100).optional(),
+		query: sessionSearchQuerySchema.optional(),
+		archived: z.boolean().optional(),
 	})
 	.strict();
 
 export const listChatSessionsOutputSchema = z
 	.object({
 		items: z.array(chatSessionSchema),
+	})
+	.strict();
+
+export const updateChatSessionInputSchema = z
+	.object({
+		sessionId: uuidV7Schema,
+		title: sessionTitleSchema,
+	})
+	.strict();
+
+export const updateChatSessionOutputSchema = z
+	.object({
+		session: chatSessionSchema,
+	})
+	.strict();
+
+export const setChatSessionArchivedInputSchema = z
+	.object({
+		sessionId: uuidV7Schema,
+		archived: z.boolean(),
+	})
+	.strict();
+
+export const setChatSessionArchivedOutputSchema = updateChatSessionOutputSchema;
+
+export const deleteChatSessionInputSchema = z
+	.object({
+		sessionId: uuidV7Schema,
+	})
+	.strict();
+
+export const deleteChatSessionOutputSchema = z
+	.object({
+		sessionId: uuidV7Schema,
 	})
 	.strict();
 
@@ -391,6 +459,8 @@ export type OpenAiCompatibleProviderConfigInput = z.infer<
 >;
 export type ConfigureChatProviderInput = z.infer<typeof configureChatProviderInputSchema>;
 export type ChatProviderStatus = z.infer<typeof chatProviderStatusSchema>;
+export type TestChatProviderInput = z.infer<typeof testChatProviderInputSchema>;
+export type TestChatProviderOutput = z.infer<typeof testChatProviderOutputSchema>;
 export type OpenAiCompatibleProviderStatus = z.infer<typeof openAiCompatibleProviderStatusSchema>;
 export type OpenAiCompatibleProviderState = z.infer<typeof openAiCompatibleProviderStateSchema>;
 export type ChatMessageRole = z.infer<typeof chatMessageRoleSchema>;
@@ -405,6 +475,12 @@ export type CreateChatSessionInput = z.infer<typeof createChatSessionInputSchema
 export type CreateChatSessionOutput = z.infer<typeof createChatSessionOutputSchema>;
 export type ListChatSessionsInput = z.infer<typeof listChatSessionsInputSchema>;
 export type ListChatSessionsOutput = z.infer<typeof listChatSessionsOutputSchema>;
+export type UpdateChatSessionInput = z.infer<typeof updateChatSessionInputSchema>;
+export type UpdateChatSessionOutput = z.infer<typeof updateChatSessionOutputSchema>;
+export type SetChatSessionArchivedInput = z.infer<typeof setChatSessionArchivedInputSchema>;
+export type SetChatSessionArchivedOutput = z.infer<typeof setChatSessionArchivedOutputSchema>;
+export type DeleteChatSessionInput = z.infer<typeof deleteChatSessionInputSchema>;
+export type DeleteChatSessionOutput = z.infer<typeof deleteChatSessionOutputSchema>;
 export type GetChatSessionInput = z.infer<typeof getChatSessionInputSchema>;
 export type GetChatSessionOutput = z.infer<typeof getChatSessionOutputSchema>;
 export type ChatRunEventCursor = z.infer<typeof chatRunEventCursorSchema>;

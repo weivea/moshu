@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import Database from "bun:sqlite";
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -91,7 +92,7 @@ describe("application database", () => {
 				expect(foreignKeys?.foreign_keys).toBe(1);
 				expect(busyTimeout?.timeout).toBe(5000);
 				expect(journalMode?.journal_mode).toBe("wal");
-				expect(getDatabaseUserVersion(database.client)).toBe(1);
+				expect(getDatabaseUserVersion(database.client)).toBe(2);
 
 				applyAppMigrations(database.client);
 
@@ -103,6 +104,45 @@ describe("application database", () => {
 					.map((row) => row.name);
 
 				expect(schemaObjectsAfter).toEqual(schemaObjectsBefore);
+			} finally {
+				database.close();
+			}
+		});
+	});
+
+	test("migrates existing v1 Sessions without losing data", () => {
+		withTempDatabase((databasePath) => {
+			const sessionId = createUuidV7();
+			const legacyDatabase = new Database(databasePath);
+			legacyDatabase.exec(`
+				CREATE TABLE chat_sessions (
+					id TEXT PRIMARY KEY NOT NULL,
+					title TEXT NOT NULL,
+					default_mode TEXT NOT NULL,
+					created_at_ms INTEGER NOT NULL,
+					updated_at_ms INTEGER NOT NULL,
+					last_message_at_ms INTEGER
+				);
+				INSERT INTO chat_sessions (
+					id, title, default_mode, created_at_ms, updated_at_ms, last_message_at_ms
+				) VALUES (
+					'${sessionId}', 'Legacy Session', 'ask', 1, 1, NULL
+				);
+				PRAGMA user_version = 1;
+			`);
+			legacyDatabase.close();
+
+			const database = openAppDatabase(databasePath);
+			try {
+				expect(getDatabaseUserVersion(database.client)).toBe(2);
+				expect(database.chat.getSession({ sessionId }).session).toMatchObject({
+					id: sessionId,
+					title: "Legacy Session",
+					archivedAt: undefined,
+				});
+				expect(
+					database.chat.setSessionArchived({ sessionId, archived: true }).session.archivedAt,
+				).toBeDefined();
 			} finally {
 				database.close();
 			}
@@ -132,6 +172,58 @@ describe("application database", () => {
 						})
 						.run(),
 				).toThrow();
+			} finally {
+				database.close();
+			}
+		});
+	});
+
+	test("supports searching, renaming, archiving, restoring, and deleting Sessions", () => {
+		withTempDatabase((databasePath) => {
+			const database = openAppDatabase(databasePath);
+
+			try {
+				const first = database.chat.createSession({ title: "Alpha notes" }).session;
+				const second = database.chat.createSession({ title: "Beta notes" }).session;
+
+				const renamed = database.chat.updateSession({
+					sessionId: first.id,
+					title: "Alpha architecture",
+				}).session;
+				expect(renamed.title).toBe("Alpha architecture");
+
+				expect(
+					database.chat
+						.listSessions({
+							query: "alpha",
+						})
+						.items.map((session) => session.id),
+				).toEqual([first.id]);
+				expect(database.chat.listSessions({ query: "%" }).items).toEqual([]);
+				expect(database.chat.listSessions({ query: "_" }).items).toEqual([]);
+
+				const archived = database.chat.setSessionArchived({
+					sessionId: first.id,
+					archived: true,
+				}).session;
+				expect(archived.archivedAt).toBeDefined();
+				expect(database.chat.listSessions().items.map((session) => session.id)).toEqual([
+					second.id,
+				]);
+				expect(
+					database.chat.listSessions({ archived: true }).items.map((session) => session.id),
+				).toEqual([first.id]);
+
+				const restored = database.chat.setSessionArchived({
+					sessionId: first.id,
+					archived: false,
+				}).session;
+				expect(restored.archivedAt).toBeUndefined();
+
+				database.chat.deleteSession({ sessionId: second.id });
+				expect(() => database.chat.getSession({ sessionId: second.id })).toThrow(
+					`Chat session ${second.id} was not found.`,
+				);
 			} finally {
 				database.close();
 			}

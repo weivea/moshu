@@ -1,6 +1,6 @@
 import { AppIcon, type AppIconName } from "@moshu/ui";
 import { Button } from "@heroui/react";
-import { NavLink, Outlet } from "react-router-dom";
+import { NavLink, Outlet, useLocation } from "react-router-dom";
 import { useI18n, type MessageKey } from "./i18n";
 import { useAppearance } from "./providers";
 import { RuntimeStatus } from "./runtime-status";
@@ -12,7 +12,7 @@ const navigation = [
 	{ to: "/tasks", label: "nav.tasks", icon: "tasks" },
 	{ to: "/agents", label: "nav.agents", icon: "agents" },
 	{ to: "/canvas", label: "nav.canvas", icon: "canvas" },
-	{ to: "/settings/general", label: "nav.settings", icon: "settings" },
+	{ to: "/settings/providers", label: "nav.settings", icon: "settings" },
 ] as const satisfies readonly {
 	to: string;
 	label: MessageKey;
@@ -22,6 +22,9 @@ const navigation = [
 export function AppShell() {
 	const { t, toggleLocale } = useI18n();
 	const { toggleTheme } = useAppearance();
+	const { pathname } = useLocation();
+	const usesWorkspaceLayout =
+		pathname.startsWith("/chat") || pathname === "/chats" || pathname === "/settings/providers";
 
 	return (
 		<div className="app-shell">
@@ -55,7 +58,7 @@ export function AppShell() {
 				</footer>
 			</aside>
 
-			<main className="content">
+			<main className={usesWorkspaceLayout ? "content content--workspace" : "content"}>
 				<Outlet />
 			</main>
 

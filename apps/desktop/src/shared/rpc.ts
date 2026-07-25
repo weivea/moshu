@@ -6,10 +6,20 @@ import type {
 	ChatSendAcceptedOutput,
 	ConfigureChatProviderInput,
 	CreateChatSessionOutput,
+	DeleteChatSessionInput,
+	DeleteChatSessionOutput,
 	EmptyParams,
 	GetChatSessionInput,
 	GetChatSessionSnapshotOutput,
+	ListChatSessionsInput,
+	ListChatSessionsOutput,
 	RuntimeInfo,
+	SetChatSessionArchivedInput,
+	SetChatSessionArchivedOutput,
+	TestChatProviderInput,
+	TestChatProviderOutput,
+	UpdateChatSessionInput,
+	UpdateChatSessionOutput,
 } from "@moshu/contracts";
 import type { RPCSchema } from "electrobun/bun";
 
@@ -35,6 +45,14 @@ export type DesktopRpc = {
 				params: ConfigureChatProviderInput;
 				response: ChatProviderStatus;
 			};
+			testChatProvider: {
+				params: TestChatProviderInput;
+				response: TestChatProviderOutput;
+			};
+			deleteChatProvider: {
+				params: EmptyParams;
+				response: ChatProviderStatus;
+			};
 			createChatSession: {
 				params: EmptyParams;
 				response: CreateChatSessionOutput;
@@ -42,6 +60,22 @@ export type DesktopRpc = {
 			getChatSession: {
 				params: GetChatSessionInput;
 				response: GetChatSessionSnapshotOutput;
+			};
+			listChatSessions: {
+				params: ListChatSessionsInput;
+				response: ListChatSessionsOutput;
+			};
+			updateChatSession: {
+				params: UpdateChatSessionInput;
+				response: UpdateChatSessionOutput;
+			};
+			setChatSessionArchived: {
+				params: SetChatSessionArchivedInput;
+				response: SetChatSessionArchivedOutput;
+			};
+			deleteChatSession: {
+				params: DeleteChatSessionInput;
+				response: DeleteChatSessionOutput;
 			};
 			sendChatMessage: {
 				params: SendDesktopChatMessageInput;

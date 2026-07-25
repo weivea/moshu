@@ -1,7 +1,8 @@
 # 墨枢
 
-墨枢是一款 Local-first 的桌面 Agent 应用。当前仓库已按
-[`docs/implementation`](./docs/implementation/README.md) 初始化 Phase 0 工程基线。
+墨枢是一款 Local-first 的桌面 Agent 应用。当前仓库已完成 Phase 0 工程基线和最小
+Ask Chat POC，正在推进 Provider 设置页与普通 Chat Session 管理。详见
+[实施进度](./docs/implementation/progress.md)。
 
 ## 环境
 

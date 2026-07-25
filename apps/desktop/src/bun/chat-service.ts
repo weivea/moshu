@@ -3,7 +3,9 @@ import {
 	AskChatRuntimeError,
 	type AskChatMessage,
 	type AskChatRuntime,
+	type AskProviderConfiguration,
 	type AskProviderConfigStore,
+	normalizeAskProviderConfiguration,
 } from "@moshu/agent-runtime";
 import {
 	appErrorSchema,
@@ -19,11 +21,27 @@ import {
 	type ConfigureChatProviderInput,
 	configureChatProviderInputSchema,
 	type CreateChatSessionOutput,
+	type DeleteChatSessionInput,
+	type DeleteChatSessionOutput,
+	deleteChatSessionInputSchema,
 	type GetChatSessionInput,
 	type GetChatSessionOutput,
 	type GetChatSessionSnapshotOutput,
 	getChatSessionSnapshotOutputSchema,
 	getChatSessionInputSchema,
+	type ListChatSessionsInput,
+	type ListChatSessionsOutput,
+	listChatSessionsInputSchema,
+	type SetChatSessionArchivedInput,
+	type SetChatSessionArchivedOutput,
+	setChatSessionArchivedInputSchema,
+	type TestChatProviderInput,
+	type TestChatProviderOutput,
+	testChatProviderInputSchema,
+	testChatProviderOutputSchema,
+	type UpdateChatSessionInput,
+	type UpdateChatSessionOutput,
+	updateChatSessionInputSchema,
 } from "@moshu/contracts";
 import { type ChatRepository, createUuidV7 } from "@moshu/database";
 
@@ -31,6 +49,7 @@ const DEFAULT_PROVIDER_BASE_URL = "https://api.openai.com/v1";
 
 type ChatEventListener = (event: ChatRunEvent) => void;
 type ChatTaskScheduler = (task: () => void) => void;
+type ProviderConnectionTester = (configuration: AskProviderConfiguration) => Promise<void>;
 
 interface ChatServiceLogger {
 	error(message: string, error: unknown): void;
@@ -42,6 +61,7 @@ export interface DesktopChatServiceOptions {
 	runtime: AskChatRuntime;
 	schedule?: ChatTaskScheduler;
 	logger?: ChatServiceLogger;
+	testProviderConnection?: ProviderConnectionTester;
 }
 
 export interface SendDesktopChatMessageInput {
@@ -63,6 +83,7 @@ export class DesktopChatService {
 	readonly #runtime: AskChatRuntime;
 	readonly #schedule: ChatTaskScheduler;
 	readonly #logger: ChatServiceLogger;
+	readonly #testProviderConnection: ProviderConnectionTester;
 	readonly #providerId = createUuidV7();
 	readonly #listeners = new Set<ChatEventListener>();
 	readonly #activeRuns = new Map<string, ActiveChatRun>();
@@ -75,6 +96,7 @@ export class DesktopChatService {
 		this.#runtime = options.runtime;
 		this.#schedule = options.schedule ?? ((task) => setTimeout(task, 0));
 		this.#logger = options.logger ?? console;
+		this.#testProviderConnection = options.testProviderConnection ?? testOpenAiCompatibleProvider;
 	}
 
 	subscribe(listener: ChatEventListener): () => void {
@@ -92,18 +114,54 @@ export class DesktopChatService {
 			configured: status.configured,
 			baseUrl: status.baseUrl ?? DEFAULT_PROVIDER_BASE_URL,
 			model: status.model ?? "",
+			...(status.apiKeyMask === undefined ? {} : { apiKeyMask: status.apiKeyMask }),
 		});
 	}
 
 	configureProvider(input: ConfigureChatProviderInput): ChatProviderStatus {
 		const parsedInput = configureChatProviderInputSchema.parse(input);
+		this.#assertProviderCanChange();
+		const apiKey = this.#resolveApiKey(
+			parsedInput.baseUrl,
+			parsedInput.apiKey,
+			"configure the Provider",
+		);
 		this.#providerConfigStore.set({
 			provider: "openai-compatible",
-			apiKey: parsedInput.apiKey,
+			apiKey,
 			baseUrl: parsedInput.baseUrl,
 			model: parsedInput.model,
 		});
 
+		return this.getProviderStatus();
+	}
+
+	async testProvider(input: TestChatProviderInput): Promise<TestChatProviderOutput> {
+		const startedAt = Date.now();
+
+		try {
+			const configuration = this.#resolveProviderConfiguration(
+				testChatProviderInputSchema.parse(input),
+			);
+			await this.#testProviderConnection(configuration);
+			return testChatProviderOutputSchema.parse({
+				schemaVersion: 1,
+				ok: true,
+				latencyMs: Date.now() - startedAt,
+			});
+		} catch (error) {
+			return testChatProviderOutputSchema.parse({
+				schemaVersion: 1,
+				ok: false,
+				latencyMs: Date.now() - startedAt,
+				error: toAppError(error, "provider-connection-test"),
+			});
+		}
+	}
+
+	deleteProvider(): ChatProviderStatus {
+		this.#assertProviderCanChange();
+		this.#providerConfigStore.clear();
 		return this.getProviderStatus();
 	}
 
@@ -112,6 +170,28 @@ export class DesktopChatService {
 			title: "New chat",
 			defaultMode: "ask",
 		});
+	}
+
+	listSessions(input: ListChatSessionsInput = {}): ListChatSessionsOutput {
+		return this.#repository.listSessions(listChatSessionsInputSchema.parse(input));
+	}
+
+	updateSession(input: UpdateChatSessionInput): UpdateChatSessionOutput {
+		return this.#repository.updateSession(updateChatSessionInputSchema.parse(input));
+	}
+
+	setSessionArchived(input: SetChatSessionArchivedInput): SetChatSessionArchivedOutput {
+		const parsedInput = setChatSessionArchivedInputSchema.parse(input);
+		if (parsedInput.archived) {
+			this.#assertSessionCanBeRemovedFromActiveList(parsedInput.sessionId);
+		}
+		return this.#repository.setSessionArchived(parsedInput);
+	}
+
+	deleteSession(input: DeleteChatSessionInput): DeleteChatSessionOutput {
+		const parsedInput = deleteChatSessionInputSchema.parse(input);
+		this.#assertSessionCanBeRemovedFromActiveList(parsedInput.sessionId);
+		return this.#repository.deleteSession(parsedInput);
 	}
 
 	getSession(input: GetChatSessionInput): GetChatSessionOutput {
@@ -139,6 +219,21 @@ export class DesktopChatService {
 				kind: "duplicate_run_id",
 				message: "This chat already has an active response.",
 				retryable: false,
+			});
+		}
+
+		const currentSession = this.#repository.getSession({ sessionId: input.sessionId });
+		if (currentSession.session.archivedAt !== undefined) {
+			throw new AskChatRuntimeError({
+				kind: "provider_failure",
+				message: "Archived chat Sessions cannot send new messages.",
+				retryable: false,
+			});
+		}
+		if (currentSession.messages.length === 0 && currentSession.session.title === "New chat") {
+			this.#repository.updateSession({
+				sessionId: input.sessionId,
+				title: createSessionTitle(input.content),
 			});
 		}
 
@@ -230,12 +325,22 @@ export class DesktopChatService {
 					this.#emit(cancelledMessage.event);
 				}
 				this.#releaseRun(activeRun);
+			} else {
+				this.#emitLatestEvent(result.run.id);
+				return {
+					run: this.#finalizeOrphanedRun(result.run),
+				};
 			}
 			return result;
 		}
 
 		this.#emitLatestEvent(result.run.id);
-		this.#runtime.cancel(input.runId, input.reason);
+		const runtimeCancelled = this.#runtime.cancel(input.runId, input.reason);
+		if (!runtimeCancelled && activeRun === undefined) {
+			return {
+				run: this.#finalizeOrphanedRun(result.run),
+			};
+		}
 		return result;
 	}
 
@@ -388,6 +493,182 @@ export class DesktopChatService {
 		if (this.#activeSessions.get(activeRun.sessionId) === activeRun.runId) {
 			this.#activeSessions.delete(activeRun.sessionId);
 		}
+	}
+
+	#resolveProviderConfiguration(input: TestChatProviderInput): AskProviderConfiguration {
+		const apiKey = this.#resolveApiKey(input.baseUrl, input.apiKey, "test the Provider");
+
+		return normalizeAskProviderConfiguration({
+			provider: "openai-compatible",
+			apiKey,
+			baseUrl: input.baseUrl,
+			model: input.model,
+		});
+	}
+
+	#assertSessionCanBeRemovedFromActiveList(sessionId: string): void {
+		if (this.#activeSessions.has(sessionId)) {
+			throw new AskChatRuntimeError({
+				kind: "duplicate_run_id",
+				message: "Stop the active response before archiving or deleting this Session.",
+				retryable: false,
+			});
+		}
+
+		const snapshot = this.#repository.getSession({ sessionId });
+		for (const run of snapshot.runs) {
+			if (
+				(run.status === "queued" || run.status === "running" || run.status === "cancelling") &&
+				!this.#activeRuns.has(run.id)
+			) {
+				this.#finalizeOrphanedRun(run);
+			}
+		}
+
+		const hasRemainingActiveRun = this.#repository
+			.getSession({ sessionId })
+			.runs.some(
+				(run) => run.status === "queued" || run.status === "running" || run.status === "cancelling",
+			);
+		if (hasRemainingActiveRun) {
+			throw new AskChatRuntimeError({
+				kind: "duplicate_run_id",
+				message: "Resolve the active response before archiving or deleting this Session.",
+				retryable: false,
+			});
+		}
+	}
+
+	#finalizeOrphanedRun(run: ChatRun): ChatRun {
+		let currentRun = run;
+		if (currentRun.status === "queued" || currentRun.status === "running") {
+			currentRun = this.#repository.cancelRun({
+				runId: currentRun.id,
+				reason: "The application restarted before this response completed.",
+			}).run;
+			this.#emitLatestEvent(currentRun.id);
+		}
+
+		if (currentRun.assistantMessageId !== undefined) {
+			const message = this.#repository.getMessage({
+				sessionId: currentRun.sessionId,
+				messageId: currentRun.assistantMessageId,
+			});
+			if (message.status === "streaming") {
+				const cancelledMessage = this.#repository.cancelAssistantMessage({
+					runId: currentRun.id,
+					messageId: currentRun.assistantMessageId,
+				});
+				this.#emit(cancelledMessage.event);
+			}
+		}
+
+		if (currentRun.status === "cancelling") {
+			const cancelledRun = this.#repository.updateRunStatus({
+				runId: currentRun.id,
+				status: "cancelled",
+			});
+			this.#emit(cancelledRun.event);
+			currentRun = cancelledRun.run;
+		}
+
+		return currentRun;
+	}
+
+	#assertProviderCanChange(): void {
+		if (this.#activeRuns.size > 0) {
+			throw new AskChatRuntimeError({
+				kind: "duplicate_run_id",
+				message: "Stop active responses before changing the Provider configuration.",
+				retryable: false,
+			});
+		}
+	}
+
+	#resolveApiKey(baseUrl: string, apiKey: string | undefined, action: string): string {
+		if (apiKey !== undefined) {
+			return apiKey;
+		}
+
+		const storedConfiguration = this.#providerConfigStore.get();
+		if (
+			storedConfiguration !== null &&
+			new URL(storedConfiguration.baseUrl ?? DEFAULT_PROVIDER_BASE_URL).origin ===
+				new URL(baseUrl).origin
+		) {
+			return storedConfiguration.apiKey;
+		}
+
+		throw new AskChatRuntimeError({
+			kind: "not_configured",
+			message: `A new API key is required to ${action} for a different Endpoint origin.`,
+			retryable: false,
+		});
+	}
+}
+
+function createSessionTitle(content: string): string {
+	const normalized = content.trim().replace(/\s+/g, " ");
+	return normalized.length <= 60 ? normalized : `${normalized.slice(0, 57)}...`;
+}
+
+async function testOpenAiCompatibleProvider(
+	configuration: AskProviderConfiguration,
+): Promise<void> {
+	const baseUrl = configuration.baseUrl ?? DEFAULT_PROVIDER_BASE_URL;
+	const controller = new AbortController();
+	const timeout = setTimeout(() => controller.abort(), 10_000);
+
+	try {
+		const response = await fetch(`${baseUrl}/models`, {
+			method: "GET",
+			redirect: "error",
+			headers: {
+				Authorization: `Bearer ${configuration.apiKey}`,
+				Accept: "application/json",
+			},
+			signal: controller.signal,
+		});
+
+		if (response.ok) {
+			return;
+		}
+		if (response.status === 401 || response.status === 403) {
+			throw new AskChatRuntimeError({
+				kind: "provider_authentication",
+				message: "Provider authentication failed.",
+				retryable: false,
+				statusCode: response.status,
+			});
+		}
+		if (response.status === 429) {
+			throw new AskChatRuntimeError({
+				kind: "provider_rate_limited",
+				message: "Provider rate limit reached.",
+				retryable: true,
+				statusCode: response.status,
+			});
+		}
+		throw new AskChatRuntimeError({
+			kind: "provider_failure",
+			message: `Provider connection test failed with status ${response.status}.`,
+			retryable: response.status >= 500,
+			statusCode: response.status,
+		});
+	} catch (error) {
+		if (error instanceof AskChatRuntimeError) {
+			throw error;
+		}
+		throw new AskChatRuntimeError({
+			kind: "provider_network",
+			message:
+				error instanceof Error && error.name === "AbortError"
+					? "Provider connection test timed out."
+					: "Provider connection test could not reach the endpoint.",
+			retryable: true,
+		});
+	} finally {
+		clearTimeout(timeout);
 	}
 }
 

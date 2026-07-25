@@ -1,6 +1,6 @@
 import type Database from "bun:sqlite";
 
-const CURRENT_USER_VERSION = 1;
+const CURRENT_USER_VERSION = 2;
 
 function readUserVersion(client: Database): number {
 	const row = client.query<{ user_version: number }, []>("PRAGMA user_version").get();
@@ -102,6 +102,14 @@ export function applyAppMigrations(client: Database): void {
 			CREATE INDEX IF NOT EXISTS chat_run_events_session_created_at_idx
 				ON chat_run_events(session_id, created_at_ms);
 		`);
+
+		if (currentUserVersion < 2) {
+			client.exec(`
+				ALTER TABLE chat_sessions ADD COLUMN archived_at_ms INTEGER;
+				CREATE INDEX IF NOT EXISTS chat_sessions_archived_updated_at_idx
+					ON chat_sessions(archived_at_ms, updated_at_ms);
+			`);
+		}
 
 		client.exec(`PRAGMA user_version = ${CURRENT_USER_VERSION}`);
 		client.exec("COMMIT");

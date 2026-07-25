@@ -1,5 +1,7 @@
 # 工程交付计划
 
+> 本文维护目标、依赖和出口，不直接表示完成度。当前状态见[实施进度](./progress.md)。
+
 ## 1. 估算口径
 
 本计划提供依赖和容量基线，不是固定发布日期。
@@ -194,7 +196,7 @@ flowchart LR
 
 | 波次 | 参考周 | 可演示结果 |
 | --- | --- | --- |
-| W1 Read-only | 1–4 | Provider 设置、普通 Chat、附件、Session 保存 |
+| W1 Read-only | 1–4 | Provider 设置、普通 Chat、Session 保存与管理 |
 | W2 Project | 3–7 | 添加 Project、Ask/Plan、文件读取、轨迹 |
 | W3 Controlled action | 6–10 | Agent 写文件、命令审批、Allow all、Diff |
 | W4 Resilience | 9–13 | Scheduler、后台任务、通知、崩溃恢复 |

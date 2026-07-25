@@ -1,10 +1,11 @@
-import { createAskChatRuntime, InMemoryAskProviderConfigStore } from "@moshu/agent-runtime";
+import { createAskChatRuntime } from "@moshu/agent-runtime";
 import { openAppDatabase } from "@moshu/database";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { BrowserWindow, Updater, Utils } from "electrobun/bun";
 import { logChatRpcDiagnostic } from "../shared/chat-rpc-diagnostics";
 import { DesktopChatService } from "./chat-service";
+import { FileAskProviderConfigStore } from "./file-provider-config-store";
 import { createDesktopRpc } from "./rpc";
 
 const DEV_SERVER_URL = "http://127.0.0.1:5173";
@@ -30,7 +31,9 @@ async function getMainViewUrl(): Promise<string> {
 
 mkdirSync(Utils.paths.userData, { recursive: true });
 const database = openAppDatabase(join(Utils.paths.userData, "moshu.db"));
-const providerConfigStore = new InMemoryAskProviderConfigStore();
+const providerConfigStore = new FileAskProviderConfigStore(
+	join(Utils.paths.userData, "provider.json"),
+);
 const chatRuntime = createAskChatRuntime({ providerConfigStore });
 const chatService = new DesktopChatService({
 	repository: database.chat,

@@ -15,10 +15,12 @@ export const chatSessionsTable = sqliteTable(
 		createdAtMs: integer("created_at_ms").notNull(),
 		updatedAtMs: integer("updated_at_ms").notNull(),
 		lastMessageAtMs: integer("last_message_at_ms"),
+		archivedAtMs: integer("archived_at_ms"),
 	},
 	(table) => [
 		index("chat_sessions_updated_at_idx").on(table.updatedAtMs),
 		index("chat_sessions_last_message_at_idx").on(table.lastMessageAtMs),
+		index("chat_sessions_archived_updated_at_idx").on(table.archivedAtMs, table.updatedAtMs),
 	],
 );
 

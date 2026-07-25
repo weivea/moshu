@@ -19,6 +19,7 @@ export interface AskProviderConfigurationStatus {
 	configured: boolean;
 	baseUrl?: string;
 	model?: string;
+	apiKeyMask?: string;
 }
 
 export interface AskProviderConfigStore {
@@ -48,18 +49,29 @@ export class InMemoryAskProviderConfigStore implements AskProviderConfigStore {
 	}
 
 	getStatus(): AskProviderConfigurationStatus {
-		if (this.#configuration === null) {
-			return { configured: false };
-		}
-
-		return {
-			configured: true,
-			model: this.#configuration.model,
-			...(this.#configuration.baseUrl === undefined
-				? {}
-				: { baseUrl: this.#configuration.baseUrl }),
-		};
+		return getAskProviderConfigurationStatus(this.#configuration);
 	}
+}
+
+export function getAskProviderConfigurationStatus(
+	configuration: AskProviderConfiguration | null,
+): AskProviderConfigurationStatus {
+	if (configuration === null) {
+		return { configured: false };
+	}
+
+	return {
+		configured: true,
+		model: configuration.model,
+		apiKeyMask: maskAskProviderApiKey(configuration.apiKey),
+		...(configuration.baseUrl === undefined ? {} : { baseUrl: configuration.baseUrl }),
+	};
+}
+
+export function maskAskProviderApiKey(apiKey: string): string {
+	const normalized = requireNonEmptyString(apiKey, "apiKey");
+	const visibleSuffix = normalized.length > 4 ? normalized.slice(-4) : "";
+	return `${"•".repeat(8)}${visibleSuffix}`;
 }
 
 export function normalizeAskProviderConfiguration(

@@ -7,7 +7,12 @@ import type {
 	ChatSendAcceptedOutput,
 	ConfigureChatProviderInput,
 	CreateChatSessionOutput,
+	DeleteChatSessionOutput,
 	GetChatSessionSnapshotOutput,
+	ListChatSessionsOutput,
+	SetChatSessionArchivedOutput,
+	TestChatProviderOutput,
+	UpdateChatSessionOutput,
 } from "@moshu/contracts";
 
 import { createRpcChatTransport, type RpcChatClient } from "./rpc-transport";
@@ -38,6 +43,7 @@ describe("RPC Chat transport", () => {
 			endpoint: "https://api.openai.com/v1",
 			model: "gpt-4.1-mini",
 			askMode: "Ask",
+			apiKeyMask: "********cret",
 		});
 		expect(client.lastConfiguration?.apiKey).toBe("sk-test-secret");
 
@@ -70,6 +76,29 @@ describe("RPC Chat transport", () => {
 		});
 		expect(session.messages[1]?.status).toBe("streaming");
 	});
+
+	test("maps Provider testing and Session management operations", async () => {
+		const client = new FakeRpcChatClient();
+		const transport = createRpcChatTransport(client);
+
+		expect(
+			await transport.testProvider({
+				endpoint: "https://api.openai.com/v1",
+				model: "gpt-4.1-mini",
+			}),
+		).toEqual({ ok: true, latencyMs: 12 });
+		expect(await transport.listSessions()).toEqual([
+			{
+				id: sessionId,
+				title: "New chat",
+				createdAt,
+				updatedAt: createdAt,
+			},
+		]);
+		expect((await transport.renameSession(sessionId, "Renamed")).title).toBe("Renamed");
+		expect((await transport.setSessionArchived(sessionId, true)).archivedAt).toBe(createdAt);
+		await expect(transport.deleteSession(sessionId)).resolves.toBeUndefined();
+	});
 });
 
 class FakeRpcChatClient implements RpcChatClient {
@@ -93,6 +122,25 @@ class FakeRpcChatClient implements RpcChatClient {
 			configured: true,
 			baseUrl: input.baseUrl,
 			model: input.model,
+			apiKeyMask: "********cret",
+		};
+		return this.#status;
+	}
+
+	async testChatProvider(): Promise<TestChatProviderOutput> {
+		return {
+			schemaVersion: 1,
+			ok: true,
+			latencyMs: 12,
+		};
+	}
+
+	async deleteChatProvider() {
+		this.#status = {
+			schemaVersion: 1,
+			configured: false,
+			baseUrl: "https://api.openai.com/v1",
+			model: "",
 		};
 		return this.#status;
 	}
@@ -124,6 +172,30 @@ class FakeRpcChatClient implements RpcChatClient {
 			runs: [createRun()],
 			eventCursors: [{ runId, lastSeq: 3 }],
 		};
+	}
+
+	async listChatSessions(): Promise<ListChatSessionsOutput> {
+		return { items: [createContractSession()] };
+	}
+
+	async updateChatSession(_sessionId: string, title: string): Promise<UpdateChatSessionOutput> {
+		return { session: { ...createContractSession(), title } };
+	}
+
+	async setChatSessionArchived(
+		_sessionId: string,
+		archived: boolean,
+	): Promise<SetChatSessionArchivedOutput> {
+		return {
+			session: {
+				...createContractSession(),
+				...(archived ? { archivedAt: createdAt } : {}),
+			},
+		};
+	}
+
+	async deleteChatSession(_sessionId: string): Promise<DeleteChatSessionOutput> {
+		return { sessionId };
 	}
 
 	async sendChatMessage(_input: {

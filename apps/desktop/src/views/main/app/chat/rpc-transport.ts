@@ -5,14 +5,21 @@ import type {
 	ChatRunEvent,
 	ChatSendAcceptedOutput,
 	CreateChatSessionOutput,
+	DeleteChatSessionOutput,
 	GetChatSessionSnapshotOutput,
+	ListChatSessionsOutput,
+	SetChatSessionArchivedOutput,
+	TestChatProviderOutput,
+	UpdateChatSessionOutput,
 } from "@moshu/contracts";
 
 import type {
 	ChatMessage,
 	ChatProviderConfiguration,
+	ChatProviderConnectionTestResult,
 	ChatProviderStatus,
 	ChatSession,
+	ChatSessionSummary,
 	ChatTransport,
 	ChatTransportEvent,
 	ChatTransportListener,
@@ -24,10 +31,28 @@ export interface RpcChatClient {
 		schemaVersion: 1;
 		baseUrl: string;
 		model: string;
-		apiKey: string;
+		apiKey?: string;
 	}): Promise<ContractChatProviderStatus>;
+	testChatProvider(input: {
+		schemaVersion: 1;
+		baseUrl: string;
+		model: string;
+		apiKey?: string;
+	}): Promise<TestChatProviderOutput>;
+	deleteChatProvider(): Promise<ContractChatProviderStatus>;
 	createChatSession(): Promise<CreateChatSessionOutput>;
 	getChatSession(sessionId: string): Promise<GetChatSessionSnapshotOutput>;
+	listChatSessions(input?: {
+		query?: string;
+		archived?: boolean;
+		limit?: number;
+	}): Promise<ListChatSessionsOutput>;
+	updateChatSession(sessionId: string, title: string): Promise<UpdateChatSessionOutput>;
+	setChatSessionArchived(
+		sessionId: string,
+		archived: boolean,
+	): Promise<SetChatSessionArchivedOutput>;
+	deleteChatSession(sessionId: string): Promise<DeleteChatSessionOutput>;
 	sendChatMessage(input: { sessionId: string; content: string }): Promise<ChatSendAcceptedOutput>;
 	cancelChatRun(runId: string, reason?: string): Promise<CancelChatRunOutput>;
 	subscribeChatEvents(listener: (event: ChatRunEvent) => void): () => void;
@@ -73,9 +98,28 @@ export function createRpcChatTransport(client: RpcChatClient): ChatTransport {
 					schemaVersion: 1,
 					baseUrl: input.endpoint,
 					model: input.model,
-					apiKey: input.apiKey,
+					...(input.apiKey === undefined ? {} : { apiKey: input.apiKey }),
 				}),
 			);
+			return providerStatus;
+		},
+		async testProvider(
+			input: ChatProviderConfiguration,
+		): Promise<ChatProviderConnectionTestResult> {
+			const result = await client.testChatProvider({
+				schemaVersion: 1,
+				baseUrl: input.endpoint,
+				model: input.model,
+				...(input.apiKey === undefined ? {} : { apiKey: input.apiKey }),
+			});
+			return {
+				ok: result.ok,
+				latencyMs: result.latencyMs,
+				...(result.error === undefined ? {} : { errorMessage: result.error.safeMessage }),
+			};
+		},
+		async deleteProvider() {
+			providerStatus = mapProviderStatus(await client.deleteChatProvider());
 			return providerStatus;
 		},
 		async createSession() {
@@ -83,6 +127,8 @@ export function createRpcChatTransport(client: RpcChatClient): ChatTransport {
 			const status = providerStatus ?? mapProviderStatus(await client.getChatProviderStatus());
 			return {
 				id: session.id,
+				title: session.title,
+				updatedAt: session.updatedAt,
 				model: status.model,
 				askMode: status.askMode,
 				messages: [],
@@ -90,15 +136,18 @@ export function createRpcChatTransport(client: RpcChatClient): ChatTransport {
 		},
 		async getSession(sessionId: string) {
 			const snapshot = await client.getChatSession(sessionId);
-			const fallbackStatus =
-				providerStatus ?? mapProviderStatus(await client.getChatProviderStatus());
 			const activeRun = snapshot.runs.find(
 				(run) => run.status === "queued" || run.status === "running" || run.status === "cancelling",
 			);
 			const latestRun = snapshot.runs[0];
 			const session: ChatSession = {
 				id: snapshot.session.id,
-				model: latestRun?.provider.model ?? fallbackStatus.model,
+				title: snapshot.session.title,
+				updatedAt: snapshot.session.updatedAt,
+				...(snapshot.session.archivedAt === undefined
+					? {}
+					: { archivedAt: snapshot.session.archivedAt }),
+				model: latestRun?.provider.model ?? providerStatus?.model ?? "",
 				askMode: "Ask",
 				messages: snapshot.messages.map(mapMessage),
 				eventCursors: Object.fromEntries(
@@ -118,6 +167,21 @@ export function createRpcChatTransport(client: RpcChatClient): ChatTransport {
 			}
 
 			return session;
+		},
+		async listSessions(input = {}) {
+			const output = await client.listChatSessions(input);
+			return output.items.map(mapSessionSummary);
+		},
+		async renameSession(sessionId: string, title: string) {
+			const output = await client.updateChatSession(sessionId, title);
+			return mapSessionSummary(output.session);
+		},
+		async setSessionArchived(sessionId: string, archived: boolean) {
+			const output = await client.setChatSessionArchived(sessionId, archived);
+			return mapSessionSummary(output.session);
+		},
+		async deleteSession(sessionId: string) {
+			await client.deleteChatSession(sessionId);
 		},
 		async send(input: { sessionId: string; message: string }) {
 			const accepted = await client.sendChatMessage({
@@ -153,6 +217,18 @@ function mapProviderStatus(status: ContractChatProviderStatus): ChatProviderStat
 		endpoint: status.baseUrl,
 		model: status.model,
 		askMode: "Ask",
+		...(status.apiKeyMask === undefined ? {} : { apiKeyMask: status.apiKeyMask }),
+	};
+}
+
+function mapSessionSummary(session: ListChatSessionsOutput["items"][number]): ChatSessionSummary {
+	return {
+		id: session.id,
+		title: session.title,
+		createdAt: session.createdAt,
+		updatedAt: session.updatedAt,
+		...(session.lastMessageAt === undefined ? {} : { lastMessageAt: session.lastMessageAt }),
+		...(session.archivedAt === undefined ? {} : { archivedAt: session.archivedAt }),
 	};
 }
 
