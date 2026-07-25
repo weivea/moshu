@@ -1,0 +1,10 @@
+node_modules/
+build/
+dist/
+artifacts/
+coverage/
+*.tsbuildinfo
+*.db
+*.db-shm
+*.db-wal
+.DS_Store

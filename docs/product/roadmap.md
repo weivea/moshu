@@ -301,7 +301,7 @@
 
 | 事项 | 最晚决策点 |
 | --- | --- |
-| 产品正式名称、品牌和开源许可证 | 阶段 1 |
+| 品牌视觉和第三方 NOTICE 策略（正式名称“墨枢”、MIT 许可证已确定） | 阶段 1 |
 | `BunSqliteSaver` Schema、迁移和 LangGraph 升级策略 | 阶段 0 |
 | Electrobun 版本、实际 packaged runtime 和跨 runtime 升级策略 | 阶段 0 |
 | in-process/sidecar 隔离 ADR；默认 in-process，只有实测触发才实施 sidecar | 阶段 0 |

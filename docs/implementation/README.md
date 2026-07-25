@@ -1,4 +1,4 @@
-# Agent Desktop 实施计划
+# 墨枢实施计划
 
 > 文档版本：v0.1  
 > 对应产品需求：[`docs/product`](../product/README.md)  
@@ -103,7 +103,7 @@ Electrobun `1.18.1` 的 launcher 会启动包内 Bun，并由框架创建 applic
 | DG-04 Action Broker | 路径、命令、审批和幂等契约冻结 |
 | DG-05 Release | Electrobun 签名/公证、自解压产物、Updater 完整性和回滚路径确定 |
 | DG-06 Search | Phase 1 首个 BYOK Web Search Provider 确定 |
-| DG-07 License | 产品名、开源许可证、第三方 NOTICE 策略确定 |
+| DG-07 License | 产品名“墨枢”和 MIT 开源许可证已确定；第三方 NOTICE 策略待确定 |
 | DG-08 Security gaps | Keychain、Canvas 子资源断网、RPC capability 校验、桌面 E2E 和 crash diagnostics 均有可执行方案 |
 | DG-09 Isolation | 根据 event-loop、崩溃、内存/CPU 和生命周期实测确认保持 in-process；若改用 sidecar，单独完成协议、监管、签名和恢复 ADR |
 

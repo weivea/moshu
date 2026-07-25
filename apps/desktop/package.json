@@ -1,0 +1,40 @@
+{
+	"name": "@moshu/desktop",
+	"version": "0.0.1",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"dev": "bun run build:web && electrobun dev --watch",
+		"dev:hmr": "concurrently --kill-others-on-fail \"bun run hmr\" \"bun run dev\"",
+		"hmr": "vite --port 5173",
+		"build:web": "vite build",
+		"package:canary": "bun run build:web && electrobun build --env=canary",
+		"typecheck": "tsc --noEmit -p tsconfig.bun.json && tsc --noEmit -p tsconfig.web.json && tsc --noEmit -p tsconfig.config.json",
+		"test": "vitest run"
+	},
+	"dependencies": {
+		"@moshu/agent-runtime": "workspace:*",
+		"@moshu/contracts": "workspace:*",
+		"@moshu/ui": "workspace:*",
+		"@heroui/react": "3.2.2",
+		"@heroui/styles": "3.2.2",
+		"electrobun": "1.18.1",
+		"react": "19.2.7",
+		"react-dom": "19.2.7",
+		"react-router-dom": "7.18.1"
+	},
+	"devDependencies": {
+		"@tailwindcss/vite": "4.3.3",
+		"@testing-library/jest-dom": "6.9.1",
+		"@testing-library/react": "16.3.2",
+		"@types/react": "19.2.17",
+		"@types/react-dom": "19.2.3",
+		"@types/three": "0.165.0",
+		"@vitejs/plugin-react": "4.7.0",
+		"concurrently": "10.0.3",
+		"jsdom": "26.1.0",
+		"tailwindcss": "4.3.3",
+		"vite": "6.4.3",
+		"vitest": "3.2.7"
+	}
+}

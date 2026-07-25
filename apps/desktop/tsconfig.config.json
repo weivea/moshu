@@ -1,0 +1,9 @@
+{
+	"extends": "../../tsconfig.base.json",
+	"compilerOptions": {
+		"exactOptionalPropertyTypes": false,
+		"lib": ["ES2023", "DOM", "WebWorker"],
+		"types": ["bun"]
+	},
+	"include": ["electrobun.config.ts", "vite.config.ts", "vitest.config.ts"]
+}
