@@ -1,0 +1,11 @@
+{
+	"name": "@moshu/executor",
+	"version": "0.0.1",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"build:binary": "bun run ../../scripts/build-companion-binary.ts executor",
+		"typecheck": "tsc --noEmit -p tsconfig.json",
+		"test": "bun test"
+	}
+}

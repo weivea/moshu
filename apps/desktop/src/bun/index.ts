@@ -2,9 +2,11 @@ import { BunSqliteSaver, createAskChatRuntime } from "@moshu/agent-runtime";
 import { openAppDatabase } from "@moshu/database";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { BrowserWindow, Updater, Utils } from "electrobun/bun";
+import Electrobun, { BrowserWindow, Updater, Utils } from "electrobun/bun";
 import { logChatRpcDiagnostic } from "../shared/chat-rpc-diagnostics";
 import { DesktopChatService } from "./chat-service";
+import { startCompanionPocIfEnabled } from "./companion-poc";
+import { createDesktopShutdownCoordinator } from "./desktop-lifecycle";
 import { FileAskProviderConfigStore } from "./file-provider-config-store";
 import { createDesktopRpc } from "./rpc";
 
@@ -51,6 +53,43 @@ const unsubscribeChatEvents = chatService.subscribe((event) => {
 	desktopRpc.send.chatEvent(event);
 });
 
+let shutdownStarted = false;
+let companionSupervisor: Awaited<ReturnType<typeof startCompanionPocIfEnabled>>;
+let companionStartupPromise: ReturnType<typeof startCompanionPocIfEnabled> =
+	Promise.resolve(undefined);
+const shutdownCoordinator = createDesktopShutdownCoordinator({
+	async cleanup() {
+		shutdownStarted = true;
+		unsubscribeChatEvents();
+		try {
+			await chatService.shutdown();
+		} finally {
+			try {
+				try {
+					await companionSupervisor?.shutdown();
+				} finally {
+					await companionStartupPromise;
+				}
+			} finally {
+				try {
+					checkpointSaver.close();
+				} finally {
+					database.close();
+				}
+			}
+		}
+	},
+	quit() {
+		Utils.quit();
+	},
+	reportError(error) {
+		console.error("Failed to shut down the desktop runtime cleanly.", error);
+	},
+});
+Electrobun.events.on("before-quit", (event) => {
+	shutdownCoordinator.handleBeforeQuit(event);
+});
+
 const mainWindow = new BrowserWindow({
 	title: "墨枢",
 	url: await getMainViewUrl(),
@@ -63,33 +102,23 @@ const mainWindow = new BrowserWindow({
 	},
 });
 
-let shutdownPromise: Promise<void> | undefined;
-
-function shutdown(): Promise<void> {
-	if (shutdownPromise !== undefined) {
-		return shutdownPromise;
-	}
-
-	shutdownPromise = (async () => {
-		unsubscribeChatEvents();
-		try {
-			await chatService.shutdown();
-		} finally {
-			try {
-				checkpointSaver.close();
-			} finally {
-				database.close();
-			}
-		}
-	})();
-	return shutdownPromise;
-}
-
 mainWindow.on("close", () => {
 	console.info("墨枢 main window closed.");
-	void shutdown().catch((error: unknown) => {
-		console.error("Failed to shut down the chat runtime cleanly.", error);
-	});
+	shutdownCoordinator.handleWindowClose();
+});
+
+companionStartupPromise = startCompanionPocIfEnabled({
+	onSupervisorCreated(supervisor) {
+		companionSupervisor = supervisor;
+		if (shutdownStarted) {
+			void supervisor.shutdown().catch((error: unknown) => {
+				console.error("Failed to cancel companion startup during desktop shutdown.", error);
+			});
+		}
+	},
+}).catch((error: unknown) => {
+	console.error("Companion POC failed to start; continuing with desktop Chat only.", error);
+	return undefined;
 });
 
 console.info(`墨枢 started with Bun ${Bun.version}.`);

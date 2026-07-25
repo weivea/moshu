@@ -13,16 +13,22 @@
 	],
 	"scripts": {
 		"dev": "bun run --cwd apps/desktop dev",
+		"dev:companions": "bun run --cwd apps/desktop dev:companions",
 		"dev:hmr": "bun run --cwd apps/desktop dev:hmr",
 		"build": "bun run --cwd apps/desktop build:web",
+		"build:companions": "bun run --cwd apps/agents-server build:binary && bun run --cwd apps/executor build:binary",
 		"package:canary": "bun run --cwd apps/desktop package:canary",
+		"package:poc": "bun run --cwd apps/desktop package:poc",
+		"smoke:companions": "bun run build:companions && bun run ./scripts/smoke-companions.ts",
+		"smoke:parent-death": "bun run build:companions && bun run ./scripts/smoke-companion-parent-death.ts",
 		"format": "biome format --write .",
 		"format:check": "biome format .",
 		"lint": "biome lint .",
 		"typecheck": "bun run --cwd packages/deepagents build:types && bun run --filter '@moshu/*' typecheck",
 		"test:unit": "bun test packages",
+		"test:companions": "bun test apps/agents-server apps/executor",
 		"test:web": "bun run --cwd apps/desktop test",
-		"test": "bun run test:unit && bun run test:web",
+		"test": "bun run test:unit && bun run test:companions && bun run test:web",
 		"check": "bun run format:check && bun run lint && bun run typecheck && bun run test"
 	},
 	"devDependencies": {
