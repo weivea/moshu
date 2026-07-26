@@ -215,7 +215,8 @@ Project Chat 属于一个 Project。Project 指向一个本地文件夹，可以
 
 ### 9.2 中断与恢复
 
-- 应用退出前不要求等待所有 Run 完成；应保存最后检查点。
+- 关闭页面或窗口不自动停止 Run；只要 desktop client 仍运行，任务可在 agents server/executor 中继续。
+- 用户退出应用时，client 先停止接受新 Run，再协作式要求 agents server 保存检查点、executor 取消/清理 invocation 和进程树；不留下孤儿 companion。
 - 再次打开后，Session 显示“可继续”“需确认状态”或“不可恢复”。
 - 恢复前展示已完成动作、待审批动作和下一步。
 - 对执行结果不确定的副作用操作，不得自动重放；要求用户确认或重新检查外部状态。
@@ -236,6 +237,7 @@ Project Chat 属于一个 Project。Project 指向一个本地文件夹，可以
 - 达到上限的新 Run 进入 FIFO 队列；用户可调整优先级或取消。
 - 同一 Session 同一时刻只允许一个产生副作用的 Run，避免文件竞态。
 - 同一 Project 的多个 Run 可并行，但检测到操作同一文件时必须串行或提示冲突。
+- 当前 desktop 的多个 Agent 可绑定同一个 local Executor；Executor offline 时相关 Agent 不能启动新 Run。
 
 ### 10.2 后台任务
 
@@ -249,21 +251,22 @@ Project Chat 属于一个 Project。Project 指向一个本地文件夹，可以
 展示：
 
 - 运行中、排队、待审批、失败和已完成任务。
-- Session、Project、Agent、模型、开始时间、耗时和费用。
+- Session、Project、Agent、Executor、模型、开始时间、耗时和费用。
 - 暂停/停止、恢复、打开会话和查看错误。
+- Executor syncing/online/offline、inventory fresh/stale、重连状态和“当前无法启动新 Run”的原因。
 
 ## 11. Deep Agents 运行时映射
 
 | Deep Agents 能力 | 产品表现 |
 | --- | --- |
 | todo middleware | 可视化计划与待办进度 |
-| filesystem backend | 项目文件和会话工作区 |
+| filesystem backend | agents server 形成 Action，executor 在 grant 校验后访问项目文件和会话工作区 |
 | synchronous subagents | Run 内委派卡片和分支轨迹 |
 | asynchronous subagents | 后台子任务卡片，可查看、更新或取消 |
 | summarization | “已压缩上下文”事件及压缩前后 Token 摘要 |
-| checkpointer | Session/Run 中断恢复 |
-| human-in-the-loop | 审批卡和继续执行 |
-| Skills/Memory | Agent 能力和按需上下文 |
+| checkpointer | agents server 持久化 Session/Run 中断恢复 |
+| human-in-the-loop | agents server 持久化审批，client 展示，executor 只执行一次性 grant |
+| Skills/Memory | Agent 保存 assigned executor stable ref；server 按 version/hash 获取 Skill metadata/`SKILL.md`，executor 管理 immutable content/resources/scripts |
 | event streaming | 消息、工具、子 Agent 和状态的实时 UI |
 
 ## 12. 文件变更与 Git
