@@ -1,7 +1,9 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, test, vi } from "vitest";
 
+import { ChatSessionNotFoundError } from "../../../../shared/rpc-errors";
 import { I18nProvider } from "../i18n";
+import { isRendererSessionRetired } from "./session-recovery-coordinator";
 import { SessionSidebar } from "./session-sidebar";
 import type {
 	ChatProviderConfiguration,
@@ -16,6 +18,9 @@ beforeEach(() => {
 		configurable: true,
 		value: "en-US",
 	});
+	sessionStorage.clear();
+	localStorage.clear();
+	window.history.replaceState(null, "");
 	vi.restoreAllMocks();
 });
 
@@ -45,6 +50,11 @@ describe("SessionSidebar", () => {
 			selectedSessionId: "session-1",
 			onNewSession,
 		});
+		localStorage.setItem("moshu.lastChatSessionId", "session-1");
+		window.history.replaceState(
+			{ usr: { hydratedSession: { id: "session-1", title: "stale transcript" } } },
+			"",
+		);
 
 		const initialItem = (await screen.findByText("Architecture notes")).closest("li");
 		if (initialItem === null) {
@@ -95,6 +105,9 @@ describe("SessionSidebar", () => {
 		fireEvent.click(within(confirmedDialog).getByRole("button", { name: "Delete" }));
 		await waitFor(() => expect(screen.queryByText("System design")).not.toBeInTheDocument());
 		expect(transport.deletedSessionIds).toEqual(["session-1"]);
+		expect(isRendererSessionRetired("session-1")).toBe(true);
+		expect(localStorage.getItem("moshu.lastChatSessionId")).toBeNull();
+		expect(window.history.state).toEqual({ usr: {} });
 	});
 
 	test("keeps the current selection when a delayed delete completes", async () => {
@@ -138,7 +151,70 @@ describe("SessionSidebar", () => {
 		});
 
 		expect(onNewSession).not.toHaveBeenCalled();
+		expect(isRendererSessionRetired("session-1")).toBe(true);
 	});
+
+	test("treats typed SESSION_NOT_FOUND deletion as conclusive retirement", async () => {
+		const transport = new FakeSessionTransport();
+		vi.spyOn(transport, "deleteSession").mockRejectedValueOnce(new ChatSessionNotFoundError());
+		renderSidebar(transport, { selectedSessionId: "session-1" });
+		const item = (await screen.findByText("Architecture notes")).closest("li");
+		if (item === null) {
+			throw new Error("Session item was not rendered.");
+		}
+		fireEvent.click(within(item).getByLabelText("Chat actions"));
+		fireEvent.click(within(item).getByRole("button", { name: "Delete" }));
+		const dialog = await screen.findByRole("alertdialog");
+		fireEvent.click(within(dialog).getByRole("button", { name: "Delete" }));
+
+		await waitFor(() => expect(screen.queryByText("Architecture notes")).not.toBeInTheDocument());
+		expect(isRendererSessionRetired("session-1")).toBe(true);
+		expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+	});
+
+	test.each(["rename", "archive"] as const)(
+		"globally retires only the missing Session after a typed %s failure",
+		async (operation) => {
+			const transport = new FakeSessionTransport();
+			const onNewSession = vi.fn();
+			if (operation === "rename") {
+				vi.spyOn(transport, "renameSession").mockRejectedValueOnce(new ChatSessionNotFoundError());
+			} else {
+				vi.spyOn(transport, "setSessionArchived").mockRejectedValueOnce(
+					new ChatSessionNotFoundError(),
+				);
+			}
+			localStorage.setItem("moshu.lastChatSessionId", "session-2");
+			window.history.replaceState(
+				{ usr: { hydratedSession: { id: "session-2", title: "keep" } } },
+				"",
+			);
+			renderSidebar(transport, {
+				selectedSessionId: "session-2",
+				onNewSession,
+			});
+			const item = (await screen.findByText("Architecture notes")).closest("li");
+			if (item === null) {
+				throw new Error("Session item was not rendered.");
+			}
+			fireEvent.click(within(item).getByLabelText("Chat actions"));
+			if (operation === "rename") {
+				fireEvent.click(within(item).getByRole("button", { name: "Rename" }));
+				fireEvent.click(screen.getByRole("button", { name: "Save" }));
+			} else {
+				fireEvent.click(within(item).getByRole("button", { name: "Archive" }));
+			}
+
+			await waitFor(() => expect(screen.queryByText("Architecture notes")).not.toBeInTheDocument());
+			expect(isRendererSessionRetired("session-1")).toBe(true);
+			expect(isRendererSessionRetired("session-2")).toBe(false);
+			expect(screen.getByText("Launch plan")).toBeVisible();
+			expect(localStorage.getItem("moshu.lastChatSessionId")).toBe("session-2");
+			expect(window.history.state.usr.hydratedSession.id).toBe("session-2");
+			expect(onNewSession).not.toHaveBeenCalled();
+			expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+		},
+	);
 });
 
 function renderSidebar(

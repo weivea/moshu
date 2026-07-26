@@ -5,7 +5,15 @@
 	"type": "module",
 	"scripts": {
 		"build:binary": "bun run ../../scripts/build-companion-binary.ts agents-server",
+		"build:smoke-binary": "bun run ../../scripts/build-companion-binary.ts agents-server smoke",
 		"typecheck": "tsc --noEmit -p tsconfig.json",
 		"test": "bun test"
+	},
+	"dependencies": {
+		"@moshu/agent-runtime": "workspace:*",
+		"@moshu/contracts": "workspace:*",
+		"@moshu/database": "workspace:*",
+		"@moshu/process-rpc": "workspace:*",
+		"zod": "4.4.3"
 	}
 }

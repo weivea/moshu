@@ -1,7 +1,7 @@
-import { ChatOpenAI } from "@langchain/openai";
-import { AIMessage, AIMessageChunk, BaseMessage, HumanMessage } from "@langchain/core/messages";
 import type { BaseLanguageModel } from "@langchain/core/language_models/base";
+import { AIMessage, AIMessageChunk, BaseMessage, HumanMessage } from "@langchain/core/messages";
 import type { BaseCheckpointSaver } from "@langchain/langgraph-checkpoint";
+import { ChatOpenAI } from "@langchain/openai";
 import { createDeepAgent } from "@moshu/deepagents/browser";
 import { createMiddleware } from "langchain";
 import type { AskProviderConfigStore, AskProviderConfiguration } from "./ask-provider-config";
@@ -78,7 +78,7 @@ export interface AskChatRuntime {
 	stream(input: AskChatRunInput): AskChatRunStream;
 	cancel(runId: string, reason?: string): boolean;
 	getThreadMessages(threadId: string): Promise<AskChatMessage[]>;
-	deleteThread(threadId: string): Promise<void>;
+	deleteThread(threadId: string, signal?: AbortSignal): Promise<void>;
 	shutdown(): Promise<void>;
 }
 
@@ -87,6 +87,8 @@ export interface AskChatRuntimeOptions {
 	checkpointer?: BaseCheckpointSaver;
 	agentFactory?: AskAgentFactory;
 	modelFactory?: AskModelFactory;
+	threadCleanupWaitTimeoutMs?: number;
+	shutdownCleanupTimeoutMs?: number;
 }
 
 export type AskChatErrorKind =
@@ -97,7 +99,10 @@ export type AskChatErrorKind =
 	| "provider_rate_limited"
 	| "provider_network"
 	| "provider_model"
-	| "provider_failure";
+	| "provider_failure"
+	| "thread_busy"
+	| "runtime_shutdown"
+	| "shutdown_timeout";
 
 export class AskChatRuntimeError extends Error {
 	readonly kind: AskChatErrorKind;
@@ -149,10 +154,23 @@ export class DeepAgentsAskChatRuntime implements AskChatRuntime {
 	readonly #agentFactory: AskAgentFactory;
 	readonly #checkpointer: BaseCheckpointSaver | undefined;
 	readonly #activeRuns = new Map<string, ActiveRun>();
+	readonly #threadFences = new Map<string, Promise<void>>();
+	readonly #threadCleanupWaitTimeoutMs: number;
+	readonly #shutdownCleanupTimeoutMs: number;
+	#shutdownExecution: Promise<void> | undefined;
+	#shuttingDown = false;
 
 	constructor(options: AskChatRuntimeOptions) {
 		this.#providerConfigStore = options.providerConfigStore;
 		this.#checkpointer = options.checkpointer;
+		this.#threadCleanupWaitTimeoutMs = requirePositiveSafeInteger(
+			options.threadCleanupWaitTimeoutMs ?? 5_000,
+			"threadCleanupWaitTimeoutMs",
+		);
+		this.#shutdownCleanupTimeoutMs = requirePositiveSafeInteger(
+			options.shutdownCleanupTimeoutMs ?? 1_000,
+			"shutdownCleanupTimeoutMs",
+		);
 		this.#agentFactory =
 			options.agentFactory ??
 			((configuration) =>
@@ -204,8 +222,24 @@ export class DeepAgentsAskChatRuntime implements AskChatRuntime {
 		return true;
 	}
 
-	async deleteThread(threadId: string): Promise<void> {
-		await this.#checkpointer?.deleteThread(createCheckpointThreadId(threadId));
+	async deleteThread(threadId: string, signal?: AbortSignal): Promise<void> {
+		this.#assertAcceptingWork();
+		const fence = this.#createThreadFence(threadId);
+		let operation: Promise<void> | undefined;
+		try {
+			await this.#waitForThreadFence(fence.previous, undefined, signal);
+			signal?.throwIfAborted();
+			operation = Promise.resolve().then(() =>
+				this.#checkpointer?.deleteThread(createCheckpointThreadId(threadId)),
+			);
+			fence.settleAfter(operation);
+			await waitForOperationOrAbort(operation, signal);
+			signal?.throwIfAborted();
+		} finally {
+			if (operation === undefined) {
+				fence.settleAfter(Promise.resolve());
+			}
+		}
 	}
 
 	async getThreadMessages(threadId: string): Promise<AskChatMessage[]> {
@@ -239,16 +273,37 @@ export class DeepAgentsAskChatRuntime implements AskChatRuntime {
 	}
 
 	async shutdown(): Promise<void> {
+		if (this.#shutdownExecution !== undefined) {
+			return this.#shutdownExecution;
+		}
+		this.#shuttingDown = true;
+		const execution = this.#performShutdown();
+		this.#shutdownExecution = execution;
+		return execution;
+	}
+
+	async #performShutdown(): Promise<void> {
 		const activeRuns = [...this.#activeRuns.values()];
 
 		for (const activeRun of activeRuns) {
 			activeRun.controller.abort(new AskChatCancelledError(activeRun.runId));
 		}
 
-		await Promise.allSettled(activeRuns.map((activeRun) => activeRun.result));
+		const cleanup = Promise.allSettled([
+			...activeRuns.map((activeRun) => activeRun.result),
+			...this.#threadFences.values(),
+		]);
+		if (!(await settlesWithin(cleanup, this.#shutdownCleanupTimeoutMs))) {
+			throw new AskChatRuntimeError({
+				kind: "shutdown_timeout",
+				message: "Ask chat runtime cleanup exceeded its shutdown deadline.",
+				retryable: false,
+			});
+		}
 	}
 
 	#startRun(input: AskChatRunInput, onEvent: DeltaEventHandler | undefined): ActiveRun {
+		this.#assertAcceptingWork();
 		if (this.#activeRuns.has(input.runId)) {
 			throw new AskChatRuntimeError({
 				kind: "duplicate_run_id",
@@ -260,10 +315,19 @@ export class DeepAgentsAskChatRuntime implements AskChatRuntime {
 
 		const controller = new AbortController();
 		const detachAbortRelay = relayAbortSignal(input.signal, controller, input.runId);
-
-		const result = this.#executeRun(input, controller.signal, onEvent).finally(() => {
+		const threadId = input.threadId ?? input.runId;
+		const fence = this.#createThreadFence(threadId);
+		const cleanupOperations: Promise<void>[] = [];
+		const registerCleanup = (cleanup: Promise<void>): void => {
+			cleanupOperations.push(cleanup.then(noop, noop));
+		};
+		const result = (async () => {
+			await this.#waitForThreadFence(fence.previous, input.runId, controller.signal);
+			return this.#executeRun(input, controller.signal, onEvent, registerCleanup);
+		})().finally(() => {
 			detachAbortRelay();
 			this.#activeRuns.delete(input.runId);
+			fence.settleAfter(Promise.allSettled(cleanupOperations).then(noop));
 		});
 
 		const activeRun: ActiveRun = {
@@ -276,10 +340,79 @@ export class DeepAgentsAskChatRuntime implements AskChatRuntime {
 		return activeRun;
 	}
 
+	#assertAcceptingWork(): void {
+		if (!this.#shuttingDown) {
+			return;
+		}
+		throw new AskChatRuntimeError({
+			kind: "runtime_shutdown",
+			message: "Ask chat runtime is shutting down.",
+			retryable: false,
+		});
+	}
+
+	#createThreadFence(threadId: string): {
+		previous: Promise<void> | undefined;
+		settleAfter(operation: Promise<unknown>): void;
+	} {
+		const previous = this.#threadFences.get(threadId);
+		let settle: (() => void) | undefined;
+		const completion = new Promise<void>((resolve) => {
+			settle = resolve;
+		});
+		const fence = (previous ?? Promise.resolve()).then(() => completion);
+		this.#threadFences.set(threadId, fence);
+		void fence.then(() => {
+			if (this.#threadFences.get(threadId) === fence) {
+				this.#threadFences.delete(threadId);
+			}
+		});
+		let settlementRegistered = false;
+		return {
+			previous,
+			settleAfter(operation) {
+				if (settlementRegistered) {
+					return;
+				}
+				settlementRegistered = true;
+				void operation.then(
+					() => settle?.(),
+					() => settle?.(),
+				);
+			},
+		};
+	}
+
+	#waitForThreadFence(
+		fence: Promise<void> | undefined,
+		runId?: string,
+		signal?: AbortSignal,
+	): Promise<void> {
+		if (fence === undefined) {
+			signal?.throwIfAborted();
+			return Promise.resolve();
+		}
+		return waitForFence(fence, this.#threadCleanupWaitTimeoutMs, signal, () =>
+			runId === undefined
+				? new AskChatRuntimeError({
+						kind: "thread_busy",
+						message: "The ask chat thread is still finishing previous provider cleanup.",
+						retryable: true,
+					})
+				: new AskChatRuntimeError({
+						kind: "thread_busy",
+						message: "The ask chat thread is still finishing previous provider cleanup.",
+						retryable: true,
+						runId,
+					}),
+		);
+	}
+
 	async #executeRun(
 		input: AskChatRunInput,
 		signal: AbortSignal,
 		onEvent: DeltaEventHandler | undefined,
+		registerCleanup: IteratorCleanupRegistrar,
 	): Promise<AskChatRunResult> {
 		try {
 			throwIfCancelled(signal, input.runId);
@@ -294,19 +427,31 @@ export class DeepAgentsAskChatRuntime implements AskChatRuntime {
 				});
 			}
 
-			const agent = await this.#agentFactory(providerConfiguration);
+			const agent = await waitForAbortable(
+				this.#agentFactory(providerConfiguration),
+				signal,
+				input.runId,
+			);
 			const messageHistory = toLangChainMessages(input.messages);
-			const stream = await agent.stream(
-				{ messages: messageHistory },
-				{
-					streamMode: "messages",
-					signal,
-					configurable: {
-						thread_id: createCheckpointThreadId(input.threadId ?? input.runId),
-						checkpoint_ns: "",
-						run_id: input.runId,
+			const streamAcquisition = Promise.resolve().then(() =>
+				agent.stream(
+					{ messages: messageHistory },
+					{
+						streamMode: "messages",
+						signal,
+						configurable: {
+							thread_id: createCheckpointThreadId(input.threadId ?? input.runId),
+							checkpoint_ns: "",
+							run_id: input.runId,
+						},
 					},
-				},
+				),
+			);
+			const stream = await acquireProviderStream(
+				streamAcquisition,
+				signal,
+				input.runId,
+				registerCleanup,
 			);
 
 			const state: StreamAggregationState = {
@@ -314,9 +459,15 @@ export class DeepAgentsAskChatRuntime implements AskChatRuntime {
 				usage: undefined,
 			};
 
-			for await (const streamItem of stream) {
+			for await (const streamItem of iterateWithAbort(
+				stream,
+				signal,
+				input.runId,
+				registerCleanup,
+			)) {
 				throwIfCancelled(signal, input.runId);
-				await consumeStreamItem(streamItem, state, input.runId, onEvent);
+				await consumeStreamItem(streamItem, state, input.runId, signal, onEvent, registerCleanup);
+				throwIfCancelled(signal, input.runId);
 			}
 
 			throwIfCancelled(signal, input.runId);
@@ -406,16 +557,21 @@ async function consumeStreamItem(
 	streamItem: unknown,
 	state: StreamAggregationState,
 	runId: string,
+	signal: AbortSignal,
 	onEvent: DeltaEventHandler | undefined,
+	registerCleanup: IteratorCleanupRegistrar,
 ): Promise<void> {
 	const payload = unwrapStreamPayload(streamItem);
 
 	if (hasTextStream(payload)) {
-		for await (const delta of payload.text) {
-			await emitDelta(state, runId, delta, onEvent);
+		throwIfCancelled(signal, runId);
+		for await (const delta of iterateWithAbort(payload.text, signal, runId, registerCleanup)) {
+			throwIfCancelled(signal, runId);
+			await emitDelta(state, runId, delta, signal, onEvent);
+			throwIfCancelled(signal, runId);
 		}
 
-		const usage = await resolveUsageStream(payload);
+		const usage = await resolveUsageStream(payload, signal, runId);
 		if (usage !== undefined) {
 			state.usage = usage;
 		}
@@ -432,7 +588,7 @@ async function consumeStreamItem(
 			state.usage = usage;
 		}
 
-		await emitDelta(state, runId, extractTextDelta(payload.content, state.text), onEvent);
+		await emitDelta(state, runId, extractTextDelta(payload.content, state.text), signal, onEvent);
 	}
 }
 
@@ -440,8 +596,10 @@ async function emitDelta(
 	state: StreamAggregationState,
 	runId: string,
 	delta: string,
+	signal: AbortSignal,
 	onEvent: DeltaEventHandler | undefined,
 ): Promise<void> {
+	throwIfCancelled(signal, runId);
 	if (delta.length === 0) {
 		return;
 	}
@@ -452,11 +610,16 @@ async function emitDelta(
 		return;
 	}
 
-	await onEvent({
-		type: "message.delta",
+	await waitForAbortable(
+		onEvent({
+			type: "message.delta",
+			runId,
+			delta,
+		}),
+		signal,
 		runId,
-		delta,
-	});
+	);
+	throwIfCancelled(signal, runId);
 }
 
 function unwrapStreamPayload(streamItem: unknown): unknown {
@@ -556,14 +719,18 @@ function hasTextStream(value: unknown): value is {
 	return isAsyncIterable(value.text);
 }
 
-async function resolveUsageStream(value: {
-	usage?: PromiseLike<unknown>;
-}): Promise<AskChatUsage | undefined> {
+async function resolveUsageStream(
+	value: {
+		usage?: PromiseLike<unknown>;
+	},
+	signal: AbortSignal,
+	runId: string,
+): Promise<AskChatUsage | undefined> {
 	if (value.usage === undefined) {
 		return undefined;
 	}
 
-	return normalizeUsage(await value.usage);
+	return normalizeUsage(await waitForAbortable(value.usage, signal, runId));
 }
 
 function isAsyncIterable(value: unknown): value is AsyncIterable<string> {
@@ -589,6 +756,201 @@ function throwIfCancelled(signal: AbortSignal, runId: string): void {
 	}
 
 	throw new AskChatCancelledError(runId, getAbortReason(reason));
+}
+
+async function* iterateWithAbort<T>(
+	iterable: AsyncIterable<T>,
+	signal: AbortSignal,
+	runId: string,
+	registerCleanup: IteratorCleanupRegistrar,
+): AsyncGenerator<T> {
+	const iterator = iterable[Symbol.asyncIterator]();
+	let completed = false;
+	try {
+		while (true) {
+			throwIfCancelled(signal, runId);
+			const next = await waitForAbortable(iterator.next(), signal, runId);
+			throwIfCancelled(signal, runId);
+			if (next.done) {
+				completed = true;
+				return;
+			}
+			yield next.value;
+			throwIfCancelled(signal, runId);
+		}
+	} finally {
+		if (!completed && typeof iterator.return === "function") {
+			const close = Promise.resolve()
+				.then(() => iterator.return?.())
+				.then(noop);
+			registerCleanup(close);
+			if (signal.aborted) {
+				// The per-thread cleanup fence observes detached provider cleanup.
+			} else {
+				try {
+					await close;
+				} catch {
+					// Preserve the original completion reason.
+				}
+			}
+		}
+	}
+}
+
+async function acquireProviderStream(
+	acquisition: Promise<AsyncIterable<unknown>>,
+	signal: AbortSignal,
+	runId: string,
+	registerCleanup: IteratorCleanupRegistrar,
+): Promise<AsyncIterable<unknown>> {
+	let settleDisposition: ((disposition: "consumed" | "abandoned") => void) | undefined;
+	const disposition = new Promise<"consumed" | "abandoned">((resolve) => {
+		settleDisposition = resolve;
+	});
+	const outcome = acquisition.then(
+		(stream) => ({ status: "fulfilled" as const, stream }),
+		(error: unknown) => ({ status: "rejected" as const, error }),
+	);
+	registerCleanup(
+		Promise.all([outcome, disposition]).then(async ([result, streamDisposition]) => {
+			if (streamDisposition !== "abandoned" || result.status !== "fulfilled") {
+				return;
+			}
+			const iterator = result.stream[Symbol.asyncIterator]();
+			if (typeof iterator.return === "function") {
+				await iterator.return();
+			}
+		}),
+	);
+
+	try {
+		const stream = await waitForAbortable(acquisition, signal, runId);
+		settleDisposition?.("consumed");
+		return stream;
+	} catch (error) {
+		settleDisposition?.(signal.aborted ? "abandoned" : "consumed");
+		throw error;
+	}
+}
+
+function waitForFence(
+	fence: Promise<void>,
+	timeoutMs: number,
+	signal: AbortSignal | undefined,
+	createTimeoutError: () => Error,
+): Promise<void> {
+	signal?.throwIfAborted();
+	return new Promise<void>((resolve, reject) => {
+		let settled = false;
+		const finish = (error?: unknown): void => {
+			if (settled) {
+				return;
+			}
+			settled = true;
+			clearTimeout(timer);
+			signal?.removeEventListener("abort", onAbort);
+			if (error === undefined) {
+				resolve();
+			} else {
+				reject(error);
+			}
+		};
+		const onAbort = (): void => finish(signal?.reason ?? new DOMException("Aborted", "AbortError"));
+		const timer = setTimeout(() => finish(createTimeoutError()), timeoutMs);
+		signal?.addEventListener("abort", onAbort, { once: true });
+		void fence.then(
+			() => finish(),
+			(error: unknown) => finish(error),
+		);
+		if (signal?.aborted) {
+			onAbort();
+		}
+	});
+}
+
+function waitForOperationOrAbort<T>(operation: Promise<T>, signal?: AbortSignal): Promise<T> {
+	signal?.throwIfAborted();
+	if (signal === undefined) {
+		return operation;
+	}
+	return new Promise<T>((resolve, reject) => {
+		let settled = false;
+		const finish = (result: { value: T } | { error: unknown }): void => {
+			if (settled) {
+				return;
+			}
+			settled = true;
+			signal.removeEventListener("abort", onAbort);
+			if ("error" in result) {
+				reject(result.error);
+			} else {
+				resolve(result.value);
+			}
+		};
+		const onAbort = (): void =>
+			finish({ error: signal.reason ?? new DOMException("Aborted", "AbortError") });
+		signal.addEventListener("abort", onAbort, { once: true });
+		void operation.then(
+			(value) => finish({ value }),
+			(error: unknown) => finish({ error }),
+		);
+		if (signal.aborted) {
+			onAbort();
+		}
+	});
+}
+
+async function settlesWithin(promise: Promise<unknown>, timeoutMs: number): Promise<boolean> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		return await Promise.race([
+			promise.then(
+				() => true,
+				() => true,
+			),
+			new Promise<false>((resolve) => {
+				timer = setTimeout(() => resolve(false), timeoutMs);
+			}),
+		]);
+	} finally {
+		if (timer !== undefined) {
+			clearTimeout(timer);
+		}
+	}
+}
+
+function requirePositiveSafeInteger(value: number, name: string): number {
+	if (!Number.isSafeInteger(value) || value <= 0) {
+		throw new TypeError(`${name} must be a positive safe integer.`);
+	}
+	return value;
+}
+
+async function waitForAbortable<T>(
+	value: T | PromiseLike<T>,
+	signal: AbortSignal,
+	runId: string,
+): Promise<T> {
+	throwIfCancelled(signal, runId);
+	let rejectCancellation: ((error: AskChatCancelledError) => void) | undefined;
+	const cancellation = new Promise<never>((_resolve, reject) => {
+		rejectCancellation = reject;
+	});
+	const onAbort = (): void => {
+		rejectCancellation?.(
+			signal.reason instanceof AskChatCancelledError
+				? signal.reason
+				: new AskChatCancelledError(runId, getAbortReason(signal.reason)),
+		);
+	};
+	signal.addEventListener("abort", onAbort, { once: true });
+	try {
+		const result = await Promise.race([Promise.resolve(value), cancellation]);
+		throwIfCancelled(signal, runId);
+		return result;
+	} finally {
+		signal.removeEventListener("abort", onAbort);
+	}
 }
 
 function relayAbortSignal(
@@ -773,6 +1135,7 @@ interface StreamAggregationState {
 }
 
 type DeltaEventHandler = ((event: AskChatMessageDeltaEvent) => void | Promise<void>) | undefined;
+type IteratorCleanupRegistrar = (cleanup: Promise<void>) => void;
 
 class AsyncEventQueue<T> implements AsyncIterable<T> {
 	#items: T[] = [];

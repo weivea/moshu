@@ -1,32 +1,28 @@
-export const BOOTSTRAP_CHANNEL = "moshu-companion-bootstrap";
-export const BOOTSTRAP_CONTROL_VERSION = 0;
-export const MAX_CONTROL_RECORD_BYTES = 4096;
+import {
+	type AgentsServerBootstrapRecord,
+	type AgentsServerReadyRecord,
+	agentsServerBootstrapRecordSchema,
+	agentsServerReadyRecordSchema,
+	companionBootstrapChannel,
+	companionControlVersion,
+	maxCompanionControlRecordBytes,
+	parseCompanionControlRecord,
+	serializeCompanionControlRecord,
+} from "@moshu/contracts";
 
-export interface AgentsServerBootstrapRecord {
-	channel: typeof BOOTSTRAP_CHANNEL;
-	controlVersion: typeof BOOTSTRAP_CONTROL_VERSION;
-	type: "START";
-	role: "agents-server";
-	nonce: string;
-}
-
-export interface AgentsServerReadyRecord {
-	channel: typeof BOOTSTRAP_CHANNEL;
-	controlVersion: typeof BOOTSTRAP_CONTROL_VERSION;
-	type: "READY";
-	role: "agents-server";
-	pid: number;
-	processVersion: string;
-	nonce: string;
-	endpoint: {
-		host: "127.0.0.1";
-		port: number;
-	};
-}
+export const BOOTSTRAP_CHANNEL = companionBootstrapChannel;
+export const BOOTSTRAP_CONTROL_VERSION = companionControlVersion;
+export const MAX_CONTROL_RECORD_BYTES = maxCompanionControlRecordBytes;
+export type { AgentsServerBootstrapRecord, AgentsServerReadyRecord };
 
 export interface BootstrapControlChannel {
 	input: string;
 	parentClosed: Promise<void>;
+}
+
+interface ByteStreamReader {
+	read(): Promise<{ done: boolean; value: Uint8Array | undefined }>;
+	releaseLock(): void;
 }
 
 export async function openBootstrapControlChannel(
@@ -34,14 +30,12 @@ export async function openBootstrapControlChannel(
 ): Promise<BootstrapControlChannel> {
 	const reader = stream.getReader();
 	const bytes: number[] = [];
-
 	try {
 		while (true) {
 			const result = await reader.read();
 			if (result.done) {
 				throw new Error("Parent control channel closed before the bootstrap record.");
 			}
-
 			for (let index = 0; index < result.value.byteLength; index += 1) {
 				const byte = result.value[index];
 				if (byte === undefined) {
@@ -57,21 +51,7 @@ export async function openBootstrapControlChannel(
 					}
 					return {
 						input: new TextDecoder("utf-8", { fatal: true }).decode(Uint8Array.from(bytes)),
-						parentClosed: (async () => {
-							try {
-								while (true) {
-									const next = await reader.read();
-									if (next.done) {
-										return;
-									}
-									if (next.value.byteLength > 0) {
-										throw new Error("Parent sent unexpected data after bootstrap.");
-									}
-								}
-							} finally {
-								reader.releaseLock();
-							}
-						})(),
+						parentClosed: monitorParentClosure(reader),
 					};
 				}
 			}
@@ -83,67 +63,27 @@ export async function openBootstrapControlChannel(
 }
 
 export function parseAgentsServerBootstrapRecord(input: string): AgentsServerBootstrapRecord {
-	const parsed = parseControlRecord(input);
-	if (
-		parsed.channel !== BOOTSTRAP_CHANNEL ||
-		parsed.controlVersion !== BOOTSTRAP_CONTROL_VERSION ||
-		parsed.type !== "START" ||
-		parsed.role !== "agents-server" ||
-		!isNonce(parsed.nonce)
-	) {
-		throw new Error("Invalid agents-server bootstrap control record.");
-	}
-
-	return {
-		channel: BOOTSTRAP_CHANNEL,
-		controlVersion: BOOTSTRAP_CONTROL_VERSION,
-		type: "START",
-		role: "agents-server",
-		nonce: parsed.nonce,
-	};
+	return parseCompanionControlRecord(input, agentsServerBootstrapRecordSchema, "bootstrap");
 }
 
 export function serializeReadyRecord(record: AgentsServerReadyRecord): string {
-	const serialized = `${JSON.stringify(record)}\n`;
-	if (new TextEncoder().encode(serialized).byteLength > MAX_CONTROL_RECORD_BYTES) {
-		throw new Error("READY control record exceeds the byte limit.");
-	}
-	return serialized;
-}
-
-function parseControlRecord(input: string): Record<string, unknown> {
-	if (new TextEncoder().encode(input).byteLength > MAX_CONTROL_RECORD_BYTES) {
-		throw new Error("Bootstrap control record exceeds the byte limit.");
-	}
-
-	const withoutLineFeed = input.endsWith("\n") ? input.slice(0, -1) : input;
-	const record = withoutLineFeed.endsWith("\r") ? withoutLineFeed.slice(0, -1) : withoutLineFeed;
-	if (record.length === 0 || record.includes("\n") || record.includes("\r")) {
-		throw new Error("Expected exactly one bootstrap control record.");
-	}
-
-	let parsed: unknown;
-	try {
-		parsed = JSON.parse(record);
-	} catch {
-		throw new Error("Bootstrap control record is not valid JSON.");
-	}
-
-	if (!isObject(parsed)) {
-		throw new Error("Bootstrap control record must be an object.");
-	}
-	return parsed;
-}
-
-function isObject(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function isNonce(value: unknown): value is string {
-	return (
-		typeof value === "string" &&
-		value.length >= 8 &&
-		value.length <= 128 &&
-		/^[A-Za-z0-9._-]+$/.test(value)
+	return new TextDecoder().decode(
+		serializeCompanionControlRecord(record, agentsServerReadyRecordSchema),
 	);
+}
+
+async function monitorParentClosure(reader: ByteStreamReader): Promise<void> {
+	try {
+		while (true) {
+			const next = await reader.read();
+			if (next.done) {
+				return;
+			}
+			if ((next.value?.byteLength ?? 0) > 0) {
+				throw new Error("Parent sent unexpected data after bootstrap.");
+			}
+		}
+	} finally {
+		reader.releaseLock();
+	}
 }

@@ -13,6 +13,13 @@
     "apps/agents-server": {
       "name": "@moshu/agents-server",
       "version": "0.0.1",
+      "dependencies": {
+        "@moshu/agent-runtime": "workspace:*",
+        "@moshu/contracts": "workspace:*",
+        "@moshu/database": "workspace:*",
+        "@moshu/process-rpc": "workspace:*",
+        "zod": "4.4.3",
+      },
     },
     "apps/desktop": {
       "name": "@moshu/desktop",
@@ -20,14 +27,14 @@
       "dependencies": {
         "@heroui/react": "3.2.2",
         "@heroui/styles": "3.2.2",
-        "@moshu/agent-runtime": "workspace:*",
         "@moshu/contracts": "workspace:*",
-        "@moshu/database": "workspace:*",
+        "@moshu/process-rpc": "workspace:*",
         "@moshu/ui": "workspace:*",
         "electrobun": "1.18.1",
         "react": "19.2.7",
         "react-dom": "19.2.7",
         "react-router-dom": "7.18.1",
+        "zod": "4.4.3",
       },
       "devDependencies": {
         "@tailwindcss/vite": "4.3.3",
@@ -47,6 +54,10 @@
     "apps/executor": {
       "name": "@moshu/executor",
       "version": "0.0.1",
+      "dependencies": {
+        "@moshu/contracts": "workspace:*",
+        "@moshu/process-rpc": "workspace:*",
+      },
     },
     "packages/action-broker": {
       "name": "@moshu/action-broker",
@@ -336,9 +347,9 @@
 
     "@moshu/domain": ["@moshu/domain@workspace:packages/domain"],
 
-    "@moshu/process-rpc": ["@moshu/process-rpc@workspace:packages/process-rpc"],
-
     "@moshu/executor": ["@moshu/executor@workspace:apps/executor"],
+
+    "@moshu/process-rpc": ["@moshu/process-rpc@workspace:packages/process-rpc"],
 
     "@moshu/ui": ["@moshu/ui@workspace:packages/ui"],
 

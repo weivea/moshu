@@ -115,7 +115,7 @@ function parseProviderConfigDocument(value: unknown): ProviderConfigDocument {
 			provider,
 			apiKey: configuration.apiKey,
 			model: configuration.model,
-			baseUrl: configuration.baseUrl,
+			...(configuration.baseUrl === undefined ? {} : { baseUrl: configuration.baseUrl }),
 		}),
 	};
 }

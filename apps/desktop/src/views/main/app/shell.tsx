@@ -1,7 +1,10 @@
-import { AppIcon, type AppIconName } from "@moshu/ui";
 import { Button } from "@heroui/react";
-import { NavLink, Outlet, useLocation } from "react-router-dom";
-import { useI18n, type MessageKey } from "./i18n";
+import { AppIcon, type AppIconName } from "@moshu/ui";
+import { useCallback } from "react";
+import { NavLink, Outlet, useLocation, useNavigate } from "react-router-dom";
+import { chatTransport } from "./chat/rpc-chat-transport";
+import { ChatSessionRecoveryRoot } from "./chat/session-recovery-coordinator";
+import { type MessageKey, useI18n } from "./i18n";
 import { useAppearance } from "./providers";
 import { RuntimeStatus } from "./runtime-status";
 
@@ -18,53 +21,85 @@ const navigation = [
 	label: MessageKey;
 	icon: AppIconName;
 }[];
+const lastChatSessionStorageKey = "moshu.lastChatSessionId";
 
 export function AppShell() {
 	const { t, toggleLocale } = useI18n();
 	const { toggleTheme } = useAppearance();
-	const { pathname } = useLocation();
+	const location = useLocation();
+	const navigate = useNavigate();
+	const { pathname } = location;
 	const usesWorkspaceLayout =
 		pathname.startsWith("/chat") || pathname === "/chats" || pathname === "/settings/providers";
+	const activeSessionId = readActiveChatSessionId(pathname);
+	const handleActiveSessionRetired = useCallback(
+		(retiredSessionId: string) => {
+			const rememberedSessionId = localStorage.getItem(lastChatSessionStorageKey);
+			navigate("/chat/new", {
+				replace: true,
+				state:
+					rememberedSessionId !== null && rememberedSessionId !== retiredSessionId
+						? { preserveRememberedSession: true }
+						: null,
+			});
+		},
+		[navigate],
+	);
 
 	return (
-		<div className="app-shell">
-			<aside className="sidebar">
-				<header className="brand">
-					<span className="brand__mark">
-						<AppIcon name="agents" size={20} />
-					</span>
-					<div>
-						<strong>{t("app.name")}</strong>
-						<small>{t("app.phase")}</small>
-					</div>
-				</header>
+		<ChatSessionRecoveryRoot
+			activeSessionId={activeSessionId}
+			onActiveSessionRetired={handleActiveSessionRetired}
+			routeKey={`${location.key}:${pathname}`}
+			transport={chatTransport}
+		>
+			<div className="app-shell">
+				<aside className="sidebar">
+					<header className="brand">
+						<span className="brand__mark">
+							<AppIcon name="agents" size={20} />
+						</span>
+						<div>
+							<strong>{t("app.name")}</strong>
+							<small>{t("app.phase")}</small>
+						</div>
+					</header>
 
-				<nav aria-label="Primary">
-					{navigation.map((item) => (
-						<NavLink
-							key={item.to}
-							to={item.to}
-							className={({ isActive }) => (isActive ? "nav-item is-active" : "nav-item")}
-						>
-							<AppIcon name={item.icon} />
-							<span>{t(item.label)}</span>
-						</NavLink>
-					))}
-				</nav>
+					<nav aria-label="Primary">
+						{navigation.map((item) => (
+							<NavLink
+								key={item.to}
+								to={item.to}
+								className={({ isActive }) => (isActive ? "nav-item is-active" : "nav-item")}
+							>
+								<AppIcon name={item.icon} />
+								<span>{t(item.label)}</span>
+							</NavLink>
+						))}
+					</nav>
 
-				<footer className="sidebar__footer">
-					<Button onPress={toggleTheme}>{t("action.toggleTheme")}</Button>
-					<Button onPress={toggleLocale}>{t("action.toggleLanguage")}</Button>
-				</footer>
-			</aside>
+					<footer className="sidebar__footer">
+						<Button onPress={toggleTheme}>{t("action.toggleTheme")}</Button>
+						<Button onPress={toggleLocale}>{t("action.toggleLanguage")}</Button>
+					</footer>
+				</aside>
 
-			<main className={usesWorkspaceLayout ? "content content--workspace" : "content"}>
-				<Outlet />
-			</main>
+				<main className={usesWorkspaceLayout ? "content content--workspace" : "content"}>
+					<Outlet />
+				</main>
 
-			<aside className="inspector">
-				<RuntimeStatus />
-			</aside>
-		</div>
+				<aside className="inspector">
+					<RuntimeStatus />
+				</aside>
+			</div>
+		</ChatSessionRecoveryRoot>
 	);
+}
+
+function readActiveChatSessionId(pathname: string): string | null {
+	const match = /^\/chat\/([^/]+)$/u.exec(pathname);
+	if (match?.[1] === undefined || match[1] === "new") {
+		return null;
+	}
+	return decodeURIComponent(match[1]);
 }

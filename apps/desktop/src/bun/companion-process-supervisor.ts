@@ -1,5 +1,13 @@
-import { randomUUID } from "node:crypto";
-import { dirname, isAbsolute } from "node:path";
+import { randomBytes, randomUUID } from "node:crypto";
+import { tmpdir } from "node:os";
+import { dirname, isAbsolute, join } from "node:path";
+import type {
+	AgentsServerBootstrapRecord,
+	AgentsServerDataPaths,
+	ExecutorBootstrapRecord,
+	ProcessPeerIdentity,
+	RpcCredentialBinding,
+} from "@moshu/contracts";
 
 import {
 	type AgentsServerReadyRecord,
@@ -54,7 +62,16 @@ export interface CompanionProcessSnapshot {
 }
 
 export interface CompanionSupervisorSnapshot {
-	status: "idle" | "starting" | "running" | "restarting" | "stopping" | "stopped" | "failed";
+	status:
+		| "idle"
+		| "starting"
+		| "connecting-client"
+		| "waiting-executor"
+		| "running"
+		| "restarting"
+		| "stopping"
+		| "stopped"
+		| "failed";
 	restartAttempts: number;
 	processes: Partial<Record<CompanionRole, CompanionProcessSnapshot>>;
 }
@@ -86,7 +103,7 @@ export interface CompanionRestartScheduledEvent {
 }
 
 export interface CompanionSupervisorHooks {
-	onCrash?(event: CompanionCrashEvent): void;
+	onCrash?(event: CompanionCrashEvent): void | PromiseLike<void>;
 	onRestartScheduled?(event: CompanionRestartScheduledEvent): void;
 	onRestarted?(snapshot: CompanionSupervisorSnapshot): void;
 	onRestartBudgetExhausted?(event: { attempts: number; cause: CompanionRestartCause }): void;
@@ -103,11 +120,28 @@ export interface CompanionSupervisorDependencies extends TimerDependencies {
 	spawnProcess: CompanionProcessSpawner;
 	now(): number;
 	createNonce(): string;
+	createInstanceId(): string;
+	createCredential(): string;
 	sleep(delayMs: number): Promise<void>;
+}
+
+export interface DesktopAgentsConnection {
+	closed: Promise<void>;
+	isClosed(): boolean;
+	close(): void | Promise<void>;
+}
+
+export interface DesktopAgentsConnectOptions {
+	agentsServer: AgentsServerReadyRecord;
+	identity: ProcessPeerIdentity;
+	credential: string;
 }
 
 export interface CompanionProcessSupervisorOptions {
 	executables: Record<CompanionRole, string>;
+	dataPaths?: AgentsServerDataPaths;
+	connectClient?: (options: DesktopAgentsConnectOptions) => Promise<DesktopAgentsConnection>;
+	additionalPeerBindings?: readonly RpcCredentialBinding[];
 	environment?: Readonly<Record<string, string>>;
 	startupTimeoutMs?: number;
 	shutdownTimeoutMs?: number;
@@ -219,10 +253,14 @@ export class CompanionProcessSupervisor {
 	private readonly shutdownTimeoutMs: number;
 	private readonly hooks: CompanionSupervisorHooks;
 	private readonly dependencies: CompanionSupervisorDependencies;
+	private readonly dataPaths: AgentsServerDataPaths;
+	private readonly connectClient: NonNullable<CompanionProcessSupervisorOptions["connectClient"]>;
+	private readonly additionalPeerBindings: readonly RpcCredentialBinding[];
 	private readonly restartBudget: RestartBudget;
-	private readonly generations: Record<CompanionRole, number> = {
+	private readonly generations: Record<CompanionRole | "client", number> = {
 		"agents-server": 0,
 		executor: 0,
+		client: 0,
 	};
 	private readonly processes: Partial<Record<CompanionRole, ManagedCompanionProcess>> = {};
 	private readonly shutdownSignal = createDeferredSignal();
@@ -232,12 +270,17 @@ export class CompanionProcessSupervisor {
 	private startPromise: Promise<CompanionSupervisorSnapshot> | undefined;
 	private restartPromise: Promise<void> | undefined;
 	private shutdownPromise: Promise<void> | undefined;
-	private queuedCrash: CompanionCrashEvent | undefined;
+	private queuedRestartCause: CompanionRestartCause | undefined;
+	private clientConnection: DesktopAgentsConnection | undefined;
+	private clientIdentity: ProcessPeerIdentity | undefined;
 
 	constructor(options: CompanionProcessSupervisorOptions) {
 		assertAbsoluteExecutablePath("agents-server", options.executables["agents-server"]);
 		assertAbsoluteExecutablePath("executor", options.executables.executor);
 		this.executables = options.executables;
+		this.dataPaths = options.dataPaths ?? createDefaultDataPaths();
+		this.connectClient = options.connectClient ?? createNoopDesktopConnection;
+		this.additionalPeerBindings = options.additionalPeerBindings ?? [];
 		this.environment = options.environment ?? createMinimalCompanionEnvironment();
 		this.startupTimeoutMs = assertPositiveTimeout(
 			options.startupTimeoutMs ?? 10_000,
@@ -253,6 +296,9 @@ export class CompanionProcessSupervisor {
 			spawnProcess: options.dependencies?.spawnProcess ?? spawnBunCompanionProcess,
 			now: options.dependencies?.now ?? Date.now,
 			createNonce: options.dependencies?.createNonce ?? randomUUID,
+			createInstanceId: options.dependencies?.createInstanceId ?? randomUUID,
+			createCredential:
+				options.dependencies?.createCredential ?? (() => randomBytes(32).toString("base64url")),
 			sleep:
 				options.dependencies?.sleep ??
 				((delayMs) =>
@@ -318,18 +364,48 @@ export class CompanionProcessSupervisor {
 			await this.startPair(lifecycleEpoch);
 			this.assertLifecycleActive(lifecycleEpoch);
 			this.status = "running";
+			if (this.clientConnection?.isClosed()) {
+				throw new Error("Desktop agents connection closed while entering runtime readiness.");
+			}
 			this.activateCrashDetection();
+			await this.waitForStableStartup(lifecycleEpoch);
 			return this.getSnapshot();
 		} catch (error) {
-			if (!this.shutdownRequested) {
-				this.status = "stopping";
-			}
-			await this.stopPair();
-			if (!this.shutdownRequested) {
+			if (!this.shutdownRequested && this.status !== "failed") {
+				await this.startRestartOwner(
+					{ message: toError(error, "Companion startup failed.").message },
+					lifecycleEpoch,
+				);
+				if (this.status === "running") {
+					return this.getSnapshot();
+				}
 				this.status = "failed";
 			}
 			throw error;
 		}
+	}
+
+	private async waitForStableStartup(lifecycleEpoch: number): Promise<void> {
+		while (this.isLifecycleActive(lifecycleEpoch)) {
+			await Promise.resolve();
+			const owner = this.restartPromise;
+			if (owner !== undefined) {
+				await owner;
+				continue;
+			}
+			if (this.status === "failed") {
+				throw new Error("Companion startup recovery was exhausted.");
+			}
+			if (this.clientConnection?.isClosed() || !this.hasRunningPair()) {
+				await this.startRestartOwner(
+					{ message: "Companion pair became unavailable during startup." },
+					lifecycleEpoch,
+				);
+				continue;
+			}
+			return;
+		}
+		this.assertLifecycleActive(lifecycleEpoch);
 	}
 
 	shutdown(): Promise<void> {
@@ -343,7 +419,7 @@ export class CompanionProcessSupervisor {
 		this.shutdownRequested = true;
 		this.lifecycleEpoch += 1;
 		this.shutdownSignal.resolve();
-		this.queuedCrash = undefined;
+		this.queuedRestartCause = undefined;
 		this.status = "stopping";
 		const operations: Promise<unknown>[] = [];
 		if (this.startPromise !== undefined) {
@@ -353,46 +429,111 @@ export class CompanionProcessSupervisor {
 			operations.push(this.restartPromise);
 		}
 		this.shutdownPromise = (async () => {
-			await this.stopPair();
-			await Promise.allSettled(operations);
-			await this.stopPair();
-			this.status = "stopped";
+			try {
+				await this.stopPair();
+				await Promise.allSettled(operations);
+				await this.stopPair();
+				this.status = "stopped";
+			} catch (error) {
+				this.status = "failed";
+				throw error;
+			}
 		})();
 		return this.shutdownPromise;
 	}
 
 	private async startPair(lifecycleEpoch: number): Promise<void> {
 		this.assertLifecycleActive(lifecycleEpoch);
-		const agentsServer = await this.launchCompanion("agents-server", lifecycleEpoch);
+		for (const role of ["executor", "agents-server"] as const) {
+			if (this.processes[role] !== undefined) {
+				throw new TerminationUnconfirmedError(
+					`Cannot start ${role} while its previous process is still tracked.`,
+				);
+			}
+		}
+		const serverIdentity = this.createPeerIdentity("agents-server");
+		const clientIdentity = this.createPeerIdentity("client");
+		const executorIdentity = this.createPeerIdentity("executor");
+		const clientCredential = this.dependencies.createCredential();
+		const executorCredential = this.dependencies.createCredential();
+		const agentsBootstrap: AgentsServerBootstrapRecord = {
+			channel: "moshu-companion-bootstrap",
+			controlVersion: 1,
+			type: "START",
+			role: "agents-server",
+			nonce: this.dependencies.createNonce(),
+			serverIdentity,
+			peerBindings: [
+				{ credential: clientCredential, identity: clientIdentity },
+				{ credential: executorCredential, identity: executorIdentity },
+				...this.additionalPeerBindings,
+			],
+			paths: this.dataPaths,
+		};
+		const agentsServer = await this.launchCompanion(
+			"agents-server",
+			agentsBootstrap,
+			lifecycleEpoch,
+		);
 		if (agentsServer.ready?.role !== "agents-server") {
 			throw new Error("agents-server did not produce its expected READY record.");
 		}
 		this.assertLifecycleActive(lifecycleEpoch);
-		await this.launchCompanion("executor", agentsServer.ready, lifecycleEpoch);
+		this.status = "connecting-client";
+		const connectionPromise = this.connectClient({
+			agentsServer: agentsServer.ready,
+			identity: clientIdentity,
+			credential: clientCredential,
+		});
+		let connection: DesktopAgentsConnection;
+		try {
+			connection = await this.waitForLifecycle(connectionPromise, lifecycleEpoch);
+		} catch (error) {
+			void connectionPromise
+				.then((lateConnection) => lateConnection.close())
+				.catch((connectionError: unknown) => {
+					if (!this.shutdownRequested) {
+						this.reportFatalError(
+							toError(connectionError, "Desktop agents connection failed after cancellation."),
+						);
+					}
+				});
+			throw error;
+		}
+		this.assertLifecycleActive(lifecycleEpoch);
+		this.clientConnection = connection;
+		this.observeClientConnection(connection);
+		this.status = "waiting-executor";
+		const executorBootstrap: ExecutorBootstrapRecord = {
+			channel: "moshu-companion-bootstrap",
+			controlVersion: 1,
+			type: "START",
+			role: "executor",
+			nonce: this.dependencies.createNonce(),
+			identity: executorIdentity,
+			credential: executorCredential,
+			agentsServer: {
+				identity: agentsServer.ready.serverIdentity,
+				endpoint: agentsServer.ready.endpoint,
+			},
+		};
+		await Promise.race([
+			this.launchCompanion("executor", executorBootstrap, lifecycleEpoch),
+			connection.closed.then(() => {
+				throw new Error("Desktop agents connection closed before executor readiness.");
+			}),
+		]);
+		if (connection.isClosed()) {
+			throw new Error("Desktop agents connection closed before runtime readiness.");
+		}
 	}
 
 	private async launchCompanion(
-		role: "agents-server",
-		lifecycleEpoch: number,
-	): Promise<ManagedCompanionProcess>;
-	private async launchCompanion(
-		role: "executor",
-		agentsServer: AgentsServerReadyRecord,
-		lifecycleEpoch: number,
-	): Promise<ManagedCompanionProcess>;
-	private async launchCompanion(
 		role: CompanionRole,
-		agentsServerOrEpoch: AgentsServerReadyRecord | number,
-		executorEpoch?: number,
+		bootstrapRecord: AgentsServerBootstrapRecord | ExecutorBootstrapRecord,
+		lifecycleEpoch: number,
 	): Promise<ManagedCompanionProcess> {
-		const agentsServer = typeof agentsServerOrEpoch === "number" ? undefined : agentsServerOrEpoch;
-		const lifecycleEpoch =
-			typeof agentsServerOrEpoch === "number"
-				? agentsServerOrEpoch
-				: (executorEpoch ?? fail("executor requires a lifecycle generation."));
 		this.assertLifecycleActive(lifecycleEpoch);
-		this.generations[role] += 1;
-		const nonce = this.dependencies.createNonce();
 		this.assertLifecycleActive(lifecycleEpoch);
 		const child = this.dependencies.spawnProcess({
 			role,
@@ -404,7 +545,7 @@ export class CompanionProcessSupervisor {
 				role,
 				pid: child.pid,
 				generation: this.generations[role],
-				nonce,
+				nonce: bootstrapRecord.nonce,
 				startedAtMs: this.dependencies.now(),
 			},
 			child,
@@ -417,11 +558,8 @@ export class CompanionProcessSupervisor {
 
 		const bootstrap =
 			role === "agents-server"
-				? serializeAgentsServerBootstrap(nonce)
-				: serializeExecutorBootstrap(
-						nonce,
-						agentsServer ?? fail("executor requires an agents-server READY record."),
-					);
+				? serializeAgentsServerBootstrap(bootstrapRecord as AgentsServerBootstrapRecord)
+				: serializeExecutorBootstrap(bootstrapRecord as ExecutorBootstrapRecord);
 
 		try {
 			await this.waitForLifecycle(child.writeStdin(bootstrap), lifecycleEpoch);
@@ -430,14 +568,18 @@ export class CompanionProcessSupervisor {
 					? {
 							role,
 							pid: child.pid,
-							nonce,
+							nonce: bootstrapRecord.nonce,
+							serverIdentity: (bootstrapRecord as AgentsServerBootstrapRecord).serverIdentity,
 						}
 					: {
 							role,
 							pid: child.pid,
-							nonce,
+							nonce: bootstrapRecord.nonce,
+							identity: (bootstrapRecord as ExecutorBootstrapRecord).identity,
 							agentsServer:
-								agentsServer ?? fail("executor requires an agents-server READY record."),
+								this.processes["agents-server"]?.ready?.role === "agents-server"
+									? this.processes["agents-server"].ready
+									: fail("executor requires an agents-server READY record."),
 						};
 			managed.ready = await this.waitForLifecycle(
 				withTimeout(
@@ -456,10 +598,55 @@ export class CompanionProcessSupervisor {
 		}
 	}
 
+	private createPeerIdentity(role: CompanionRole | "client"): ProcessPeerIdentity {
+		if (role === "client" && this.clientIdentity !== undefined) {
+			return this.clientIdentity;
+		}
+		this.generations[role] += 1;
+		const identity: ProcessPeerIdentity = {
+			role: role === "agents-server" ? "agents" : role,
+			peerId:
+				role === "agents-server"
+					? "moshu-local-agents"
+					: role === "client"
+						? "moshu-desktop-client"
+						: "moshu-local-executor",
+			instanceId: this.dependencies.createInstanceId(),
+			generation: this.generations[role],
+		};
+		if (role === "client") {
+			this.clientIdentity = identity;
+		}
+		return identity;
+	}
+
+	private observeClientConnection(connection: DesktopAgentsConnection): void {
+		void connection.closed.then(
+			() => {
+				if (
+					this.clientConnection === connection &&
+					this.status === "running" &&
+					!this.shutdownRequested
+				) {
+					const cause = { message: "Desktop agents connection closed." };
+					if (this.restartPromise === undefined) {
+						this.beginRestart(cause);
+					} else {
+						this.queuedRestartCause = cause;
+					}
+				}
+			},
+			(error: unknown) => this.reportFatalError(toError(error, "Desktop RPC connection failed.")),
+		);
+	}
+
 	private observeExit(managed: ManagedCompanionProcess): void {
 		void managed.child.exited.then(
 			(exitCode) => {
 				managed.exitCode = exitCode;
+				if (managed.expectedExit && this.processes[managed.identity.role] === managed) {
+					this.processes[managed.identity.role] = undefined;
+				}
 				if (
 					managed.watching &&
 					!managed.expectedExit &&
@@ -503,22 +690,33 @@ export class CompanionProcessSupervisor {
 			generation: managed.identity.generation,
 			exitCode,
 		};
-		this.hooks.onCrash?.(crash);
 		if (this.restartPromise !== undefined) {
-			this.queuedCrash = crash;
-			return;
+			this.queuedRestartCause = crash;
+		} else {
+			this.beginRestart(crash);
 		}
-
-		this.beginRestart(crash);
+		this.invokeCrashObserver(crash);
 	}
 
-	private beginRestart(crash: CompanionCrashEvent): void {
+	private invokeCrashObserver(crash: CompanionCrashEvent): void {
+		try {
+			const result = this.hooks.onCrash?.(crash);
+			if (result !== undefined) {
+				void Promise.resolve(result).catch((error: unknown) => {
+					this.reportFatalError(toError(error, "Companion crash observer failed."));
+				});
+			}
+		} catch (error) {
+			this.reportFatalError(toError(error, "Companion crash observer failed."));
+		}
+	}
+
+	private beginRestart(cause: CompanionRestartCause): void {
 		if (this.shutdownRequested) {
 			return;
 		}
 		const lifecycleEpoch = this.lifecycleEpoch;
-		const restartPromise = this.restartAfterCrash(crash, lifecycleEpoch);
-		this.restartPromise = restartPromise;
+		const restartPromise = this.startRestartOwner(cause, lifecycleEpoch);
 		void restartPromise
 			.catch((error: unknown) => {
 				if (error instanceof LifecycleCancelledError && this.shutdownRequested) {
@@ -527,33 +725,101 @@ export class CompanionProcessSupervisor {
 				this.status = "failed";
 				this.reportFatalError(toError(error, "Companion restart failed."));
 			})
-			.finally(() => {
-				if (this.restartPromise === restartPromise) {
-					this.restartPromise = undefined;
+			.catch(() => undefined);
+	}
+
+	private startRestartOwner(cause: CompanionRestartCause, lifecycleEpoch: number): Promise<void> {
+		if (this.restartPromise !== undefined) {
+			this.queuedRestartCause = cause;
+			return this.restartPromise;
+		}
+
+		let resolveOwner: (() => void) | undefined;
+		let rejectOwner: ((error: unknown) => void) | undefined;
+		const owner = new Promise<void>((resolve, reject) => {
+			resolveOwner = resolve;
+			rejectOwner = reject;
+		});
+		this.restartPromise = owner;
+		const clearOwner = (): void => {
+			if (this.restartPromise === owner) {
+				this.restartPromise = undefined;
+			}
+		};
+		const rejectRestartOwner = (error: unknown): void => {
+			clearOwner();
+			rejectOwner?.(error);
+		};
+		const settleRestartOwner = (): void => {
+			const queuedCause = this.takeQueuedRestartCause();
+			if (queuedCause !== undefined) {
+				void this.driveRestartOwner(queuedCause, lifecycleEpoch).then(
+					settleRestartOwner,
+					rejectRestartOwner,
+				);
+				return;
+			}
+			clearOwner();
+			resolveOwner?.();
+			if (this.status === "running" && this.hasRunningPair()) {
+				try {
+					this.hooks.onRestarted?.(this.getSnapshot());
+				} catch (error) {
+					this.reportFatalError(toError(error, "Companion restart observer failed."));
 				}
-				const queuedCrash = this.queuedCrash;
-				this.queuedCrash = undefined;
-				if (
-					queuedCrash !== undefined &&
-					this.status === "running" &&
-					this.generations[queuedCrash.role] === queuedCrash.generation &&
-					this.processes[queuedCrash.role] === undefined
-				) {
-					this.beginRestart(queuedCrash);
-				}
-			});
+			}
+		};
+		void this.driveRestartOwner(cause, lifecycleEpoch).then(settleRestartOwner, rejectRestartOwner);
+		return owner;
+	}
+
+	private async driveRestartOwner(
+		initialCause: CompanionRestartCause,
+		lifecycleEpoch: number,
+	): Promise<void> {
+		let cause = initialCause;
+		while (this.isLifecycleActive(lifecycleEpoch)) {
+			await this.restartAfterCrash(cause, lifecycleEpoch);
+			await Promise.resolve();
+			const queuedCause = this.takeQueuedRestartCause();
+			if (queuedCause === undefined) {
+				return;
+			}
+			cause = queuedCause;
+		}
+		this.assertLifecycleActive(lifecycleEpoch);
+	}
+
+	private takeQueuedRestartCause(): CompanionRestartCause | undefined {
+		if (this.clientConnection?.isClosed()) {
+			this.queuedRestartCause = undefined;
+			return { message: "Desktop agents connection closed during restart." };
+		}
+		const queuedCause = this.queuedRestartCause;
+		this.queuedRestartCause = undefined;
+		if (
+			queuedCause !== undefined &&
+			(!("role" in queuedCause) ||
+				(this.generations[queuedCause.role] === queuedCause.generation &&
+					this.processes[queuedCause.role] === undefined))
+		) {
+			return queuedCause;
+		}
+		return undefined;
 	}
 
 	private async restartAfterCrash(
-		initialCause: CompanionCrashEvent,
+		initialCause: CompanionRestartCause,
 		lifecycleEpoch: number,
 	): Promise<void> {
 		let cause: CompanionRestartCause = initialCause;
 		while (this.isLifecycleActive(lifecycleEpoch)) {
+			this.status = "restarting";
+			await this.stopPair();
+			this.assertLifecycleActive(lifecycleEpoch);
+
 			const permit = this.restartBudget.take();
 			if (permit === undefined) {
-				await this.stopPair();
-				this.assertLifecycleActive(lifecycleEpoch);
 				this.status = "failed";
 				this.hooks.onRestartBudgetExhausted?.({
 					attempts: this.restartBudget.attemptsUsed,
@@ -564,21 +830,15 @@ export class CompanionProcessSupervisor {
 				}
 				return;
 			}
-			this.status = "restarting";
 			this.hooks.onRestartScheduled?.({ ...permit, cause });
 			await this.waitForLifecycle(this.dependencies.sleep(permit.delayMs), lifecycleEpoch);
 			this.assertLifecycleActive(lifecycleEpoch);
 
-			await this.stopPair();
-			this.assertLifecycleActive(lifecycleEpoch);
 			try {
 				await this.startPair(lifecycleEpoch);
 				this.assertLifecycleActive(lifecycleEpoch);
 				this.status = "running";
 				this.activateCrashDetection();
-				if (this.hasRunningPair()) {
-					this.hooks.onRestarted?.(this.getSnapshot());
-				}
 				return;
 			} catch (error) {
 				await this.stopPair();
@@ -629,8 +889,29 @@ export class CompanionProcessSupervisor {
 	}
 
 	private async stopPair(): Promise<void> {
-		await this.stopProcess("executor");
-		await this.stopProcess("agents-server");
+		const connection = this.clientConnection;
+		this.clientConnection = undefined;
+		if (connection !== undefined) {
+			try {
+				await connection.close();
+			} catch (error) {
+				this.reportFatalError(toError(error, "Failed to close the desktop agents connection."));
+			}
+		}
+		let stopError: unknown;
+		try {
+			await this.stopProcess("executor");
+		} catch (error) {
+			stopError = error;
+		}
+		try {
+			await this.stopProcess("agents-server");
+		} catch (error) {
+			stopError ??= error;
+		}
+		if (stopError !== undefined) {
+			throw stopError;
+		}
 	}
 
 	private stopProcess(role: CompanionRole): Promise<void> {
@@ -681,9 +962,11 @@ export class CompanionProcessSupervisor {
 						this.dependencies,
 					);
 					if (!exitedAfterKill) {
-						this.reportFatalError(
-							new Error(`${role} did not exit after SIGKILL within ${this.shutdownTimeoutMs}ms.`),
+						const error = new TerminationUnconfirmedError(
+							`${role} did not exit after SIGKILL within ${this.shutdownTimeoutMs}ms.`,
 						);
+						this.reportFatalError(error);
+						throw error;
 					}
 				}
 			}
@@ -716,7 +999,11 @@ export class CompanionProcessSupervisor {
 
 	private reportFatalError(error: Error): void {
 		if (this.hooks.onFatalError !== undefined) {
-			this.hooks.onFatalError(error);
+			try {
+				this.hooks.onFatalError(error);
+			} catch (callbackError) {
+				console.error("Companion fatal-error observer failed.", callbackError);
+			}
 		} else {
 			console.error(error);
 		}
@@ -735,16 +1022,35 @@ function createReadySnapshot(ready: CompanionReadyRecord): CompanionReadySnapsho
 		return {
 			...common,
 			role: ready.role,
+			serverIdentity: { ...ready.serverIdentity },
 			endpoint: { ...ready.endpoint },
 		};
 	}
 	return {
 		...common,
 		role: ready.role,
+		identity: { ...ready.identity },
 		agentsServer: {
-			host: ready.agentsServer.host,
-			port: ready.agentsServer.port,
+			identity: { ...ready.agentsServer.identity },
+			endpoint: { ...ready.agentsServer.endpoint },
 		},
+	};
+}
+
+function createDefaultDataPaths(): AgentsServerDataPaths {
+	const directory = join(tmpdir(), `moshu-companion-${process.pid}`);
+	return {
+		productDatabase: join(directory, "moshu.db"),
+		checkpointDatabase: join(directory, "moshu-checkpoints.db"),
+		providerConfig: join(directory, "provider.json"),
+	};
+}
+
+async function createNoopDesktopConnection(): Promise<DesktopAgentsConnection> {
+	return {
+		closed: new Promise<void>(() => undefined),
+		isClosed: () => false,
+		close() {},
 	};
 }
 
@@ -847,6 +1153,8 @@ function toError(error: unknown, fallbackMessage: string): Error {
 class TimeoutMarkerError extends Error {}
 
 class LifecycleCancelledError extends Error {}
+
+class TerminationUnconfirmedError extends Error {}
 
 function createDeferredSignal(): {
 	promise: Promise<void>;

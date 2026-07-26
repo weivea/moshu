@@ -1,5 +1,7 @@
-import { createRequire } from "node:module";
+/// <reference path="./rpc-websocket-client-module.d.ts" />
+
 import type { Duplex } from "node:stream";
+import RpcWebSocketImplementation from "rpc-websocket-client";
 import type WebSocket from "ws";
 
 export type RpcWebSocketRawData = WebSocket.RawData;
@@ -35,6 +37,4 @@ interface RpcWebSocketClientConstructor {
 	readonly OPEN: typeof WebSocket.OPEN;
 }
 
-const require = createRequire(import.meta.url);
-
-export const RpcWebSocketClient: RpcWebSocketClientConstructor = require("rpc-websocket-client");
+export const RpcWebSocketClient: RpcWebSocketClientConstructor = RpcWebSocketImplementation;

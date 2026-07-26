@@ -1,15 +1,22 @@
 import { resolve } from "node:path";
+import { createElectrobunCodesignEnvironment } from "./companion-signing";
 
 const desktopDirectory = resolve(import.meta.dir, "..");
 const repositoryRoot = resolve(desktopDirectory, "../..");
 
 await run([process.execPath, "run", "build:companions"], repositoryRoot);
 await run([process.execPath, "run", "build:web"], desktopDirectory);
-await run([process.execPath, "x", "electrobun", "dev", "--watch"], desktopDirectory, {
-	...process.env,
-	MOSHU_COMPANION_POC: "1",
-	MOSHU_COMPANION_WORKSPACE_ROOT: repositoryRoot,
-});
+await run(
+	[process.execPath, "x", "electrobun", "dev", "--watch"],
+	desktopDirectory,
+	createElectrobunCodesignEnvironment(
+		{
+			...process.env,
+			MOSHU_COMPANION_WORKSPACE_ROOT: repositoryRoot,
+		},
+		process.platform,
+	),
+);
 
 async function run(
 	command: string[],

@@ -1,10 +1,12 @@
 import {
 	type ChatSession,
-	chatSessionSchema,
 	type CreateChatSessionInput,
 	type CreateChatSessionOutput,
+	type CreateProcessChatSessionInput,
+	chatSessionSchema,
 	createChatSessionInputSchema,
 	createChatSessionOutputSchema,
+	createProcessChatSessionInputSchema,
 	type DeleteChatSessionInput,
 	type DeleteChatSessionOutput,
 	deleteChatSessionInputSchema,
@@ -15,6 +17,8 @@ import {
 	type ListChatSessionsOutput,
 	listChatSessionsInputSchema,
 	listChatSessionsOutputSchema,
+	type ProcessPeerIdentity,
+	processPeerIdentitySchema,
 	type SetChatSessionArchivedInput,
 	type SetChatSessionArchivedOutput,
 	setChatSessionArchivedInputSchema,
@@ -28,7 +32,7 @@ import { and, desc, eq, isNotNull, isNull, sql } from "drizzle-orm";
 
 import type { AppDrizzleDatabase } from "./database";
 import { createUuidV7 } from "./ids";
-import { chatSessionsTable } from "./schema";
+import { chatSessionCreateRequestsTable, chatSessionsTable } from "./schema";
 
 interface RepositoryClock {
 	now(): number;
@@ -40,8 +44,37 @@ interface RepositoryIdGenerator {
 
 type SessionRow = typeof chatSessionsTable.$inferSelect;
 
+export const maxSessionCreateIdempotencyRecords = 1_024;
+
+export class ChatSessionNotFoundError extends Error {
+	constructor(readonly sessionId: string) {
+		super(`Chat session ${sessionId} was not found.`);
+		this.name = "ChatSessionNotFoundError";
+	}
+}
+
+export class SessionCreateKeyConflictError extends Error {
+	constructor(readonly createKey: string) {
+		super(`Session create key ${createKey} was reused with a different origin or parameters.`);
+		this.name = "SessionCreateKeyConflictError";
+	}
+}
+
+export class SessionCreateCapacityError extends Error {
+	constructor() {
+		super("Session create idempotency capacity is full.");
+		this.name = "SessionCreateCapacityError";
+	}
+}
+
+export interface IdempotentSessionCreateInput {
+	request: CreateProcessChatSessionInput;
+	origin: ProcessPeerIdentity;
+}
+
 export interface SessionRepository {
 	create(input: CreateChatSessionInput): CreateChatSessionOutput;
+	createIdempotently(input: IdempotentSessionCreateInput): CreateChatSessionOutput;
 	list(input?: ListChatSessionsInput): ListChatSessionsOutput;
 	get(input: GetChatSessionInput): ChatSession;
 	update(input: UpdateChatSessionInput): UpdateChatSessionOutput;
@@ -88,6 +121,79 @@ export class SqliteSessionRepository implements SessionRepository {
 
 		this.orm.insert(chatSessionsTable).values(row).run();
 		return createChatSessionOutputSchema.parse({ session: buildSession(row as SessionRow) });
+	}
+
+	createIdempotently(input: IdempotentSessionCreateInput): CreateChatSessionOutput {
+		const request = createProcessChatSessionInputSchema.parse(input.request);
+		const origin = processPeerIdentitySchema.parse(input.origin);
+		if (origin.role !== "client") {
+			throw new TypeError("Idempotent Session creation requires a client origin.");
+		}
+
+		return this.orm.transaction((transaction) => {
+			const existing = transaction
+				.select()
+				.from(chatSessionCreateRequestsTable)
+				.where(eq(chatSessionCreateRequestsTable.createKey, request.createKey))
+				.get();
+			if (existing !== undefined) {
+				if (
+					existing.originRole !== origin.role ||
+					existing.originPeerId !== origin.peerId ||
+					existing.originInstanceId !== origin.instanceId ||
+					existing.originGeneration !== origin.generation ||
+					existing.title !== request.title ||
+					existing.defaultMode !== request.defaultMode
+				) {
+					throw new SessionCreateKeyConflictError(request.createKey);
+				}
+				const row = transaction
+					.select()
+					.from(chatSessionsTable)
+					.where(eq(chatSessionsTable.id, existing.sessionId))
+					.get();
+				if (row === undefined) {
+					throw new Error("Session create idempotency record refers to a missing Session.");
+				}
+				return createChatSessionOutputSchema.parse({ session: buildSession(row) });
+			}
+
+			const recordCount =
+				transaction
+					.select({ value: sql<number>`count(*)` })
+					.from(chatSessionCreateRequestsTable)
+					.get()?.value ?? 0;
+			if (recordCount >= maxSessionCreateIdempotencyRecords) {
+				throw new SessionCreateCapacityError();
+			}
+
+			const nowMs = this.clock.now();
+			const row: typeof chatSessionsTable.$inferInsert = {
+				id: this.idGenerator.create(nowMs),
+				title: request.title,
+				defaultMode: request.defaultMode,
+				createdAtMs: nowMs,
+				updatedAtMs: nowMs,
+				lastMessageAtMs: null,
+				archivedAtMs: null,
+			};
+			transaction.insert(chatSessionsTable).values(row).run();
+			transaction
+				.insert(chatSessionCreateRequestsTable)
+				.values({
+					createKey: request.createKey,
+					originRole: origin.role,
+					originPeerId: origin.peerId,
+					originInstanceId: origin.instanceId,
+					originGeneration: origin.generation,
+					title: request.title,
+					defaultMode: request.defaultMode,
+					sessionId: row.id,
+					createdAtMs: nowMs,
+				})
+				.run();
+			return createChatSessionOutputSchema.parse({ session: buildSession(row as SessionRow) });
+		});
 	}
 
 	list(input: ListChatSessionsInput = {}): ListChatSessionsOutput {
@@ -162,7 +268,7 @@ export class SqliteSessionRepository implements SessionRepository {
 			.where(eq(chatSessionsTable.id, sessionId))
 			.get();
 		if (row === undefined) {
-			throw new Error(`Chat session ${sessionId} was not found.`);
+			throw new ChatSessionNotFoundError(sessionId);
 		}
 		return row;
 	}

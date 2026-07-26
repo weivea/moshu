@@ -1,21 +1,25 @@
 import { chmodSync, constants, readdirSync, statSync } from "node:fs";
 import { access } from "node:fs/promises";
-import { join } from "node:path";
-
+import { join, resolve } from "node:path";
 import {
 	COMPANION_EXECUTABLE_ROLES,
 	getCompanionExecutableFilename,
 	resolveCurrentHostCompanionPlatform,
 } from "../src/shared/companion-executable-names";
+import {
+	assertEmbeddedCompanionEntitlements,
+	createCompanionCodesignCommand,
+	createCompanionEntitlementsInspectionCommand,
+	resolveCompanionCodesignIdentity,
+} from "./companion-signing";
+import { verifyPackagedCompanionLaunch } from "./packaged-companion-verification";
 
 const buildDirectory = requireEnvironment("ELECTROBUN_BUILD_DIR");
 const targetOs = requireEnvironment("ELECTROBUN_OS");
 const targetPlatform = resolveCurrentHostCompanionPlatform(targetOs, process.platform);
 const companionDirectory = findCompanionDirectory(buildDirectory, targetPlatform);
-const signingIdentity =
-	process.env.MOSHU_COMPANION_CODESIGN_IDENTITY?.trim() ||
-	process.env.ELECTROBUN_DEVELOPER_ID?.trim() ||
-	"-";
+const signingIdentity = resolveCompanionCodesignIdentity(process.env);
+const companionEntitlementsPath = resolve(import.meta.dir, "..", "companion-entitlements.plist");
 const executables = COMPANION_EXECUTABLE_ROLES.map((role) =>
 	join(companionDirectory, getCompanionExecutableFilename(role, targetPlatform)),
 );
@@ -29,9 +33,14 @@ for (const executable of executables) {
 		throw new Error(`Bundled companion is not a regular file: ${executable}`);
 	}
 	if (targetPlatform === "darwin") {
-		signMacExecutable(executable, signingIdentity);
+		await access(companionEntitlementsPath, constants.R_OK);
+		signMacExecutable(executable, signingIdentity, companionEntitlementsPath);
 		verifyMacExecutable(executable);
+		verifyMacEntitlements(executable);
 	}
+}
+if (targetPlatform !== "darwin") {
+	await verifyPackagedCompanionLaunch(executables as [string, string], buildDirectory);
 }
 
 console.info(
@@ -76,13 +85,11 @@ function isMissingPathError(error: unknown): boolean {
 	return error instanceof Error && "code" in error && error.code === "ENOENT";
 }
 
-function signMacExecutable(executable: string, identity: string): void {
-	const command = ["codesign", "--force", "--sign", identity];
-	if (identity !== "-") {
-		command.push("--options", "runtime", "--timestamp");
-	}
-	command.push(executable);
-	runCommand(command, `Failed to sign companion executable ${executable}`);
+function signMacExecutable(executable: string, identity: string, entitlementsPath: string): void {
+	runCommand(
+		createCompanionCodesignCommand({ executable, identity, entitlementsPath }),
+		`Failed to sign companion executable ${executable}`,
+	);
 }
 
 function verifyMacExecutable(executable: string): void {
@@ -92,7 +99,15 @@ function verifyMacExecutable(executable: string): void {
 	);
 }
 
-function runCommand(command: string[], failureMessage: string): void {
+function verifyMacEntitlements(executable: string): void {
+	const output = runCommand(
+		createCompanionEntitlementsInspectionCommand(executable),
+		`Failed to inspect companion entitlements for ${executable}`,
+	);
+	assertEmbeddedCompanionEntitlements(output, executable);
+}
+
+function runCommand(command: string[], failureMessage: string): string {
 	const result = Bun.spawnSync({
 		cmd: command,
 		stdout: "pipe",
@@ -102,4 +117,5 @@ function runCommand(command: string[], failureMessage: string): void {
 		const stderr = new TextDecoder().decode(result.stderr).trim();
 		throw new Error(`${failureMessage}: ${stderr || `exit code ${result.exitCode}`}`);
 	}
+	return `${new TextDecoder().decode(result.stdout)}\n${new TextDecoder().decode(result.stderr)}`;
 }

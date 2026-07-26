@@ -3,7 +3,7 @@ import { useI18n } from "../i18n";
 import { ChatComposer } from "./chat-composer";
 import { MessageList } from "./message-list";
 import { SessionSidebar } from "./session-sidebar";
-import type { ChatTransport } from "./transport";
+import type { ChatSession, ChatTransport } from "./transport";
 import { useChatController } from "./use-chat-controller";
 
 export type {
@@ -18,7 +18,10 @@ export type {
 export interface ChatPageProps {
 	transport: ChatTransport;
 	sessionId?: string;
+	initialSession?: ChatSession;
 	onSessionChange?(sessionId: string): void;
+	onSessionHydrated?(sessionId: string): void;
+	onSessionRetired?(sessionId: string): void;
 	onNewSession?(): void;
 	onSelectSession?(sessionId: string): void;
 	onOpenProviderSettings?(): void;
@@ -27,7 +30,10 @@ export interface ChatPageProps {
 export function ChatPage({
 	transport,
 	sessionId,
+	initialSession,
 	onSessionChange,
+	onSessionHydrated,
+	onSessionRetired,
 	onNewSession = () => {},
 	onSelectSession = () => {},
 	onOpenProviderSettings = () => {},
@@ -36,7 +42,10 @@ export function ChatPage({
 	const controller = useChatController({
 		transport,
 		sessionId,
+		initialSession,
 		onSessionChange,
+		onSessionHydrated,
+		onSessionRetired,
 	});
 	const sessionRefreshKey = [
 		controller.session?.id ?? "",
@@ -145,7 +154,7 @@ export function ChatPage({
 						) : null}
 
 						<MessageList
-							isLoading={controller.isSessionLoading}
+							isLoading={controller.isSessionLoading && controller.session === null}
 							messages={controller.session?.messages ?? []}
 							sessionId={controller.session?.id ?? sessionId}
 						/>

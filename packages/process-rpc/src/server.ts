@@ -446,6 +446,7 @@ function createServerTransport(
 				);
 			}
 			if (socket.sendText(text) === 0) {
+				socket.terminate();
 				throw new RpcHandshakeError("INTERNAL_ERROR", "Server WebSocket dropped a frame.");
 			}
 		},

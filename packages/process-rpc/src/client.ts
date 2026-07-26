@@ -30,14 +30,21 @@ import {
 	connectStreamingWebSocketClient,
 	type StreamingWebSocketConnection,
 } from "./streaming-websocket-client";
-import { truncateWebSocketCloseReason } from "./websocket-utils";
 
 export interface ConnectRpcClientOptions extends RpcEndpointOptions {
 	readonly url: string | URL;
 	readonly identity: RpcPeerIdentity;
 	readonly protocol?: RpcProtocolVersion;
+	/**
+	 * Requires the hello acknowledgement to contain this exact authenticated server identity before
+	 * any peer handlers are activated.
+	 */
+	readonly expectedServerIdentity?: RpcPeerIdentity;
+	/** @deprecated Prefer `expectedServerIdentity` when the server identity is known. */
 	readonly expectedServerRole?: RpcPeerRole;
+	/** @deprecated Prefer `expectedServerIdentity` when the server identity is known. */
 	readonly expectedServerPeerId?: string;
+	readonly signal?: AbortSignal;
 	/**
 	 * Produces sensitive HTTP upgrade headers at connection time. Post-upgrade listeners do not
 	 * retain the provider or returned object, and headers are never serialized into RPC envelopes.
@@ -47,11 +54,13 @@ export interface ConnectRpcClientOptions extends RpcEndpointOptions {
 
 interface ResolvedClientOptions {
 	readonly endpoint: RpcEndpointOptions;
+	readonly expectedServerIdentity: RpcPeerIdentity | undefined;
 	readonly expectedServerPeerId: string | undefined;
 	readonly expectedServerRole: RpcPeerRole;
 	readonly identity: RpcPeerIdentity;
 	readonly limits: ResolvedRpcLimits;
 	readonly protocol: RpcProtocolVersion;
+	readonly signal: AbortSignal | undefined;
 	readonly url: string;
 }
 
@@ -67,6 +76,7 @@ export function connectRpcClient(options: ConnectRpcClientOptions): Promise<RpcP
 		resolved.url,
 		resolved.limits,
 		options.getHandshakeHeaders,
+		resolved.signal,
 	);
 	return finishClientConnection(connection, resolved);
 }
@@ -82,11 +92,16 @@ function resolveClientOptions(options: ConnectRpcClientOptions): ResolvedClientO
 
 	return {
 		endpoint,
+		expectedServerIdentity:
+			options.expectedServerIdentity === undefined
+				? undefined
+				: rpcPeerIdentitySchema.parse(options.expectedServerIdentity),
 		expectedServerPeerId: options.expectedServerPeerId,
 		expectedServerRole: options.expectedServerRole ?? "agents",
 		identity: rpcPeerIdentitySchema.parse(options.identity),
 		limits: resolveRpcLimits(options.limits),
 		protocol: rpcProtocolVersionSchema.parse(options.protocol ?? CURRENT_PROCESS_RPC_PROTOCOL),
+		signal: options.signal,
 		url: options.url.toString(),
 	};
 }
@@ -95,14 +110,70 @@ async function openStreamingConnection(
 	url: string,
 	limits: ResolvedRpcLimits,
 	provider: RpcHandshakeHeadersProvider | undefined,
+	signal: AbortSignal | undefined,
 ): Promise<StreamingWebSocketConnection> {
-	const headers = await resolveHandshakeHeaders(provider);
+	const headers = await resolveHandshakeHeadersWithAbort(provider, signal);
 	return connectStreamingWebSocketClient({
 		url,
 		handshakeTimeoutMs: limits.handshakeTimeoutMs,
 		maxPayloadBytes: limits.maxFrameBytes,
 		...(headers === undefined ? {} : { headers }),
+		...(signal === undefined ? {} : { signal }),
 	});
+}
+
+function resolveHandshakeHeadersWithAbort(
+	provider: RpcHandshakeHeadersProvider | undefined,
+	signal: AbortSignal | undefined,
+): Promise<Readonly<Record<string, string>> | undefined> {
+	if (signal === undefined) {
+		return resolveHandshakeHeaders(provider);
+	}
+	if (signal.aborted) {
+		return Promise.reject(createClientAbortError(signal.reason));
+	}
+	return new Promise((resolve, reject) => {
+		let settled = false;
+		const cleanup = (): void => signal.removeEventListener("abort", onAbort);
+		const onAbort = (): void => {
+			if (settled) {
+				return;
+			}
+			settled = true;
+			cleanup();
+			reject(createClientAbortError(signal.reason));
+		};
+		signal.addEventListener("abort", onAbort, { once: true });
+		resolveHandshakeHeaders(provider).then(
+			(headers) => {
+				if (settled) {
+					return;
+				}
+				settled = true;
+				cleanup();
+				resolve(headers);
+			},
+			(error: unknown) => {
+				if (settled) {
+					return;
+				}
+				settled = true;
+				cleanup();
+				reject(error);
+			},
+		);
+		if (signal.aborted) {
+			onAbort();
+		}
+	});
+}
+
+function createClientAbortError(reason: unknown): RpcHandshakeError {
+	return new RpcHandshakeError(
+		"INTERNAL_ERROR",
+		"RPC client connection was aborted.",
+		reason === undefined ? undefined : { cause: reason },
+	);
 }
 
 async function finishClientConnection(
@@ -129,16 +200,39 @@ function completeRpcHandshake(
 	return new Promise<RpcPeer>((resolve, reject) => {
 		let settled = false;
 		let connectedPeer: RpcPeer | null = null;
+		let failedSocketSinkAttached = false;
 		const socket = connection.socket;
 		const handshakeTimer = setTimeout(() => {
 			failHandshake("HANDSHAKE_TIMEOUT", "Timed out waiting for the hello acknowledgement.");
 		}, options.limits.handshakeTimeoutMs);
 
-		const cleanupHandshakeListeners = (): void => {
+		const cleanupFailedSocketSink = (): void => {
+			if (!failedSocketSinkAttached) {
+				return;
+			}
+			failedSocketSinkAttached = false;
+			socket.off("error", onFailedSocketError);
+			socket.off("close", onFailedSocketClose);
+		};
+		const onFailedSocketError = (): void => undefined;
+		const onFailedSocketClose = (): void => cleanupFailedSocketSink();
+		const armFailedSocketSink = (): void => {
+			if (failedSocketSinkAttached) {
+				return;
+			}
+			failedSocketSinkAttached = true;
+			socket.on("error", onFailedSocketError);
+			socket.once("close", onFailedSocketClose);
+		};
+		const cleanupHandshakeListeners = (removePingListener: boolean): void => {
 			clearTimeout(handshakeTimer);
 			socket.off("message", onHandshakeMessage);
 			socket.off("error", onHandshakeError);
 			socket.off("close", onHandshakeClose);
+			if (removePingListener) {
+				socket.off("ping", onPing);
+			}
+			options.signal?.removeEventListener("abort", onAbort);
 		};
 
 		const failHandshake = (code: RpcProtocolErrorCode, message: string, cause?: unknown): void => {
@@ -146,24 +240,18 @@ function completeRpcHandshake(
 				return;
 			}
 			settled = true;
-			cleanupHandshakeListeners();
+			armFailedSocketSink();
 			let closeFailure: unknown;
 			try {
-				if (socket.readyState === RpcWebSocketClient.OPEN) {
-					socket.close(1002, truncateWebSocketCloseReason(`${code}: ${message}`));
-				} else if (socket.readyState !== RpcWebSocketClient.CLOSED) {
+				if (socket.readyState !== RpcWebSocketClient.CLOSED) {
 					socket.terminate();
 				}
 			} catch (error) {
 				closeFailure = error;
-				try {
-					socket.terminate();
-				} catch (terminateError) {
-					closeFailure = new AggregateError(
-						[error, terminateError],
-						"Failed to close the WebSocket after an RPC handshake failure.",
-					);
-				}
+			}
+			cleanupHandshakeListeners(true);
+			if (socket.readyState === RpcWebSocketClient.CLOSED) {
+				queueMicrotask(cleanupFailedSocketSink);
 			}
 			let rejectionCause = cause;
 			if (closeFailure !== undefined) {
@@ -189,7 +277,7 @@ function completeRpcHandshake(
 				return;
 			}
 			settled = true;
-			cleanupHandshakeListeners();
+			cleanupHandshakeListeners(false);
 			const peer = new RpcPeer({
 				localIdentity: options.identity,
 				remoteIdentity: ack.peer,
@@ -257,11 +345,15 @@ function completeRpcHandshake(
 				);
 				return;
 			}
-			if (
-				ack.data.peer.role !== options.expectedServerRole ||
-				(options.expectedServerPeerId !== undefined &&
-					ack.data.peer.peerId !== options.expectedServerPeerId)
-			) {
+			const exactIdentityMismatch =
+				options.expectedServerIdentity !== undefined &&
+				!isSameRpcPeerIdentity(ack.data.peer, options.expectedServerIdentity);
+			const legacyIdentityMismatch =
+				options.expectedServerIdentity === undefined &&
+				(ack.data.peer.role !== options.expectedServerRole ||
+					(options.expectedServerPeerId !== undefined &&
+						ack.data.peer.peerId !== options.expectedServerPeerId));
+			if (exactIdentityMismatch || legacyIdentityMismatch) {
 				failHandshake("IDENTITY_MISMATCH", "Server identity did not match the expected peer.");
 				return;
 			}
@@ -276,6 +368,9 @@ function completeRpcHandshake(
 				"INTERNAL_ERROR",
 				`WebSocket closed during the RPC handshake (${code}): ${reason.toString("utf8")}`,
 			);
+		};
+		const onAbort = (): void => {
+			failHandshake("INTERNAL_ERROR", "RPC client connection was aborted.", options.signal?.reason);
 		};
 		const onPing = (data: Buffer): void => {
 			try {
@@ -304,6 +399,11 @@ function completeRpcHandshake(
 		socket.on("message", onHandshakeMessage);
 		socket.on("error", onHandshakeError);
 		socket.on("close", onHandshakeClose);
+		options.signal?.addEventListener("abort", onAbort, { once: true });
+		if (options.signal?.aborted === true) {
+			onAbort();
+			return;
+		}
 
 		const hello: RpcHelloEnvelope = {
 			schemaVersion: PROCESS_RPC_SCHEMA_VERSION,
@@ -425,11 +525,30 @@ async function resolveHandshakeHeaders(
 	if (isStringHeaderRecord(headersInit)) {
 		return headersInit;
 	}
-	const headers = new Headers(headersInit);
+	if (Array.isArray(headersInit)) {
+		const resolved: Record<string, string> = {};
+		for (const entry of headersInit) {
+			if (entry.length !== 2 || entry[0] === undefined || entry[1] === undefined) {
+				throw new RpcHandshakeError(
+					"AUTHENTICATION_FAILED",
+					"RPC handshake headers must contain name/value pairs.",
+				);
+			}
+			const existing = resolved[entry[0]];
+			resolved[entry[0]] = existing === undefined ? entry[1] : `${existing}, ${entry[1]}`;
+		}
+		return resolved;
+	}
 	const resolved: Record<string, string> = {};
-	headers.forEach((value, name) => {
-		resolved[name] = value;
-	});
+	if (headersInit instanceof Headers) {
+		headersInit.forEach((value, name) => {
+			resolved[name] = value;
+		});
+		return resolved;
+	}
+	for (const [name, value] of Object.entries(headersInit)) {
+		resolved[name] = typeof value === "string" ? value : value.join(", ");
+	}
 	return resolved;
 }
 

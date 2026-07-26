@@ -1,18 +1,36 @@
 import type { AppIconName } from "@moshu/ui";
-import { useEffect } from "react";
-import { useNavigate, useParams } from "react-router-dom";
+import { useCallback, useEffect, useState } from "react";
+import { useLocation, useNavigate, useParams } from "react-router-dom";
+import { isAgentsUnavailableError } from "../../../shared/rpc-errors";
 import { ChatPage } from "./chat/chat-page";
-import { createRpcChatTransport } from "./chat/rpc-transport";
+import { chatTransport } from "./chat/rpc-chat-transport";
+import {
+	isRendererSessionRetired,
+	useChatSessionRecovery,
+} from "./chat/session-recovery-coordinator";
+import type { ChatSession, ChatTransport } from "./chat/transport";
 import { EmptyState } from "./empty-state";
 import { type MessageKey, useI18n } from "./i18n";
 import { ProviderSettingsPage } from "./provider-settings-page";
-import { desktopClient } from "../lib/rpc";
 
-const chatTransport = createRpcChatTransport(desktopClient);
 const lastChatSessionStorageKey = "moshu.lastChatSessionId";
+const initialHydrationRetryDelayMs = 100;
+const maxInitialHydrationAttempts = 5;
 
-export function ChatHomePage() {
+interface ChatHomePageProps {
+	transport?: ChatTransport;
+	retryDelayMs?: number;
+	maxAttempts?: number;
+}
+
+export function ChatHomePage({
+	transport = chatTransport,
+	retryDelayMs = initialHydrationRetryDelayMs,
+	maxAttempts = maxInitialHydrationAttempts,
+}: ChatHomePageProps = {}) {
 	const navigate = useNavigate();
+	const { coordinator: sessionRecoveryCoordinator } = useChatSessionRecovery(transport, undefined);
+	const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
 	useEffect(() => {
 		const lastSessionId = localStorage.getItem(lastChatSessionStorageKey);
@@ -20,40 +38,104 @@ export function ChatHomePage() {
 			navigate("/chat/new", { replace: true });
 			return;
 		}
+		if (isRendererSessionRetired(lastSessionId)) {
+			localStorage.removeItem(lastChatSessionStorageKey);
+			navigate("/chat/new", { replace: true });
+			return;
+		}
 
 		let active = true;
-		void chatTransport
-			.getSession(lastSessionId)
-			.then(() => {
-				if (active) {
-					navigate(`/chat/${lastSessionId}`, { replace: true });
+		let attempts = 0;
+		let inFlight = false;
+		let retryRequested = false;
+		let waitingForReadiness = false;
+		let retryTimer: ReturnType<typeof setTimeout> | undefined;
+
+		const scheduleRetry = () => {
+			if (!active || inFlight || !waitingForReadiness || attempts >= maxAttempts) {
+				return;
+			}
+			if (retryTimer !== undefined) {
+				clearTimeout(retryTimer);
+			}
+			retryTimer = setTimeout(() => {
+				retryTimer = undefined;
+				retryRequested = false;
+				void hydrate();
+			}, retryDelayMs);
+		};
+		const hydrate = async () => {
+			if (!active || inFlight || attempts >= maxAttempts) {
+				return;
+			}
+			inFlight = true;
+			attempts += 1;
+			try {
+				const hydratedSession = await transport.getSession(lastSessionId);
+				if (!active) {
+					return;
 				}
-			})
-			.catch(() => {
-				if (active) {
-					localStorage.removeItem(lastChatSessionStorageKey);
+				waitingForReadiness = false;
+				setErrorMessage(null);
+				navigate(`/chat/${lastSessionId}`, {
+					replace: true,
+					state: { hydratedSession },
+				});
+			} catch (error) {
+				const sessionMiss = sessionRecoveryCoordinator.handleSessionMiss(lastSessionId, error);
+				if (!active) {
+					return;
+				}
+				if (sessionMiss) {
+					waitingForReadiness = false;
 					navigate("/chat/new", { replace: true });
+					return;
 				}
-			});
+				setErrorMessage(
+					error instanceof Error ? error.message : "Failed to restore the remembered chat Session.",
+				);
+				waitingForReadiness = isAgentsUnavailableError(error);
+			} finally {
+				inFlight = false;
+				if (retryRequested) {
+					scheduleRetry();
+				}
+			}
+		};
+		const unsubscribeReady = transport.subscribeAgentsReady?.(() => {
+			retryRequested = true;
+			scheduleRetry();
+		});
+		retryTimer = setTimeout(() => {
+			retryTimer = undefined;
+			void hydrate();
+		}, 0);
 
 		return () => {
 			active = false;
+			if (retryTimer !== undefined) {
+				clearTimeout(retryTimer);
+			}
+			unsubscribeReady?.();
 		};
-	}, [navigate]);
+	}, [maxAttempts, navigate, retryDelayMs, sessionRecoveryCoordinator, transport]);
 
-	return null;
+	return errorMessage === null ? null : <div role="alert">{errorMessage}</div>;
 }
 
-export function NewChatPage() {
+export function NewChatPage({ transport = chatTransport }: { transport?: ChatTransport } = {}) {
 	const navigate = useNavigate();
+	const location = useLocation();
 
 	useEffect(() => {
-		localStorage.removeItem(lastChatSessionStorageKey);
-	}, []);
+		if (!shouldPreserveRememberedSession(location.state)) {
+			localStorage.removeItem(lastChatSessionStorageKey);
+		}
+	}, [location.state]);
 
 	return (
 		<ChatPage
-			transport={chatTransport}
+			transport={transport}
 			onSessionChange={(sessionId) => navigate(`/chat/${sessionId}`, { replace: true })}
 			onNewSession={() => navigate("/chat/new")}
 			onSelectSession={(sessionId) => navigate(`/chat/${sessionId}`)}
@@ -66,29 +148,84 @@ export function ChatsPage() {
 	return <NewChatPage />;
 }
 
-export function ChatSessionPage() {
+export function ChatSessionPage({ transport = chatTransport }: { transport?: ChatTransport } = {}) {
 	const { sessionId } = useParams();
+	const location = useLocation();
 	const navigate = useNavigate();
-	useEffect(() => {
-		if (sessionId !== undefined) {
-			localStorage.setItem(lastChatSessionStorageKey, sessionId);
+	const hydratedSession =
+		sessionId === undefined ? undefined : readHydratedSession(location.state, sessionId);
+	const handleSessionHydrated = useCallback((hydratedSessionId: string) => {
+		if (isRendererSessionRetired(hydratedSessionId)) {
+			return;
 		}
-	}, [sessionId]);
+		localStorage.setItem(lastChatSessionStorageKey, hydratedSessionId);
+	}, []);
+	const handleSessionRetired = useCallback(
+		(retiredSessionId: string) => {
+			const rememberedSessionId = localStorage.getItem(lastChatSessionStorageKey);
+			navigate("/chat/new", {
+				replace: true,
+				state:
+					rememberedSessionId !== null && rememberedSessionId !== retiredSessionId
+						? { preserveRememberedSession: true }
+						: null,
+			});
+		},
+		[navigate],
+	);
+	const sessionIsRetired = sessionId !== undefined && isRendererSessionRetired(sessionId);
+
+	useEffect(() => {
+		if (sessionId !== undefined && sessionIsRetired) {
+			handleSessionRetired(sessionId);
+		}
+	}, [handleSessionRetired, sessionId, sessionIsRetired]);
 
 	if (sessionId === undefined) {
 		throw new Error("Chat session route is missing its session ID.");
 	}
+	if (sessionIsRetired) {
+		return null;
+	}
 
 	return (
 		<ChatPage
-			transport={chatTransport}
+			transport={transport}
 			sessionId={sessionId}
+			initialSession={hydratedSession}
 			onSessionChange={(nextSessionId) => navigate(`/chat/${nextSessionId}`, { replace: true })}
+			onSessionHydrated={handleSessionHydrated}
+			onSessionRetired={handleSessionRetired}
 			onNewSession={() => navigate("/chat/new")}
 			onSelectSession={(nextSessionId) => navigate(`/chat/${nextSessionId}`)}
 			onOpenProviderSettings={() => navigate("/settings/providers")}
 		/>
 	);
+}
+
+function shouldPreserveRememberedSession(state: unknown): boolean {
+	return (
+		typeof state === "object" &&
+		state !== null &&
+		"preserveRememberedSession" in state &&
+		state.preserveRememberedSession === true
+	);
+}
+
+function readHydratedSession(state: unknown, sessionId: string): ChatSession | undefined {
+	if (isRendererSessionRetired(sessionId)) {
+		return undefined;
+	}
+	if (typeof state !== "object" || state === null || !("hydratedSession" in state)) {
+		return undefined;
+	}
+	const hydratedSession = state.hydratedSession;
+	return typeof hydratedSession === "object" &&
+		hydratedSession !== null &&
+		"id" in hydratedSession &&
+		hydratedSession.id === sessionId
+		? (hydratedSession as ChatSession)
+		: undefined;
 }
 
 export function ProviderSettingsRoutePage() {

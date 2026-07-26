@@ -1,20 +1,23 @@
-import { probeAgentRuntime } from "@moshu/agent-runtime";
 import {
+	agentsRuntimeInfoSchema,
 	cancelChatRunInputSchema,
 	cancelChatRunOutputSchema,
 	chatProviderStatusSchema,
 	chatSendAcceptedOutputSchema,
 	configureChatProviderInputSchema,
-	createChatSessionOutputSchema,
 	deleteChatSessionInputSchema,
 	deleteChatSessionOutputSchema,
 	emptyParamsSchema,
+	type GetChatSessionPageOutput,
 	getChatSessionInputSchema,
+	getChatSessionPageInputSchema,
+	getChatSessionPageOutputSchema,
 	getChatSessionSnapshotOutputSchema,
 	listChatSessionsInputSchema,
 	listChatSessionsOutputSchema,
+	productRpcMethods,
 	runtimeInfoSchema,
-	sendChatMessageInputSchema,
+	sendAskChatMessageInputSchema,
 	setChatSessionArchivedInputSchema,
 	setChatSessionArchivedOutputSchema,
 	testChatProviderInputSchema,
@@ -24,113 +27,192 @@ import {
 } from "@moshu/contracts";
 import { BrowserView, Updater } from "electrobun/bun";
 import { traceChatRpcRequest } from "../shared/chat-rpc-diagnostics";
-import type { DesktopRpc, SendDesktopChatMessageInput } from "../shared/rpc";
-import type { DesktopChatService } from "./chat-service";
-
-const sendDesktopChatMessageInputSchema = sendChatMessageInputSchema.pick({
-	sessionId: true,
-	content: true,
-});
+import {
+	acknowledgeChatSessionInvalidationInputSchema,
+	type DesktopRpc,
+	type SendDesktopChatMessageInput,
+} from "../shared/rpc";
+import type { DesktopAgentsClient } from "./desktop-agents-client";
 
 export interface DesktopRpcDependencies {
-	chatService: DesktopChatService;
+	agentsClient: DesktopAgentsClient;
 }
 
-export function createDesktopRpc({ chatService }: DesktopRpcDependencies) {
+export function createDesktopRpc({ agentsClient }: DesktopRpcDependencies) {
 	return BrowserView.defineRPC<DesktopRpc>({
 		maxRequestTime: 15_000,
 		handlers: {
 			requests: {
 				getRuntimeInfo: async (params) => {
-					emptyParamsSchema.parse(params);
-
+					const server = await agentsClient.request(
+						productRpcMethods.runtimeGet,
+						params,
+						emptyParamsSchema,
+						agentsRuntimeInfoSchema,
+					);
 					return runtimeInfoSchema.parse({
 						apiVersion: 1,
 						appName: "墨枢",
 						appVersion: "0.0.1",
 						channel: await Updater.localInfo.channel(),
 						electrobunVersion: "1.18.1",
-						bunVersion: Bun.version,
-						platform: process.platform,
-						arch: process.arch,
-						deepAgents: probeAgentRuntime(),
+						bunVersion: server.bunVersion,
+						platform: server.platform,
+						arch: server.arch,
+						deepAgents: server.deepAgents,
 					});
 				},
-				getChatProviderStatus: async (params) => {
-					emptyParamsSchema.parse(params);
-					return chatProviderStatusSchema.parse(chatService.getProviderStatus());
-				},
-				configureChatProvider: async (params) =>
-					chatProviderStatusSchema.parse(
-						chatService.configureProvider(configureChatProviderInputSchema.parse(params)),
+				getChatProviderStatus: (params) =>
+					agentsClient.request(
+						productRpcMethods.providerStatus,
+						params,
+						emptyParamsSchema,
+						chatProviderStatusSchema,
 					),
-				testChatProvider: async (params) =>
-					testChatProviderOutputSchema.parse(
-						await chatService.testProvider(testChatProviderInputSchema.parse(params)),
+				configureChatProvider: (params) =>
+					agentsClient.request(
+						productRpcMethods.providerConfigure,
+						params,
+						configureChatProviderInputSchema,
+						chatProviderStatusSchema,
 					),
-				deleteChatProvider: async (params) => {
-					emptyParamsSchema.parse(params);
-					return chatProviderStatusSchema.parse(chatService.deleteProvider());
-				},
-				createChatSession: async (params) => {
-					return traceChatRpcRequest({
+				testChatProvider: (params) =>
+					agentsClient.request(
+						productRpcMethods.providerTest,
+						params,
+						testChatProviderInputSchema,
+						testChatProviderOutputSchema,
+					),
+				deleteChatProvider: (params) =>
+					agentsClient.request(
+						productRpcMethods.providerDelete,
+						params,
+						emptyParamsSchema,
+						chatProviderStatusSchema,
+					),
+				createChatSession: (params) =>
+					traceChatRpcRequest({
 						side: "bun",
 						operation: "createChatSession",
 						input: params,
-						execute: () => {
-							emptyParamsSchema.parse(params);
-							return createChatSessionOutputSchema.parse(chatService.createSession());
-						},
-					});
-				},
-				getChatSession: async (params) =>
+						execute: () => agentsClient.createSession(),
+					}),
+				getChatSession: (params) =>
 					traceChatRpcRequest({
 						side: "bun",
 						operation: "getChatSession",
 						input: params,
-						execute: async () =>
-							getChatSessionSnapshotOutputSchema.parse(
-								await chatService.getSessionSnapshot(getChatSessionInputSchema.parse(params)),
-							),
+						execute: () => getCompleteSessionSnapshot(agentsClient, params),
 					}),
-				listChatSessions: async (params) =>
-					listChatSessionsOutputSchema.parse(
-						chatService.listSessions(listChatSessionsInputSchema.parse(params)),
+				listChatSessions: (params) =>
+					agentsClient.request(
+						productRpcMethods.sessionList,
+						params,
+						listChatSessionsInputSchema,
+						listChatSessionsOutputSchema,
 					),
-				updateChatSession: async (params) =>
-					updateChatSessionOutputSchema.parse(
-						chatService.updateSession(updateChatSessionInputSchema.parse(params)),
+				updateChatSession: (params) =>
+					agentsClient.request(
+						productRpcMethods.sessionUpdate,
+						params,
+						updateChatSessionInputSchema,
+						updateChatSessionOutputSchema,
 					),
-				setChatSessionArchived: async (params) =>
-					setChatSessionArchivedOutputSchema.parse(
-						chatService.setSessionArchived(setChatSessionArchivedInputSchema.parse(params)),
+				setChatSessionArchived: (params) =>
+					agentsClient.request(
+						productRpcMethods.sessionArchive,
+						params,
+						setChatSessionArchivedInputSchema,
+						setChatSessionArchivedOutputSchema,
 					),
-				deleteChatSession: async (params) =>
-					deleteChatSessionOutputSchema.parse(
-						await chatService.deleteSession(deleteChatSessionInputSchema.parse(params)),
+				deleteChatSession: (params) =>
+					agentsClient.request(
+						productRpcMethods.sessionDelete,
+						params,
+						deleteChatSessionInputSchema,
+						deleteChatSessionOutputSchema,
 					),
-				sendChatMessage: async (params: SendDesktopChatMessageInput) =>
+				sendChatMessage: (params: SendDesktopChatMessageInput) =>
 					traceChatRpcRequest({
 						side: "bun",
 						operation: "sendChatMessage",
 						input: params,
-						execute: () =>
-							chatSendAcceptedOutputSchema.parse(
-								chatService.sendMessage(sendDesktopChatMessageInputSchema.parse(params)),
-							),
+						execute: () => forwardChatSend(agentsClient, params),
 					}),
-				cancelChatRun: async (params) =>
+				cancelChatRun: (params) =>
 					traceChatRpcRequest({
 						side: "bun",
 						operation: "cancelChatRun",
 						input: params,
 						execute: () =>
-							cancelChatRunOutputSchema.parse(
-								chatService.cancel(cancelChatRunInputSchema.parse(params)),
+							agentsClient.request(
+								productRpcMethods.chatCancel,
+								{
+									runId: params.runId,
+									...(params.reason === undefined ? {} : { reason: params.reason }),
+								},
+								cancelChatRunInputSchema,
+								cancelChatRunOutputSchema,
+								params.sessionId,
 							),
 					}),
+				acknowledgeChatSessionInvalidation: (params) => {
+					agentsClient.acknowledgeChatSessionInvalidation(
+						acknowledgeChatSessionInvalidationInputSchema.parse(params),
+					);
+					return {};
+				},
 			},
 			messages: {},
 		},
+	});
+}
+
+async function forwardChatSend(
+	agentsClient: DesktopAgentsClient,
+	input: SendDesktopChatMessageInput,
+) {
+	return agentsClient.request(
+		productRpcMethods.chatSend,
+		{ ...input, requestId: input.requestId ?? crypto.randomUUID() },
+		sendAskChatMessageInputSchema,
+		chatSendAcceptedOutputSchema,
+	);
+}
+
+async function getCompleteSessionSnapshot(agentsClient: DesktopAgentsClient, input: unknown) {
+	const parsedInput = getChatSessionInputSchema.parse(input);
+	let cursor: string | undefined;
+	let session: GetChatSessionPageOutput["session"] | undefined;
+	const messages: GetChatSessionPageOutput["messages"] = [];
+	const chronologicalRuns: GetChatSessionPageOutput["runs"] = [];
+	const eventCursors: GetChatSessionPageOutput["eventCursors"] = [];
+
+	while (true) {
+		const page = await agentsClient.request(
+			productRpcMethods.sessionGet,
+			{
+				sessionId: parsedInput.sessionId,
+				...(cursor === undefined ? {} : { cursor }),
+				limit: 2,
+			},
+			getChatSessionPageInputSchema,
+			getChatSessionPageOutputSchema,
+		);
+		session = page.session;
+		messages.push(...page.messages);
+		chronologicalRuns.push(...page.runs);
+		eventCursors.push(...page.eventCursors);
+		if (page.nextCursor === undefined) {
+			break;
+		}
+		cursor = page.nextCursor;
+	}
+
+	return getChatSessionSnapshotOutputSchema.parse({
+		session,
+		messages: messages.map((message, index) => ({ ...message, sequence: index + 1 })),
+		runs: chronologicalRuns.reverse(),
+		eventCursors,
 	});
 }

@@ -4,29 +4,29 @@
 	"private": true,
 	"type": "module",
 	"scripts": {
-		"dev": "bun run build:web && electrobun dev --watch",
+		"dev": "bun run ./scripts/dev-companions-poc.ts",
 		"dev:companions": "bun run ./scripts/dev-companions-poc.ts",
 		"dev:hmr": "concurrently --kill-others-on-fail \"bun run hmr\" \"bun run dev\"",
 		"hmr": "vite --port 5173",
 		"build:web": "vite build",
-		"package:canary": "bun run build:web && electrobun build --env=canary",
+		"package:canary": "bun run ./scripts/package-companions-poc.ts",
 		"package:poc": "bun run ./scripts/package-companions-poc.ts",
 		"typecheck": "tsc --noEmit -p tsconfig.bun.json && tsc --noEmit -p tsconfig.web.json && tsc --noEmit -p tsconfig.config.json",
-		"test:bun": "bun test src/bun",
+		"test:bun": "bun test src/bun scripts",
 		"test:web": "vitest run",
 		"test": "bun run test:bun && bun run test:web"
 	},
 	"dependencies": {
-		"@moshu/agent-runtime": "workspace:*",
 		"@moshu/contracts": "workspace:*",
-		"@moshu/database": "workspace:*",
+		"@moshu/process-rpc": "workspace:*",
 		"@moshu/ui": "workspace:*",
 		"@heroui/react": "3.2.2",
 		"@heroui/styles": "3.2.2",
 		"electrobun": "1.18.1",
 		"react": "19.2.7",
 		"react-dom": "19.2.7",
-		"react-router-dom": "7.18.1"
+		"react-router-dom": "7.18.1",
+		"zod": "4.4.3"
 	},
 	"devDependencies": {
 		"@tailwindcss/vite": "4.3.3",

@@ -29,6 +29,7 @@ export interface StreamingWebSocketClientOptions {
 	readonly headers?: Readonly<Record<string, string>>;
 	readonly handshakeTimeoutMs: number;
 	readonly maxPayloadBytes: number;
+	readonly signal?: AbortSignal;
 }
 
 export interface StreamingWebSocketConnection {
@@ -43,7 +44,10 @@ export interface StreamingWebSocketConnection {
 export function connectStreamingWebSocketClient(
 	options: StreamingWebSocketClientOptions,
 ): Promise<StreamingWebSocketConnection> {
-	const { url: inputUrl, headers, handshakeTimeoutMs, maxPayloadBytes } = options;
+	const { url: inputUrl, headers, handshakeTimeoutMs, maxPayloadBytes, signal } = options;
+	if (signal?.aborted === true) {
+		return Promise.reject(createConnectionAbortedError(signal.reason));
+	}
 	const url = parseWebSocketUrl(inputUrl);
 	const port = getPort(url);
 	const websocketKey = randomBytes(16).toString("base64");
@@ -58,6 +62,7 @@ export function connectStreamingWebSocketClient(
 		maxPayloadBytes,
 		port,
 		request,
+		signal,
 		url,
 	});
 }
@@ -68,6 +73,7 @@ interface UpgradeConnectionOptions {
 	readonly maxPayloadBytes: number;
 	readonly port: number;
 	readonly request: string;
+	readonly signal: AbortSignal | undefined;
 	readonly url: URL;
 }
 
@@ -77,10 +83,12 @@ function connectUpgradedSocket({
 	maxPayloadBytes,
 	port,
 	request,
+	signal,
 	url,
 }: UpgradeConnectionOptions): Promise<StreamingWebSocketConnection> {
 	return new Promise<StreamingWebSocketConnection>((resolve, reject) => {
 		let settled = false;
+		let failureSinkAttached = false;
 		let received = Buffer.alloc(0);
 		let deadlineTimer: ReturnType<typeof setTimeout> | null = null;
 		const connectEvent = url.protocol === "wss:" ? "secureConnect" : "connect";
@@ -108,15 +116,38 @@ function connectUpgradedSocket({
 			socket.off("error", onError);
 			socket.off("end", onEnd);
 			socket.off("close", onClose);
+			signal?.removeEventListener("abort", onAbort);
 		};
 
+		const cleanupFailureSink = (): void => {
+			if (!failureSinkAttached) {
+				return;
+			}
+			failureSinkAttached = false;
+			socket.off("error", onFailureSocketError);
+			socket.off("close", onFailureSocketClose);
+		};
+		const onFailureSocketError = (): void => undefined;
+		const onFailureSocketClose = (): void => cleanupFailureSink();
+		const armFailureSink = (): void => {
+			if (failureSinkAttached) {
+				return;
+			}
+			failureSinkAttached = true;
+			socket.on("error", onFailureSocketError);
+			socket.once("close", onFailureSocketClose);
+		};
 		const fail = (error: RpcHandshakeError): void => {
 			if (settled) {
 				return;
 			}
 			settled = true;
-			cleanup();
+			armFailureSink();
 			socket.destroy();
+			cleanup();
+			if (socket.closed) {
+				queueMicrotask(cleanupFailureSink);
+			}
 			reject(error);
 		};
 
@@ -165,6 +196,9 @@ function connectUpgradedSocket({
 					"WebSocket transport closed during the HTTP upgrade.",
 				),
 			);
+		};
+		const onAbort = (): void => {
+			fail(createConnectionAbortedError(signal?.reason));
 		};
 		const onData = (chunk: Buffer): void => {
 			received = Buffer.concat([received, chunk]);
@@ -231,8 +265,20 @@ function connectUpgradedSocket({
 		socket.once("timeout", onTimeout);
 		socket.setTimeout(handshakeTimeoutMs);
 		socket.once(connectEvent, onConnect);
+		signal?.addEventListener("abort", onAbort, { once: true });
 		deadlineTimer = setTimeout(onTimeout, handshakeTimeoutMs);
+		if (signal?.aborted === true) {
+			onAbort();
+		}
 	});
+}
+
+function createConnectionAbortedError(reason: unknown): RpcHandshakeError {
+	return new RpcHandshakeError(
+		"INTERNAL_ERROR",
+		"RPC WebSocket connection was aborted.",
+		reason === undefined ? undefined : { cause: reason },
+	);
 }
 
 function createStreamingConnection(
