@@ -105,6 +105,16 @@ export type ChatTransportEvent =
 	  };
 
 export type ChatTransportListener = (event: ChatTransportEvent) => void;
+export interface ChatSessionInvalidation {
+	sessionId: string;
+	reason: "session_retired" | "history_expired";
+}
+export type ChatSessionInvalidationListener = (
+	invalidation: ChatSessionInvalidation,
+) => void | PromiseLike<void>;
+export interface ChatSessionInvalidationSubscriptionOptions {
+	authoritative?: boolean;
+}
 
 export interface ChatTransport {
 	getProviderStatus(): Promise<ChatProviderStatus>;
@@ -117,7 +127,13 @@ export interface ChatTransport {
 	renameSession(sessionId: string, title: string): Promise<ChatSessionSummary>;
 	setSessionArchived(sessionId: string, archived: boolean): Promise<ChatSessionSummary>;
 	deleteSession(sessionId: string): Promise<void>;
-	send(input: { sessionId: string; message: string }): Promise<ChatSendResult>;
+	send(input: { requestId: string; sessionId: string; message: string }): Promise<ChatSendResult>;
 	cancel(input: { sessionId: string; requestId: string }): Promise<void>;
+	retireSession?(sessionId: string): void;
 	subscribe(listener: ChatTransportListener): () => void;
+	subscribeAgentsReady?(listener: () => void): () => void;
+	subscribeSessionInvalidations?(
+		listener: ChatSessionInvalidationListener,
+		options?: ChatSessionInvalidationSubscriptionOptions,
+	): () => void;
 }

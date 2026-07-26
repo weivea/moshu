@@ -1,9 +1,9 @@
 import type {
 	CancelChatRunOutput,
-	ChatMessage as ContractChatMessage,
-	ChatProviderStatus as ContractChatProviderStatus,
 	ChatRunEvent,
 	ChatSendAcceptedOutput,
+	ChatMessage as ContractChatMessage,
+	ChatProviderStatus as ContractChatProviderStatus,
 	CreateChatSessionOutput,
 	DeleteChatSessionOutput,
 	GetChatSessionSnapshotOutput,
@@ -12,13 +12,19 @@ import type {
 	TestChatProviderOutput,
 	UpdateChatSessionOutput,
 } from "@moshu/contracts";
-
+import { AgentsUnavailableError, ChatSessionNotFoundError } from "../../../../shared/rpc-errors";
+import {
+	SessionRetirementCache,
+	SessionRetirementCapacityError,
+} from "../../../../shared/session-retirement-cache";
 import type {
 	ChatMessage,
 	ChatProviderConfiguration,
 	ChatProviderConnectionTestResult,
 	ChatProviderStatus,
 	ChatSession,
+	ChatSessionInvalidation,
+	ChatSessionInvalidationSubscriptionOptions,
 	ChatSessionSummary,
 	ChatTransport,
 	ChatTransportEvent,
@@ -26,6 +32,7 @@ import type {
 } from "./transport";
 
 export interface RpcChatClient {
+	subscribeAgentsReady?(listener: () => void): () => void;
 	getChatProviderStatus(): Promise<ContractChatProviderStatus>;
 	configureChatProvider(input: {
 		schemaVersion: 1;
@@ -53,9 +60,17 @@ export interface RpcChatClient {
 		archived: boolean,
 	): Promise<SetChatSessionArchivedOutput>;
 	deleteChatSession(sessionId: string): Promise<DeleteChatSessionOutput>;
-	sendChatMessage(input: { sessionId: string; content: string }): Promise<ChatSendAcceptedOutput>;
-	cancelChatRun(runId: string, reason?: string): Promise<CancelChatRunOutput>;
+	sendChatMessage(input: {
+		requestId: string;
+		sessionId: string;
+		content: string;
+	}): Promise<ChatSendAcceptedOutput>;
+	cancelChatRun(sessionId: string, runId: string, reason?: string): Promise<CancelChatRunOutput>;
 	subscribeChatEvents(listener: (event: ChatRunEvent) => void): () => void;
+	subscribeChatSessionInvalidations?(
+		listener: (invalidation: ChatSessionInvalidation) => void | PromiseLike<void>,
+		options?: ChatSessionInvalidationSubscriptionOptions,
+	): () => void;
 }
 
 interface ActiveRequest {
@@ -63,12 +78,28 @@ interface ActiveRequest {
 	messageId: string;
 }
 
-export function createRpcChatTransport(client: RpcChatClient): ChatTransport {
+export function createRpcChatTransport(
+	client: RpcChatClient,
+	options: { now?: () => number } = {},
+): ChatTransport {
 	const listeners = new Set<ChatTransportListener>();
 	const activeRequests = new Map<string, ActiveRequest>();
+	const retiredSessions = new SessionRetirementCache<undefined>({ now: options.now });
+	let backpressuredRetirementSessionId: string | undefined;
 	let providerStatus: ChatProviderStatus | undefined;
+	const assertSessionSnapshotAllowed = (sessionId: string): void => {
+		if (backpressuredRetirementSessionId !== undefined) {
+			throw new AgentsUnavailableError("The renderer retirement cache is at capacity.");
+		}
+		if (retiredSessions.has(sessionId)) {
+			throw new ChatSessionNotFoundError();
+		}
+	};
 
 	client.subscribeChatEvents((event) => {
+		if (backpressuredRetirementSessionId !== undefined || retiredSessions.has(event.sessionId)) {
+			return;
+		}
 		const mappedEvent = mapRunEvent(event, activeRequests);
 		if (mappedEvent === undefined) {
 			return;
@@ -135,7 +166,9 @@ export function createRpcChatTransport(client: RpcChatClient): ChatTransport {
 			};
 		},
 		async getSession(sessionId: string) {
+			assertSessionSnapshotAllowed(sessionId);
 			const snapshot = await client.getChatSession(sessionId);
+			assertSessionSnapshotAllowed(sessionId);
 			const activeRun = snapshot.runs.find(
 				(run) => run.status === "queued" || run.status === "running" || run.status === "cancelling",
 			);
@@ -183,15 +216,18 @@ export function createRpcChatTransport(client: RpcChatClient): ChatTransport {
 		async deleteSession(sessionId: string) {
 			await client.deleteChatSession(sessionId);
 		},
-		async send(input: { sessionId: string; message: string }) {
+		async send(input: { requestId: string; sessionId: string; message: string }) {
 			const accepted = await client.sendChatMessage({
+				requestId: input.requestId,
 				sessionId: input.sessionId,
 				content: input.message,
 			});
-			activeRequests.set(accepted.run.id, {
-				sessionId: input.sessionId,
-				messageId: accepted.assistantMessage.id,
-			});
+			if (accepted.assistantMessage.status === "streaming") {
+				activeRequests.set(accepted.run.id, {
+					sessionId: input.sessionId,
+					messageId: accepted.assistantMessage.id,
+				});
+			}
 
 			return {
 				requestId: accepted.run.id,
@@ -200,13 +236,41 @@ export function createRpcChatTransport(client: RpcChatClient): ChatTransport {
 			};
 		},
 		async cancel(input: { sessionId: string; requestId: string }) {
-			await client.cancelChatRun(input.requestId, "User stopped the response.");
+			await client.cancelChatRun(input.sessionId, input.requestId, "User stopped the response.");
+		},
+		retireSession(sessionId: string) {
+			if (
+				backpressuredRetirementSessionId !== undefined &&
+				backpressuredRetirementSessionId !== sessionId
+			) {
+				throw new SessionRetirementCapacityError();
+			}
+			try {
+				retiredSessions.remember(sessionId, undefined);
+				backpressuredRetirementSessionId = undefined;
+			} catch (error) {
+				if (error instanceof SessionRetirementCapacityError) {
+					backpressuredRetirementSessionId = sessionId;
+				}
+				throw error;
+			}
+			for (const [requestId, request] of activeRequests) {
+				if (request.sessionId === sessionId) {
+					activeRequests.delete(requestId);
+				}
+			}
 		},
 		subscribe(listener: ChatTransportListener) {
 			listeners.add(listener);
 			return () => {
 				listeners.delete(listener);
 			};
+		},
+		subscribeAgentsReady(listener) {
+			return client.subscribeAgentsReady?.(listener) ?? (() => undefined);
+		},
+		subscribeSessionInvalidations(listener, options) {
+			return client.subscribeChatSessionInvalidations?.(listener, options) ?? (() => undefined);
 		},
 	};
 }

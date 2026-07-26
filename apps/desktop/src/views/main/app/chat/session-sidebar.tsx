@@ -1,8 +1,8 @@
 import { Button } from "@heroui/react";
-import { type FormEvent, useEffect, useRef, useState } from "react";
-
+import { type FormEvent, useCallback, useEffect, useRef, useState } from "react";
 import { ConfirmationDialog } from "../confirmation-dialog";
 import { useI18n } from "../i18n";
+import { isRendererSessionRetired, useChatSessionRecovery } from "./session-recovery-coordinator";
 import type { ChatSessionSummary, ChatTransport } from "./transport";
 
 export interface SessionSidebarProps {
@@ -25,6 +25,10 @@ export function SessionSidebar({
 	onSelectSession,
 }: SessionSidebarProps) {
 	const { locale, t } = useI18n();
+	const { coordinator: sessionRecoveryCoordinator } = useChatSessionRecovery(
+		transport,
+		selectedSessionId,
+	);
 	const [query, setQuery] = useState("");
 	const [showArchived, setShowArchived] = useState(false);
 	const [sessions, setSessions] = useState<ChatSessionSummary[]>([]);
@@ -47,37 +51,56 @@ export function SessionSidebar({
 		};
 	}, []);
 
-	// biome-ignore lint/correctness/useExhaustiveDependencies: refreshKey invalidates this query.
-	useEffect(() => {
+	const loadSessions = useCallback(async (): Promise<void> => {
 		const requestNumber = requestNumberRef.current + 1;
 		requestNumberRef.current = requestNumber;
 		setIsLoading(true);
 		setErrorMessage(undefined);
 
-		void transport
-			.listSessions({
+		try {
+			const items = await transport.listSessions({
 				...(query.trim().length === 0 ? {} : { query: query.trim() }),
 				archived: showArchived,
-			})
-			.then((items) => {
-				if (requestNumberRef.current === requestNumber) {
-					setSessions(items);
-				}
-			})
-			.catch(() => {
-				if (requestNumberRef.current === requestNumber) {
-					setErrorMessage(t("sessions.error.load"));
-				}
-			})
-			.finally(() => {
-				if (requestNumberRef.current === requestNumber) {
-					setIsLoading(false);
-				}
 			});
+			if (requestNumberRef.current === requestNumber) {
+				setSessions(items.filter((session) => !isRendererSessionRetired(session.id)));
+			}
+		} catch {
+			if (requestNumberRef.current === requestNumber) {
+				setErrorMessage(t("sessions.error.load"));
+			}
+		} finally {
+			if (requestNumberRef.current === requestNumber) {
+				setIsLoading(false);
+			}
+		}
+	}, [query, showArchived, t, transport]);
+
+	// biome-ignore lint/correctness/useExhaustiveDependencies: refreshKey invalidates this query.
+	useEffect(() => {
+		void loadSessions();
 		return () => {
 			requestNumberRef.current += 1;
 		};
-	}, [query, refreshKey, showArchived, t, transport]);
+	}, [loadSessions, refreshKey]);
+
+	useEffect(() => {
+		return transport.subscribeSessionInvalidations?.(() => {
+			void loadSessions();
+		});
+	}, [loadSessions, transport]);
+
+	useEffect(
+		() =>
+			sessionRecoveryCoordinator.subscribeRetirements((sessionId) => {
+				setSessions((current) => current.filter((session) => session.id !== sessionId));
+				setEditingSessionId((current) => (current === sessionId ? undefined : current));
+				setPendingSessionId((current) => (current === sessionId ? undefined : current));
+				setSessionToDelete((current) => (current?.id === sessionId ? undefined : current));
+				setOpenMenuSessionId((current) => (current === sessionId ? undefined : current));
+			}),
+		[sessionRecoveryCoordinator],
+	);
 
 	const startRename = (session: ChatSessionSummary) => {
 		setEditingSessionId(session.id);
@@ -104,8 +127,11 @@ export function SessionSidebar({
 			);
 			onSessionUpdated?.(updated);
 			setEditingSessionId(undefined);
-		} catch {
-			if (mountedRef.current) {
+		} catch (error) {
+			if (
+				!sessionRecoveryCoordinator.handleSessionMiss(editingSessionId, error) &&
+				mountedRef.current
+			) {
 				setErrorMessage(t("sessions.error.rename"));
 			}
 		} finally {
@@ -130,8 +156,8 @@ export function SessionSidebar({
 			if (session.id === selectedSessionIdRef.current && !wasArchived) {
 				onNewSession();
 			}
-		} catch {
-			if (mountedRef.current) {
+		} catch (error) {
+			if (!sessionRecoveryCoordinator.handleSessionMiss(session.id, error) && mountedRef.current) {
 				setErrorMessage(
 					session.archivedAt === undefined
 						? t("sessions.error.archive")
@@ -155,15 +181,13 @@ export function SessionSidebar({
 		setErrorMessage(undefined);
 		try {
 			await transport.deleteSession(session.id);
+			sessionRecoveryCoordinator.recordSessionRetired(session.id);
 			if (!mountedRef.current) {
 				return;
 			}
 			setSessions((current) => current.filter((candidate) => candidate.id !== session.id));
-			if (session.id === selectedSessionIdRef.current) {
-				onNewSession();
-			}
-		} catch {
-			if (mountedRef.current) {
+		} catch (error) {
+			if (!sessionRecoveryCoordinator.handleSessionMiss(session.id, error) && mountedRef.current) {
 				setErrorMessage(t("sessions.error.delete"));
 			}
 		} finally {

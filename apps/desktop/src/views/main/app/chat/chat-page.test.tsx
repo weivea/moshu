@@ -1,12 +1,16 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, test, vi } from "vitest";
+import { AgentsUnavailableError, ChatSessionNotFoundError } from "../../../../shared/rpc-errors";
 import { I18nProvider } from "../i18n";
 import { ChatPage, type ChatPageProps } from "./chat-page";
+import { isRendererSessionRetired } from "./session-recovery-coordinator";
 import {
 	type ChatMessage,
 	type ChatProviderConfiguration,
 	type ChatProviderStatus,
 	type ChatSession,
+	type ChatSessionInvalidation,
+	type ChatSessionInvalidationListener,
 	type ChatTransport,
 	type ChatTransportEvent,
 	type ChatTransportListener,
@@ -19,6 +23,9 @@ beforeEach(() => {
 		value: "en-US",
 	});
 	HTMLElement.prototype.scrollIntoView = vi.fn();
+	sessionStorage.clear();
+	localStorage.clear();
+	window.history.replaceState(null, "");
 });
 
 describe("ChatPage", () => {
@@ -153,6 +160,50 @@ describe("ChatPage", () => {
 		fireEvent.click(screen.getByRole("button", { name: "Retry" }));
 
 		await waitFor(() => expect(transport.sendCalls).toHaveLength(2));
+		expect(transport.sendCalls[0]?.requestId).toBe(transport.sendCalls[1]?.requestId);
+	});
+
+	test("globally retires an active Session before handling a typed send miss", async () => {
+		const transport = new FakeChatTransport({
+			configured: true,
+			model: "gpt-4.1-mini",
+		});
+		transport.sessions.set("missing-send-session", {
+			id: "missing-send-session",
+			title: "Missing send chat",
+			updatedAt: "2026-01-01T00:00:00.000Z",
+			model: "gpt-4.1-mini",
+			askMode: "Ask",
+			messages: [createMessage("existing-message", "user", "Existing transcript")],
+		});
+		transport.nextSendError = new ChatSessionNotFoundError();
+		const onSessionRetired = vi.fn();
+		localStorage.setItem("moshu.lastChatSessionId", "missing-send-session");
+		window.history.replaceState(
+			{
+				usr: {
+					hydratedSession: transport.sessions.get("missing-send-session"),
+					unrelated: "keep",
+				},
+			},
+			"",
+		);
+		renderChatPage({
+			transport,
+			sessionId: "missing-send-session",
+			onSessionRetired,
+		});
+		const prompt = await screen.findByLabelText("Prompt");
+		fireEvent.change(prompt, { target: { value: "This Session is gone" } });
+		fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+		await waitFor(() => expect(onSessionRetired).toHaveBeenCalledWith("missing-send-session"));
+		expect(isRendererSessionRetired("missing-send-session")).toBe(true);
+		expect(screen.queryByText("Existing transcript")).not.toBeInTheDocument();
+		expect(screen.queryByText("Missing send chat")).not.toBeInTheDocument();
+		expect(localStorage.getItem("moshu.lastChatSessionId")).toBeNull();
+		expect(window.history.state).toEqual({ usr: { unrelated: "keep" } });
+		expect(screen.queryByRole("alert")).not.toBeInTheDocument();
 	});
 
 	test("routes a newly created session after a failed first send is retried", async () => {
@@ -174,6 +225,7 @@ describe("ChatPage", () => {
 		fireEvent.click(screen.getByRole("button", { name: "Retry" }));
 
 		await waitFor(() => expect(transport.sendCalls).toHaveLength(2));
+		expect(transport.sendCalls[0]?.requestId).toBe(transport.sendCalls[1]?.requestId);
 		expect(onSessionChange).toHaveBeenCalledWith("session-1");
 	});
 
@@ -198,6 +250,41 @@ describe("ChatPage", () => {
 		);
 		expect(screen.getByText("Stopped")).toBeVisible();
 		expect(transport.cancelCalls).toHaveLength(1);
+	});
+
+	test("globally retires an active Session before handling a typed cancel miss", async () => {
+		const transport = new FakeChatTransport({
+			configured: true,
+			model: "gpt-4.1-mini",
+		});
+		transport.sessions.set("missing-cancel-session", {
+			id: "missing-cancel-session",
+			title: "Missing cancel chat",
+			updatedAt: "2026-01-01T00:00:00.000Z",
+			model: "gpt-4.1-mini",
+			askMode: "Ask",
+			messages: [
+				createMessage("cancel-user", "user", "Question"),
+				createMessage("cancel-assistant", "assistant", "Partial", "streaming"),
+			],
+			activeResponse: {
+				requestId: "missing-cancel-run",
+				messageId: "cancel-assistant",
+			},
+		});
+		transport.nextCancelError = new ChatSessionNotFoundError();
+		const onSessionRetired = vi.fn();
+		renderChatPage({
+			transport,
+			sessionId: "missing-cancel-session",
+			onSessionRetired,
+		});
+		fireEvent.click(await screen.findByRole("button", { name: "Stop" }));
+
+		await waitFor(() => expect(onSessionRetired).toHaveBeenCalledWith("missing-cancel-session"));
+		expect(isRendererSessionRetired("missing-cancel-session")).toBe(true);
+		expect(screen.queryByText("Partial")).not.toBeInTheDocument();
+		expect(screen.queryByRole("alert")).not.toBeInTheDocument();
 	});
 
 	test("ignores a stop failure after navigating to another Session", async () => {
@@ -292,6 +379,57 @@ describe("ChatPage", () => {
 		fireEvent.click(screen.getByRole("button", { name: "Save" }));
 
 		expect(await screen.findByRole("heading", { name: "Renamed session" })).toBeVisible();
+	});
+
+	test("retires a delayed typed hydration miss without disturbing the replacement Session", async () => {
+		const transport = new FakeChatTransport({
+			configured: true,
+			model: "gpt-4.1-mini",
+		});
+		transport.sessions.set("missing-hydration-a", {
+			id: "missing-hydration-a",
+			title: "Missing hydration A",
+			updatedAt: "2026-01-01T00:00:00.000Z",
+			model: "gpt-4.1-mini",
+			askMode: "Ask",
+			messages: [],
+		});
+		transport.sessions.set("replacement-hydration-b", {
+			id: "replacement-hydration-b",
+			title: "Replacement hydration B",
+			updatedAt: "2026-01-01T00:00:00.000Z",
+			model: "gpt-4.1-mini",
+			askMode: "Ask",
+			messages: [createMessage("replacement-hydration-message", "user", "Hydration B stays")],
+		});
+		const hydrationGate = createDeferred();
+		transport.sessionLoadGates.set("missing-hydration-a", hydrationGate.promise);
+		transport.nextGetSessionError = new ChatSessionNotFoundError();
+		const onSessionRetired = vi.fn();
+		const rendered = renderChatPage({
+			transport,
+			sessionId: "missing-hydration-a",
+			onSessionRetired,
+		});
+		await waitFor(() => expect(transport.getSessionCalls).toContain("missing-hydration-a"));
+
+		rendered.rerender(
+			<I18nProvider>
+				<ChatPage
+					transport={transport}
+					sessionId="replacement-hydration-b"
+					onSessionRetired={onSessionRetired}
+				/>
+			</I18nProvider>,
+		);
+		expect(await screen.findByText("Hydration B stays")).toBeVisible();
+		hydrationGate.resolve();
+
+		await waitFor(() => expect(isRendererSessionRetired("missing-hydration-a")).toBe(true));
+		expect(isRendererSessionRetired("replacement-hydration-b")).toBe(false);
+		expect(screen.getByRole("heading", { name: "Replacement hydration B" })).toBeVisible();
+		expect(screen.getByText("Hydration B stays")).toBeVisible();
+		expect(onSessionRetired).not.toHaveBeenCalled();
 	});
 
 	test("keeps persisted Session history readable without a configured Provider", async () => {
@@ -420,6 +558,268 @@ describe("ChatPage", () => {
 		expect(await screen.findByText("Complete")).toBeVisible();
 	});
 
+	test("shows an initial snapshot optimistically, then reconciles a terminal event during authoritative hydration", async () => {
+		const transport = new FakeChatTransport({
+			configured: true,
+			model: "gpt-4.1-mini",
+		});
+		const gate = createDeferred();
+		transport.sessionLoadGate = gate.promise;
+		transport.captureSessionBeforeGate = true;
+		const initialSession: ChatSession = {
+			id: "initial-hydration-session",
+			title: "Stale initial title",
+			updatedAt: "2026-01-01T00:00:00.000Z",
+			model: "gpt-4.1-mini",
+			askMode: "Ask",
+			messages: [
+				createMessage("initial-user", "user", "Initial question"),
+				createMessage("initial-assistant", "assistant", "Stale partial", "streaming"),
+			],
+			activeResponse: {
+				requestId: "initial-request",
+				messageId: "initial-assistant",
+			},
+			eventCursors: { "initial-request": 0 },
+		};
+		transport.sessions.set("initial-hydration-session", {
+			...cloneSession(initialSession),
+			title: "Authoritative title",
+			messages: [
+				createMessage("initial-user", "user", "Initial question"),
+				createMessage("initial-assistant", "assistant", "", "streaming"),
+			],
+		});
+		transport.pending.set("initial-request", {
+			sessionId: "initial-hydration-session",
+			messageId: "initial-assistant",
+		});
+
+		renderChatPage({
+			transport,
+			sessionId: "initial-hydration-session",
+			initialSession,
+		});
+
+		expect(screen.getByText("Stale partial")).toBeVisible();
+		await waitFor(() => expect(transport.getSessionCalls).toEqual(["initial-hydration-session"]));
+		expect(transport.listenerCountsAtSessionLoad).toEqual([1]);
+		transport.emitDelta("initial-request", "Answer during fetch");
+		transport.emitCompleted("initial-request");
+		gate.resolve();
+
+		expect(await screen.findByRole("heading", { name: "Authoritative title" })).toBeVisible();
+		expect(screen.getAllByText("Answer during fetch")).toHaveLength(1);
+		expect(await screen.findByText("Complete")).toBeVisible();
+		expect(screen.queryByRole("button", { name: "Stop" })).not.toBeInTheDocument();
+	});
+
+	test("retains an event delivered synchronously when the authoritative subscription is installed", async () => {
+		const transport = new FakeChatTransport({
+			configured: true,
+			model: "gpt-4.1-mini",
+		});
+		const gate = createDeferred();
+		transport.sessionLoadGate = gate.promise;
+		const session: ChatSession = {
+			id: "subscribe-first-session",
+			title: "Subscribe first",
+			updatedAt: "2026-01-01T00:00:00.000Z",
+			model: "gpt-4.1-mini",
+			askMode: "Ask",
+			messages: [
+				createMessage("subscribe-user", "user", "Question"),
+				createMessage("subscribe-assistant", "assistant", "", "streaming"),
+			],
+			activeResponse: {
+				requestId: "subscribe-request",
+				messageId: "subscribe-assistant",
+			},
+			eventCursors: { "subscribe-request": 0 },
+		};
+		transport.sessions.set(session.id, cloneSession(session));
+		transport.eventOnSubscribe = {
+			type: "response.delta",
+			sessionId: session.id,
+			requestId: "subscribe-request",
+			messageId: "subscribe-assistant",
+			delta: "Delivered before fetch",
+			sequence: 1,
+		};
+
+		renderChatPage({
+			transport,
+			sessionId: session.id,
+			initialSession: cloneSession(session),
+		});
+		await waitFor(() => expect(transport.getSessionCalls).toEqual([session.id]));
+		gate.resolve();
+
+		expect(await screen.findByText("Delivered before fetch")).toBeVisible();
+		expect(transport.listenerCountsAtSessionLoad).toEqual([1]);
+	});
+
+	test("serializes an authoritative invalidation refresh behind initial hydration", async () => {
+		const transport = new FakeChatTransport({
+			configured: true,
+			model: "gpt-4.1-mini",
+		});
+		const gate = createDeferred();
+		transport.sessionLoadGate = gate.promise;
+		transport.sessions.set("serialized-hydration-session", {
+			id: "serialized-hydration-session",
+			title: "Serialized hydration",
+			updatedAt: "2026-01-01T00:00:00.000Z",
+			model: "gpt-4.1-mini",
+			askMode: "Ask",
+			messages: [],
+		});
+
+		renderChatPage({ transport, sessionId: "serialized-hydration-session" });
+		await waitFor(() =>
+			expect(transport.getSessionCalls).toEqual(["serialized-hydration-session"]),
+		);
+		let invalidation: Promise<void> | undefined;
+		act(() => {
+			invalidation = transport.emitInvalidation({
+				sessionId: "serialized-hydration-session",
+				reason: "history_expired",
+			});
+		});
+		expect(transport.getSessionCalls).toEqual(["serialized-hydration-session"]);
+
+		gate.resolve();
+		await act(async () => {
+			await invalidation;
+		});
+		expect(transport.getSessionCalls).toEqual([
+			"serialized-hydration-session",
+			"serialized-hydration-session",
+		]);
+	});
+
+	test("orders buffered events after the authoritative cursor without duplicating snapshot content", async () => {
+		const transport = new FakeChatTransport({
+			configured: true,
+			model: "gpt-4.1-mini",
+		});
+		const gate = createDeferred();
+		transport.sessionLoadGate = gate.promise;
+		transport.captureSessionBeforeGate = true;
+		const session: ChatSession = {
+			id: "cursor-session",
+			title: "Cursor reconciliation",
+			updatedAt: "2026-01-01T00:00:00.000Z",
+			model: "gpt-4.1-mini",
+			askMode: "Ask",
+			messages: [
+				createMessage("cursor-user", "user", "Question"),
+				createMessage("cursor-assistant", "assistant", "AB", "streaming"),
+			],
+			activeResponse: {
+				requestId: "cursor-request",
+				messageId: "cursor-assistant",
+			},
+			eventCursors: { "cursor-request": 2 },
+		};
+		transport.sessions.set(session.id, cloneSession(session));
+
+		renderChatPage({
+			transport,
+			sessionId: session.id,
+			initialSession: cloneSession(session),
+		});
+		await waitFor(() => expect(transport.getSessionCalls).toEqual([session.id]));
+		transport.emitEvent({
+			type: "response.delta",
+			sessionId: session.id,
+			requestId: "cursor-request",
+			messageId: "cursor-assistant",
+			delta: "B",
+			sequence: 2,
+		});
+		transport.emitEvent({
+			type: "response.completed",
+			sessionId: session.id,
+			requestId: "cursor-request",
+			messageId: "cursor-assistant",
+			content: "ABC",
+			sequence: 4,
+		});
+		transport.emitEvent({
+			type: "response.delta",
+			sessionId: session.id,
+			requestId: "cursor-request",
+			messageId: "cursor-assistant",
+			delta: "C",
+			sequence: 3,
+		});
+		gate.resolve();
+
+		expect(await screen.findByText("ABC")).toBeVisible();
+		expect(screen.getAllByText("ABC")).toHaveLength(1);
+		expect(await screen.findByText("Complete")).toBeVisible();
+		expect(screen.queryByText("ABBC")).not.toBeInTheDocument();
+	});
+
+	test("rehydrates a stale initial snapshot when navigating back to a Session", async () => {
+		const transport = new FakeChatTransport({
+			configured: true,
+			model: "gpt-4.1-mini",
+		});
+		const staleSession: ChatSession = {
+			id: "back-session",
+			title: "Stale history title",
+			updatedAt: "2026-01-01T00:00:00.000Z",
+			model: "gpt-4.1-mini",
+			askMode: "Ask",
+			messages: [createMessage("stale-back-message", "user", "Stale history")],
+		};
+		transport.sessions.set("back-session", {
+			...cloneSession(staleSession),
+			title: "First authoritative title",
+			messages: [createMessage("first-back-message", "assistant", "First authoritative")],
+		});
+		transport.sessions.set("other-session", {
+			id: "other-session",
+			title: "Other Session",
+			updatedAt: "2026-01-01T00:00:00.000Z",
+			model: "gpt-4.1-mini",
+			askMode: "Ask",
+			messages: [createMessage("other-message", "user", "Other content")],
+		});
+		const rendered = renderChatPage({
+			transport,
+			sessionId: staleSession.id,
+			initialSession: staleSession,
+		});
+		expect(await screen.findByText("First authoritative")).toBeVisible();
+
+		rendered.rerender(
+			<I18nProvider>
+				<ChatPage transport={transport} sessionId="other-session" />
+			</I18nProvider>,
+		);
+		expect(await screen.findByText("Other content")).toBeVisible();
+		transport.sessions.set("back-session", {
+			...cloneSession(staleSession),
+			title: "Fresh after back",
+			messages: [createMessage("fresh-back-message", "assistant", "Fresh after back")],
+		});
+		rendered.rerender(
+			<I18nProvider>
+				<ChatPage transport={transport} sessionId={staleSession.id} initialSession={staleSession} />
+			</I18nProvider>,
+		);
+
+		expect(await screen.findByRole("heading", { name: "Fresh after back" })).toBeVisible();
+		expect(
+			screen.getByText("Fresh after back", { selector: ".chat-message__content" }),
+		).toBeVisible();
+		expect(screen.queryByText("Stale history")).not.toBeInTheDocument();
+		expect(transport.getSessionCalls.filter((id) => id === staleSession.id)).toHaveLength(2);
+	});
+
 	test("buffers events for a newly requested route while its snapshot is loading", async () => {
 		const transport = new FakeChatTransport({
 			configured: true,
@@ -532,6 +932,251 @@ describe("ChatPage", () => {
 		);
 		expect(screen.queryByText("Delayed send")).not.toBeInTheDocument();
 	});
+
+	test("retires a delayed typed send miss without disturbing the replacement Session", async () => {
+		const transport = new FakeChatTransport({
+			configured: true,
+			model: "gpt-4.1-mini",
+		});
+		transport.sessions.set("missing-send-a", {
+			id: "missing-send-a",
+			title: "Missing Session A",
+			updatedAt: "2026-01-01T00:00:00.000Z",
+			model: "gpt-4.1-mini",
+			askMode: "Ask",
+			messages: [],
+		});
+		transport.sessions.set("replacement-send-b", {
+			id: "replacement-send-b",
+			title: "Replacement Session B",
+			updatedAt: "2026-01-01T00:00:00.000Z",
+			model: "gpt-4.1-mini",
+			askMode: "Ask",
+			messages: [createMessage("replacement-message", "user", "Keep replacement state")],
+		});
+		const sendGate = createDeferred();
+		transport.sendReturnGate = sendGate.promise;
+		transport.nextSendError = new ChatSessionNotFoundError();
+		const onSessionRetired = vi.fn();
+		const rendered = renderChatPage({
+			transport,
+			sessionId: "missing-send-a",
+			onSessionRetired,
+		});
+		const prompt = await screen.findByLabelText("Prompt");
+		fireEvent.change(prompt, { target: { value: "Delayed missing send" } });
+		fireEvent.click(screen.getByRole("button", { name: "Send" }));
+		await waitFor(() => expect(transport.sendCalls).toHaveLength(1));
+
+		rendered.rerender(
+			<I18nProvider>
+				<ChatPage
+					transport={transport}
+					sessionId="replacement-send-b"
+					onSessionRetired={onSessionRetired}
+				/>
+			</I18nProvider>,
+		);
+		expect(await screen.findByText("Keep replacement state")).toBeVisible();
+		localStorage.setItem("moshu.lastChatSessionId", "replacement-send-b");
+		sendGate.resolve();
+
+		await waitFor(() => expect(isRendererSessionRetired("missing-send-a")).toBe(true));
+		expect(isRendererSessionRetired("replacement-send-b")).toBe(false);
+		expect(screen.getByRole("heading", { name: "Replacement Session B" })).toBeVisible();
+		expect(screen.getByText("Keep replacement state")).toBeVisible();
+		expect(localStorage.getItem("moshu.lastChatSessionId")).toBe("replacement-send-b");
+		expect(onSessionRetired).not.toHaveBeenCalled();
+	});
+
+	test("acknowledges Session retirement only after active state and the sidebar are refreshed", async () => {
+		const transport = new FakeChatTransport({ configured: true, model: "gpt-4.1-mini" });
+		const onSessionRetired = vi.fn();
+		transport.sessions.set("retired-session", {
+			id: "retired-session",
+			title: "Retired chat",
+			updatedAt: "2026-01-01T00:00:00.000Z",
+			model: "gpt-4.1-mini",
+			askMode: "Ask",
+			messages: [createMessage("old-message", "user", "Stale content")],
+		});
+		renderChatPage({ transport, sessionId: "retired-session", onSessionRetired });
+		expect(await screen.findByText("Stale content")).toBeVisible();
+		transport.sessions.delete("retired-session");
+
+		await act(async () => {
+			await transport.emitInvalidation({
+				sessionId: "retired-session",
+				reason: "session_retired",
+			});
+		});
+
+		expect(screen.queryByText("Stale content")).not.toBeInTheDocument();
+		expect(screen.queryByText("Retired chat")).not.toBeInTheDocument();
+		expect(transport.listSessionCalls).toBeGreaterThanOrEqual(2);
+		expect(onSessionRetired).toHaveBeenCalledOnce();
+		expect(onSessionRetired).toHaveBeenCalledWith("retired-session");
+
+		await act(async () => {
+			await transport.emitInvalidation({
+				sessionId: "unrelated-session",
+				reason: "session_retired",
+			});
+		});
+		expect(onSessionRetired).toHaveBeenCalledOnce();
+	});
+
+	test("acknowledges history expiry only after rebuilding the active snapshot", async () => {
+		const transport = new FakeChatTransport({ configured: true, model: "gpt-4.1-mini" });
+		transport.sessions.set("expired-session", {
+			id: "expired-session",
+			title: "Expired chat",
+			updatedAt: "2026-01-01T00:00:00.000Z",
+			model: "gpt-4.1-mini",
+			askMode: "Ask",
+			messages: [createMessage("old-message", "user", "Stale snapshot")],
+		});
+		renderChatPage({ transport, sessionId: "expired-session" });
+		expect(await screen.findByText("Stale snapshot")).toBeVisible();
+		transport.sessions
+			.get("expired-session")
+			?.messages.splice(
+				0,
+				1,
+				createMessage("new-message", "assistant", "Rebuilt snapshot", "completed"),
+			);
+
+		await act(async () => {
+			await transport.emitInvalidation({
+				sessionId: "expired-session",
+				reason: "history_expired",
+			});
+		});
+
+		expect(await screen.findByText("Rebuilt snapshot")).toBeVisible();
+		expect(screen.queryByText("Stale snapshot")).not.toBeInTheDocument();
+		expect(transport.getSessionCalls.filter((id) => id === "expired-session")).toHaveLength(2);
+	});
+
+	test("acknowledges a superseded history refresh after navigation to another Session", async () => {
+		const transport = new FakeChatTransport({ configured: true, model: "gpt-4.1-mini" });
+		transport.sessions.set("navigation-session-a", {
+			id: "navigation-session-a",
+			title: "Navigation Session A",
+			updatedAt: "2026-01-01T00:00:00.000Z",
+			model: "gpt-4.1-mini",
+			askMode: "Ask",
+			messages: [],
+		});
+		transport.sessions.set("navigation-session-b", {
+			id: "navigation-session-b",
+			title: "Navigation Session B",
+			updatedAt: "2026-01-01T00:00:00.000Z",
+			model: "gpt-4.1-mini",
+			askMode: "Ask",
+			messages: [],
+		});
+		const rendered = renderChatPage({ transport, sessionId: "navigation-session-a" });
+		await screen.findByRole("heading", { name: "Navigation Session A" });
+		const refreshGate = createDeferred();
+		transport.sessionLoadGates.set("navigation-session-a", refreshGate.promise);
+		const invalidation = transport.emitInvalidation({
+			sessionId: "navigation-session-a",
+			reason: "history_expired",
+		});
+		await waitFor(() =>
+			expect(transport.getSessionCalls.filter((id) => id === "navigation-session-a")).toHaveLength(
+				2,
+			),
+		);
+
+		rendered.rerender(
+			<I18nProvider>
+				<ChatPage transport={transport} sessionId="navigation-session-b" />
+			</I18nProvider>,
+		);
+		await screen.findByRole("heading", { name: "Navigation Session B" });
+		refreshGate.resolve();
+
+		await expect(invalidation).resolves.toBeUndefined();
+		expect(screen.getByRole("heading", { name: "Navigation Session B" })).toBeVisible();
+	});
+
+	test("acknowledges conclusive deletion after removing invalidated renderer state", async () => {
+		const transport = new FakeChatTransport({ configured: true, model: "gpt-4.1-mini" });
+		transport.sessions.set("deleted-session", {
+			id: "deleted-session",
+			title: "Deleted chat",
+			updatedAt: "2026-01-01T00:00:00.000Z",
+			model: "gpt-4.1-mini",
+			askMode: "Ask",
+			messages: [createMessage("deleted-message", "user", "Must be removed")],
+		});
+		renderChatPage({ transport, sessionId: "deleted-session" });
+		expect(await screen.findByText("Must be removed")).toBeVisible();
+		transport.nextGetSessionError = new ChatSessionNotFoundError();
+		transport.sessions.delete("deleted-session");
+
+		await act(async () => {
+			await transport.emitInvalidation({
+				sessionId: "deleted-session",
+				reason: "history_expired",
+			});
+		});
+
+		expect(screen.queryByText("Must be removed")).not.toBeInTheDocument();
+		expect(screen.queryByText("Deleted chat")).not.toBeInTheDocument();
+	});
+
+	test.each([
+		["product/schema", new Error("Snapshot schema validation failed.")],
+		["availability", new AgentsUnavailableError("The agents service is reconnecting.")],
+	])("rejects history-expiry acknowledgement after a %s refetch failure", async (_name, error) => {
+		const transport = new FakeChatTransport({ configured: true, model: "gpt-4.1-mini" });
+		transport.sessions.set("failed-session", {
+			id: "failed-session",
+			title: "Failed chat",
+			updatedAt: "2026-01-01T00:00:00.000Z",
+			model: "gpt-4.1-mini",
+			askMode: "Ask",
+			messages: [],
+		});
+		renderChatPage({ transport, sessionId: "failed-session" });
+		await screen.findByRole("heading", { name: "Failed chat" });
+		transport.nextGetSessionError = error;
+
+		await expect(
+			act(async () => {
+				await transport.emitInvalidation({
+					sessionId: "failed-session",
+					reason: "history_expired",
+				});
+			}),
+		).rejects.toThrow(error.message);
+	});
+
+	test("does not make acknowledgement depend on the sidebar refetch", async () => {
+		const transport = new FakeChatTransport({ configured: true, model: "gpt-4.1-mini" });
+		transport.sessions.set("expired-session", {
+			id: "expired-session",
+			title: "Expired chat",
+			updatedAt: "2026-01-01T00:00:00.000Z",
+			model: "gpt-4.1-mini",
+			askMode: "Ask",
+			messages: [],
+		});
+		renderChatPage({ transport, sessionId: "expired-session" });
+		await screen.findByRole("heading", { name: "Expired chat" });
+		transport.nextListSessionsError = new Error("Session list unavailable.");
+
+		await act(async () => {
+			await transport.emitInvalidation({
+				sessionId: "expired-session",
+				reason: "history_expired",
+			});
+		});
+		expect(transport.getSessionCalls.filter((id) => id === "expired-session")).toHaveLength(2);
+	});
 });
 
 function renderChatPage(props: ChatPageProps) {
@@ -552,22 +1197,29 @@ async function waitForRequest(transport: FakeChatTransport) {
 
 class FakeChatTransport implements ChatTransport {
 	configureCalls: ChatProviderConfiguration[] = [];
-	sendCalls: Array<{ sessionId: string; message: string }> = [];
+	sendCalls: Array<{ requestId: string; sessionId: string; message: string }> = [];
 	cancelCalls: Array<{ sessionId: string; requestId: string }> = [];
 	getSessionCalls: string[] = [];
+	listenerCountsAtSessionLoad: number[] = [];
+	listSessionCalls = 0;
 	listeners = new Set<ChatTransportListener>();
+	invalidationListeners = new Set<ChatSessionInvalidationListener>();
 	sessions = new Map<string, ChatSession>();
 	pending = new Map<string, { sessionId: string; messageId: string }>();
 	nextProviderStatusError: Error | null = null;
 	nextConfigureError: Error | null = null;
 	nextSendError: Error | null = null;
 	nextCancelError: Error | null = null;
+	nextGetSessionError: Error | null = null;
+	nextListSessionsError: Error | null = null;
 	lastRequestId: string | null = null;
 	sessionLoadGate: Promise<void> | null = null;
+	sessionLoadGates = new Map<string, Promise<void>>();
 	captureSessionBeforeGate = false;
 	responseBeforeSendReturns: string | null = null;
 	sendReturnGate: Promise<void> | null = null;
 	cancelReturnGate: Promise<void> | null = null;
+	eventOnSubscribe: ChatTransportEvent | null = null;
 	private providerStatus: ChatProviderStatus;
 	private eventSequences = new Map<string, number>();
 	private nextSessionNumber = 1;
@@ -643,10 +1295,16 @@ class FakeChatTransport implements ChatTransport {
 
 	async getSession(sessionId: string) {
 		this.getSessionCalls.push(sessionId);
+		this.listenerCountsAtSessionLoad.push(this.listeners.size);
+		const error = this.consume("nextGetSessionError");
+		if (error) {
+			await (this.sessionLoadGates.get(sessionId) ?? this.sessionLoadGate);
+			throw error;
+		}
 		const session = this.sessions.get(sessionId);
 		const capturedSession =
 			this.captureSessionBeforeGate && session !== undefined ? cloneSession(session) : undefined;
-		await this.sessionLoadGate;
+		await (this.sessionLoadGates.get(sessionId) ?? this.sessionLoadGate);
 		const resolvedSession = capturedSession ?? this.sessions.get(sessionId);
 		if (!resolvedSession) {
 			throw new Error("Session not found.");
@@ -655,6 +1313,11 @@ class FakeChatTransport implements ChatTransport {
 	}
 
 	async listSessions(input: { query?: string; archived?: boolean; limit?: number } = {}) {
+		this.listSessionCalls += 1;
+		const error = this.consume("nextListSessionsError");
+		if (error) {
+			throw error;
+		}
 		const query = input.query?.toLocaleLowerCase() ?? "";
 		return [...this.sessions.values()]
 			.filter((session) => (session.archivedAt !== undefined) === (input.archived ?? false))
@@ -689,10 +1352,11 @@ class FakeChatTransport implements ChatTransport {
 		this.sessions.delete(sessionId);
 	}
 
-	async send(input: { sessionId: string; message: string }) {
+	async send(input: { requestId: string; sessionId: string; message: string }) {
 		this.sendCalls.push(input);
 		const error = this.consume("nextSendError");
 		if (error) {
+			await this.sendReturnGate;
 			throw error;
 		}
 
@@ -771,9 +1435,31 @@ class FakeChatTransport implements ChatTransport {
 
 	subscribe(listener: ChatTransportListener) {
 		this.listeners.add(listener);
+		if (this.eventOnSubscribe !== null) {
+			const event = this.eventOnSubscribe;
+			this.eventOnSubscribe = null;
+			listener(event);
+		}
 		return () => {
 			this.listeners.delete(listener);
 		};
+	}
+
+	subscribeSessionInvalidations(listener: ChatSessionInvalidationListener) {
+		this.invalidationListeners.add(listener);
+		return () => {
+			this.invalidationListeners.delete(listener);
+		};
+	}
+
+	async emitInvalidation(invalidation: ChatSessionInvalidation): Promise<void> {
+		for (const listener of [...this.invalidationListeners]) {
+			await listener(invalidation);
+		}
+	}
+
+	emitEvent(event: ChatTransportEvent): void {
+		this.notify(event);
 	}
 
 	emitDelta(requestId: string, delta: string) {
@@ -858,7 +1544,13 @@ class FakeChatTransport implements ChatTransport {
 	}
 
 	private consume(
-		key: "nextProviderStatusError" | "nextConfigureError" | "nextSendError" | "nextCancelError",
+		key:
+			| "nextProviderStatusError"
+			| "nextConfigureError"
+			| "nextSendError"
+			| "nextCancelError"
+			| "nextGetSessionError"
+			| "nextListSessionsError",
 	) {
 		const error = this[key];
 		this[key] = null;

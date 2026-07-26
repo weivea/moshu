@@ -1,20 +1,22 @@
 import { describe, expect, test } from "bun:test";
-import { FakeListChatModel, FakeStreamingChatModel } from "@langchain/core/utils/testing";
-import { AIMessage, AIMessageChunk, HumanMessage } from "@langchain/core/messages";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { AIMessage, AIMessageChunk, HumanMessage } from "@langchain/core/messages";
+import type { BaseCheckpointSaver } from "@langchain/langgraph-checkpoint";
+import { FakeListChatModel, FakeStreamingChatModel } from "@langchain/core/utils/testing";
 import {
-	AskChatCancelledError,
-	AskChatRuntimeError,
-	BunSqliteSaver,
-	DeepAgentsAskChatRuntime,
-	InMemoryAskProviderConfigStore,
 	type AskAgentFactory,
 	type AskAgentStreamInput,
 	type AskAgentStreamOptions,
+	AskChatCancelledError,
+	type AskChatRuntimeOptions,
+	AskChatRuntimeError,
 	type AskModelFactory,
+	BunSqliteSaver,
+	DeepAgentsAskChatRuntime,
+	InMemoryAskProviderConfigStore,
 } from "../src";
 
 describe("DeepAgentsAskChatRuntime", () => {
@@ -290,6 +292,17 @@ describe("DeepAgentsAskChatRuntime", () => {
 				}),
 			).toBeDefined();
 
+			const cancelled = new AbortController();
+			cancelled.abort(new Error("checkpoint deletion cancelled"));
+			await expect(runtime.deleteThread("delete-thread", cancelled.signal)).rejects.toThrow(
+				"checkpoint deletion cancelled",
+			);
+			expect(
+				await saver.getTuple({
+					configurable: { thread_id: "ask:delete-thread", checkpoint_ns: "" },
+				}),
+			).toBeDefined();
+
 			await runtime.deleteThread("delete-thread");
 
 			expect(
@@ -485,6 +498,513 @@ describe("DeepAgentsAskChatRuntime", () => {
 		expect(runtime.cancel("active-run", "user_cancelled")).toBe(true);
 		await expect(run.result).rejects.toBeInstanceOf(AskChatCancelledError);
 		expect(runtime.cancel("active-run")).toBe(false);
+	});
+
+	test("stops a 500-item nested text stream and closes both iterators after cancellation", async () => {
+		let nestedPulls = 0;
+		let nestedReturns = 0;
+		let outerReturns = 0;
+		const nestedText: AsyncIterable<string> = {
+			[Symbol.asyncIterator]() {
+				let index = 0;
+				return {
+					async next() {
+						nestedPulls += 1;
+						await Promise.resolve();
+						return index++ < 500
+							? { done: false as const, value: "x" }
+							: { done: true as const, value: undefined };
+					},
+					async return() {
+						nestedReturns += 1;
+						return { done: true as const, value: undefined };
+					},
+				};
+			},
+		};
+		const outerStream: AsyncIterable<unknown> = {
+			[Symbol.asyncIterator]() {
+				let delivered = false;
+				return {
+					async next() {
+						if (delivered) {
+							return { done: true as const, value: undefined };
+						}
+						delivered = true;
+						return { done: false as const, value: { text: nestedText } };
+					},
+					async return() {
+						outerReturns += 1;
+						return { done: true as const, value: undefined };
+					},
+				};
+			},
+		};
+		const runtime = createRuntime(async () => ({
+			stream: async () => outerStream,
+		}));
+		const result = runtime.run({
+			runId: "nested-500-cancel",
+			messages: [{ role: "user", content: "stop quickly" }],
+			onEvent: () => {
+				runtime.cancel("nested-500-cancel", "first item received");
+			},
+		});
+
+		await expect(result).rejects.toBeInstanceOf(AskChatCancelledError);
+		expect(nestedPulls).toBeLessThanOrEqual(2);
+		expect(nestedReturns).toBe(1);
+		expect(outerReturns).toBe(1);
+	});
+
+	test("closes an infinite yielding text iterator promptly on cancellation", async () => {
+		let pulls = 0;
+		let returns = 0;
+		let resolveFirstDelta: () => void = () => {};
+		const firstDelta = new Promise<void>((resolve) => {
+			resolveFirstDelta = resolve;
+		});
+		const infiniteText: AsyncIterable<string> = {
+			[Symbol.asyncIterator]() {
+				return {
+					async next() {
+						pulls += 1;
+						await Promise.resolve();
+						return { done: false as const, value: "x" };
+					},
+					async return() {
+						returns += 1;
+						return { done: true as const, value: undefined };
+					},
+				};
+			},
+		};
+		const runtime = createRuntime(async () => ({
+			stream: async () => createAsyncIterable([{ text: infiniteText }]),
+		}));
+		const result = runtime.run({
+			runId: "infinite-cancel",
+			messages: [{ role: "user", content: "stop" }],
+			onEvent: resolveFirstDelta,
+		});
+		const rejection = result.catch((error: unknown) => error);
+
+		await firstDelta;
+		expect(runtime.cancel("infinite-cancel", "done")).toBe(true);
+		expect(await withDeadline(rejection, 250, "infinite iterator cancellation")).toBeInstanceOf(
+			AskChatCancelledError,
+		);
+		expect(pulls).toBeLessThanOrEqual(3);
+		expect(returns).toBe(1);
+	});
+
+	test("does not await a provider iterator whose return never settles after cancellation", async () => {
+		let returns = 0;
+		const text: AsyncIterable<string> = {
+			[Symbol.asyncIterator]() {
+				return {
+					async next() {
+						return { done: false as const, value: "x" };
+					},
+					return() {
+						returns += 1;
+						return new Promise<IteratorResult<string>>(() => {});
+					},
+				};
+			},
+		};
+		const runtime = createRuntime(async () => ({
+			stream: async () => createAsyncIterable([{ text }]),
+		}));
+		const result = runtime.run({
+			runId: "hanging-return-cancel",
+			messages: [{ role: "user", content: "stop" }],
+			onEvent: () => {
+				runtime.cancel("hanging-return-cancel", "done");
+			},
+		});
+
+		expect(
+			await withDeadline(
+				result.catch((error: unknown) => error),
+				250,
+				"hanging iterator return",
+			),
+		).toBeInstanceOf(AskChatCancelledError);
+		expect(returns).toBe(1);
+	});
+
+	test("fences a pending stream acquisition until its resolved iterator is closed", async () => {
+		let resolveAcquisition: ((stream: AsyncIterable<unknown>) => void) | undefined;
+		let acquisitionStarted: (() => void) | undefined;
+		const started = new Promise<void>((resolve) => {
+			acquisitionStarted = resolve;
+		});
+		const acquisition = new Promise<AsyncIterable<unknown>>((resolve) => {
+			resolveAcquisition = resolve;
+		});
+		let firstShared = true;
+		let iteratorReturns = 0;
+		let iteratorPulls = 0;
+		const runtime = createRuntime(
+			async () => ({
+				stream: async (_input, options) => {
+					if (options.configurable.thread_id === "ask:pending-acquire" && firstShared) {
+						firstShared = false;
+						acquisitionStarted?.();
+						return acquisition;
+					}
+					return createAsyncIterable([]);
+				},
+			}),
+			{
+				threadCleanupWaitTimeoutMs: 250,
+				shutdownCleanupTimeoutMs: 250,
+			},
+		);
+		const first = runtime.run({
+			runId: "pending-acquire-first",
+			threadId: "pending-acquire",
+			messages: [{ role: "user", content: "cancel while acquiring" }],
+		});
+		await started;
+		expect(runtime.cancel("pending-acquire-first")).toBe(true);
+		await expect(first).rejects.toBeInstanceOf(AskChatCancelledError);
+
+		let sameThreadSettled = false;
+		const sameThread = runtime
+			.run({
+				runId: "pending-acquire-second",
+				threadId: "pending-acquire",
+				messages: [{ role: "user", content: "wait for close" }],
+			})
+			.finally(() => {
+				sameThreadSettled = true;
+			});
+		await expect(
+			runtime.run({
+				runId: "pending-acquire-unrelated",
+				threadId: "pending-acquire-other",
+				messages: [{ role: "user", content: "continue" }],
+			}),
+		).resolves.toMatchObject({ runId: "pending-acquire-unrelated" });
+		await Bun.sleep(10);
+		expect(sameThreadSettled).toBe(false);
+
+		resolveAcquisition?.({
+			[Symbol.asyncIterator]() {
+				return {
+					async next() {
+						iteratorPulls += 1;
+						return { done: true as const, value: undefined };
+					},
+					async return() {
+						iteratorReturns += 1;
+						return { done: true as const, value: undefined };
+					},
+				};
+			},
+		});
+		await expect(sameThread).resolves.toMatchObject({ runId: "pending-acquire-second" });
+		expect(iteratorPulls).toBe(0);
+		expect(iteratorReturns).toBe(1);
+		await runtime.shutdown();
+	});
+
+	test("observes a pending stream acquisition rejection after cancellation", async () => {
+		let rejectAcquisition: ((error: unknown) => void) | undefined;
+		let acquisitionStarted: (() => void) | undefined;
+		const started = new Promise<void>((resolve) => {
+			acquisitionStarted = resolve;
+		});
+		const acquisition = new Promise<AsyncIterable<unknown>>((_resolve, reject) => {
+			rejectAcquisition = reject;
+		});
+		const unhandled: unknown[] = [];
+		const onUnhandled = (error: unknown): void => {
+			unhandled.push(error);
+		};
+		process.on("unhandledRejection", onUnhandled);
+		let firstShared = true;
+		const runtime = createRuntime(async () => ({
+			stream: async (_input, options) => {
+				if (options.configurable.thread_id === "ask:rejected-acquire" && firstShared) {
+					firstShared = false;
+					acquisitionStarted?.();
+					return acquisition;
+				}
+				return createAsyncIterable([]);
+			},
+		}));
+		try {
+			const first = runtime.run({
+				runId: "rejected-acquire-first",
+				threadId: "rejected-acquire",
+				messages: [{ role: "user", content: "cancel while acquiring" }],
+			});
+			await started;
+			runtime.cancel("rejected-acquire-first");
+			await expect(first).rejects.toBeInstanceOf(AskChatCancelledError);
+			rejectAcquisition?.(new Error("late acquisition rejection"));
+			await expect(
+				runtime.run({
+					runId: "rejected-acquire-second",
+					threadId: "rejected-acquire",
+					messages: [{ role: "user", content: "continue after rejection" }],
+				}),
+			).resolves.toMatchObject({ runId: "rejected-acquire-second" });
+			await Bun.sleep(0);
+			expect(unhandled).toEqual([]);
+		} finally {
+			process.off("unhandledRejection", onUnhandled);
+			await runtime.shutdown();
+		}
+	});
+
+	test("keeps a never-settling stream acquisition fenced while shutdown stays bounded", async () => {
+		let acquisitionStarted: (() => void) | undefined;
+		const started = new Promise<void>((resolve) => {
+			acquisitionStarted = resolve;
+		});
+		let firstShared = true;
+		const runtime = createRuntime(
+			async () => ({
+				stream: async (_input, options) => {
+					if (options.configurable.thread_id === "ask:never-acquire" && firstShared) {
+						firstShared = false;
+						acquisitionStarted?.();
+						return new Promise<AsyncIterable<unknown>>(() => {});
+					}
+					return createAsyncIterable([]);
+				},
+			}),
+			{
+				threadCleanupWaitTimeoutMs: 15,
+				shutdownCleanupTimeoutMs: 15,
+			},
+		);
+		const first = runtime.run({
+			runId: "never-acquire-first",
+			threadId: "never-acquire",
+			messages: [{ role: "user", content: "cancel while acquiring" }],
+		});
+		await started;
+		runtime.cancel("never-acquire-first");
+		await expect(first).rejects.toBeInstanceOf(AskChatCancelledError);
+		await expect(
+			withDeadline(
+				runtime.run({
+					runId: "never-acquire-second",
+					threadId: "never-acquire",
+					messages: [{ role: "user", content: "must not overlap" }],
+				}),
+				100,
+				"pending acquisition fence",
+			),
+		).rejects.toMatchObject({ kind: "thread_busy" });
+		await expect(
+			runtime.run({
+				runId: "never-acquire-unrelated",
+				threadId: "never-acquire-other",
+				messages: [{ role: "user", content: "unrelated" }],
+			}),
+		).resolves.toMatchObject({ runId: "never-acquire-unrelated" });
+		await expect(
+			withDeadline(runtime.shutdown(), 100, "pending acquisition shutdown"),
+		).rejects.toMatchObject({ kind: "shutdown_timeout" });
+	});
+
+	test("fences slow provider cleanup from the same thread and delete while unrelated threads proceed", async () => {
+		let resolveCleanup: ((result: IteratorResult<string>) => void) | undefined;
+		const cleanup = new Promise<IteratorResult<string>>((resolve) => {
+			resolveCleanup = resolve;
+		});
+		const startedThreads: string[] = [];
+		const deletedThreads: string[] = [];
+		let firstStream = true;
+		const checkpointer = {
+			async deleteThread(threadId: string) {
+				deletedThreads.push(threadId);
+			},
+		} as unknown as BaseCheckpointSaver;
+		const runtime = createRuntime(
+			async () => ({
+				stream: async (_input, options) => {
+					startedThreads.push(options.configurable.thread_id);
+					if (!firstStream) {
+						return createAsyncIterable([]);
+					}
+					firstStream = false;
+					const text: AsyncIterable<string> = {
+						[Symbol.asyncIterator]() {
+							return {
+								async next() {
+									return { done: false as const, value: "x" };
+								},
+								return() {
+									return cleanup;
+								},
+							};
+						},
+					};
+					return createAsyncIterable([{ text }]);
+				},
+			}),
+			{
+				checkpointer,
+				threadCleanupWaitTimeoutMs: 250,
+				shutdownCleanupTimeoutMs: 250,
+			},
+		);
+		const first = runtime.run({
+			runId: "slow-cleanup-first",
+			threadId: "shared-thread",
+			messages: [{ role: "user", content: "cancel" }],
+			onEvent: () => {
+				runtime.cancel("slow-cleanup-first");
+			},
+		});
+		await expect(first).rejects.toBeInstanceOf(AskChatCancelledError);
+
+		let sameThreadSettled = false;
+		const sameThread = runtime
+			.run({
+				runId: "slow-cleanup-second",
+				threadId: "shared-thread",
+				messages: [{ role: "user", content: "wait for cleanup" }],
+			})
+			.finally(() => {
+				sameThreadSettled = true;
+			});
+		let deletionSettled = false;
+		const deletion = runtime.deleteThread("shared-thread").finally(() => {
+			deletionSettled = true;
+		});
+		await expect(
+			runtime.run({
+				runId: "unrelated-thread",
+				threadId: "other-thread",
+				messages: [{ role: "user", content: "continue" }],
+			}),
+		).resolves.toMatchObject({ runId: "unrelated-thread" });
+		await Bun.sleep(10);
+		expect(sameThreadSettled).toBe(false);
+		expect(deletionSettled).toBe(false);
+		expect(deletedThreads).toEqual([]);
+		expect(startedThreads).toEqual(["ask:shared-thread", "ask:other-thread"]);
+
+		resolveCleanup?.({ done: true, value: undefined });
+		await expect(sameThread).resolves.toMatchObject({ runId: "slow-cleanup-second" });
+		await expect(deletion).resolves.toBeUndefined();
+		expect(deletedThreads).toEqual(["ask:shared-thread"]);
+		expect(startedThreads).toEqual(["ask:shared-thread", "ask:other-thread", "ask:shared-thread"]);
+		await runtime.shutdown();
+	});
+
+	test("fails closed on a never-settling cleanup and bounds runtime shutdown", async () => {
+		let firstStream = true;
+		const runtime = createRuntime(
+			async () => ({
+				stream: async () => {
+					if (!firstStream) {
+						return createAsyncIterable([]);
+					}
+					firstStream = false;
+					const text: AsyncIterable<string> = {
+						[Symbol.asyncIterator]() {
+							return {
+								async next() {
+									return { done: false as const, value: "x" };
+								},
+								return: () => new Promise<IteratorResult<string>>(() => {}),
+							};
+						},
+					};
+					return createAsyncIterable([{ text }]);
+				},
+			}),
+			{
+				threadCleanupWaitTimeoutMs: 15,
+				shutdownCleanupTimeoutMs: 15,
+			},
+		);
+		const first = runtime.run({
+			runId: "never-cleanup-first",
+			threadId: "never-cleanup-thread",
+			messages: [{ role: "user", content: "cancel" }],
+			onEvent: () => {
+				runtime.cancel("never-cleanup-first");
+			},
+		});
+		await expect(first).rejects.toBeInstanceOf(AskChatCancelledError);
+
+		await expect(
+			withDeadline(
+				runtime.run({
+					runId: "never-cleanup-second",
+					threadId: "never-cleanup-thread",
+					messages: [{ role: "user", content: "must not overlap" }],
+				}),
+				100,
+				"same-thread cleanup fence",
+			),
+		).rejects.toMatchObject({ kind: "thread_busy" });
+		await expect(
+			runtime.run({
+				runId: "never-cleanup-unrelated",
+				threadId: "never-cleanup-other",
+				messages: [{ role: "user", content: "unrelated" }],
+			}),
+		).resolves.toMatchObject({ runId: "never-cleanup-unrelated" });
+		await expect(
+			withDeadline(runtime.shutdown(), 100, "never-settling cleanup shutdown"),
+		).rejects.toMatchObject({ kind: "shutdown_timeout" });
+		expect(() =>
+			runtime.run({
+				runId: "after-shutdown",
+				messages: [{ role: "user", content: "closed" }],
+			}),
+		).toThrow("shutting down");
+	});
+
+	test("shutdown does not consume the remainder of a yielding provider iterator", async () => {
+		let pulls = 0;
+		let returns = 0;
+		let resolveFirstDelta: () => void = () => {};
+		const firstDelta = new Promise<void>((resolve) => {
+			resolveFirstDelta = resolve;
+		});
+		const text: AsyncIterable<string> = {
+			[Symbol.asyncIterator]() {
+				return {
+					async next() {
+						pulls += 1;
+						await Promise.resolve();
+						return { done: false as const, value: "x" };
+					},
+					async return() {
+						returns += 1;
+						return { done: true as const, value: undefined };
+					},
+				};
+			},
+		};
+		const runtime = createRuntime(async () => ({
+			stream: async () => createAsyncIterable([{ text }]),
+		}));
+		const result = runtime
+			.run({
+				runId: "yielding-shutdown",
+				messages: [{ role: "user", content: "shutdown" }],
+				onEvent: resolveFirstDelta,
+			})
+			.catch((error: unknown) => error);
+
+		await firstDelta;
+		await withDeadline(runtime.shutdown(), 250, "runtime shutdown");
+		expect(await result).toBeInstanceOf(AskChatCancelledError);
+		expect(pulls).toBeLessThanOrEqual(3);
+		expect(returns).toBe(1);
 	});
 
 	test("cancels an active Deep Agents graph after streaming has started", async () => {
@@ -767,7 +1287,13 @@ function createOpenAiChunk(content: string, finishReason: "stop" | null, role?: 
 	};
 }
 
-function createRuntime(agentFactory: AskAgentFactory): DeepAgentsAskChatRuntime {
+function createRuntime(
+	agentFactory: AskAgentFactory,
+	options: Pick<
+		AskChatRuntimeOptions,
+		"checkpointer" | "threadCleanupWaitTimeoutMs" | "shutdownCleanupTimeoutMs"
+	> = {},
+): DeepAgentsAskChatRuntime {
 	const store = new InMemoryAskProviderConfigStore();
 	store.set({
 		provider: "openai-compatible",
@@ -779,6 +1305,7 @@ function createRuntime(agentFactory: AskAgentFactory): DeepAgentsAskChatRuntime 
 	return new DeepAgentsAskChatRuntime({
 		providerConfigStore: store,
 		agentFactory,
+		...options,
 	});
 }
 
@@ -856,6 +1383,22 @@ async function collectAsync<T>(iterable: AsyncIterable<T>): Promise<T[]> {
 		values.push(value);
 	}
 	return values;
+}
+
+async function withDeadline<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		return await Promise.race([
+			promise,
+			new Promise<never>((_resolve, reject) => {
+				timer = setTimeout(() => reject(new Error(`${label} exceeded ${timeoutMs}ms.`)), timeoutMs);
+			}),
+		]);
+	} finally {
+		if (timer !== undefined) {
+			clearTimeout(timer);
+		}
+	}
 }
 
 class ContextRecordingFakeModel extends FakeListChatModel {

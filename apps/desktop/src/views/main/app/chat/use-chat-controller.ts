@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { type MessageKey, useI18n } from "../i18n";
+import { useChatSessionRecovery } from "./session-recovery-coordinator";
 import {
 	type ChatMessage,
 	type ChatProviderStatus,
@@ -13,7 +14,10 @@ import {
 interface UseChatControllerOptions {
 	transport: ChatTransport;
 	sessionId?: string;
+	initialSession?: ChatSession;
 	onSessionChange?(sessionId: string): void;
+	onSessionHydrated?(sessionId: string): void;
+	onSessionRetired?(sessionId: string): void;
 }
 
 interface ChatNotice {
@@ -27,21 +31,38 @@ interface ActiveResponse {
 	messageId: string;
 }
 
+interface SessionHydration {
+	sessionId: string;
+	promise: Promise<boolean>;
+	queuedRefresh?: Promise<boolean>;
+}
+
 export function useChatController({
 	transport,
 	sessionId,
+	initialSession,
 	onSessionChange,
+	onSessionHydrated,
+	onSessionRetired,
 }: UseChatControllerOptions) {
+	const providedSession =
+		initialSession !== undefined && initialSession.id === sessionId ? initialSession : undefined;
+	const { coordinator: sessionRecoveryCoordinator, route: recoveryRoute } = useChatSessionRecovery(
+		transport,
+		sessionId,
+	);
 	const { t } = useI18n();
 	const [providerStatus, setProviderStatus] = useState<ChatProviderStatus | null>(null);
 	const [isProviderLoading, setIsProviderLoading] = useState(true);
 	const [providerError, setProviderError] = useState<string | null>(null);
-	const [session, setSession] = useState<ChatSession | null>(null);
+	const [session, setSession] = useState<ChatSession | null>(providedSession ?? null);
 	const [isSessionLoading, setIsSessionLoading] = useState(false);
 	const [draft, setDraft] = useState("");
 	const [notice, setNotice] = useState<ChatNotice | null>(null);
 	const [announcement, setAnnouncement] = useState("");
-	const [activeResponse, setActiveResponse] = useState<ActiveResponse | null>(null);
+	const [activeResponse, setActiveResponse] = useState<ActiveResponse | null>(
+		providedSession?.activeResponse ?? null,
+	);
 	const [isSending, setIsSending] = useState(false);
 	const [isStopping, setIsStopping] = useState(false);
 	const providerLoadToken = useRef(0);
@@ -50,11 +71,19 @@ export function useChatController({
 	const sendInFlightRef = useRef(false);
 	const activeSessionIdRef = useRef<string | null>(null);
 	const lastSubmittedTextRef = useRef<string | null>(null);
+	const lastSubmittedRequestIdRef = useRef<string | null>(null);
 	const hydratedSessionIdRef = useRef<string | null>(null);
+	const sessionHydrationRef = useRef<SessionHydration | null>(null);
 	const bufferedEventsRef = useRef<ChatTransportEvent[]>([]);
 	const eventCursorsRef = useRef<Record<string, number>>({});
 	const unroutedSessionIdRef = useRef<string | null>(null);
-	const acceptedRequestIdsRef = useRef(new Set<string>());
+	const acceptedRequestIdsRef = useRef(
+		new Set<string>(
+			providedSession?.activeResponse === undefined
+				? []
+				: [providedSession.activeResponse.requestId],
+		),
+	);
 	const terminalEventsBeforeAcceptanceRef = useRef(new Set<string>());
 
 	activeSessionIdRef.current = sessionId ?? session?.id ?? null;
@@ -64,6 +93,7 @@ export function useChatController({
 		sendGenerationRef.current += 1;
 		sendInFlightRef.current = false;
 		lastSubmittedTextRef.current = null;
+		lastSubmittedRequestIdRef.current = null;
 		setIsSending(false);
 		setDraft("");
 
@@ -71,6 +101,7 @@ export function useChatController({
 			sendGenerationRef.current += 1;
 			sendInFlightRef.current = false;
 			lastSubmittedTextRef.current = null;
+			lastSubmittedRequestIdRef.current = null;
 		};
 	}, [sessionId]);
 
@@ -138,31 +169,83 @@ export function useChatController({
 				eventCursorsRef.current[event.requestId] = event.sequence;
 			}
 
+			if (isTerminalTransportEvent(event)) {
+				if (acceptedRequestIdsRef.current.has(event.requestId)) {
+					acceptedRequestIdsRef.current.delete(event.requestId);
+				} else {
+					terminalEventsBeforeAcceptanceRef.current.add(event.requestId);
+				}
+			}
 			applyTransportEvent(event);
 		},
 		[applyTransportEvent],
 	);
 
-	const loadSession = useCallback(
-		async (requestedSessionId: string) => {
-			const loadToken = sessionLoadToken.current + 1;
-			sessionLoadToken.current = loadToken;
+	const clearInvalidatedSession = useCallback(
+		(invalidatedSessionId: string, notifyRetirement = false) => {
+			if (activeSessionIdRef.current !== invalidatedSessionId) {
+				return;
+			}
+			sessionLoadToken.current += 1;
+			sendGenerationRef.current += 1;
+			sendInFlightRef.current = false;
+			activeSessionIdRef.current = null;
 			hydratedSessionIdRef.current = null;
+			sessionHydrationRef.current = null;
 			bufferedEventsRef.current = [];
 			eventCursorsRef.current = {};
 			acceptedRequestIdsRef.current.clear();
 			terminalEventsBeforeAcceptanceRef.current.clear();
-			setIsSessionLoading(true);
+			unroutedSessionIdRef.current = null;
+			lastSubmittedTextRef.current = null;
+			lastSubmittedRequestIdRef.current = null;
 			setSession(null);
 			setActiveResponse(null);
+			setIsSessionLoading(false);
+			setIsSending(false);
+			setIsStopping(false);
+			setDraft("");
+			setNotice(null);
+			setAnnouncement("");
+			if (notifyRetirement) {
+				onSessionRetired?.(invalidatedSessionId);
+			}
+		},
+		[onSessionRetired],
+	);
+
+	const performSessionLoad = useCallback(
+		async (
+			requestedSessionId: string,
+			propagateFailure = false,
+			optimisticSession?: ChatSession,
+		) => {
+			const loadToken = sessionLoadToken.current + 1;
+			sessionLoadToken.current = loadToken;
+			hydratedSessionIdRef.current = null;
+			bufferedEventsRef.current = bufferedEventsRef.current.filter(
+				(event) => event.sessionId === requestedSessionId,
+			);
+			eventCursorsRef.current = {};
+			acceptedRequestIdsRef.current.clear();
+			terminalEventsBeforeAcceptanceRef.current.clear();
+			setIsSessionLoading(true);
+			setSession(optimisticSession ?? null);
+			setActiveResponse(optimisticSession?.activeResponse ?? null);
+			if (optimisticSession?.activeResponse !== undefined) {
+				acceptedRequestIdsRef.current.add(optimisticSession.activeResponse.requestId);
+			}
 			setIsStopping(false);
 			setNotice(null);
 			setAnnouncement(t("chat.status.loadingHistory"));
 
 			try {
 				const nextSession = await transport.getSession(requestedSessionId);
-				if (sessionLoadToken.current !== loadToken) {
-					return;
+				if (
+					sessionLoadToken.current !== loadToken ||
+					activeSessionIdRef.current !== requestedSessionId
+				) {
+					return false;
 				}
 
 				setSession(nextSession);
@@ -175,19 +258,31 @@ export function useChatController({
 				eventCursorsRef.current = { ...(nextSession.eventCursors ?? {}) };
 				hydratedSessionIdRef.current = requestedSessionId;
 				unroutedSessionIdRef.current = null;
-				const bufferedEvents = bufferedEventsRef.current;
+				const bufferedEvents = orderBufferedTransportEvents(bufferedEventsRef.current);
 				bufferedEventsRef.current = [];
 				for (const event of bufferedEvents) {
 					if (event.sessionId === requestedSessionId) {
 						applyTransportEventIfNew(event);
 					}
 				}
+				onSessionHydrated?.(requestedSessionId);
 				setAnnouncement(t("chat.status.historyReady"));
+				return true;
 			} catch (error) {
-				if (sessionLoadToken.current !== loadToken) {
-					return;
+				const sessionMiss = sessionRecoveryCoordinator.handleSessionMiss(requestedSessionId, error);
+				if (sessionMiss && propagateFailure) {
+					throw error;
+				}
+				if (
+					sessionLoadToken.current !== loadToken ||
+					activeSessionIdRef.current !== requestedSessionId
+				) {
+					return false;
 				}
 
+				if (sessionMiss) {
+					return false;
+				}
 				setSession(null);
 				hydratedSessionIdRef.current = null;
 				bufferedEventsRef.current = [];
@@ -202,13 +297,62 @@ export function useChatController({
 					action: "retry-session",
 				});
 				setAnnouncement(t("chat.status.historyFailed"));
+				if (propagateFailure) {
+					throw error;
+				}
+				return false;
 			} finally {
-				if (sessionLoadToken.current === loadToken) {
+				if (
+					sessionLoadToken.current === loadToken &&
+					activeSessionIdRef.current === requestedSessionId
+				) {
 					setIsSessionLoading(false);
 				}
 			}
 		},
-		[applyTransportEventIfNew, t, transport],
+		[applyTransportEventIfNew, onSessionHydrated, sessionRecoveryCoordinator, t, transport],
+	);
+
+	const loadSession = useCallback(
+		(
+			requestedSessionId: string,
+			propagateFailure = false,
+			optimisticSession?: ChatSession,
+			refreshAfterCurrent = false,
+		): Promise<boolean> => {
+			const startHydration = (): Promise<boolean> => {
+				const promise = performSessionLoad(requestedSessionId, propagateFailure, optimisticSession);
+				const hydration: SessionHydration = {
+					sessionId: requestedSessionId,
+					promise,
+				};
+				sessionHydrationRef.current = hydration;
+				const clearHydration = () => {
+					if (sessionHydrationRef.current === hydration) {
+						sessionHydrationRef.current = null;
+					}
+				};
+				void promise.then(clearHydration, clearHydration);
+				return promise;
+			};
+
+			const currentHydration = sessionHydrationRef.current;
+			if (currentHydration?.sessionId !== requestedSessionId) {
+				return startHydration();
+			}
+			if (!refreshAfterCurrent) {
+				return currentHydration.promise;
+			}
+			if (currentHydration.queuedRefresh !== undefined) {
+				return currentHydration.queuedRefresh;
+			}
+			const queuedRefresh = currentHydration.promise
+				.catch(() => false)
+				.then(() => (activeSessionIdRef.current === requestedSessionId ? startHydration() : false));
+			currentHydration.queuedRefresh = queuedRefresh;
+			return queuedRefresh;
+		},
+		[performSessionLoad],
 	);
 
 	const loadProviderStatus = useCallback(async () => {
@@ -248,25 +392,9 @@ export function useChatController({
 	}, [loadProviderStatus]);
 
 	useEffect(() => {
-		if (!sessionId) {
-			return;
-		}
-
-		void loadSession(sessionId);
-	}, [loadSession, sessionId]);
-
-	useEffect(() => {
 		return transport.subscribe((event) => {
 			if (activeSessionIdRef.current !== event.sessionId) {
 				return;
-			}
-
-			if (isTerminalTransportEvent(event)) {
-				if (acceptedRequestIdsRef.current.has(event.requestId)) {
-					acceptedRequestIdsRef.current.delete(event.requestId);
-				} else {
-					terminalEventsBeforeAcceptanceRef.current.add(event.requestId);
-				}
 			}
 
 			if (hydratedSessionIdRef.current !== event.sessionId) {
@@ -277,6 +405,50 @@ export function useChatController({
 			applyTransportEventIfNew(event);
 		});
 	}, [applyTransportEventIfNew, transport]);
+
+	useEffect(() => {
+		if (!sessionId) {
+			return;
+		}
+
+		activeSessionIdRef.current = sessionId;
+		void loadSession(
+			sessionId,
+			false,
+			initialSession?.id === sessionId ? initialSession : undefined,
+		);
+		return () => {
+			if (activeSessionIdRef.current === sessionId) {
+				activeSessionIdRef.current = null;
+			}
+			const hydration = sessionHydrationRef.current;
+			if (hydration?.sessionId === sessionId) {
+				sessionLoadToken.current += 1;
+				if (sessionHydrationRef.current === hydration) {
+					sessionHydrationRef.current = null;
+				}
+			}
+		};
+	}, [initialSession, loadSession, sessionId]);
+
+	useEffect(() => {
+		if (sessionId === undefined || recoveryRoute.sessionId !== sessionId) {
+			return;
+		}
+		return sessionRecoveryCoordinator.registerController({
+			generation: recoveryRoute.generation,
+			sessionId,
+			refresh: () => loadSession(sessionId, true, undefined, true),
+			retire: () => clearInvalidatedSession(sessionId, true),
+		});
+	}, [
+		clearInvalidatedSession,
+		loadSession,
+		recoveryRoute.generation,
+		recoveryRoute.sessionId,
+		sessionId,
+		sessionRecoveryCoordinator,
+	]);
 
 	const hasConfiguredProvider = providerStatus?.configured ?? false;
 	const meta = useMemo(
@@ -316,11 +488,16 @@ export function useChatController({
 
 			const sendGeneration = sendGenerationRef.current;
 			const startingSessionId = activeSessionIdRef.current;
+			const requestId =
+				lastSubmittedTextRef.current === content && lastSubmittedRequestIdRef.current !== null
+					? lastSubmittedRequestIdRef.current
+					: crypto.randomUUID();
 			let operationSessionId = startingSessionId;
 			sendInFlightRef.current = true;
 			setIsSending(true);
 			setNotice(null);
 			lastSubmittedTextRef.current = content;
+			lastSubmittedRequestIdRef.current = requestId;
 			setAnnouncement(t("chat.status.sending"));
 
 			try {
@@ -344,6 +521,7 @@ export function useChatController({
 				}
 
 				const result = await transport.send({
+					requestId,
 					sessionId: activeSession.id,
 					message: content,
 				});
@@ -353,7 +531,13 @@ export function useChatController({
 				) {
 					return;
 				}
-				acceptedRequestIdsRef.current.add(result.requestId);
+				if (lastSubmittedRequestIdRef.current === requestId) {
+					lastSubmittedRequestIdRef.current = null;
+				}
+				const acceptedAlreadyTerminal = result.assistantMessage.status !== "streaming";
+				if (!acceptedAlreadyTerminal) {
+					acceptedRequestIdsRef.current.add(result.requestId);
+				}
 				const completedBeforeAcceptance = terminalEventsBeforeAcceptanceRef.current.delete(
 					result.requestId,
 				);
@@ -382,7 +566,7 @@ export function useChatController({
 					};
 				});
 				setActiveResponse(
-					completedBeforeAcceptance
+					completedBeforeAcceptance || acceptedAlreadyTerminal
 						? null
 						: {
 								requestId: result.requestId,
@@ -398,10 +582,23 @@ export function useChatController({
 					onSessionChange?.(activeSession.id);
 				}
 			} catch (error) {
+				const sessionMiss =
+					operationSessionId !== null &&
+					sessionRecoveryCoordinator.handleSessionMiss(operationSessionId, error);
+				if (
+					sessionMiss &&
+					operationSessionId !== null &&
+					activeSessionIdRef.current === operationSessionId
+				) {
+					clearInvalidatedSession(operationSessionId, true);
+				}
 				if (
 					sendGenerationRef.current !== sendGeneration ||
 					activeSessionIdRef.current !== operationSessionId
 				) {
+					return;
+				}
+				if (sessionMiss) {
 					return;
 				}
 				setNotice({
@@ -419,12 +616,14 @@ export function useChatController({
 		},
 		[
 			activeResponse,
+			clearInvalidatedSession,
 			draft,
 			hasConfiguredProvider,
 			isSessionLoading,
 			onSessionChange,
 			session,
 			sessionId,
+			sessionRecoveryCoordinator,
 			t,
 			transport,
 		],
@@ -447,10 +646,14 @@ export function useChatController({
 				requestId: activeResponse.requestId,
 			});
 		} catch (error) {
+			const sessionMiss = sessionRecoveryCoordinator.handleSessionMiss(stopSessionId, error);
 			if (
 				sendGenerationRef.current !== stopGeneration ||
 				activeSessionIdRef.current !== stopSessionId
 			) {
+				return;
+			}
+			if (sessionMiss) {
 				return;
 			}
 			setIsStopping(false);
@@ -461,7 +664,7 @@ export function useChatController({
 			});
 			setAnnouncement(t("chat.status.stopFailed"));
 		}
-	}, [activeResponse, isStopping, session, t, transport]);
+	}, [activeResponse, isStopping, session, sessionRecoveryCoordinator, t, transport]);
 
 	const retryNoticeAction = useCallback(() => {
 		switch (notice?.action) {
@@ -626,19 +829,47 @@ function mergeAcceptedMessages(
 	const existingById = new Map(currentMessages.map((message) => [message.id, message]));
 	const existingUserMessage = existingById.get(userMessage.id);
 	const existingAssistantMessage = existingById.get(assistantMessage.id);
+	const mergedAssistantMessage =
+		existingAssistantMessage === undefined
+			? assistantMessage
+			: assistantMessage.status !== "streaming"
+				? existingAssistantMessage.status === "streaming"
+					? assistantMessage
+					: existingAssistantMessage
+				: existingAssistantMessage.status !== "streaming"
+					? existingAssistantMessage
+					: {
+							...assistantMessage,
+							...existingAssistantMessage,
+							createdAt: assistantMessage.createdAt,
+							content: existingAssistantMessage.content || assistantMessage.content,
+						};
 
 	return [
 		...currentMessages.filter((message) => !acceptedIds.has(message.id)),
 		existingUserMessage ?? userMessage,
-		existingAssistantMessage === undefined
-			? assistantMessage
-			: {
-					...assistantMessage,
-					...existingAssistantMessage,
-					createdAt: assistantMessage.createdAt,
-					content: existingAssistantMessage.content || assistantMessage.content,
-				},
+		mergedAssistantMessage,
 	];
+}
+
+function orderBufferedTransportEvents(events: ChatTransportEvent[]): ChatTransportEvent[] {
+	const grouped = new Map<string, Array<{ event: ChatTransportEvent; index: number }>>();
+	for (const [index, event] of events.entries()) {
+		const group = grouped.get(event.requestId) ?? [];
+		group.push({ event, index });
+		grouped.set(event.requestId, group);
+	}
+
+	return [...grouped.values()].flatMap((group) =>
+		group
+			.sort((left, right) => {
+				if (left.event.sequence === undefined || right.event.sequence === undefined) {
+					return left.index - right.index;
+				}
+				return left.event.sequence - right.event.sequence;
+			})
+			.map(({ event }) => event),
+	);
 }
 
 function isTerminalTransportEvent(

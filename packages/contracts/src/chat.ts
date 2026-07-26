@@ -20,8 +20,10 @@ const providerApiKeyMaskSchema = z.string().trim().min(1).max(64);
 const sessionTitleSchema = z.string().trim().min(1).max(200);
 const sessionSearchQuerySchema = z.string().trim().max(200);
 const userMessageContentSchema = z.string().trim().min(1).max(20_000);
-const assistantMessageContentSchema = z.string().max(200_000);
-const deltaContentSchema = z.string().min(1).max(8_000);
+export const maxAssistantMessageContentCharacters = 200_000;
+export const maxChatDeltaCharacters = 8_000;
+const assistantMessageContentSchema = z.string().max(maxAssistantMessageContentCharacters);
+const deltaContentSchema = z.string().min(1).max(maxChatDeltaCharacters);
 const cancellationReasonSchema = z.string().trim().min(1).max(500);
 const positiveSequenceSchema = z.int().min(1);
 
@@ -174,13 +176,14 @@ export const assistantCancelledChatMessageSchema = chatMessageBaseSchema.extend(
 	content: assistantMessageContentSchema,
 });
 
-export const chatMessageSchema = z.union([
-	userChatMessageSchema,
+export const assistantChatMessageSchema = z.union([
 	assistantStreamingChatMessageSchema,
 	assistantCompleteChatMessageSchema,
 	assistantFailedChatMessageSchema,
 	assistantCancelledChatMessageSchema,
 ]);
+
+export const chatMessageSchema = z.union([userChatMessageSchema, assistantChatMessageSchema]);
 
 export const chatRunStatusValues = [
 	"queued",
@@ -428,7 +431,7 @@ export const chatSendAcceptedOutputSchema = z
 	.object({
 		run: chatRunSchema,
 		userMessage: userChatMessageSchema,
-		assistantMessage: assistantStreamingChatMessageSchema,
+		assistantMessage: assistantChatMessageSchema,
 	})
 	.strict();
 

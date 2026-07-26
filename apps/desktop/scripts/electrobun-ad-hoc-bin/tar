@@ -1,0 +1,5 @@
+#!/usr/bin/env bun
+
+import { runElectrobunAdHocTar } from "../electrobun-ad-hoc-tar.ts";
+
+process.exit(runElectrobunAdHocTar(Bun.argv.slice(2)));

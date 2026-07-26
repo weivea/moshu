@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { resolve } from "node:path";
+import { posix, resolve, win32 } from "node:path";
 
 import {
 	createElectrobunCompanionCopyEntries,
@@ -7,10 +7,13 @@ import {
 	resolveCurrentHostCompanionPlatform,
 } from "../shared/companion-executable-names";
 import {
+	isPackagedCompanionExecution,
 	resolveBundledCompanionExecutables,
-	resolveCompanionPocExecutables,
+	resolveCompanionExecutableSource,
+	resolveCompanionExecutables,
 	resolveWorkspaceCompanionExecutables,
 } from "./companion-paths";
+import { assertCompanionExecutablesAvailable } from "./companion-poc";
 
 describe("companion executable platform naming", () => {
 	test("uses .exe consistently in Windows build and Electrobun copy paths", () => {
@@ -34,14 +37,14 @@ describe("companion executable platform naming", () => {
 
 describe("resolveBundledCompanionExecutables", () => {
 	test("resolves companions from the Electrobun app resources directory", () => {
-		const applicationRoot = resolve("test-fixtures", "Moshu.app");
+		const applicationRoot = posix.resolve("test-fixtures", "Moshu.app");
 		expect(
 			resolveBundledCompanionExecutables(
-				resolve(applicationRoot, "Contents", "MacOS", "bun"),
+				posix.join(applicationRoot, "Contents/MacOS/bun"),
 				"darwin",
 			),
 		).toEqual({
-			"agents-server": resolve(
+			"agents-server": posix.resolve(
 				applicationRoot,
 				"Contents",
 				"Resources",
@@ -49,7 +52,7 @@ describe("resolveBundledCompanionExecutables", () => {
 				"companions",
 				"moshu-agents-server",
 			),
-			executor: resolve(
+			executor: posix.resolve(
 				applicationRoot,
 				"Contents",
 				"Resources",
@@ -75,39 +78,162 @@ describe("resolveBundledCompanionExecutables", () => {
 	});
 
 	test("uses Windows filenames for packaged and workspace paths", () => {
-		const applicationRoot = resolve("test-fixtures", "Moshu");
+		const applicationRoot = win32.resolve("C:\\test-fixtures\\Moshu");
 		expect(
-			resolveBundledCompanionExecutables(resolve(applicationRoot, "Resources", "bun.exe"), "win32"),
+			resolveBundledCompanionExecutables(win32.join(applicationRoot, "bin", "bun.exe"), "win32"),
 		).toEqual({
-			"agents-server": resolve(
+			"agents-server": win32.resolve(
 				applicationRoot,
 				"Resources",
 				"app",
 				"companions",
 				"moshu-agents-server.exe",
 			),
-			executor: resolve(applicationRoot, "Resources", "app", "companions", "moshu-executor.exe"),
+			executor: win32.resolve(
+				applicationRoot,
+				"Resources",
+				"app",
+				"companions",
+				"moshu-executor.exe",
+			),
 		});
-		const workspaceRoot = resolve("test-fixtures", "workspace");
+		const workspaceRoot = win32.resolve("C:\\test-fixtures\\workspace");
 		expect(resolveWorkspaceCompanionExecutables(workspaceRoot, "win32")).toEqual({
-			"agents-server": resolve(
+			"agents-server": win32.resolve(
 				workspaceRoot,
 				"apps",
 				"agents-server",
 				"dist",
 				"moshu-agents-server.exe",
 			),
-			executor: resolve(workspaceRoot, "apps", "executor", "dist", "moshu-executor.exe"),
+			executor: win32.resolve(workspaceRoot, "apps", "executor", "dist", "moshu-executor.exe"),
 		});
 	});
 
-	test("rejects an enabled dev POC without a workspace root", () => {
-		expect(() =>
-			resolveCompanionPocExecutables({
-				packagedEnabled: false,
-				devEnabled: true,
+	test("uses bundled companions when no workspace root is supplied", () => {
+		const executablePath = posix.resolve("test-fixtures", "Moshu.app", "Contents", "MacOS", "bun");
+		expect(
+			resolveCompanionExecutables({
+				executablePath,
 				platform: "darwin",
 			}),
-		).toThrow("use `bun run dev:companions`");
+		).toEqual(resolveBundledCompanionExecutables(executablePath, "darwin"));
+	});
+
+	test.each([
+		["macOS", posix.resolve("test-fixtures", "Moshu.app", "Contents", "MacOS", "bun"), "darwin"],
+		["Windows", win32.resolve("C:\\test-fixtures\\Moshu\\bin\\bun.exe"), "win32"],
+		["Linux", posix.resolve("/opt/Moshu/bin/bun"), "linux"],
+	] as const)(
+		"ignores the workspace override in a packaged %s runtime",
+		(_name, executablePath, platform) => {
+			const workspaceRoot = resolve("external", "unverified-workspace");
+			const options = {
+				workspaceRoot,
+				executablePath,
+				platform,
+			};
+
+			expect(isPackagedCompanionExecution(executablePath, platform)).toBe(true);
+			expect(resolveCompanionExecutableSource(options)).toBe("bundled");
+			expect(resolveCompanionExecutables(options)).toEqual(
+				resolveBundledCompanionExecutables(executablePath, platform),
+			);
+		},
+	);
+
+	test.each([
+		["macOS", resolve("tools", "bun"), "darwin"],
+		["Windows", "C:\\tools\\bun.exe", "win32"],
+		["Linux", "/usr/local/bin/bun", "linux"],
+		["Linux user install", "/home/developer/.bun/bin/bun", "linux"],
+		["Windows project install", "C:\\work\\project\\bin\\bun.exe", "win32"],
+	] as const)(
+		"honors an explicit workspace override only in unpackaged %s development",
+		(_name, executablePath, platform) => {
+			const workspaceRoot = resolve("test-fixtures", "workspace");
+			const options = { workspaceRoot, executablePath, platform };
+
+			expect(isPackagedCompanionExecution(executablePath, platform)).toBe(false);
+			expect(resolveCompanionExecutableSource(options)).toBe("workspace");
+			expect(resolveCompanionExecutables(options)).toEqual(
+				resolveWorkspaceCompanionExecutables(workspaceRoot, platform),
+			);
+		},
+	);
+
+	test.each([
+		[
+			"Windows",
+			"C:\\ExampleBundle\\bin\\bun.exe",
+			"win32",
+			"C:\\ExampleBundle\\Resources\\main.js",
+		],
+		["Linux", "/opt/ExampleBundle/bin/bun", "linux", "/opt/ExampleBundle/Resources/main.js"],
+	] as const)(
+		"requires the exact Electrobun %s bundle marker",
+		(_name, executablePath, platform, expectedMarker) => {
+			const inspected: string[] = [];
+			expect(
+				isPackagedCompanionExecution(executablePath, platform, (filename) => {
+					inspected.push(filename);
+					return filename === expectedMarker;
+				}),
+			).toBe(true);
+			expect(inspected).toEqual([expectedMarker]);
+			expect(isPackagedCompanionExecution(executablePath, platform, () => false)).toBe(false);
+		},
+	);
+
+	test.each([
+		["stable Windows", "C:\\Program Files\\Moshu\\bin\\bun.exe", "win32"],
+		["canary Windows", "C:\\Program Files\\Moshu-canary\\bin\\BUN.EXE", "win32"],
+		["development Linux", "/opt/Moshu-dev/bin/bun", "linux"],
+		["renamed macOS", "/Applications/Local Moshu.app/Contents/MacOS/bun", "darwin"],
+	] as const)(
+		"recognizes the real %s layout even when bundle metadata is unavailable",
+		(_name, executablePath, platform) => {
+			expect(isPackagedCompanionExecution(executablePath, platform, () => false)).toBe(true);
+		},
+	);
+
+	test("reports a missing bundled executable without exposing its path", async () => {
+		const executables = {
+			"agents-server": resolve("private", "signed", "moshu-agents-server"),
+			executor: resolve("private", "signed", "moshu-executor"),
+		};
+		const error = await assertCompanionExecutablesAvailable(
+			executables,
+			"bundled",
+			async (filename) => {
+				throw new Error(`ENOENT: ${filename}`);
+			},
+		).catch((reason: unknown) => reason);
+
+		expect(error).toBeInstanceOf(Error);
+		expect((error as Error).message).toBe(
+			"Bundled agents-server companion is missing or not executable.",
+		);
+		expect((error as Error).message).not.toContain(executables["agents-server"]);
+	});
+
+	test("keeps packaged missing-companion diagnostics bundled despite a workspace override", async () => {
+		const executablePath = win32.resolve("C:\\Program Files\\Moshu\\bin\\bun.exe");
+		const options = {
+			workspaceRoot: win32.resolve("C:\\unverified\\workspace"),
+			executablePath,
+			platform: "win32" as const,
+			bundleMarkerExists: () => true,
+		};
+		const source = resolveCompanionExecutableSource(options);
+		const executables = resolveCompanionExecutables(options);
+
+		expect(source).toBe("bundled");
+		expect(executables).toEqual(resolveBundledCompanionExecutables(executablePath, "win32"));
+		await expect(
+			assertCompanionExecutablesAvailable(executables, source, async () => {
+				throw new Error("missing");
+			}),
+		).rejects.toThrow("Bundled agents-server companion is missing or not executable.");
 	});
 });

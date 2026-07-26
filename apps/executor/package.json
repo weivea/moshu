@@ -7,5 +7,9 @@
 		"build:binary": "bun run ../../scripts/build-companion-binary.ts executor",
 		"typecheck": "tsc --noEmit -p tsconfig.json",
 		"test": "bun test"
+	},
+	"dependencies": {
+		"@moshu/contracts": "workspace:*",
+		"@moshu/process-rpc": "workspace:*"
 	}
 }

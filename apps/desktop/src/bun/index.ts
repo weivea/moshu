@@ -1,20 +1,17 @@
-import { BunSqliteSaver, createAskChatRuntime } from "@moshu/agent-runtime";
-import { openAppDatabase } from "@moshu/database";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import Electrobun, { BrowserWindow, Updater, Utils } from "electrobun/bun";
 import { logChatRpcDiagnostic } from "../shared/chat-rpc-diagnostics";
-import { DesktopChatService } from "./chat-service";
-import { startCompanionPocIfEnabled } from "./companion-poc";
+import { startCompanionRuntime } from "./companion-poc";
+import type { CompanionProcessSupervisor } from "./companion-process-supervisor";
+import { DesktopAgentsClient } from "./desktop-agents-client";
 import { createDesktopShutdownCoordinator } from "./desktop-lifecycle";
-import { FileAskProviderConfigStore } from "./file-provider-config-store";
 import { createDesktopRpc } from "./rpc";
 
 const DEV_SERVER_URL = "http://127.0.0.1:5173";
 
 async function getMainViewUrl(): Promise<string> {
 	const channel = await Updater.localInfo.channel();
-
 	if (channel === "dev") {
 		try {
 			const response = await fetch(DEV_SERVER_URL, { method: "HEAD" });
@@ -27,56 +24,40 @@ async function getMainViewUrl(): Promise<string> {
 			console.info("Vite HMR server is unavailable; using bundled assets.", error);
 		}
 	}
-
 	return "views://mainview/index.html";
 }
 
 mkdirSync(Utils.paths.userData, { recursive: true });
-const database = openAppDatabase(join(Utils.paths.userData, "moshu.db"));
-const checkpointSaver = new BunSqliteSaver(join(Utils.paths.userData, "moshu-checkpoints.db"));
-const providerConfigStore = new FileAskProviderConfigStore(
-	join(Utils.paths.userData, "provider.json"),
-);
-const chatRuntime = createAskChatRuntime({
-	providerConfigStore,
-	checkpointer: checkpointSaver,
+const agentsClient = new DesktopAgentsClient();
+const desktopRpc = createDesktopRpc({ agentsClient });
+const unsubscribeAgentsReady = agentsClient.subscribeReady(() => {
+	desktopRpc.send.agentsReady({});
 });
-const chatService = new DesktopChatService({
-	sessions: database.sessions,
-	runs: database.runs,
-	providerConfigStore,
-	runtime: chatRuntime,
-});
-const desktopRpc = createDesktopRpc({ chatService });
-const unsubscribeChatEvents = chatService.subscribe((event) => {
+const unsubscribeChatEvents = agentsClient.subscribeChatEvents((event) => {
 	logChatRpcDiagnostic("bun", "send", "chatEvent", event);
 	desktopRpc.send.chatEvent(event);
 });
+const unsubscribeChatSessionInvalidations = agentsClient.subscribeChatSessionInvalidations(
+	(invalidation) => {
+		desktopRpc.send.chatSessionInvalidated(invalidation);
+	},
+);
 
 let shutdownStarted = false;
-let companionSupervisor: Awaited<ReturnType<typeof startCompanionPocIfEnabled>>;
-let companionStartupPromise: ReturnType<typeof startCompanionPocIfEnabled> =
+let companionSupervisor: CompanionProcessSupervisor | undefined;
+let companionStartupPromise: Promise<CompanionProcessSupervisor | undefined> =
 	Promise.resolve(undefined);
 const shutdownCoordinator = createDesktopShutdownCoordinator({
 	async cleanup() {
 		shutdownStarted = true;
+		unsubscribeAgentsReady();
 		unsubscribeChatEvents();
+		unsubscribeChatSessionInvalidations();
+		agentsClient.close();
 		try {
-			await chatService.shutdown();
+			await companionSupervisor?.shutdown();
 		} finally {
-			try {
-				try {
-					await companionSupervisor?.shutdown();
-				} finally {
-					await companionStartupPromise;
-				}
-			} finally {
-				try {
-					checkpointSaver.close();
-				} finally {
-					database.close();
-				}
-			}
+			await companionStartupPromise;
 		}
 	},
 	quit() {
@@ -101,23 +82,29 @@ const mainWindow = new BrowserWindow({
 		y: 80,
 	},
 });
-
 mainWindow.on("close", () => {
 	console.info("墨枢 main window closed.");
 	shutdownCoordinator.handleWindowClose();
 });
 
-companionStartupPromise = startCompanionPocIfEnabled({
+companionStartupPromise = startCompanionRuntime({
+	dataPaths: {
+		productDatabase: join(Utils.paths.userData, "moshu.db"),
+		checkpointDatabase: join(Utils.paths.userData, "moshu-checkpoints.db"),
+		providerConfig: join(Utils.paths.userData, "provider.json"),
+	},
+	connectClient: (options) => agentsClient.connect(options),
 	onSupervisorCreated(supervisor) {
 		companionSupervisor = supervisor;
 		if (shutdownStarted) {
-			void supervisor.shutdown().catch((error: unknown) => {
-				console.error("Failed to cancel companion startup during desktop shutdown.", error);
-			});
+			void supervisor.shutdown();
 		}
 	},
 }).catch((error: unknown) => {
-	console.error("Companion POC failed to start; continuing with desktop Chat only.", error);
+	console.error(
+		"Companion runtime is unavailable; server-backed features will recover or remain disabled.",
+		error,
+	);
 	return undefined;
 });
 

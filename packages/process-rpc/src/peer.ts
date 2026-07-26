@@ -317,7 +317,12 @@ export class RpcPeer {
 			method,
 			payload,
 		};
-		this.#sendEnvelope(envelope);
+		try {
+			this.#sendEnvelope(envelope);
+		} catch (error) {
+			this.#terminate(1011, "Failed to send RPC event.", error);
+			throw error;
+		}
 		return eventId;
 	}
 
@@ -333,6 +338,15 @@ export class RpcPeer {
 			this.#reportError(error);
 			this.#forceTerminateTransport();
 		}
+		this.handleTransportClose(code, reason);
+	}
+
+	/**
+	 * Immediately tears down the physical transport. This remains effective after logical close.
+	 */
+	terminate(code = 1001, reason = "RPC connection terminated."): void {
+		assertValidWebSocketCloseCode(code);
+		this.#forceTerminateTransport();
 		this.handleTransportClose(code, reason);
 	}
 

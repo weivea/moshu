@@ -1,28 +1,38 @@
 import type Database from "bun:sqlite";
 import {
-	appErrorSchema,
 	type AppError,
+	appErrorSchema,
 	type CancelChatRunInput,
 	type CancelChatRunOutput,
-	cancelChatRunInputSchema,
-	cancelChatRunOutputSchema,
 	type ChatRun,
 	type ChatRunEvent,
 	type ChatRunEventSource,
+	type ChatRunStatus,
+	cancelChatRunInputSchema,
+	cancelChatRunOutputSchema,
 	chatRunEventSchema,
 	chatRunSchema,
-	type ChatRunStatus,
 	chatRunStatusSchema,
+	deleteChatSessionOutputSchema,
 	type OpenAiCompatibleProviderConfigInput,
 	type OpenAiCompatibleProviderState,
 	openAiCompatibleProviderStateSchema,
+	retiredSessionTombstoneTtlMs,
+	sendAskChatMessageInputSchema,
 	uuidV7Schema,
 } from "@moshu/contracts";
-import { and, asc, desc, eq, gt, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gt, inArray, sql } from "drizzle-orm";
 
 import type { AppDrizzleDatabase } from "./database";
 import { createUuidV7 } from "./ids";
-import { chatRunEventsTable, chatRunsTable, chatSessionsTable } from "./schema";
+import {
+	chatRunEventsTable,
+	chatRunsTable,
+	chatSessionsTable,
+	checkpointDeletionOutboxTable,
+	retiredChatSessionsTable,
+} from "./schema";
+import { ChatSessionNotFoundError } from "./session-repository";
 
 interface RepositoryClock {
 	now(): number;
@@ -38,16 +48,19 @@ interface ErrorRecord {
 }
 
 export interface CreateRunInput {
+	clientRequestId: string;
 	sessionId: string;
 	mode: ChatRun["mode"];
 	provider: OpenAiCompatibleProviderConfigInput;
 	userMessageId: string;
+	userContent: string;
 	assistantMessageId: string;
 }
 
 export interface CreateRunResult {
 	run: ChatRun;
 	event: ChatRunEvent;
+	events: ChatRunEvent[];
 }
 
 export interface UpdateRunStatusInput {
@@ -89,15 +102,102 @@ export interface ListRunEventsInput {
 	afterSeq?: number;
 }
 
+export const maxRunEventPageSize = 1_000;
+export const maxRetiredSessionTombstones = 10_000;
+export const maxCheckpointDeletionBatchSize = 100;
+export const maxCheckpointDeletionJobs = 10_000;
+
+export interface ReplayCursorSupport {
+	serverTimeMs: number;
+	oldestSupportedCursorIssuedAtMs: number;
+	tombstoneTtlMs: typeof retiredSessionTombstoneTtlMs;
+}
+
+export interface CheckpointDeletionJob {
+	sessionId: string;
+	createdAtMs: number;
+	attemptCount: number;
+	nextAttemptAtMs: number;
+	lastAttemptAtMs?: number;
+	lastError?: string;
+}
+
+export interface ListRunEventPageInput extends ListRunEventsInput {
+	limit: number;
+}
+
+export interface ListRunEventPageOutput {
+	events: ChatRunEvent[];
+	hasMore: boolean;
+}
+
+export interface RunPageCursor {
+	createdAtMs: number;
+	id: string;
+}
+
+export interface RunJournalPageItem {
+	run: ChatRun;
+	userContent: string;
+	assistantContent?: string;
+	events: ChatRunEvent[];
+	lastEventSeq: number;
+}
+
+export interface ListRunPageInput {
+	sessionId: string;
+	after?: RunPageCursor;
+	limit: number;
+}
+
+export interface ListRunPageOutput {
+	items: RunJournalPageItem[];
+	nextCursor?: RunPageCursor;
+}
+
+type MessageCompletedPayload = Extract<ChatRunEvent, { type: "message.completed" }>["payload"];
+
+export interface CommitRunTerminalInput {
+	runId: string;
+	message: MessageCompletedPayload;
+	source?: ChatRunEventSource;
+}
+
+export interface CommitRunTerminalOutput {
+	run: ChatRun;
+	events: ChatRunEvent[];
+	committed: boolean;
+}
+
 export interface RunJournalRepository {
 	create(input: CreateRunInput): CreateRunResult;
+	getByClientRequestId(clientRequestId: string): RunJournalPageItem | undefined;
+	getClientRequestId(runId: string): string;
 	get(runId: string): ChatRun;
 	listBySession(sessionId: string): ChatRun[];
+	listPageBySession(input: ListRunPageInput): ListRunPageOutput;
 	updateStatus(input: UpdateRunStatusInput): RunStatusMutationResult;
 	appendEvent(input: AppendRunEventInput): ChatRunEvent;
 	fail(input: FailRunInput): FailRunResult;
 	cancel(input: CancelChatRunInput): CancelChatRunOutput;
+	commitTerminal(input: CommitRunTerminalInput): CommitRunTerminalOutput;
 	listEvents(input: ListRunEventsInput): ChatRunEvent[];
+	listEventPage(input: ListRunEventPageInput): ListRunEventPageOutput;
+	deleteSessionAndRetireRuns(sessionId: string): {
+		sessionId: string;
+	};
+	isSessionRetired(sessionId: string): boolean;
+	getReplayCursorSupport(): ReplayCursorSupport;
+	listPendingCheckpointDeletions(limit: number, includeDeferred?: boolean): CheckpointDeletionJob[];
+	recordCheckpointDeletionFailure(sessionId: string, error: string, nextAttemptAtMs: number): void;
+	ackCheckpointDeletion(sessionId: string): void;
+}
+
+export class ChatRunNotFoundError extends Error {
+	constructor(readonly runId: string) {
+		super(`Chat run ${runId} was not found.`);
+		this.name = "ChatRunNotFoundError";
+	}
 }
 
 type RunRow = typeof chatRunsTable.$inferSelect;
@@ -201,6 +301,36 @@ function assertTransitionAllowed(currentStatus: ChatRunStatus, nextStatus: ChatR
 	}
 }
 
+function runStatusForMessageStatus(
+	status: MessageCompletedPayload["status"],
+): Extract<ChatRunStatus, "completed" | "failed" | "cancelled"> {
+	switch (status) {
+		case "complete":
+			return "completed";
+		case "failed":
+			return "failed";
+		case "cancelled":
+			return "cancelled";
+	}
+}
+
+function requireSafeTimestamp(value: number): number {
+	if (!Number.isSafeInteger(value) || value < 0) {
+		throw new Error("Run page cursor timestamp must be a non-negative safe integer.");
+	}
+	return value;
+}
+
+function requireRequestId(value: string): string {
+	const normalized = value.trim();
+	if (
+		!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(normalized)
+	) {
+		throw new Error("Run client request ID must be a UUID.");
+	}
+	return normalized;
+}
+
 export class SqliteRunJournalRepository implements RunJournalRepository {
 	constructor(
 		private readonly client: Database,
@@ -210,9 +340,15 @@ export class SqliteRunJournalRepository implements RunJournalRepository {
 	) {}
 
 	create(input: CreateRunInput): CreateRunResult {
+		const clientRequestId = requireRequestId(input.clientRequestId);
 		const sessionId = uuidV7Schema.parse(input.sessionId);
 		const userMessageId = uuidV7Schema.parse(input.userMessageId);
 		const assistantMessageId = uuidV7Schema.parse(input.assistantMessageId);
+		const userContent = sendAskChatMessageInputSchema.parse({
+			requestId: clientRequestId,
+			sessionId,
+			content: input.userContent,
+		}).content;
 		const provider = toSafeProviderState(input.provider);
 
 		return this.inTransaction(() => {
@@ -220,19 +356,22 @@ export class SqliteRunJournalRepository implements RunJournalRepository {
 			const nowMs = this.clock.now();
 			const row: RunRow = {
 				id: this.idGenerator.create(nowMs),
+				clientRequestId,
 				sessionId,
 				mode: input.mode,
 				status: "queued",
 				providerJson: JSON.stringify(provider),
 				userMessageId,
+				userContent,
 				assistantMessageId,
+				assistantContent: null,
 				lastErrorJson: null,
 				createdAtMs: nowMs,
 				updatedAtMs: nowMs,
 				completedAtMs: null,
 			};
 			this.orm.insert(chatRunsTable).values(row).run();
-			const event = this.insertEvent({
+			const queuedEvent = this.insertEvent({
 				runId: row.id,
 				sessionId,
 				type: "run.status",
@@ -241,13 +380,53 @@ export class SqliteRunJournalRepository implements RunJournalRepository {
 				payload: { previousStatus: undefined, status: "queued" },
 				createdAtMs: nowMs,
 			});
+			const startedEvent = this.insertEvent({
+				runId: row.id,
+				sessionId,
+				type: "message.started",
+				source: { kind: "assistant" },
+				visibility: "user",
+				payload: {
+					messageId: assistantMessageId,
+					role: "assistant",
+					status: "streaming",
+				},
+				createdAtMs: nowMs,
+			});
 			this.touchSession(sessionId, nowMs, true);
-			return { run: buildRun(row), event: buildEvent(event) };
+			const event = buildEvent(queuedEvent);
+			return {
+				run: buildRun(row),
+				event,
+				events: [event, buildEvent(startedEvent)],
+			};
 		});
 	}
 
 	get(runId: string): ChatRun {
 		return buildRun(this.selectRun(uuidV7Schema.parse(runId)));
+	}
+
+	getClientRequestId(runId: string): string {
+		return this.selectRun(uuidV7Schema.parse(runId)).clientRequestId;
+	}
+
+	getByClientRequestId(clientRequestId: string): RunJournalPageItem | undefined {
+		const row = this.orm
+			.select()
+			.from(chatRunsTable)
+			.where(eq(chatRunsTable.clientRequestId, requireRequestId(clientRequestId)))
+			.get();
+		if (row === undefined) {
+			return undefined;
+		}
+		return {
+			run: buildRun(row),
+			userContent: row.userContent,
+			...(row.assistantContent === null ? {} : { assistantContent: row.assistantContent }),
+			events: terminalRunStatuses.has(row.status) ? [] : this.listEvents({ runId: row.id }),
+			lastEventSeq: this.getLastEventSeq(row.id),
+		};
 	}
 
 	listBySession(sessionId: string): ChatRun[] {
@@ -261,9 +440,91 @@ export class SqliteRunJournalRepository implements RunJournalRepository {
 			.map(buildRun);
 	}
 
+	listPageBySession(input: ListRunPageInput): ListRunPageOutput {
+		const sessionId = uuidV7Schema.parse(input.sessionId);
+		if (!Number.isInteger(input.limit) || input.limit < 1 || input.limit > 100) {
+			throw new Error("Run page limit must be between 1 and 100.");
+		}
+		const after =
+			input.after === undefined
+				? undefined
+				: {
+						createdAtMs: requireSafeTimestamp(input.after.createdAtMs),
+						id: uuidV7Schema.parse(input.after.id),
+					};
+		const cursorCondition =
+			after === undefined
+				? undefined
+				: sql`(${chatRunsTable.createdAtMs}, ${chatRunsTable.id}) > (${after.createdAtMs}, ${after.id})`;
+		const rows = this.orm
+			.select()
+			.from(chatRunsTable)
+			.where(
+				cursorCondition === undefined
+					? eq(chatRunsTable.sessionId, sessionId)
+					: and(eq(chatRunsTable.sessionId, sessionId), cursorCondition),
+			)
+			.orderBy(asc(chatRunsTable.createdAtMs), asc(chatRunsTable.id))
+			.limit(input.limit + 1)
+			.all();
+		const pageRows = rows.slice(0, input.limit);
+		const eventsByRun = new Map<string, ChatRunEvent[]>();
+		const activeRunIds = pageRows
+			.filter((row) => !terminalRunStatuses.has(row.status))
+			.map((row) => row.id);
+		if (activeRunIds.length > 0) {
+			for (const event of this.orm
+				.select()
+				.from(chatRunEventsTable)
+				.where(inArray(chatRunEventsTable.runId, activeRunIds))
+				.orderBy(asc(chatRunEventsTable.runId), asc(chatRunEventsTable.seq))
+				.all()
+				.map(buildEvent)) {
+				const events = eventsByRun.get(event.runId) ?? [];
+				events.push(event);
+				eventsByRun.set(event.runId, events);
+			}
+		}
+		const lastSeqByRun = new Map<string, number>();
+		if (pageRows.length > 0) {
+			for (const row of this.orm
+				.select({
+					runId: chatRunEventsTable.runId,
+					lastSeq: sql<number>`max(${chatRunEventsTable.seq})`,
+				})
+				.from(chatRunEventsTable)
+				.where(
+					inArray(
+						chatRunEventsTable.runId,
+						pageRows.map((pageRow) => pageRow.id),
+					),
+				)
+				.groupBy(chatRunEventsTable.runId)
+				.all()) {
+				lastSeqByRun.set(row.runId, row.lastSeq);
+			}
+		}
+		const last = pageRows.at(-1);
+		return {
+			items: pageRows.map((row) => ({
+				run: buildRun(row),
+				userContent: row.userContent,
+				...(row.assistantContent === null ? {} : { assistantContent: row.assistantContent }),
+				events: eventsByRun.get(row.id) ?? [],
+				lastEventSeq: lastSeqByRun.get(row.id) ?? 0,
+			})),
+			...(rows.length > input.limit && last !== undefined
+				? { nextCursor: { createdAtMs: last.createdAtMs, id: last.id } }
+				: {}),
+		};
+	}
+
 	updateStatus(input: UpdateRunStatusInput): RunStatusMutationResult {
 		const runId = uuidV7Schema.parse(input.runId);
 		const status = chatRunStatusSchema.parse(input.status);
+		if (terminalRunStatuses.has(status)) {
+			throw new Error(`Use commitTerminal() to transition a Run to ${status}.`);
+		}
 		return this.inTransaction(() => {
 			const row = this.selectRun(runId);
 			assertTransitionAllowed(row.status, status);
@@ -357,6 +618,7 @@ export class SqliteRunJournalRepository implements RunJournalRepository {
 				.update(chatRunsTable)
 				.set({
 					status: "failed",
+					assistantContent: input.messageEvent?.content ?? row.assistantContent,
 					lastErrorJson: serializeError(error),
 					updatedAtMs: nowMs,
 					completedAtMs: nowMs,
@@ -381,11 +643,151 @@ export class SqliteRunJournalRepository implements RunJournalRepository {
 				run: buildRun({
 					...row,
 					status: "failed",
+					assistantContent: input.messageEvent?.content ?? row.assistantContent,
 					lastErrorJson: serializeError(error),
 					updatedAtMs: nowMs,
 					completedAtMs: nowMs,
 				}),
 				events,
+			};
+		});
+	}
+
+	commitTerminal(input: CommitRunTerminalInput): CommitRunTerminalOutput {
+		const runId = uuidV7Schema.parse(input.runId);
+		return this.inTransaction(() => {
+			const row = this.selectRun(runId);
+			if (input.message.messageId !== row.assistantMessageId) {
+				throw new Error(`Run ${runId} terminal message ID does not match its assistant message.`);
+			}
+			const existingMessageRow = this.orm
+				.select()
+				.from(chatRunEventsTable)
+				.where(
+					and(
+						eq(chatRunEventsTable.runId, runId),
+						eq(chatRunEventsTable.type, "message.completed"),
+					),
+				)
+				.orderBy(desc(chatRunEventsTable.seq))
+				.get();
+			const existingMessage =
+				existingMessageRow === undefined ? undefined : buildEvent(existingMessageRow);
+			if (existingMessage !== undefined && existingMessage.type !== "message.completed") {
+				throw new Error(`Run ${runId} has an invalid terminal message event.`);
+			}
+			const message =
+				existingMessage?.type === "message.completed" ? existingMessage.payload : input.message;
+			if (message.messageId !== row.assistantMessageId) {
+				throw new Error(`Run ${runId} persisted terminal message ID is inconsistent.`);
+			}
+			const terminalStatus = runStatusForMessageStatus(message.status);
+			const terminalError = message.status === "failed" ? message.error : undefined;
+			if (terminalStatus === "failed" && terminalError === undefined) {
+				throw new Error(`Run ${runId} failed terminal message is missing its error.`);
+			}
+			if (terminalRunStatuses.has(row.status) && row.status !== terminalStatus) {
+				throw new Error(
+					`Run ${runId} terminal status ${row.status} conflicts with message status ${message.status}.`,
+				);
+			}
+
+			const nowMs = this.clock.now();
+			const source = input.source ?? { kind: "system" as const };
+			const events: ChatRunEvent[] = [];
+			if (existingMessage === undefined) {
+				events.push(
+					buildEvent(
+						this.insertEvent({
+							runId,
+							sessionId: row.sessionId,
+							type: "message.completed",
+							source: { kind: "assistant" },
+							visibility: "user",
+							payload: message,
+							createdAtMs: nowMs,
+						}),
+					),
+				);
+			}
+			if (
+				terminalStatus === "failed" &&
+				terminalError !== undefined &&
+				!this.hasEventType(runId, "run.error")
+			) {
+				events.push(
+					buildEvent(
+						this.insertEvent({
+							runId,
+							sessionId: row.sessionId,
+							type: "run.error",
+							source,
+							visibility: "user",
+							payload: { error: terminalError },
+							createdAtMs: nowMs,
+						}),
+					),
+				);
+			}
+
+			let updatedRow = row;
+			if (!terminalRunStatuses.has(row.status)) {
+				this.orm
+					.update(chatRunsTable)
+					.set({
+						status: terminalStatus,
+						assistantContent: message.content,
+						lastErrorJson: terminalError === undefined ? null : serializeError(terminalError),
+						updatedAtMs: nowMs,
+						completedAtMs: nowMs,
+					})
+					.where(eq(chatRunsTable.id, runId))
+					.run();
+				events.push(
+					buildEvent(
+						this.insertEvent({
+							runId,
+							sessionId: row.sessionId,
+							type: "run.status",
+							source,
+							visibility: "user",
+							payload: { previousStatus: row.status, status: terminalStatus },
+							createdAtMs: nowMs,
+						}),
+					),
+				);
+				updatedRow = {
+					...row,
+					status: terminalStatus,
+					assistantContent: message.content,
+					lastErrorJson: terminalError === undefined ? null : serializeError(terminalError),
+					updatedAtMs: nowMs,
+					completedAtMs: nowMs,
+				};
+			} else if (row.assistantContent !== message.content) {
+				this.orm
+					.update(chatRunsTable)
+					.set({
+						assistantContent: message.content,
+						lastErrorJson: terminalError === undefined ? null : serializeError(terminalError),
+						updatedAtMs: nowMs,
+					})
+					.where(eq(chatRunsTable.id, runId))
+					.run();
+				updatedRow = {
+					...row,
+					assistantContent: message.content,
+					lastErrorJson: terminalError === undefined ? null : serializeError(terminalError),
+					updatedAtMs: nowMs,
+				};
+			}
+			if (events.length > 0) {
+				this.touchSession(row.sessionId, nowMs, true);
+			}
+			return {
+				run: buildRun(updatedRow),
+				events,
+				committed: events.length > 0 || updatedRow !== row,
 			};
 		});
 	}
@@ -399,7 +801,7 @@ export class SqliteRunJournalRepository implements RunJournalRepository {
 		return cancelChatRunOutputSchema.parse({
 			run: this.updateStatus({
 				runId: run.id,
-				status: run.status === "queued" ? "cancelled" : "cancelling",
+				status: "cancelling",
 				source: { kind: "user" },
 			}).run,
 		});
@@ -424,6 +826,169 @@ export class SqliteRunJournalRepository implements RunJournalRepository {
 			.map(buildEvent);
 	}
 
+	listEventPage(input: ListRunEventPageInput): ListRunEventPageOutput {
+		const runId = uuidV7Schema.parse(input.runId);
+		const afterSeq = input.afterSeq ?? 0;
+		if (!Number.isInteger(afterSeq) || afterSeq < 0) {
+			throw new Error("afterSeq must be a non-negative integer.");
+		}
+		if (!Number.isInteger(input.limit) || input.limit < 1 || input.limit > maxRunEventPageSize) {
+			throw new Error(`Event page limit must be between 1 and ${maxRunEventPageSize}.`);
+		}
+		const rows = this.orm
+			.select()
+			.from(chatRunEventsTable)
+			.where(and(eq(chatRunEventsTable.runId, runId), gt(chatRunEventsTable.seq, afterSeq)))
+			.orderBy(asc(chatRunEventsTable.seq))
+			.limit(input.limit + 1)
+			.all();
+		return {
+			events: rows.slice(0, input.limit).map(buildEvent),
+			hasMore: rows.length > input.limit,
+		};
+	}
+
+	deleteSessionAndRetireRuns(sessionId: string): {
+		sessionId: string;
+	} {
+		const parsedSessionId = uuidV7Schema.parse(sessionId);
+		return this.inTransaction(() => {
+			const retiredAtMs = this.clock.now();
+			this.orm
+				.delete(retiredChatSessionsTable)
+				.where(
+					sql`${retiredChatSessionsTable.retiredAtMs} <= ${
+						retiredAtMs - retiredSessionTombstoneTtlMs
+					}`,
+				)
+				.run();
+			const existingRetirement = this.orm
+				.select({ sessionId: retiredChatSessionsTable.sessionId })
+				.from(retiredChatSessionsTable)
+				.where(eq(retiredChatSessionsTable.sessionId, parsedSessionId))
+				.get();
+			if (existingRetirement !== undefined) {
+				return {
+					...deleteChatSessionOutputSchema.parse({ sessionId: parsedSessionId }),
+				};
+			}
+			this.assertSessionExists(parsedSessionId);
+			const retainedCount =
+				this.orm.select({ count: sql<number>`count(*)` }).from(retiredChatSessionsTable).get()
+					?.count ?? 0;
+			if (retainedCount >= maxRetiredSessionTombstones) {
+				throw new Error(
+					`Retired Session recovery capacity is full (${maxRetiredSessionTombstones}); Session deletion is temporarily unavailable.`,
+				);
+			}
+			this.orm
+				.insert(retiredChatSessionsTable)
+				.values({ sessionId: parsedSessionId, retiredAtMs })
+				.run();
+			const checkpointDeletionCount =
+				this.orm.select({ count: sql<number>`count(*)` }).from(checkpointDeletionOutboxTable).get()
+					?.count ?? 0;
+			if (checkpointDeletionCount >= maxCheckpointDeletionJobs) {
+				throw new Error(
+					`Checkpoint deletion recovery capacity is full (${maxCheckpointDeletionJobs}); Session deletion is temporarily unavailable.`,
+				);
+			}
+			this.orm
+				.insert(checkpointDeletionOutboxTable)
+				.values({
+					sessionId: parsedSessionId,
+					createdAtMs: retiredAtMs,
+					nextAttemptAtMs: retiredAtMs,
+				})
+				.onConflictDoNothing()
+				.run();
+			this.orm.delete(chatSessionsTable).where(eq(chatSessionsTable.id, parsedSessionId)).run();
+			return {
+				...deleteChatSessionOutputSchema.parse({ sessionId: parsedSessionId }),
+			};
+		});
+	}
+
+	isSessionRetired(sessionId: string): boolean {
+		const cutoffMs = this.clock.now() - retiredSessionTombstoneTtlMs;
+		return (
+			this.orm
+				.select({ sessionId: retiredChatSessionsTable.sessionId })
+				.from(retiredChatSessionsTable)
+				.where(
+					and(
+						eq(retiredChatSessionsTable.sessionId, uuidV7Schema.parse(sessionId)),
+						gt(retiredChatSessionsTable.retiredAtMs, cutoffMs),
+					),
+				)
+				.get() !== undefined
+		);
+	}
+
+	getReplayCursorSupport(): ReplayCursorSupport {
+		const serverTimeMs = this.clock.now();
+		return {
+			serverTimeMs,
+			oldestSupportedCursorIssuedAtMs: serverTimeMs - retiredSessionTombstoneTtlMs,
+			tombstoneTtlMs: retiredSessionTombstoneTtlMs,
+		};
+	}
+
+	listPendingCheckpointDeletions(limit: number, includeDeferred = false): CheckpointDeletionJob[] {
+		if (!Number.isSafeInteger(limit) || limit < 1 || limit > maxCheckpointDeletionBatchSize) {
+			throw new Error(
+				`Checkpoint deletion batch limit must be between 1 and ${maxCheckpointDeletionBatchSize}.`,
+			);
+		}
+		const nowMs = this.clock.now();
+		return this.orm
+			.select()
+			.from(checkpointDeletionOutboxTable)
+			.where(
+				includeDeferred
+					? undefined
+					: sql`${checkpointDeletionOutboxTable.nextAttemptAtMs} <= ${nowMs}`,
+			)
+			.orderBy(
+				asc(checkpointDeletionOutboxTable.nextAttemptAtMs),
+				asc(checkpointDeletionOutboxTable.createdAtMs),
+				asc(checkpointDeletionOutboxTable.sessionId),
+			)
+			.limit(limit)
+			.all()
+			.map((row) => ({
+				sessionId: row.sessionId,
+				createdAtMs: row.createdAtMs,
+				attemptCount: row.attemptCount,
+				nextAttemptAtMs: row.nextAttemptAtMs,
+				...(row.lastAttemptAtMs === null ? {} : { lastAttemptAtMs: row.lastAttemptAtMs }),
+				...(row.lastError === null ? {} : { lastError: row.lastError }),
+			}));
+	}
+
+	recordCheckpointDeletionFailure(sessionId: string, error: string, nextAttemptAtMs: number): void {
+		if (!Number.isSafeInteger(nextAttemptAtMs) || nextAttemptAtMs < 0) {
+			throw new TypeError("Checkpoint deletion retry time must be a non-negative safe integer.");
+		}
+		this.orm
+			.update(checkpointDeletionOutboxTable)
+			.set({
+				attemptCount: sql`${checkpointDeletionOutboxTable.attemptCount} + 1`,
+				lastAttemptAtMs: this.clock.now(),
+				lastError: error.slice(0, 2_000),
+				nextAttemptAtMs,
+			})
+			.where(eq(checkpointDeletionOutboxTable.sessionId, uuidV7Schema.parse(sessionId)))
+			.run();
+	}
+
+	ackCheckpointDeletion(sessionId: string): void {
+		this.orm
+			.delete(checkpointDeletionOutboxTable)
+			.where(eq(checkpointDeletionOutboxTable.sessionId, uuidV7Schema.parse(sessionId)))
+			.run();
+	}
+
 	private inTransaction<TResult>(callback: () => TResult): TResult {
 		this.client.exec("BEGIN IMMEDIATE");
 		try {
@@ -443,14 +1008,34 @@ export class SqliteRunJournalRepository implements RunJournalRepository {
 			.where(eq(chatSessionsTable.id, sessionId))
 			.get();
 		if (row === undefined) {
-			throw new Error(`Chat session ${sessionId} was not found.`);
+			throw new ChatSessionNotFoundError(sessionId);
 		}
+	}
+
+	private hasEventType(runId: string, type: ChatRunEvent["type"]): boolean {
+		return (
+			this.orm
+				.select({ id: chatRunEventsTable.id })
+				.from(chatRunEventsTable)
+				.where(and(eq(chatRunEventsTable.runId, runId), eq(chatRunEventsTable.type, type)))
+				.get() !== undefined
+		);
+	}
+
+	private getLastEventSeq(runId: string): number {
+		return (
+			this.orm
+				.select({ value: sql<number>`coalesce(max(${chatRunEventsTable.seq}), 0)` })
+				.from(chatRunEventsTable)
+				.where(eq(chatRunEventsTable.runId, runId))
+				.get()?.value ?? 0
+		);
 	}
 
 	private selectRun(runId: string): RunRow {
 		const row = this.orm.select().from(chatRunsTable).where(eq(chatRunsTable.id, runId)).get();
 		if (row === undefined) {
-			throw new Error(`Chat run ${runId} was not found.`);
+			throw new ChatRunNotFoundError(runId);
 		}
 		return row;
 	}

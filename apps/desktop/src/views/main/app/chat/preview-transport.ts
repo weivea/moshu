@@ -280,7 +280,11 @@ export function createPreviewChatTransport(): ChatTransport {
 				throw new Error("The requested chat session could not be found.");
 			}
 		},
-		async send(input: { sessionId: string; message: string }): Promise<ChatSendResult> {
+		async send(input: {
+			requestId: string;
+			sessionId: string;
+			message: string;
+		}): Promise<ChatSendResult> {
 			requireConfiguredProvider();
 			const trimmedMessage = input.message.trim();
 			if (!trimmedMessage) {

@@ -1,63 +1,55 @@
-export const BOOTSTRAP_CHANNEL = "moshu-companion-bootstrap";
-export const BOOTSTRAP_CONTROL_VERSION = 0;
-export const MAX_CONTROL_RECORD_BYTES = 4096;
+import {
+	companionBootstrapChannel,
+	companionControlVersion,
+	type ExecutorBootstrapRecord,
+	type ExecutorReadyRecord,
+	executorBootstrapRecordSchema,
+	executorReadyRecordSchema,
+	maxCompanionControlRecordBytes,
+	parseCompanionControlRecord,
+	serializeCompanionControlRecord,
+} from "@moshu/contracts";
 
-export interface AgentsServerReadyRecord {
-	channel: typeof BOOTSTRAP_CHANNEL;
-	controlVersion: typeof BOOTSTRAP_CONTROL_VERSION;
-	type: "READY";
-	role: "agents-server";
-	pid: number;
-	processVersion: string;
-	nonce: string;
-	endpoint: {
-		host: "127.0.0.1";
-		port: number;
-	};
-}
-
-export interface ExecutorBootstrapRecord {
-	channel: typeof BOOTSTRAP_CHANNEL;
-	controlVersion: typeof BOOTSTRAP_CONTROL_VERSION;
-	type: "START";
-	role: "executor";
-	nonce: string;
-	agentsServer: AgentsServerReadyRecord;
-}
-
-export interface ExecutorReadyRecord {
-	channel: typeof BOOTSTRAP_CHANNEL;
-	controlVersion: typeof BOOTSTRAP_CONTROL_VERSION;
-	type: "READY";
-	role: "executor";
-	pid: number;
-	processVersion: string;
-	nonce: string;
-	agentsServer: {
-		host: "127.0.0.1";
-		port: number;
-		nonce: string;
-	};
-}
+export const BOOTSTRAP_CHANNEL = companionBootstrapChannel;
+export const BOOTSTRAP_CONTROL_VERSION = companionControlVersion;
+export const MAX_CONTROL_RECORD_BYTES = maxCompanionControlRecordBytes;
+export type { ExecutorBootstrapRecord, ExecutorReadyRecord };
 
 export interface BootstrapControlChannel {
 	input: string;
 	parentClosed: Promise<void>;
+	cancelParentMonitor(): Promise<void>;
+}
+
+interface ByteStreamReader {
+	cancel(reason?: unknown): Promise<void>;
+	read(): Promise<{ done: boolean; value: Uint8Array | undefined }>;
+	releaseLock(): void;
 }
 
 export async function openBootstrapControlChannel(
 	stream: ReadableStream<Uint8Array>,
+	signal?: AbortSignal,
 ): Promise<BootstrapControlChannel> {
 	const reader = stream.getReader();
 	const bytes: number[] = [];
-
+	const onAbort = (): void => {
+		void reader.cancel("Executor bootstrap was cancelled.").catch(() => undefined);
+	};
+	signal?.addEventListener("abort", onAbort, { once: true });
 	try {
+		if (isSignalAborted(signal)) {
+			await reader.cancel("Executor bootstrap was cancelled.").catch(() => undefined);
+			throw getBootstrapAbortError(signal?.reason);
+		}
 		while (true) {
 			const result = await reader.read();
+			if (isSignalAborted(signal)) {
+				throw getBootstrapAbortError(signal?.reason);
+			}
 			if (result.done) {
 				throw new Error("Parent control channel closed before the bootstrap record.");
 			}
-
 			for (let index = 0; index < result.value.byteLength; index += 1) {
 				const byte = result.value[index];
 				if (byte === undefined) {
@@ -71,129 +63,81 @@ export async function openBootstrapControlChannel(
 					if (index !== result.value.byteLength - 1) {
 						throw new Error("Parent sent data after the bootstrap control record.");
 					}
+					if (isSignalAborted(signal)) {
+						throw getBootstrapAbortError(signal?.reason);
+					}
+					signal?.removeEventListener("abort", onAbort);
+					const monitor = createParentClosureMonitor(reader);
 					return {
 						input: new TextDecoder("utf-8", { fatal: true }).decode(Uint8Array.from(bytes)),
-						parentClosed: (async () => {
-							try {
-								while (true) {
-									const next = await reader.read();
-									if (next.done) {
-										return;
-									}
-									if (next.value.byteLength > 0) {
-										throw new Error("Parent sent unexpected data after bootstrap.");
-									}
-								}
-							} finally {
-								reader.releaseLock();
-							}
-						})(),
+						parentClosed: monitor.closed,
+						cancelParentMonitor: monitor.cancel,
 					};
 				}
 			}
 		}
 	} catch (error) {
+		signal?.removeEventListener("abort", onAbort);
 		reader.releaseLock();
 		throw error;
 	}
 }
 
-export function parseExecutorBootstrapRecord(input: string): ExecutorBootstrapRecord {
-	const parsed = parseControlRecord(input);
-	const agentsServer = parsed.agentsServer;
-	if (
-		parsed.channel !== BOOTSTRAP_CHANNEL ||
-		parsed.controlVersion !== BOOTSTRAP_CONTROL_VERSION ||
-		parsed.type !== "START" ||
-		parsed.role !== "executor" ||
-		!isNonce(parsed.nonce) ||
-		!isAgentsServerReadyRecord(agentsServer)
-	) {
-		throw new Error("Invalid executor bootstrap control record.");
-	}
+function getBootstrapAbortError(reason: unknown): Error {
+	return reason instanceof Error ? reason : new Error("Executor bootstrap was cancelled.");
+}
 
-	return {
-		channel: BOOTSTRAP_CHANNEL,
-		controlVersion: BOOTSTRAP_CONTROL_VERSION,
-		type: "START",
-		role: "executor",
-		nonce: parsed.nonce,
-		agentsServer,
-	};
+function isSignalAborted(signal: AbortSignal | undefined): boolean {
+	return signal?.aborted === true;
+}
+
+export function parseExecutorBootstrapRecord(input: string): ExecutorBootstrapRecord {
+	return parseCompanionControlRecord(input, executorBootstrapRecordSchema, "bootstrap");
 }
 
 export function serializeReadyRecord(record: ExecutorReadyRecord): string {
-	const serialized = `${JSON.stringify(record)}\n`;
-	if (new TextEncoder().encode(serialized).byteLength > MAX_CONTROL_RECORD_BYTES) {
-		throw new Error("READY control record exceeds the byte limit.");
-	}
-	return serialized;
-}
-
-function parseControlRecord(input: string): Record<string, unknown> {
-	if (new TextEncoder().encode(input).byteLength > MAX_CONTROL_RECORD_BYTES) {
-		throw new Error("Bootstrap control record exceeds the byte limit.");
-	}
-
-	const withoutLineFeed = input.endsWith("\n") ? input.slice(0, -1) : input;
-	const record = withoutLineFeed.endsWith("\r") ? withoutLineFeed.slice(0, -1) : withoutLineFeed;
-	if (record.length === 0 || record.includes("\n") || record.includes("\r")) {
-		throw new Error("Expected exactly one bootstrap control record.");
-	}
-
-	let parsed: unknown;
-	try {
-		parsed = JSON.parse(record);
-	} catch {
-		throw new Error("Bootstrap control record is not valid JSON.");
-	}
-
-	if (!isObject(parsed)) {
-		throw new Error("Bootstrap control record must be an object.");
-	}
-	return parsed;
-}
-
-function isAgentsServerReadyRecord(value: unknown): value is AgentsServerReadyRecord {
-	if (!isObject(value)) {
-		return false;
-	}
-	const endpoint = value.endpoint;
-	return (
-		value.channel === BOOTSTRAP_CHANNEL &&
-		value.controlVersion === BOOTSTRAP_CONTROL_VERSION &&
-		value.type === "READY" &&
-		value.role === "agents-server" &&
-		isPid(value.pid) &&
-		isProcessVersion(value.processVersion) &&
-		isNonce(value.nonce) &&
-		isObject(endpoint) &&
-		endpoint.host === "127.0.0.1" &&
-		isPort(endpoint.port)
+	return new TextDecoder().decode(
+		serializeCompanionControlRecord(record, executorReadyRecordSchema),
 	);
 }
 
-function isObject(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
-}
-
-function isNonce(value: unknown): value is string {
-	return (
-		typeof value === "string" &&
-		value.length >= 8 &&
-		value.length <= 128 &&
-		/^[A-Za-z0-9._-]+$/.test(value)
-	);
-}
-
-function isPid(value: unknown): value is number {
-	return Number.isSafeInteger(value) && Number(value) > 0;
-}
-
-function isPort(value: unknown): value is number {
-	return Number.isInteger(value) && Number(value) >= 1 && Number(value) <= 65_535;
-}
-
-function isProcessVersion(value: unknown): value is string {
-	return typeof value === "string" && value.length >= 1 && value.length <= 64;
+function createParentClosureMonitor(reader: ByteStreamReader): {
+	closed: Promise<void>;
+	cancel(): Promise<void>;
+} {
+	let cancelled = false;
+	let cancelPromise: Promise<void> | undefined;
+	const closed = (async () => {
+		try {
+			while (true) {
+				const next = await reader.read();
+				if (next.done || cancelled) {
+					return;
+				}
+				if ((next.value?.byteLength ?? 0) > 0) {
+					throw new Error("Parent sent unexpected data after bootstrap.");
+				}
+			}
+		} catch (error) {
+			if (!cancelled) {
+				throw error;
+			}
+		} finally {
+			reader.releaseLock();
+		}
+	})();
+	return {
+		closed,
+		cancel() {
+			if (cancelPromise !== undefined) {
+				return cancelPromise;
+			}
+			cancelled = true;
+			cancelPromise = reader
+				.cancel("Executor bootstrap monitor cancelled.")
+				.catch(() => undefined)
+				.then(() => closed);
+			return cancelPromise;
+		},
+	};
 }

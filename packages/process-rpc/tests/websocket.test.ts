@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
+import { getEventListeners } from "node:events";
 import { createServer as createTcpServer, Socket, type Server as TcpServer } from "node:net";
 
 import {
@@ -187,6 +188,167 @@ describe("Bun WebSocket process RPC", () => {
 		peers.push(peer);
 		await expectWeakReferencesCollected([providerReference, headersReference]);
 		expect(peer.isClosed).toBe(false);
+	});
+
+	test("validates the exact server identity before activating event handlers", async () => {
+		const identity = createClientIdentity("exact-server-identity");
+		const staleServerIdentity: RpcPeerIdentity = {
+			...agentsIdentity,
+			instanceId: "stale-agents-start",
+			generation: agentsIdentity.generation - 1,
+		};
+		const event = JSON.stringify({
+			schemaVersion: PROCESS_RPC_SCHEMA_VERSION,
+			protocol: CURRENT_PROCESS_RPC_PROTOCOL,
+			type: "event",
+			eventId: "stale-pre-resolution-event",
+			traceId: "stale-pre-resolution-event",
+			method: "fixture.pre-resolution",
+			payload: { stale: true },
+		});
+		const rawServer = await startRawHandshakeBurstServer(identity, staleServerIdentity, [
+			createServerWebSocketFrame(Buffer.from(event), 0x1, true),
+		]);
+		let handlerInvocations = 0;
+		try {
+			await expect(
+				connectRpcClient({
+					url: rawServer.url,
+					identity,
+					expectedServerIdentity: agentsIdentity,
+					limits: defaultLimits,
+					handlers: {
+						events: {
+							"fixture.pre-resolution": () => {
+								handlerInvocations += 1;
+							},
+						},
+					},
+					methodAllowlist: {
+						agents: { events: ["fixture.pre-resolution"] },
+					},
+				}),
+			).rejects.toMatchObject({ code: "IDENTITY_MISMATCH" });
+			await within(rawServer.closed);
+			await Bun.sleep(10);
+			expect(handlerInvocations).toBe(0);
+			expect(rawServer.isClean()).toBe(true);
+		} finally {
+			await rawServer.stop();
+		}
+	});
+
+	test("contains receiver errors racing a failed hello acknowledgement and releases listeners", async () => {
+		const uncaught: unknown[] = [];
+		const unhandled: unknown[] = [];
+		const onUncaught = (error: unknown): void => {
+			uncaught.push(error);
+		};
+		const onUnhandled = (error: unknown): void => {
+			unhandled.push(error);
+		};
+		const initialUncaughtListeners = process.listenerCount("uncaughtException");
+		const initialUnhandledListeners = process.listenerCount("unhandledRejection");
+		process.on("uncaughtException", onUncaught);
+		process.on("unhandledRejection", onUnhandled);
+		try {
+			const attacks = [
+				createServerWebSocketFrame(Buffer.alloc(MIN_RPC_FRAME_BYTES + 1, 0x61), 0x1, true),
+				createServerWebSocketFrame(Buffer.from([0xc3, 0x28]), 0x1, true),
+			];
+			for (const [index, attack] of attacks.entries()) {
+				const identity = createClientIdentity(`failed-ack-race-${index}`);
+				const rawServer = await startRawHandshakeBurstServer(
+					identity,
+					{
+						...agentsIdentity,
+						instanceId: `unexpected-agents-${index}`,
+						generation: agentsIdentity.generation + index + 1,
+					},
+					[attack],
+					true,
+				);
+				try {
+					await expect(
+						connectRpcClient({
+							url: rawServer.url,
+							identity,
+							expectedServerIdentity: agentsIdentity,
+							limits: {
+								...defaultLimits,
+								maxFrameBytes: MIN_RPC_FRAME_BYTES,
+							},
+						}),
+					).rejects.toMatchObject({ code: "IDENTITY_MISMATCH" });
+					await within(rawServer.closed);
+					expect(rawServer.isClean()).toBe(true);
+				} finally {
+					await rawServer.stop();
+				}
+			}
+			await Bun.sleep(20);
+			expect(uncaught).toEqual([]);
+			expect(unhandled).toEqual([]);
+		} finally {
+			process.off("uncaughtException", onUncaught);
+			process.off("unhandledRejection", onUnhandled);
+		}
+		expect(process.listenerCount("uncaughtException")).toBe(initialUncaughtListeners);
+		expect(process.listenerCount("unhandledRejection")).toBe(initialUnhandledListeners);
+	});
+
+	test("aborts a stalled hello handshake and releases its signal listener", async () => {
+		const identity = createClientIdentity("aborted-stalled-hello");
+		const controller = new AbortController();
+		const rawServer = await startStalledHelloServer();
+		try {
+			const connecting = connectRpcClient({
+				url: rawServer.url,
+				identity,
+				expectedServerIdentity: agentsIdentity,
+				signal: controller.signal,
+				limits: {
+					...defaultLimits,
+					handshakeTimeoutMs: 5_000,
+				},
+			});
+			await rawServer.upgraded;
+			expect(getEventListeners(controller.signal, "abort").length).toBeGreaterThan(0);
+
+			const startedAt = performance.now();
+			controller.abort(new Error("Parent control channel closed."));
+			await expect(within(connecting, 250)).rejects.toMatchObject({
+				code: "INTERNAL_ERROR",
+			});
+			expect(performance.now() - startedAt).toBeLessThan(250);
+			await within(rawServer.closed);
+			await Bun.sleep(0);
+			expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
+			expect(rawServer.isClean()).toBe(true);
+		} finally {
+			await rawServer.stop();
+		}
+	});
+
+	test("does not resolve credentials for an already-aborted connection", async () => {
+		const controller = new AbortController();
+		controller.abort(new Error("Executor parent exited."));
+		let providerCalls = 0;
+
+		await expect(
+			connectRpcClient({
+				url: "ws://127.0.0.1:1/rpc",
+				identity: createClientIdentity("pre-aborted"),
+				expectedServerIdentity: agentsIdentity,
+				signal: controller.signal,
+				getHandshakeHeaders: () => {
+					providerCalls += 1;
+					return { authorization: "unused" };
+				},
+			}),
+		).rejects.toMatchObject({ code: "INTERNAL_ERROR" });
+		expect(providerCalls).toBe(0);
+		expect(getEventListeners(controller.signal, "abort")).toHaveLength(0);
 	});
 
 	test("enforces an absolute HTTP upgrade deadline against drip-fed headers", async () => {
@@ -1640,6 +1802,103 @@ async function startRawWebSocketServer(
 		socket.on("data", onData);
 		return () => socket.listenerCount("data") === 0 || socket.destroyed;
 	});
+}
+
+async function startRawHandshakeBurstServer(
+	clientIdentity: RpcPeerIdentity,
+	serverIdentity: RpcPeerIdentity,
+	framesAfterAck: readonly Buffer[],
+	endAfterWrite = false,
+): Promise<RawTcpTestServer> {
+	return startRawTcpServer((socket) => {
+		let request = Buffer.alloc(0);
+		const onData = (chunk: Buffer): void => {
+			request = Buffer.concat([request, chunk]);
+			const headerEnd = request.indexOf("\r\n\r\n");
+			if (headerEnd === -1) {
+				return;
+			}
+			socket.off("data", onData);
+			const headerText = request.subarray(0, headerEnd).toString("latin1");
+			const key = /^Sec-WebSocket-Key:\s*(.+)$/im.exec(headerText)?.[1]?.trim();
+			if (key === undefined) {
+				socket.destroy();
+				return;
+			}
+			const accept = createHash("sha1")
+				.update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`, "ascii")
+				.digest("base64");
+			socket.write(
+				[
+					"HTTP/1.1 101 Switching Protocols",
+					"Upgrade: websocket",
+					"Connection: Upgrade",
+					`Sec-WebSocket-Accept: ${accept}`,
+					"",
+					"",
+				].join("\r\n"),
+			);
+			const acknowledgement = JSON.stringify({
+				schemaVersion: PROCESS_RPC_SCHEMA_VERSION,
+				protocol: CURRENT_PROCESS_RPC_PROTOCOL,
+				type: "hello-ack",
+				connectionId: "raw-handshake-burst",
+				peer: serverIdentity,
+				acceptedPeer: clientIdentity,
+			});
+			socket.write(
+				Buffer.concat([
+					createServerWebSocketFrame(Buffer.from(acknowledgement), 0x1, true),
+					...framesAfterAck,
+				]),
+				() => {
+					if (endAfterWrite) {
+						socket.end();
+					}
+				},
+			);
+		};
+		socket.on("data", onData);
+		return () => socket.destroyed || socket.listenerCount("data") === 0;
+	});
+}
+
+async function startStalledHelloServer(): Promise<RawTcpTestServer & { upgraded: Promise<void> }> {
+	const upgraded = deferred<void>();
+	const server = await startRawTcpServer((socket) => {
+		let request = Buffer.alloc(0);
+		const onData = (chunk: Buffer): void => {
+			request = Buffer.concat([request, chunk]);
+			const headerEnd = request.indexOf("\r\n\r\n");
+			if (headerEnd === -1) {
+				return;
+			}
+			socket.off("data", onData);
+			const headerText = request.subarray(0, headerEnd).toString("latin1");
+			const key = /^Sec-WebSocket-Key:\s*(.+)$/im.exec(headerText)?.[1]?.trim();
+			if (key === undefined) {
+				socket.destroy();
+				return;
+			}
+			const accept = createHash("sha1")
+				.update(`${key}258EAFA5-E914-47DA-95CA-C5AB0DC85B11`, "ascii")
+				.digest("base64");
+			socket.write(
+				[
+					"HTTP/1.1 101 Switching Protocols",
+					"Upgrade: websocket",
+					"Connection: Upgrade",
+					`Sec-WebSocket-Accept: ${accept}`,
+					"",
+					"",
+				].join("\r\n"),
+			);
+			upgraded.resolve();
+		};
+		socket.on("data", onData);
+		return () => socket.destroyed;
+	});
+	return { ...server, upgraded: upgraded.promise };
 }
 
 async function startPingBeforeAckServer(identity: RpcPeerIdentity): Promise<RawTcpTestServer> {

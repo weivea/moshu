@@ -243,6 +243,57 @@ describe("process RPC protocol", () => {
 		await expect(peer.closed).resolves.toEqual({ code: 1000, reason: "test close" });
 	});
 
+	test("terminates the exact peer when an outbound event send throws", () => {
+		const sendError = new Error("socket dropped frame");
+		let terminated = false;
+		const peer = new RpcPeer({
+			localIdentity: agentsIdentity,
+			remoteIdentity: clientIdentity,
+			protocol: CURRENT_PROCESS_RPC_PROTOCOL,
+			resolvedLimits: resolveRpcLimits({ heartbeatIntervalMs: 0 }),
+			transport: {
+				send: () => {
+					throw sendError;
+				},
+				close: () => undefined,
+				terminate: () => {
+					terminated = true;
+				},
+				isOpen: () => !terminated,
+			},
+		});
+
+		expect(() => peer.emitEvent("chat.event", {})).toThrow(sendError);
+		expect(terminated).toBe(true);
+		expect(peer.isClosed).toBe(true);
+	});
+
+	test("force-terminates the physical transport after logical close", () => {
+		let closeCalls = 0;
+		let terminateCalls = 0;
+		const peer = new RpcPeer({
+			localIdentity: agentsIdentity,
+			remoteIdentity: clientIdentity,
+			protocol: CURRENT_PROCESS_RPC_PROTOCOL,
+			resolvedLimits: resolveRpcLimits({ heartbeatIntervalMs: 0 }),
+			transport: {
+				send: () => undefined,
+				close: () => {
+					closeCalls += 1;
+				},
+				terminate: () => {
+					terminateCalls += 1;
+				},
+				isOpen: () => true,
+			},
+		});
+
+		peer.close();
+		peer.terminate();
+		expect(closeCalls).toBe(1);
+		expect(terminateCalls).toBe(1);
+	});
+
 	test("retains generation high-water marks and rejects conflicts", () => {
 		const fence = new InMemoryRpcGenerationFence();
 		let fencedBy: RpcPeerIdentity | undefined;
