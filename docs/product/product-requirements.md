@@ -113,13 +113,17 @@ Agent、MCP 和 Skills 可组合、可移植、可按范围启停，且扩展权
 
 网页内容、模型输出和 Canvas 均视为不可信输入；密钥、本机文件与命令能力不进入 WebView。
 
+### 7.7 决策与执行分离
+
+agents server 拥有 Agent、Run、Policy、审批和持久状态；executor 只执行经过一次性授权的本机动作。角色拆分不等于完整沙箱，但任何扩展都不得绕过这条边界。
+
 ## 8. 功能域总览
 
 | 功能域 | 核心能力 | 详细文档 |
 | --- | --- | --- |
 | Chat | 普通 Chat、附件、流式回复、引用、导出 | [核心体验](./core-experience.md) |
 | Project | 本地目录、项目上下文、文件操作、终端、Git Diff | [核心体验](./core-experience.md) |
-| Agent Runtime | Ask/Plan/Agent、待办、子 Agent、审批、恢复 | [核心体验](./core-experience.md) |
+| Agent Runtime | Ask/Plan/Agent、待办、子 Agent、审批、Executor 绑定与恢复 | [核心体验](./core-experience.md) |
 | Custom Agent | 可视化配置、导入导出、范围与权限 | [Agent 与扩展](./agents-integrations.md) |
 | Provider | 国内外模型、兼容 Endpoint、能力与成本 | [Agent 与扩展](./agents-integrations.md) |
 | MCP | 本地/远程连接、OAuth、工具管理和配置导入 | [Agent 与扩展](./agents-integrations.md) |
@@ -135,7 +139,8 @@ Agent、MCP 和 Skills 可组合、可移植、可按范围启停，且扩展权
 | Project | 指向一个本地文件夹的应用实体；该目录可以是 Git 仓库 |
 | Session | 一条可持久化的会话线程，属于普通 Chat 或某个 Project |
 | Run | 用户消息触发的一次 Agent 执行，可包含多个模型和工具步骤 |
-| Agent | 一组提示词、模型策略、工具、Skills、知识与权限配置 |
+| Agent | 一组提示词、模型策略、工具、Skills、知识与权限配置；MCP/Skill 只引用 assigned Executor 的 stable resource version/hash |
+| Executor | 自身 MCP config/credential/OAuth、Skill immutable content 与实际 Tool/进程树的唯一所有者；server inventory 只是同步 cache，当前 desktop 默认一个本地 Executor |
 | Tool | Agent 可调用的原子能力，来源可以是内置工具或 MCP |
 | Skill | 符合 Agent Skills 规范的可复用说明、脚本和资源目录 |
 | Knowledge Base | 经本地切分和索引、按需检索进入上下文的资料集合 |
@@ -173,6 +178,7 @@ Agent、MCP 和 Skills 可组合、可移植、可按范围启停，且扩展权
 | Provider API 差异 | 工具调用、流式和用量字段不一致 | 建立能力注册表、适配层和兼容性测试 |
 | 模型不遵守工具约束 | 越权或重复动作 | 权限在工具层执行，不依赖提示词自律 |
 | Deep Agents 预览 API 变化 | 异步子 Agent 等能力可能变更 | 封装运行时边界，锁版本并维护升级测试 |
+| 三角色连接或 companion 崩溃 | Executor 离线、Run 中断或旧实例结果污染 | stable identity、instance/generation、capped restart、reconcile 和恢复 UX |
 | 本机命令无天然沙箱 | 可能访问项目外资源 | 命令策略、环境隔离、审批和高风险硬限制 |
 | MCP/Skill 供应链 | 第三方扩展可带来副作用 | 安装审查、能力清单、作用域和运行审批 |
 | Canvas 运行不可信代码 | XSS、本地访问或资源滥用 | sandbox BrowserView、独立 origin、CSP；默认断网 POC 失败时禁用任意脚本 |

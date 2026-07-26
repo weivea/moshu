@@ -1,0 +1,19 @@
+{
+	"name": "@moshu/process-rpc",
+	"version": "0.0.1",
+	"private": true,
+	"type": "module",
+	"exports": {
+		".": "./src/index.ts"
+	},
+	"scripts": {
+		"typecheck": "tsc --noEmit -p tsconfig.json && bun run typecheck:consumer",
+		"typecheck:consumer": "tsc --noEmit -p tests/consumer/tsconfig.json",
+		"test": "bun test"
+	},
+	"dependencies": {
+		"@types/ws": "8.18.1",
+		"rpc-websocket-client": "npm:ws@8.21.1",
+		"zod": "4.4.3"
+	}
+}

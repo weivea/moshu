@@ -112,6 +112,15 @@
         "@moshu/contracts": "workspace:*",
       },
     },
+    "packages/process-rpc": {
+      "name": "@moshu/process-rpc",
+      "version": "0.0.1",
+      "dependencies": {
+        "@types/ws": "8.18.1",
+        "rpc-websocket-client": "npm:ws@8.21.1",
+        "zod": "4.4.3",
+      },
+    },
     "packages/ui": {
       "name": "@moshu/ui",
       "version": "0.0.1",
@@ -329,6 +338,8 @@
 
     "@moshu/executor": ["@moshu/executor@workspace:apps/executor"],
 
+    "@moshu/process-rpc": ["@moshu/process-rpc@workspace:packages/process-rpc"],
+
     "@moshu/ui": ["@moshu/ui@workspace:packages/ui"],
 
     "@nodelib/fs.scandir": ["@nodelib/fs.scandir@2.1.5", "https://ms-feed-12.pkgs.visualstudio.com/1es-public/_packaging/npm-public/npm/registry/@nodelib/fs.scandir/-/fs.scandir-2.1.5.tgz", { "dependencies": { "@nodelib/fs.stat": "2.0.5", "run-parallel": "^1.1.9" } }, "sha1-dhnC6yGyVIP20WdUi0z9WnSIw9U="],
@@ -508,6 +519,8 @@
     "@types/three": ["@types/three@0.165.0", "https://ms-feed-12.pkgs.visualstudio.com/1es-public/_packaging/npm-public/npm/registry/@types/three/-/three-0.165.0.tgz", { "dependencies": { "@tweenjs/tween.js": "~23.1.1", "@types/stats.js": "*", "@types/webxr": "*", "fflate": "~0.8.2", "meshoptimizer": "~0.18.1" } }, "sha1-6vFH5pufxJ3cL1Gz5CWtA83lwjY="],
 
     "@types/webxr": ["@types/webxr@0.5.24", "https://ms-feed-2.pkgs.visualstudio.com/1es-public/_packaging/npm-public/npm/registry/@types/webxr/-/webxr-0.5.24.tgz", {}, "sha1-c01dkNrcWAmlPkInJsYDN/ovSkQ="],
+
+    "@types/ws": ["@types/ws@8.18.1", "https://ms-feed-2.pkgs.visualstudio.com/1es-public/_packaging/npm-public/npm/registry/@types/ws/-/ws-8.18.1.tgz", { "dependencies": { "@types/node": "*" } }, "sha1-SEZOS/Ld/RfbE9hFRn9gcP/qSqk="],
 
     "@vitejs/plugin-react": ["@vitejs/plugin-react@4.7.0", "https://ms-feed-12.pkgs.visualstudio.com/1es-public/_packaging/npm-public/npm/registry/@vitejs/plugin-react/-/plugin-react-4.7.0.tgz", { "dependencies": { "@babel/core": "^7.28.0", "@babel/plugin-transform-react-jsx-self": "^7.27.1", "@babel/plugin-transform-react-jsx-source": "^7.27.1", "@rolldown/pluginutils": "1.0.0-beta.27", "@types/babel__core": "^7.20.5", "react-refresh": "^0.17.0" }, "peerDependencies": { "vite": "^4.2.0 || ^5.0.0 || ^6.0.0 || ^7.0.0" } }, "sha1-ZHr057t1rTrdV452KtmEuQ9KJLk="],
 
@@ -836,6 +849,8 @@
     "reusify": ["reusify@1.1.0", "https://ms-feed-12.pkgs.visualstudio.com/1es-public/_packaging/npm-public/npm/registry/reusify/-/reusify-1.1.0.tgz", {}, "sha1-D+E7lSLhRz9RtVjueW4I8R+bSJ8="],
 
     "rollup": ["rollup@4.62.2", "https://ms-feed-25.pkgs.visualstudio.com/1es-public/_packaging/npm-public/npm/registry/rollup/-/rollup-4.62.2.tgz", { "dependencies": { "@types/estree": "1.0.9" }, "optionalDependencies": { "@rollup/rollup-android-arm-eabi": "4.62.2", "@rollup/rollup-android-arm64": "4.62.2", "@rollup/rollup-darwin-arm64": "4.62.2", "@rollup/rollup-darwin-x64": "4.62.2", "@rollup/rollup-freebsd-arm64": "4.62.2", "@rollup/rollup-freebsd-x64": "4.62.2", "@rollup/rollup-linux-arm-gnueabihf": "4.62.2", "@rollup/rollup-linux-arm-musleabihf": "4.62.2", "@rollup/rollup-linux-arm64-gnu": "4.62.2", "@rollup/rollup-linux-arm64-musl": "4.62.2", "@rollup/rollup-linux-loong64-gnu": "4.62.2", "@rollup/rollup-linux-loong64-musl": "4.62.2", "@rollup/rollup-linux-ppc64-gnu": "4.62.2", "@rollup/rollup-linux-ppc64-musl": "4.62.2", "@rollup/rollup-linux-riscv64-gnu": "4.62.2", "@rollup/rollup-linux-riscv64-musl": "4.62.2", "@rollup/rollup-linux-s390x-gnu": "4.62.2", "@rollup/rollup-linux-x64-gnu": "4.62.2", "@rollup/rollup-linux-x64-musl": "4.62.2", "@rollup/rollup-openbsd-x64": "4.62.2", "@rollup/rollup-openharmony-arm64": "4.62.2", "@rollup/rollup-win32-arm64-msvc": "4.62.2", "@rollup/rollup-win32-ia32-msvc": "4.62.2", "@rollup/rollup-win32-x64-gnu": "4.62.2", "@rollup/rollup-win32-x64-msvc": "4.62.2", "fsevents": "~2.3.2" }, "bin": { "rollup": "dist/bin/rollup" } }, "sha1-2Q/Ey4EfBxMDyJC3eVlWNPNflUE="],
+
+    "rpc-websocket-client": ["ws@8.21.1", "https://ms-feed-2.pkgs.visualstudio.com/1es-public/_packaging/npm-public/npm/registry/ws/-/ws-8.21.1.tgz", { "peerDependencies": { "bufferutil": "^4.0.1", "utf-8-validate": ">=5.0.2" }, "optionalPeers": ["bufferutil", "utf-8-validate"] }, "sha1-BFZQzUsSB4CedUcUYiPDgUqa9YY="],
 
     "rrweb-cssom": ["rrweb-cssom@0.8.0", "https://ms-feed-2.pkgs.visualstudio.com/1es-public/_packaging/npm-public/npm/registry/rrweb-cssom/-/rrweb-cssom-0.8.0.tgz", {}, "sha1-MCHRtDUvvzthSq7tC8DVc5q+C8I="],
 
