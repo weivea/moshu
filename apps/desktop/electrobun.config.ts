@@ -3,6 +3,16 @@ import type { ElectrobunConfig } from "electrobun";
 import { resolveCompanionCodesignIdentity } from "./scripts/companion-signing";
 import { createElectrobunCompanionCopyEntries } from "./src/shared/companion-executable-names";
 
+export const companionSourceWatchPaths = [
+	"../agents-server/src",
+	"../executor/src",
+	"../../packages/agent-runtime/src",
+	"../../packages/contracts/src",
+	"../../packages/database/src",
+	"../../packages/deepagents/src",
+	"../../packages/process-rpc/src",
+];
+
 export function createElectrobunConfig(
 	environment: NodeJS.ProcessEnv = process.env,
 	platform: NodeJS.Platform = process.platform,
@@ -28,6 +38,7 @@ export function createElectrobunConfig(
 			// Companion binaries are compiled for the build host, so cross-target packaging is unsupported.
 			targets: "current",
 			useAsar: false,
+			watch: companionSourceWatchPaths,
 			watchIgnore: ["dist/**"],
 			mac: {
 				bundleCEF: false,
@@ -47,6 +58,7 @@ export function createElectrobunConfig(
 			exitOnLastWindowClosed: false,
 		},
 		scripts: {
+			preBuild: "scripts/build-companions.ts",
 			postBuild: "scripts/prepare-companion-bundle.ts",
 			postPackage: "scripts/verify-mac-package.ts",
 		},

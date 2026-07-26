@@ -4,7 +4,6 @@ import { createElectrobunCodesignEnvironment } from "./companion-signing";
 const desktopDirectory = resolve(import.meta.dir, "..");
 const repositoryRoot = resolve(desktopDirectory, "../..");
 
-await run([process.execPath, "run", "build:companions"], repositoryRoot);
 await run([process.execPath, "run", "build:web"], desktopDirectory);
 await run(
 	[process.execPath, "x", "electrobun", "dev", "--watch"],

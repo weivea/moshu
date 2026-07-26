@@ -45,13 +45,29 @@ bun run dev:hmr
 
 该命令会：
 
-1. 依次将 agents server 和 executor 编译成独立可执行文件。
+1. 并行启动 Vite HMR server 和 desktop 开发流程。
 2. 构建一次 React WebView，作为 Vite 不可用时的回退资源。
-3. 并行启动 Vite HMR server 和 `electrobun dev --watch`。
-4. 由 desktop supervisor 启动两个 companion，并等待认证注册和 readiness。
+3. Electrobun `preBuild` 依次将 agents server 和 executor 编译成独立可执行文件。
+4. `electrobun dev --watch` 构建并启动 desktop，由 supervisor 启动两个 companion 并等待认证注册和 readiness。
 
-HMR 只覆盖 React WebView。修改 `apps/agents-server`、`apps/executor` 或它们引用的共享包后，需停止并重新运行
-`bun run dev:hmr`，以重新编译 companion。修改 desktop Application Host 时由 Electrobun watch 负责重建。
+React WebView 使用 Vite HMR，通常不重开窗口。agents server 和 executor 使用完整自动重载：修改它们或当前引用的
+共享包源码后，Electrobun 会进行 300ms 防抖、停止当前应用、重新编译两个 companion，再构建并启动 desktop。
+该过程会重开桌面窗口，不保留 WebView 内存状态；持久化数据库和 checkpoint 不受影响。构建失败时应用保持停止，
+修复源码并再次保存后会重新尝试。
+
+当前 companion 自动重载覆盖：
+
+```text
+apps/agents-server/src/
+apps/executor/src/
+packages/agent-runtime/src/
+packages/contracts/src/
+packages/database/src/
+packages/deepagents/src/
+packages/process-rpc/src/
+```
+
+修改 desktop Application Host 时同样由 Electrobun watch 重建并重启应用。
 
 不需要 Vite HMR 时可以运行：
 
@@ -60,6 +76,7 @@ bun run dev
 ```
 
 此模式使用预构建的 WebView 资源并启动 Electrobun watch。
+它不提供 React HMR，但 companion 和 Application Host 的完整自动重载仍然有效。
 
 ## 构建与打包
 

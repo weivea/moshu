@@ -1,15 +1,30 @@
 import { describe, expect, test } from "bun:test";
-import { createElectrobunConfig } from "../electrobun.config";
+import { companionSourceWatchPaths, createElectrobunConfig } from "../electrobun.config";
 
-describe("Electrobun signing hooks", () => {
+describe("Electrobun config", () => {
 	test("disables Electrobun's timestamped signer for default ad-hoc packages", () => {
 		const config = createElectrobunConfig({}, "darwin");
 		expect(config.build.mac?.codesign).toBe(false);
 		expect(config.build.mac?.notarize).toBe(false);
 		expect(config.scripts).toEqual({
+			preBuild: "scripts/build-companions.ts",
 			postBuild: "scripts/prepare-companion-bundle.ts",
 			postPackage: "scripts/verify-mac-package.ts",
 		});
+	});
+
+	test("rebuilds the desktop app when companion sources change", () => {
+		const config = createElectrobunConfig({}, "darwin");
+		expect(config.build.watch).toEqual(companionSourceWatchPaths);
+		expect(config.build.watch).toEqual([
+			"../agents-server/src",
+			"../executor/src",
+			"../../packages/agent-runtime/src",
+			"../../packages/contracts/src",
+			"../../packages/database/src",
+			"../../packages/deepagents/src",
+			"../../packages/process-rpc/src",
+		]);
 	});
 
 	test("uses the companion Developer ID for Electrobun's hardened outer signing", () => {
