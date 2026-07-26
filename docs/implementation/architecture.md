@@ -1,536 +1,430 @@
 # 技术架构
 
+> 状态：批准的目标架构；尚未完全实现
+> 当前实现证据见[实施进度](./progress.md)
+
 ## 1. 架构目标
 
-- UI、Agent 和本机副作用相互解耦。
-- 单个 Run/Provider/Tool 错误不损坏其他会话；application runtime 异常后可从持久状态恢复。
-- 权限与审批在模型之外执行。
-- 运行事件、checkpoint 和业务数据可独立演进。
-- Provider、MCP、Skills、Knowledge 和 Canvas 共享工具、事件、权限和密钥基础设施。
-- 首发 macOS，但模块边界不依赖 macOS 特有业务逻辑。
+- UI、Agent 决策和本机副作用由不同应用角色承载。
+- 每项持久状态和实际资源只有一个明确所有者。
+- 进程断线、重启和迟到消息不能污染新的执行实例。
+- 权限与审批在模型之外决定，executor 在执行前独立验证授权。
+- Provider、MCP、Skills、Knowledge 和 Canvas 复用稳定协议、事件、权限和 Secret 基础设施。
+- 首发为单机 macOS desktop；协议保留未来独立 client/executor 的注册能力，但不提前实现远程部署。
 
-## 2. 总体架构
+## 2. 术语与实现状态
+
+本文中的“三进程”指三个**应用角色/可执行程序**：
+
+| 角色 | 可执行程序 | 核心职责 |
+| --- | --- | --- |
+| Electrobun client | 桌面应用 | UI、系统集成、companion supervisor |
+| agents server | Bun compiled binary | 业务数据、Provider、Agent runtime、Run、Policy/approval |
+| executor | Bun compiled binary | Tool、MCP、Skill 和本机进程执行 |
+
+Electrobun 可另有 launcher、application worker 和 WebView 等框架进程，因此不能用 PID 数量判断架构是否正确。
+
+当前仓库代码仍是单 Electrobun Application Host 内的 Ask Chat 切片。以下图和职责描述是迁移目标，不代表 companion、WebSocket 或 registry 已存在。
+
+## 3. 总体架构
 
 ```mermaid
 flowchart LR
-    UI[React WebView UI] <-->|Typed Electrobun RPC| HOST[Electrobun Application Host]
-    HOST --> DB[(App DB / bun:sqlite)]
-    HOST --> VAULT[Secret Vault / macOS Keychain]
-    HOST --> SCHED[Run Scheduler]
-    HOST --> NOTIFY[OS Dialog / Notification / Updater]
+    subgraph C[Electrobun client]
+        UI[React WebView]
+        DESKTOP[Window / Menu / Updater]
+        SUP[Companion Supervisor]
+        UI <-->|typed Electrobun RPC| DESKTOP
+    end
 
-    SCHED --> DAS[DeepAgentService / in-process]
-    DAS --> REG[Run Registry / Abort / Interrupt]
-    DAS --> DA[Deep Agents JS / LangGraph]
-    DAS --> PROVIDERS[Provider Adapters]
-    DAS --> CP[(Checkpoint DB / BunSqliteSaver)]
-    DA --> TOOLBRIDGE[Brokered Backend + Tool Bridge]
-    TOOLBRIDGE -->|In-process typed request| POLICY
+    subgraph S[agents server]
+        RPCS[Versioned JSON RPC]
+        APP[Application Services]
+        AGENT[Deep Agents / LangGraph]
+        PROVIDER[Provider Adapters]
+        POLICY[Policy / Approval]
+        BROKER[Action Broker]
+        DB[(Business DB)]
+        CP[(Checkpoint DB)]
+        VAULT[Provider Secret Vault]
+    end
 
-    HOST --> POLICY[Policy Engine]
-    POLICY --> BROKER[Action Broker]
-    BROKER --> FILES[Filesystem Adapter]
-    BROKER --> COMMANDS[Command Runner]
-    BROKER --> GIT[Git Adapter]
-    BROKER --> WEB[Web Tools]
+    subgraph E[executor]
+        RPCE[Versioned JSON RPC]
+        TOOLS[Tool Bridge]
+        MCP[MCP Lifecycle]
+        SKILLS[Skill Store / Resources / Scripts]
+        PROC[Cancellation / Process Trees]
+    end
 
-    UI -->|layout/control only| PREVIEW[Sandboxed Canvas BrowserView]
-    HOST --> PREVIEW
-    PREVIEW -->|no RPC / isolated partition| CANVAS[Untrusted Canvas content]
+    C <-->|WebSocket| S
+    S <-->|WebSocket| E
+    SUP -->|start / stop / bounded restart| S
+    SUP -->|start / stop / bounded restart| E
+
+    APP --> AGENT
+    APP --> PROVIDER
+    APP --> POLICY
+    POLICY --> BROKER
+    APP --> DB
+    AGENT --> CP
+    PROVIDER --> VAULT
+    BROKER -->|one-time execution grant| TOOLS
+    TOOLS --> MCP
+    TOOLS --> SKILLS
+    TOOLS --> PROC
 ```
 
-本文锁定的 Electrobun `1.18.1` 不是 Electron 的多进程替代实现：原生 launcher 启动应用包内的 Bun，框架在 Bun main thread 初始化原生 GUI event loop，并在 application worker 中执行 `src/bun/index.ts`。开发者需要 Bun 工具链完成 install/script/build，但发行包已经包含 runtime，终端用户不需要另装 Bun。
-
-参考实现 `oh-your-pi` 直接在该 application worker 内 import Pi Agent SDK，没有应用级 sidecar。本文只复用这种 Electrobun 拓扑和 typed RPC 模式，Agent 实现仍固定为 LangChain `deepagents`。上游 `main` 已出现 Cottontail/JSC 路线，因此升级 Electrobun 等同于更换 application runtime，必须重新通过全部 Runtime POC。
-
-### 2.1 参考实现可复用模式
-
-- `src/bun/index.ts` 作为 Electrobun composition root，Agent SDK 直接运行在 application worker。
-- shared Zod DTO → `BrowserView.defineRPC` adapter → application service → WebView client，SDK 类型不穿透 UI。
-- Prompt/start 请求快速返回，delta、Tool、认证和完成状态由 typed message 持续推送。
-- 每次请求显式携带 workspace/thread identity，不让 Host 依赖 UI 当前选中项。
-- GUI 文件预览与 Agent Tool 分离；共同使用 `realpath`、根目录 containment、软链接逃逸检查、大小上限和二进制检测。
-
-Pi SDK 的 SessionManager、JSONL、ModelRuntime、事件 mapper 和权限 extension 不复用；参考项目也没有 Keychain、完整自动更新、durable HITL、崩溃恢复或 app-level 命令进程监管，不能把这些缺口当作产品基线。
-
-### 2.2 安全说明
-
-- Electrobun Application Host 与 in-process DeepAgentService 都是受信任应用代码，不是 OS 权限沙箱。
-- DeepAgentService 不暴露通用 Shell backend；所有本机副作用进入同进程但独立分层的 Policy Engine 与 Action Broker。
-- Electrobun 加密 RPC 保护 View 与 Host 的传输，但不代替身份、Schema、capability 和状态校验。
-- `BrowserView` 的 `sandbox: true` 会禁用 RPC，只保留事件通道；它不是完整的网络或操作系统沙箱。
-- 真正的权限边界是 Host 中的 Policy Engine、Action Broker、RPC 校验、Secret Vault 和操作系统权限。
-- stdio MCP Server 是用户主动安装的本机程序，Phase 2 必须明确提示它具有宿主机权限。
-
-## 3. 运行时与模块职责
-
-### 3.1 Electrobun Application Host
-
-作为 composition root，承担桌面特权、全局协调和 Agent application service：
-
-- 窗口、菜单、深链、自定义协议和应用生命周期。
-- Electrobun typed RPC 注册、BrowserView 身份和 capability 校验。
-- Secret Vault、数据库仓储和迁移。
-- Run Scheduler、DeepAgentService、Run Registry 和启动恢复。
-- Policy Engine、审批和 Action Broker。
-- 文件、命令、Git、网络出口和系统通知。
-- Canvas Preview 创建、CSP/导航策略、权限拒绝和销毁。
-- 更新、签名信息和本地诊断。
-
-LLM graph 由 Host 内的 DeepAgentService 异步运行，Markdown 仍只在 WebView 渲染。命令、Git、索引、序列化和大事件转换不得阻塞 application worker；Phase 0 必须用 3 个并发 Run 证明 RPC、窗口和取消仍可响应，达不到预算时再触发隔离 ADR。
-
-### 3.2 View RPC 边界
-
-- 主 WebView 只获得按领域分组的命令、查询和消息 API。
-- Electrobun RPC Schema 提供编译期类型；所有安全相关入参与出参仍使用共享 Zod Schema做运行时校验。
-- 不向 WebView 暴露通用 RPC 转发、文件路径拼接、Shell、Host 对象或 Secret。
-- Host 按已登记的 BrowserView ID、窗口角色和当前 capability 校验请求，不信任只由 UI 声明的身份。
-- 订阅绑定 View 生命周期，View 销毁时自动释放；已接受的 Run 是否继续由后台任务策略决定，不依赖某个页面存活。
-- Canvas Preview 设置 `sandbox: true`，不注册应用 RPC，只允许经过校验的单向事件。
-
-### 3.3 React WebView UI
-
-- 页面、路由、表单、消息、轨迹、Diff、任务中心和设置 UI。
-- 通过 Query 获取持久状态，通过 Subscription 接收增量事件。
-- WebView 缓存不是事实来源；刷新后从数据库恢复。
-- Markdown/HTML 经过清理，外链交给 Host 校验后打开。
-- 不导入 Bun/Node-only 包、Provider SDK、数据库或 Deep Agents。
-
-### 3.4 DeepAgentService
-
-Phase 1 默认直接运行在 Electrobun application worker。它不是 Pi SDK 的 `SessionManager` 或 JSONL host，而是围绕 Deep Agents/LangGraph 建立以下模型：
-
-- 共享不可变 graph definition/compiled graph cache。
-- `threadId` 对应可持久 LangGraph thread，`runId` 对应一次应用执行。
-- `RunRegistry` 只保存活动 Run 的 `AbortController`、stream task、pending interrupt IDs 和资源句柄。
-- checkpointer 是 thread 内 Agent state（包括 conversation messages）的持久事实来源；`store` 仅用于跨 thread 的长期记忆和 StoreBackend 文件，不承担 Chat Session 目录管理。
-- `app.db` 保存 Session 标题、归档、搜索、Run 状态和 UI/event 投影；这些产品投影不得重新拼装后回灌 Agent context。
-- Registry、Provider client 和 stream iterator 不持久化。
-- start 命令快速返回 accepted/run ID，后续 delta、Tool、interrupt 和完成状态通过规范化事件流发送。
-
-职责：
-
-- 构建有效 Agent 配置和 Deep Agents graph。
-- 调用 Provider、管理 LangGraph thread/checkpoint。
-- 把 Deep Agents stream 转为内部 RuntimeEvent。
-- 调用 Brokered Backend/Tool Bridge，不直接执行 Shell。
-- 接收开始、恢复、停止和审批继续命令。
-- 只在内存持有当前 Run 所需的 Provider Key。
-- 在应用退出、窗口策略变化和 Session 删除时显式 dispose/abort，释放 Provider、stream 和命令资源。
-
-不承担：
-
-- UI 数据查询。
-- API Key 永久存储。
-- 任意本地路径授权。
-- 应用更新或系统通知。
-
-HITL 不能复制参考实现的 pending Promise：approval/interrupt 必须先落库，恢复时使用同一 `threadId`、LangGraph config 与 `Command({ resume })`，即使 WebView reload 或应用重启也不会永久悬挂。
-
-### 3.5 可选 sidecar 决策
-
-仅以下实测结果可以触发 sidecar ADR：
-
-- 选定 Electrobun application runtime 无法正确加载 Deep Agents、Provider SDK、`AsyncLocalStorage` 或必需 native addon。
-- Deep Agents 导致 application worker 崩溃、event-loop 长时间阻塞或无法满足内存/CPU隔离要求。
-- Agent 必须跨 Host 生命周期作为独立 daemon 运行，或需要独立升级边界。
-- 命令进程树必须由独立进程监管才能可靠回收。
-
-仅“Agent 是长任务”不构成 sidecar 理由。若 ADR 选择 sidecar，才增加 bundled runtime、framed RPC、版本握手、背压、heartbeat、crash loop、process-tree kill、Secret channel、checkpoint writer ownership、签名和更新矩阵；本文默认实现不包含这些复杂度。
-
-### 3.6 Canvas Preview
-
-- Web Canvas 使用单独 Electrobun `BrowserView`，不在主 WebView 中执行不可信页面。
-- 设置 `sandbox: true`，不注册 Electrobun RPC；使用独立 partition 和受控 `views://`/wrapper 页面。
-- wrapper 页面设置严格 CSP，默认拒绝脚本外联、权限、导航、新窗口、下载和网络。
-- 当前 Electrobun 未提供与 Electron `webRequest` 等价且有文档保证的子资源拦截 API。Phase 0 必须用真实 HTTP/DNS 测试证明默认断网；未通过前 Web Canvas 只能渲染应用生成的静态内容，不能承诺任意 HTML 隔离运行。
-- 用户允许某个 Canvas/域名访问网络时，必须通过明确的 Host capability 和受控代理实现，不能仅依赖顶层导航规则。
-- Preview 无法调用应用 RPC；编辑内容由 Host 通过受控资源加载更新。
-
-## 4. 仓库布局
+应用协议只允许：
 
 ```text
-.
-├── apps/
-│   └── desktop/
-│       ├── src/bun/           # Electrobun entry, RPC adapters and desktop services
-│       ├── src/agent/         # in-process DeepAgentService and Run Registry
-│       ├── src/views/main/    # React WebView and typed RPC client
-│       ├── src/views/canvas/  # minimal sandbox wrapper
-│       ├── electrobun.config.ts
-│       └── vite.config.ts
-├── packages/
-│   ├── contracts/          # Zod schemas, IDs, RPC and event contracts
-│   ├── domain/             # Pure state machines and policies
-│   ├── database/           # Drizzle schema, repositories and migrations
-│   ├── deepagents/         # In-repository Deep Agents implementation
-│   ├── agent-runtime/      # Deep Agents wrapper and stream normalization
-│   ├── action-broker/      # filesystem, command, git and web actions
-│   ├── providers/          # model/embedding adapters and capabilities
-│   ├── ui/                 # design tokens and reusable React components
-│   ├── mcp/                # Phase 2
-│   ├── skills/             # Phase 2
-│   ├── knowledge/          # Phase 2
-│   ├── canvas/             # Canvas domain and render protocol
-│   └── testkit/            # fakes, fixtures and contract suites
-├── docs/
-├── scripts/
-├── package.json
-├── bunfig.toml
-└── bun.lock
+client <-> agents server <-> executor
 ```
 
-避免在第一天创建所有空包。Phase 0 只创建 `contracts`、`domain`、`database`、`agent-runtime`、`action-broker` 和 `ui`；其余在对应垂直切片开始时创建。
+client 不提供绕过 agents server 的 executor RPC，executor 也不直接读取 client 状态、业务 DB 或 checkpoint。
 
-## 5. 分层规则
+## 4. 角色职责
 
-```text
-WebView/UI
-    ↓ contracts only
-Application services
-    ↓
-Domain (pure TypeScript)
-    ↓ ports
-Adapters (Electrobun, Bun SQLite, LangChain, MCP, filesystem)
-```
+### 4.1 Electrobun client
 
-强制规则：
+负责：
 
-- `domain` 不依赖 Electrobun、Bun、React、LangChain、数据库或操作系统。
-- `contracts` 只放跨 WebView/RPC 和模块边界的稳定类型，不复用数据库 Row 类型。
-- Provider/MCP SDK 类型不穿透到 UI。
-- 所有 Adapter 错误映射为稳定的 `AppError`。
-- 任意 Tool 必须声明 `riskClass`、`sideEffectClass`、`idempotencyClass` 和 `requiredCapabilities`。
+- React WebView、路由、表单、消息、轨迹、审批、Diff、任务中心和设置 UI。
+- 窗口、菜单、通知、外链、深链、Updater、Canvas BrowserView 和桌面诊断入口。
+- 主 WebView 的最小 typed Electrobun RPC、View 身份和 capability 校验。
+- 启动、监管和关闭一个本地 agents server 与一个本地 executor。
+- 展示 server/executor 的连接、恢复、重试和 crash-loop 状态。
 
-## 6. 构建与依赖策略
+不负责：
 
-### 6.1 Electrobun CLI + Vite
+- 业务数据库或 checkpoint 写入。
+- Provider 调用、Agent graph、Policy 决策或 Action intent。
+- 文件、命令、Git、MCP 或 Skill 脚本的实际执行。
+- 永久保存或向 WebView 返回 Secret 明文。
 
-- Electrobun CLI 负责 Application Host 构建、应用 bundle、自解压产物、签名、公证和更新 metadata。
-- React WebView 沿用官方 React + Tailwind + Vite 集成模式；Vite 只处理 WebView 资源和 HMR。
-- 产品锁定 Electrobun `1.18.1` 及其发行包内 runtime；开发 CI 的 Bun 版本与 package 内 runtime 分别记录，不能相互推断。
-- Phase 0 在开发、package、签名/公证产物中直接 import 并运行 Deep Agents，验证 RPC、`bun:sqlite`、BrowserView、`views://` 资源和 Updater。
-- `useAsar` 仅在 package smoke 证明 Host、DeepAgentService、迁移和静态资源均可正确加载后启用；必须放在真实文件系统的资源使用 `asarUnpack` 或构建复制规则。
+### 4.2 agents server
 
-### 6.2 Application runtime 兼容
+agents server 是业务事实来源，独占：
 
-- `node:fs`、Web Streams、`fetch` 等基础 API 的高兼容度不能推导出 Deep Agents 整体兼容。
-- `AsyncLocalStorage`、`node:child_process`、`worker_threads`、取消/流背压和 Node 原生模块列为高风险面。
-- `bun add`、类型检查、参考项目成功或单次模型回复只证明可安装/可启动；Go 条件必须在 Electrobun application worker 内覆盖真实 Provider、工具调用、HITL、checkpoint、同步 subagent、并发、取消和故障恢复。
-- 不在生产用全局 monkey patch 或静默 fallback 掩盖语义差异。
+- 业务 DB、migration、backup、checkpoint 和启动 reconciliation。
+- Provider/model 配置与 credential、Agent definitions/versions 及其不可变快照。
+- Provider/model Secret Vault、Provider 访问和模型用量。
+- Agent runtime、LangGraph thread/checkpoint、Run Scheduler、Run 状态和 durable event。
+- Executor/Agent registry、可用性投影和 Run 到 executor 的调度。
+- Policy Engine、审批、Allow all、Action intent/result 和 recovery decision。
+- execution grant 的签发、使用状态和审计。
+- Agent 对 executor resource 的稳定引用，以及从 executor 同步得到的可替换、非权威、可丢弃 inventory/capability cache。
 
-### 6.3 SQLite 与 Bun 兼容
+agents server 不保存可恢复 MCP/Skill config、MCP credential/OAuth state 或 Skill 内容副本，也不直接执行文件、命令、Git、MCP Tool 或 Skill 脚本。
 
-- 业务 DB 使用 Bun 内置 `bun:sqlite` 和 Drizzle Bun SQLite adapter，避免 `better-sqlite3` 的 Node ABI 与重建链。
-- `@langchain/langgraph-checkpoint-sqlite` 硬依赖 `better-sqlite3`，不列入生产依赖。
-- 项目实现 `BunSqliteSaver extends BaseCheckpointSaver`，复用 LangGraph serializer 和 thread/checkpoint 语义，并运行与官方 saver 语义对齐的项目行为 contract suite。
-- App DB 与 checkpoint DB 均启用 WAL；备份、迁移、退出和崩溃恢复需要覆盖 WAL/SHM 文件。
-- 新增 Node 原生模块前必须单独证明 Bun ABI 兼容、目标架构打包和签名加载，不能假设 Electron/Node 预编译产物可用。
+### 4.3 executor
 
-### 6.4 发布安全基线
+executor 是本机执行事实来源，独占：
 
-Electrobun 不提供 Electron Fuses、`safeStorage` 或同等的框架级安全开关。Phase 0 必须建立并验证：
+- 内置 Tool 的实际文件、命令、Git、网络或其他 host 操作。
+- MCP config、credential/token/OAuth state、stdio/HTTP/SSE 连接和子进程生命周期。
+- Skill installation、immutable versions、content/hash、metadata、资源和脚本。
+- executor-private DB、Skill data root、`ExecutorSecretStore` 和相关本地数据。
+- 持久化 `inventoryEpoch`、单调递增 `inventoryRevision`，以及带 deletion tombstone 的有界 inventory change log。
+- invocation 取消、超时、输出限制、子进程组和进程树清理。
+- 本 executor 的能力、健康状态和运行中 invocation registry。
 
-- 所有生产产物签名、公证；更新 metadata 与下载产物执行完整性和来源校验。
-- 主 WebView 仅注册最小 typed RPC，Canvas BrowserView 设置 `sandbox: true` 且不注册 RPC。
-- 生产构建关闭调试入口，不发布敏感 source map，忽略外部环境传入的调试配置。
-- Secret Vault 通过 macOS Keychain adapter 保存 Provider Key；Keychain 不可用时显式报错，不回退到明文或应用自制弱加密。
-- CSP、导航、权限、外链和 Canvas 子资源网络测试作为发布阻断项。
+executor 不拥有产品 DB/checkpoint、Agent definitions、Agent runtime、Provider 访问、Provider/model credential 或 Policy/approval。它拥有自身 MCP credential 并可在 connection/process 生命周期内加载到内存或目标 MCP child 的最小环境；每次 Tool action 仍需 server 的一次性 execution grant。
 
-### 6.5 依赖升级
+## 5. Desktop 部署与生命周期
 
-- Electrobun 与其实际 application runtime 作为一组升级，运行 Deep Agents/host/RPC/BrowserView/package/update 兼容矩阵。
-- Deep Agents/LangChain 作为一组升级，运行 Provider、checkpoint、interrupt 和 stream contract suite。
-- 每次升级必须通过已有 checkpoint 恢复 fixture。
-- 只有在稳定版无法修复阻断问题且 canary 通过完整矩阵时才可临时采用 prerelease，并记录回退版本。
-- 自动依赖 PR 不自动合并生产依赖。
+### 5.1 当前批准的 desktop 模式
 
-## 7. DeepAgentService
+“当前 desktop 模式”指批准的部署方式，不等于代码已实现：
 
-### 7.1 AgentFactory
+- client 启动并监管一个本地 agents server。
+- client 启动并监管一个由当前 host environment 支持的本地 executor。
+- agents server 只绑定 loopback 动态端口。
+- client 与 executor 都作为 WebSocket client 连接并注册到 agents server。
+- client 可通过 agents server 列出已注册 executor；desktop 首版通常只有一个。
+- 多个 Agent 绑定同一 executor，关系为 **Agent N:1 Executor**。
 
-`AgentFactory` 输入稳定的 `EffectiveAgentConfig`：
+### 5.2 启动
+
+1. client 生成新的 client `instanceId`/`generation`，启动 agents-server binary。
+2. agents server 取得动态 loopback 端口，通过受控 bootstrap 返回 endpoint、protocol range 和分别绑定 client/executor 的一次性注册材料。
+3. agents server 打开业务 DB/checkpoint，完成 migration 或开发期 reset，并恢复 registry 投影。
+4. client 连接并用稳定 `clientId` 注册。
+5. client 启动 executor；executor 生成新的 `instanceId`/`generation`，连接并用稳定 `executorId` 注册能力。
+6. agents server 先将 executor 标为 `syncing`，立即调用 `inventory.getSnapshot()` 并原子替换本地 cache。
+7. full sync 成功后 agents server 才将 executor 标为 online/runnable；绑定它的 Agent 才可启动新 Run。
+
+bootstrap 只负责发现本地 endpoint 和首个认证材料，不承载业务 RPC。
+
+### 5.3 正常退出
+
+1. client 请求 agents server 停止接受新 Run。
+2. agents server 持久化 shutdown intent，取消或中断活动 Run，并要求 executor 停止 invocation。
+3. executor 终止受管进程树、关闭 MCP/Skill 资源并回报完成。
+4. agents server flush event/checkpoint/DB 后关闭。
+5. client 等待两个 companion 在有界超时内退出；只有超时后才升级终止。
+
+client 不应在退出时把仍有副作用结果未对账的 Run 伪装为正常完成。
+
+### 5.4 异常与重启
+
+- companion 异常退出由 client 使用有上限的指数退避重启；每个角色分别计数。
+- 达到上限后停止自动重启，进入明确的 recovery UX，允许重试、重置开发数据或导出诊断。
+- agents server 重启后从 DB/checkpoint 恢复；client/executor 使用稳定 ID 和新的 instance/generation 重新注册。
+- executor 离线时，其 Agent 不能启动新 Run。已执行中的 Run 由 server 标记 interrupted/recovery-required，不假设 Tool 未发生。
+- client/WebView 重连不改变 server 中的 Run 所有权；按 durable event cursor 补齐。
+- 旧 instance/generation 的连接、callback、grant 或 result 一律拒绝。
+
+## 6. 身份、注册与可用性
+
+### 6.1 身份层级
+
+| 字段 | 生命周期 | 用途 |
+| --- | --- | --- |
+| `clientId` | 安装级稳定 | client 逻辑身份，重连/重启保留 |
+| `executorId` | executor 配置级稳定 | Agent 绑定、能力和历史关联 |
+| `instanceId` | 每次进程启动/连接注册新建 | 区分并发或迟到实例 |
+| `generation` | 稳定身份下单调递增 | 解决新旧实例竞争 |
+| `connectionId` | 单 WebSocket | 观测与连接级背压 |
+
+server 只承认某稳定身份的最高有效 generation。`instanceId` 不复用；断线重连也必须产生新的连接身份并重新注册。
+
+### 6.2 注册
+
+client 注册声明 UI/API capability；executor 注册声明 host platform、Tool/MCP/Skill capability、并发限制和版本。server 校验：
+
+- protocol/version overlap。
+- bootstrap 或后续认证材料。
+- stable ID、instance ID、generation 和角色。
+- binary/build compatibility。
+- capability Schema 和大小上限。
+
+注册成功后 server 返回当前 server instance、协商版本、heartbeat/lease 参数和可见 registry snapshot。每次 executor connection/registration 接受后都进入 `syncing`，不能复用上次连接的 cache 直接标记 runnable。
+
+### 6.3 Agent 与 Executor
+
+- Agent 定义和版本由 server 持久化，并包含 `executorId` 绑定。
+- 当前 desktop 自动创建/选择唯一 local executor；UI 仍从 server registry 读取，而不是硬编码“本机总是在线”。
+- executor syncing/offline 时可以查看 Agent、Session 和历史 Run，但不能启动新 Run。
+- 未来 executor 可独立启动和注册；client 可列出并选择已登记 executor。远程调度、配对、TLS、租户和网络信任模型另立 ADR。
+
+### 6.4 Inventory 同步与对账
+
+executor 仍是 MCP/Skill/config/credential 的唯一 source of truth；server inventory 只是 discovery/reconciliation cache：
+
+1. executor 在自己的 DB 中持久化 opaque `inventoryEpoch` 和该 epoch 内单调递增的 `inventoryRevision`。普通进程重启保留 epoch/revision；inventory store reset/recreate 才生成新 epoch。
+2. 每次 MCP/Skill config、lifecycle descriptor、Tool schema 或 executor capability 变化时，executor 在同一持久化 transaction 中更新权威状态、递增 revision，并追加 change record；删除使用 tombstone。有界 log 可压缩，并公开最早可增量读取的 revision。
+3. commit 后 executor 发送轻量 `inventory.changed` hint；payload 只含 epoch、最新 revision 和 category，不含 resource config、Tool schema body、credential、环境值或 Skill 内容。
+4. server 对 hint 去抖后调用 `inventory.getChanges(sinceRevision, cursor)`，分页拉取并原子应用同一 epoch 的连续变化。
+5. 无论是否收到 hint，server 都为每个 online executor 每 60 秒执行一次增量 reconciliation，并使用独立的 ±20% random jitter，即每次间隔在 48–72 秒内。
+6. revision gap、change log 已压缩、epoch 变化/reset、invalid cursor 或无法证明连续性时，server 调用 `inventory.getSnapshot()` 并原子替换整个 cache。
+7. executor offline 时 cache 只标记 stale，不清空。hint/poll/RPC 失败不能解释为 resource deletion；删除只来自有效 tombstone 或成功 full snapshot 的原子替换。
+
+每次 connection/registration/reconnect 都强制立即 full sync；完成前 registry 状态是 `syncing`，assigned Agent 不 runnable。client-routed MCP/Skill mutation 返回 executor commit 后的 epoch/revision，server 随即增量拉取到该位置以 read its own write；同步暂时失败时保留 persisted mutation result，但 cache 标记 stale，不能伪造 descriptor 或删除。
+
+cache 只可包含 stable resource ID、version/hash、MCP Tool schema、health、executor capability 和 redacted `credentialConfigured` 状态。token、sensitive env、recoverable MCP config、完整 `SKILL.md`/resources、executor secret locator 一律禁止进入 snapshot/change/hint/cache。
+
+Run start/restore 仍通过 live executor RPC 验证每个 assigned resource 的 owner/version/hash 和当前 Tool schema。inventory polling 只用于 discovery/reconciliation，既不是授权，也不能替代 Policy/approval/execution grant。
+
+## 7. RPC 拓扑与协议
+
+### 7.1 Transport
+
+- application transport 使用 WebSocket。
+- payload 使用 versioned JSON RPC；请求、响应、notification 和 stream event 都由共享 Zod schema 校验。
+- desktop agents server 只监听 loopback 动态端口，不使用固定公开端口。
+- 长 Run 由快速 `accepted` 响应加事件流表示，不用无限 RPC timeout。
+- 每条连接有最大 frame、in-flight、队列和 backpressure 限制。
+
+### 7.2 信封
 
 ```ts
-interface EffectiveAgentConfig {
-  agentVersionId: string;
-  mode: "ask" | "plan" | "agent";
-  model: ResolvedModelConfig;
-  project?: ResolvedProjectContext;
-  tools: EffectiveToolDefinition[];
-  permissions: EffectivePermissionPolicy;
-  skills: ResolvedSkillSource[];
-  memory: ResolvedMemorySource[];
-  subagents: ResolvedSubagent[];
+interface RpcEnvelope<T> {
+  protocolVersion: number;
+  requestId?: string;
+  method: string;
+  sender: {
+    role: "client" | "agents_server" | "executor";
+    stableId: string;
+    instanceId: string;
+    generation: number;
+  };
+  payload: T;
 }
 ```
 
-构建步骤：
+所有跨角色消息显式携带 correlation ID；Run/Tool/Action 消息还必须携带 `runId`、`toolCallId`、`actionId` 或 `invocationId`。角色不能依赖 UI 当前选择或连接顺序推断业务身份。
 
-1. 解析 Agent、Session、Project 和临时覆盖。
-2. 验证模型能力与依赖。
-3. 按模式裁剪工具。
-4. 生成 Brokered Backend 和 Tool wrappers。
-5. 配置 checkpoint、interrupt 和 stream transformers。
-6. 记录配置快照哈希，再开始 Run。
+### 7.3 未来扩展缝
 
-### 7.2 模式强制
+协议允许未来：
 
-- **Ask**：不注册写文件、命令和有副作用 Tool。
-- **Plan**：只注册只读工具和结构化 `submit_plan`；计划批准后创建关联的执行 Run。
-- **Agent**：注册有效执行工具，实际动作仍由 Policy Engine 判断。
-- 切换模式不会改变正在运行的 Run；只影响下一次提交。
+- client 与 executor 独立启动后向既有 agents server 注册。
+- 一个 client 列出多个 executor。
+- Docker、cloud VM 或 remote-server transport adapter。
 
-### 7.3 Stream Normalizer
+当前范围不包含远程 discovery、配对、TLS/PKI、多租户、NAT 穿透、云调度或容器编排。不得为“未来远程”提前弱化 desktop loopback 和最小权限默认值。
 
-Deep Agents/LangGraph 事件转换为稳定的 `AppRunEvent`：
+## 8. Agent runtime、Provider 与持久化
 
-- message delta/final。
-- todo/plan updated。
-- subagent started/progress/completed。
-- tool proposed/approval/executing/result。
-- context summarized。
-- usage recorded。
-- run status/error。
+### 8.1 Agent runtime
 
-转换器必须容忍未知上游事件：记录调试日志，但不能让整个流失败。
+Deep Agents/LangGraph 只运行在 agents server：
 
-### 7.4 子 Agent
+- `threadId` 对应持久 LangGraph thread，`runId` 对应一次应用执行。
+- server 的 Run Registry 只保存活动 graph/Provider/interrupt handle；DB、checkpoint、Run 状态和事件才是可恢复事实。
+- `AgentFactory` 解析 Agent、Session、Project、Provider、executor capability 及稳定 MCP/Skill resource refs，生成不可变 effective config snapshot。
+- Ask/Plan/Agent 的有效 Tool 集由 server 强制裁剪。
+- Deep Agents stream 先转换为稳定 `AppRunEvent`，持久化后再推送 client。
 
-Phase 1：
+### 8.2 Provider
 
-- 使用 Deep Agents 同步 subagent。
-- 子 Agent 共享 Project Broker，但可拥有更窄权限和工具。
-- UI 根据 namespace/agent name 展示嵌套轨迹。
-- 同一 Run 的子 Agent 不计入全局 Session 并发槽，但单 Run 设置子 Agent 并行上限。
+- Provider adapter、连接测试、模型调用、用量和错误归一化属于 agents server。
+- Provider/model Secret 从 server Secret Vault 按 Run scope 读取，不进入 client 或 executor。
+- MCP credential/token/OAuth state 由 owning executor 的 `ExecutorSecretStore` 管理；server 只路由不落盘的设置 command，不保存 recoverable copy。
 
-Phase 2：
+### 8.3 数据所有权
 
-- POC A：本地启动 Agent Protocol Server，复用 Deep Agents async middleware。
-- POC B：实现 Local Task Broker，子任务映射为独立本地 Run。
-- 以启动复杂度、恢复能力、资源占用和 API 稳定性选择，不同时维护两套正式实现。
+```text
+appData/
+├── database/app.db          # agents server
+├── database/checkpoints.db  # agents server
+├── attachments/             # agents server 管理的产品资产
+├── change-blobs/            # agents server 管理的 Action 记录
+├── canvas/                  # client/server 受控产品资产
+├── executors/<executorId>/  # local executor private root，0700
+│   ├── executor.db          # MCP/Skill state + inventory epoch/revision/change log
+│   ├── skills/              # immutable Skill version content/resources
+│   └── secrets/             # local ExecutorSecretStore files，0600
+└── logs/                    # 各角色独立写，诊断时汇总
+```
 
-## 8. Run Scheduler
+- `app.db` 和 checkpoint DB 都只有 agents server writer。
+- executor 不打开产品 DB；`executor.db` 只由 owning executor 写入，server 不把 inventory cache 当作恢复来源。
+- server 先持久化 event/Action result，再向 client 发布。
+- local executor root 使用 `0700`，credential file 使用 `0600`，写入采用临时文件 + atomic replace，并检查 owner；拒绝 symlink，平台支持时使用 no-follow。
+- 该本地文件基线只防范其他普通 OS 用户，不防范同账户 malware、root、磁盘 snapshot 或 backup。`ExecutorSecretStore` Port 允许其他 executor 改用 Keychain、Docker Secret 或 cloud secret manager。
+- 本次开发期重构无需迁移现有 DB/checkpoint；不兼容时明确重置，不能静默误读。
 
-### 8.1 调度规则
-
-- 设置值 `maxActiveSessions` 范围 1–5，默认 3。
-- 每个 Session 最多一个副作用 Run。
-- 队列默认 FIFO，用户提升优先级后记录审计事件。
-- `waiting_approval` 是否占槽：Phase 0 压测后决定；默认释放模型计算槽，但保留 Session 写锁。
-- 同一 Project 的文件写入经过 per-path lock；多个 Run 可读并行。
-- 除 Session 槽外，设置全局和 per-Provider Connection 的模型调用信号量；主 Agent 与同步子 Agent 都计入，避免子 Agent 绕过并发和限流策略。
-- 命令执行和知识索引使用独立并发池，不能占满模型调度器或 Electrobun application worker。
-
-### 8.2 Runtime 生命周期
-
-- 应用启动生成 `appInstanceId`；Run Registry 中的 callback/event 必须同时匹配 `runId` 和当前 execution token，防止取消或恢复后的迟到事件污染新执行。
-- WebView reload 只释放订阅，不自动停止 Run；关闭最后窗口时由后台运行策略决定保留 Host、显示 Tray，或协作式取消后退出。
-- 应用退出先停止接收新 Run，再 abort graph/provider、终止 Action Broker 管理的命令进程树、flush 事件/checkpoint，并给出有界超时。
-- application runtime 异常退出后，下一次启动把旧实例的 `preparing/running/waiting_approval/waiting_user/stopping` Run 转为 `interrupted`；durable HITL 可恢复，内存 Promise 不可作为状态来源。
-- 活动 Session/graph/Provider 资源必须有 dispose、空闲回收和并发上限，不能让 registry 随会话无限增长。
-- 恢复前执行 Tool Recovery Resolver，不直接重放状态不确定的副作用。
-
-## 9. Action Broker
+## 9. Tool Bridge、Action Broker 与授权
 
 ### 9.1 请求流程
 
 ```mermaid
 sequenceDiagram
-    participant A as Agent Tool
-    participant S as DeepAgentService
-    participant P as Policy Engine
-    participant U as User
-    participant B as Action Broker
-    participant D as DB/Event Log
+    participant A as Agent runtime / server
+    participant P as Policy + Approval / server
+    participant B as Action Broker / server
+    participant E as Executor Tool Bridge
+    participant D as Business DB / server
+    participant C as Client
 
-    A->>S: ActionRequest + run/tool/idempotency IDs
-    S->>P: validate execution, identity, scope and arguments
-    P-->>S: allow / approval_required / deny
+    A->>P: proposed Action
+    P->>D: persist policy decision
     alt approval required
-        S->>D: persist interrupt + approval request
-        S-->>U: typed event / show approval card
-        U->>S: approve/edit/reject/respond
-        S->>D: persist decision
+        P-->>C: approval.requested
+        C->>P: approve / edit / reject
+        P->>D: persist approval
     end
-    S->>B: execute authorized request
-    B->>D: persist intent
-    B->>B: perform side effect
-    B->>D: persist result and change journal
-    B-->>A: typed result
+    B->>D: persist Action intent
+    B->>B: issue one-time execution grant
+    B->>E: invocation + grant
+    E->>E: validate identity, generation, digest, expiry, single use
+    E->>E: execute Tool / process tree
+    E-->>B: typed result
+    B->>D: persist result / outcome_unknown
+    B-->>A: Tool result
 ```
 
-### 9.2 Tool 元数据
+### 9.2 一次性 execution grant
 
-每项工具注册：
+grant 至少绑定：
 
-| 字段 | 示例 |
-| --- | --- |
-| `riskClass` | low / medium / high / prohibited |
-| `sideEffectClass` | none / local_write / external_write / execution |
-| `idempotencyClass` | pure / idempotent / conditionally_idempotent / non_idempotent |
-| `scopeResolver` | project path、domain、MCP server 等 |
-| `approvalRenderer` | Diff、命令、JSON 参数、OAuth scope |
-| `redactor` | Secret/Header/路径脱敏 |
-| `recoveryStrategy` | retry / verify_then_retry / manual_only |
+- `grantId`、`actionId`、`invocationId`、`runId`、`toolCallId`。
+- 目标 `executorId` 及其当前 instance/generation。
+- action type、参数摘要、能力、路径/网络范围和风险决策摘要。
+- 签发/过期时间、单次使用 nonce 和 protocol version。
 
-### 9.3 文件
+executor 必须拒绝过期、重复、目标不匹配、参数摘要变化、旧 generation 或未认证 server 连接上的 grant。执行结果必须带回 `grantId`/`invocationId`；server 才能完成 Action result。
 
-Brokered Backend 实现 Deep Agents filesystem protocol：
+### 9.3 恢复
 
-- 路径规范化、`realpath`、Project 根目录、软链接和大小写校验。
-- GUI 文件预览与 Agent filesystem Tool 使用不同 API；预览只读，初始正文上限 512 KiB，并在读取后再次确认 canonical path 仍在 Project 内。
-- 读、glob、grep 默认尊重排除规则。
-- 写入使用预期 revision/哈希和临时文件原子替换。
-- 写前后生成哈希、Patch 和必要的压缩内容快照。
-- 大文件、二进制和批量删除提高风险等级。
+- server 在发送 invocation 前持久化 intent。
+- executor 断线且结果未知时，server 将 Action 标为 `outcome_unknown`。
+- pure/idempotent Action 可按策略验证后重试；non-idempotent Action 不自动重放。
+- grant 不跨 executor restart 复用；恢复需 server 重新决策并签发新 grant。
 
-### 9.4 命令
+## 10. MCP 与 Skills
 
-不把任意 Shell 字符串当作可自动批准命令：
+### 10.1 MCP
 
-- 自动允许候选必须使用 `executable + args[]`，`shell=false`。
-- 管道、重定向、变量展开或复合命令进入 `shell_command`，至少中风险并显示完整命令。
-- 默认最小环境和受控 PATH；Secret 只在明确配置的变量中注入。
-- 每次执行有 cwd、超时、输出上限、进程组和取消句柄。
-- 高风险分类不能只靠字符串黑名单。
+- executor 是其 MCP config、credential/token/OAuth state、lifecycle、Tool inventory 和本地数据的唯一 source of truth。
+- client 提供完整 MCP UI；command 先到 server 做 client/executor identity、Agent binding 和产品授权校验，再路由到选定 executor。executor 持久化后返回 redacted result 与新的 inventory epoch/revision，server 立即按第 6.4 节拉取到该 revision。
+- executor offline 时 command 明确失败；server 可展示标为 stale 的 inventory cache，但不能据此编辑、恢复配置或返回 success。
+- server 只保存 Agent resource refs 和可替换、非权威、可丢弃的 redacted inventory/capability cache，不保存 MCP config、Secret Ref、credential 或 OAuth state。
+- Agent runtime 只从 server 获得规范化 ToolDefinition；每次调用仍经过 Policy/approval、Action intent 和 execution grant。
+- executor 从自己的 `ExecutorSecretStore` 加载 credential；stdio MCP 只向目标 child 注入最小环境，不修改 executor 全局环境，也不传给无关 child/Agent。
+- HTTP MCP 可在可行时按 request 注入凭证，但这是优化，不是所有 transport 的统一要求。
+- query RPC、inventory、UI、prompt、日志、诊断和 export 永不返回 MCP credential。
+- executor 可在 connection/process 生命周期内持有 credential reference；撤销、过期或 MCP shutdown 必须关闭资源并释放引用。JavaScript runtime 不保证可靠清零 string memory。
+- executor-owned credential 只解决 MCP 认证，不授予 Tool 权限；连接保持 authenticated 时，每次 Tool execution 仍需新的、一次性 execution grant。
 
-### 9.5 Git
+### 10.2 Skills
 
-- 通过固定 executable 和参数数组调用系统 Git。
-- 所有命令加禁用 pager/外部 diff 的参数和受控环境。
-- Phase 1 只开放 status、diff、apply reverse patch 等白名单操作。
-- push、commit、branch、worktree 不注册为 Agent Tool。
+- executor 是 Skill installation、immutable version、content/hash、metadata、resources/scripts 和本地数据的唯一 source of truth。
+- client 提供完整 Skill UI；command 经 server 校验 client/executor identity 与产品授权后路由到 executor，只有 executor 持久化成功后才返回 redacted result/inventory epoch/revision，并触发 server read-own-write reconciliation。
+- Agent version 只保存 owning `executorId + stableSkillId + version + contentHash`；同一 Agent 不能引用其他 executor 的 MCP/Skill。
+- server 构建或恢复 Agent 时，按稳定 ref 从 executor 获取 metadata 与 `SKILL.md` 并验证 version/hash；offline、missing 或 mismatch 均 fail closed。
+- fetched Skill content 只用于内存中的 prompt assembly；Agent version、Run config snapshot、checkpoint、event、backup、inventory 和 diagnostics 都不保存可恢复正文，恢复时重新按 ref 获取。
+- server 可缓存 replaceable inventory/descriptor snapshot，但不能把它当作 Skill 恢复副本。
+- references/assets/scripts 的读取或执行继续通过 executor；Skill 不能借 `allowed-tools` 绕过 Policy 或 grant。
+- executor offline 时，依赖其 Skill 的 Agent 不得以缺失内容的方式静默启动。
 
-## 10. Provider 架构
+## 11. Canvas
 
-```ts
-interface ChatProviderAdapter {
-  type: ProviderType;
-  testConnection(input: TestConnectionInput): Promise<TestConnectionResult>;
-  listModels?(connection: ProviderConnection): Promise<ModelSummary[]>;
-  createChatModel(config: ResolvedModelConfig): BaseChatModel;
-  normalizeUsage(raw: unknown): NormalizedUsage;
-  resolveCapabilities(model: ModelSummary): ModelCapabilities;
-}
-```
+- 主 WebView 只编辑和展示受控产品状态。
+- Web Canvas 使用独立 sandbox BrowserView/partition，不注册业务 RPC。
+- Canvas 不能直接连接 executor；任何文件、网络或脚本能力都必须经 agents server Policy 和 executor grant。
+- 默认断网、CSP、导航、下载和本地资源隔离仍是发布阻断项。
 
-- OpenAI、Anthropic、Gemini、DeepSeek 使用对应 LangChain Provider。
-- Kimi、智谱使用品牌化 OpenAI-compatible preset。
-- Custom Claude-compatible 通过 Anthropic 自定义 API URL。
-- Adapter 内部处理认证、URL、Header、用量和错误；UI 只认稳定契约。
-- 同一 Provider Connection 的登录/刷新串行执行并绑定 AbortController，WebView reload 或用户取消不会留下并发 OAuth 流。
-- Provider Key 由 Host 内的 DeepAgentService 按 Run scope 从 Secret Vault 读取并交给 Provider adapter，不经过 WebView RPC。
-- Secret 不进入通用事件总线、checkpoint 或持久化 trace；Run 结束、连接切换或取消时释放引用。
+## 12. 构建、打包与版本
 
-## 11. 持久化
+- `agents-server` 和 `executor` 都使用 TypeScript strict + Bun，编译为目标架构二进制。
+- 两个 companion 与 Electrobun client 来自同一 release，随应用打包、签名、校验和更新。
+- 启动注册必须比较 client/server/executor build 与 protocol compatibility；未知组合 fail closed。
+- stable 产物不得依赖用户安装 Bun/Node，也不得运行时下载 companion。
+- package smoke 必须证明 companion 可执行权限、路径、签名、动态库、loopback 和协作退出均正常。
 
-### 11.1 分库
+## 13. 安全边界
 
-```text
-appData/
-├── database/app.db             # 产品业务数据
-├── database/checkpoints.db     # LangGraph checkpoint
-├── attachments/
-├── change-blobs/
-├── canvas/
-├── skills/
-├── knowledge/
-└── logs/
-```
+- 三角色均为受信任应用代码；拆进程提供故障和职责隔离，不等于完整 OS sandbox。
+- WebView 仍按不可信处理，只能通过 client 的领域 RPC。
+- agents server 的 Policy/approval 是授权事实来源；executor 的 grant validation 是执行前最后一道强制门。
+- executor-owned MCP credential/config 与 execution grant 是正交状态：前者维持连接认证，后者逐次授权 Tool execution。
+- executor 的文件根、命令解析、环境、网络、输出和进程树约束不能仅依赖 grant 字符串。
+- RPC 加密/认证不能代替 Schema、角色、stable identity、instance/generation、capability 和业务状态校验。
+- loopback 不等于可信；本机其他进程不得仅凭端口即可注册或调用。
 
-- `app.db` 只由 Host 的 Repository 层通过 `bun:sqlite` 写入。
-- `checkpoints.db` 只由同一 application worker 内的 `BunSqliteSaver` adapter 写入。
-- 一个产品 Session 映射一个稳定 LangGraph `thread_id`；每次 Run 只设置独立 `run_id`，并仅提交当前用户 turn，由 Deep Agents 从 checkpoint 恢复先前 messages。
-- `app.db` 只保存 SessionCatalog 与 RunJournal。Run/Event 提供稳定 correlation ID、运行状态、安全错误和 event cursor，不保存 conversation message row。
-- SessionCatalog 是产品 Session 列表的事实来源；不得从 checkpointer `list()` 反推列表，因为未发送消息的 Session 没有 checkpoint，且标题、搜索、归档和产品排序不属于 Deep Agents thread state。
-- transcript 查询由 Host 通过 Deep Agents checkpoint state 构造；运行中、失败和取消状态再与 RunJournal event 投影合并，WebView 不直接读取 checkpoint。
-- 两者都使用 WAL，但不尝试跨库事务。
-- Run 状态与 checkpoint 通过 `threadId/checkpointId` 引用；恢复时进行一致性核对。
-- Phase 1 保持单 application worker、每个 DB 独立连接所有权。只有未来 sidecar/Runtime Pool ADR 通过后，才重新设计 checkpoint writer ownership，并完成 `SQLITE_BUSY`、WAL 备份和清理测试。
+## 14. 架构验收
 
-### 11.2 为什么分库
-
-- 避免 UI 查询依赖 LangGraph 内部表。
-- Deep Agents/LangGraph 升级可独立迁移 checkpoint。
-- 业务备份、数据导出和删除策略更清晰。
-- 避免业务 Repository 与 LangGraph saver 共用连接、事务和 Schema 生命周期。
-
-### 11.3 数据一致性
-
-- 运行事件先写 `app.db` 再推送 WebView。
-- checkpoint 写入和业务事件不是原子事务，因此每个 Run 保存 `lastCheckpointId` 和 `lastDurableEventSeq`。
-- 启动恢复器处理“checkpoint 领先”或“事件领先”的情况，并产生 reconciliation 事件。
-- 业务表使用显式 transaction；文件副作用使用 intent/result journal。
-
-### 11.4 桌面状态
-
-- 窗口位置、尺寸和最近 UI 偏好不写入 checkpoint，与 Agent 状态分开。
-- 小型窗口状态文件使用 Schema 校验、150 ms 防抖、临时文件 + rename 原子替换；POSIX 平台权限为 `0600`。
-- 损坏的窗口状态只重置 UI 布局，不影响 Session、Run 或 checkpoint 恢复。
-
-## 12. Canvas 架构
-
-### 12.1 编辑
-
-- CodeMirror 负责 Markdown、Code、Mermaid 和 Vega-Lite 源码。
-- Canvas 文档使用 revision 和 Patch API。
-- 用户草稿与命名版本分开存储。
-- Agent 调用 Canvas Tool 时必须提交 `baseRevision`；冲突返回 typed error。
-
-### 12.2 预览
-
-- Markdown、Mermaid 和 Vega-Lite 在主 WebView 中使用严格清理后的输出。
-- Web Canvas 只在独立 sandbox Preview `BrowserView` 运行。
-- Preview 资源通过受控 `views://` wrapper 或构建时复制的只读资源读取，不使用任意 `file://`。
-- Preview 默认 CSP 为 `default-src 'none'`，按 Canvas 类型最小开放脚本、样式、图片和字体来源；用户内容不得覆盖安全头或 wrapper CSP。
-- 顶层导航、下载和外链由 Host 拦截；子资源默认断网只有在 DG-08 POC 通过后才能视为成立。
-
-## 13. Phase 2 扩展架构
-
-### 13.1 MCP
-
-- `McpManager` 运行在 Host 管理的 Integration Service 中，管理连接生命周期；`@langchain/mcp-adapters` 仅存在 Adapter 内。
-- stdio Server 由该服务启动并使用最小环境；DeepAgentService 只获得 Tool Schema 和代理 Tool，不持有 MCP 子进程、OAuth Token 或直连能力。
-- 每次 MCP Tool 调用都先进入 Action Broker；有副作用调用在执行前写 `action_executions` intent，执行完成后写 result。
-- Integration Service 在调用完成前退出时，未完成 execution 进入 `outcome_unknown`，恢复器不得自动重放非幂等 Tool。
-- 远程 OAuth Provider 通过 Host Secret Vault 保存 Token。
-- MCP Tool 转换为统一 ToolDefinition，必须补齐风险和恢复元数据。
-
-### 13.2 Skills
-
-- 安装时复制到应用数据目录、验证 `SKILL.md`、记录来源与内容哈希。
-- DeepAgentService 接收解析后的有效 Skill 路径，不直接扫描用户任意目录。
-- Skill 脚本通过 Command Tool 执行，不能绕过 Policy Engine。
-
-### 13.3 Knowledge
-
-定义 `KnowledgeIndexStore` Port：
-
-- `upsertDocuments`、`deleteDocuments`、`search`、`rebuild`、`stats`。
-- Phase 2 启动前对 SQLite vector extension 与 LanceDB 做打包、签名、性能和迁移 POC。
-- 未通过 POC 前不在核心 Schema 中耦合具体向量数据库。
-
-## 14. 可观察性
-
-- Host、DeepAgentService、Broker 和 Preview 使用统一 correlation IDs。
-- 本地结构化日志默认不记录完整 prompt、文件内容或 Secret。
-- Run 轨迹来自业务事件，不直接展示日志。
-- 可选调试包包含版本、配置摘要、脱敏日志和 DB integrity 结果，用户确认后导出。
-- Electrobun 当前没有可直接替代 Electron `crashReporter` 的项目级基线；Phase 0 必须定义 Application Host、原生 launcher 和可选 sidecar 的崩溃日志采集与用户授权导出路径。
-
-## 15. 架构验收
+旧 ARC-011“Phase 0 决定保持 in-process 或条件性 sidecar”已废止；三角色是批准基线。
 
 | ID | 验收 |
 | --- | --- |
-| ARC-001 | WebView 无法导入/调用 application runtime、Secret、文件或 Shell |
-| ARC-002 | Provider/graph/Tool 错误不拖垮其他 Run；application runtime 强制退出后可在重启时恢复 |
-| ARC-003 | 未经 Action Broker 的写文件/命令调用不可达 |
-| ARC-004 | Ask/Plan 模式即使提示注入也无法获得副作用 Tool |
-| ARC-005 | WebView 断线重连可按 event sequence 补齐轨迹 |
-| ARC-006 | checkpoint 与业务事件发生偏差时恢复器能确定状态 |
-| ARC-007 | Web Canvas 无法调用应用 RPC、Bun、本地文件或未授权网络 |
-| ARC-008 | 打包签名产物可直接加载 Deep Agents、Provider SDK、`bun:sqlite`、Keychain adapter 和 Preview |
-| ARC-009 | Electrobun application worker 内 Deep Agents 的 stream、HITL、checkpoint、取消、subagent 和上下文传播 contract 全部通过 |
-| ARC-010 | stable/canary 更新校验、失败回滚与 runtime 版本探测在签名产物中通过 |
-| ARC-011 | Phase 0 以实测决定保持 in-process；若选择 sidecar，相关协议、监管、签名和恢复验收全部补齐 |
+| ARC-001 | packaged desktop 同时包含可启动的 client、agents-server 和 executor；框架额外 PID 不影响角色识别 |
+| ARC-002 | 业务应用 RPC 只有 `client <-> server <-> executor`，不存在 client 直连 executor 的特权路径 |
+| ARC-003 | desktop server 只绑定动态 loopback；未认证本机进程不能注册或调用 |
+| ARC-004 | stable ID 在重连/重启后保持，旧 instance/generation 的消息、result 和 grant 被拒绝 |
+| ARC-005 | agents server 是产品 DB/checkpoint、Provider/model、Agent、Run/event、Policy/approval/Action 的唯一写入所有者 |
+| ARC-006 | 每个 executor 是其 MCP config/credential/OAuth/lifecycle、Skill immutable content/resources、Tool/进程树和 private data 的唯一 source of truth |
+| ARC-007 | 一个本地 executor 可承载多个 Agent；offline 时相关 Agent 不能启动新 Run |
+| ARC-008 | policy/approval/intent 先持久化，executor 只执行有效的一次性 grant，重复或篡改 grant 被拒绝 |
+| ARC-009 | Agent 只引用 assigned executor 的稳定 MCP/Skill resource；server 按 version/hash 获取 Skill metadata/`SKILL.md`，missing/mismatch fail closed |
+| ARC-010 | client 协作关闭两个 companion；异常退出使用 capped backoff，达到上限后进入 recovery UX |
+| ARC-012 | server/executor 分别被 kill 后，Run/Action 能进入确定的 completed/interrupted/outcome_unknown 状态，不盲目重复副作用 |
+| ARC-013 | 两个 TypeScript + Bun companion 在签名产物中可执行、可握手、可更新，终端用户无需安装 runtime |
+| ARC-014 | 当前实现与目标差距始终在 progress 文档中明确，不用现有单进程 Ask 测试替代目标架构验收 |
+| ARC-015 | Provider/model credential 从不进入 executor；MCP credential 只在 executor private store/目标 process memory 中使用，永不经 query/UI/prompt/log/diagnostic/export 暴露 |
+| ARC-016 | client MCP/Skill command 经 server 校验后路由；executor offline 或持久化失败时不返回成功，server snapshot 不能恢复 executor config |
+| ARC-017 | 每次 executor 注册/重连先 full inventory sync；epoch/revision、hint、60 秒 ±20% poll、delta/tombstone 和 snapshot fallback 可收敛且 cache 可丢弃 |
+| ARC-018 | syncing/offline cache 标为 stale 且失败 poll 不代表删除；Run start/restore 仍 live 验证 resource/version/hash，inventory 不构成授权 |
