@@ -3715,7 +3715,7 @@ describe("ChatApplicationService provider and model resolution", () => {
 		}
 	});
 
-	test("listAvailableModels returns only enabled models of enabled providers with reasoning", async () => {
+	test("listAvailableModels returns only enabled models of authorized enabled providers", async () => {
 		const database = openAppDatabase(":memory:");
 		const scheduler = new ManualScheduler();
 		const registry = createTestProviderRegistry({ seed: false });
@@ -3756,6 +3756,17 @@ describe("ChatApplicationService provider and model resolution", () => {
 				enabledModelIds: ["hidden"],
 			});
 			await registry.update({ providerId: disabledProviderId, enabled: false });
+			const unauthorized = await registry.create({
+				displayName: "Unauthorized",
+				api: "openai-responses",
+				baseUrl: "https://unauthorized.example/v1",
+			});
+			await registry.setModels(
+				unauthorized.id,
+				[createProviderModel("unauthorized", { enabled: false })],
+				modelsFetchedAt,
+			);
+			registry.setModelsEnabled(unauthorized.id, ["unauthorized"]);
 
 			const output = service.listAvailableModels();
 			const identities = output.models.map((entry) => `${entry.providerId}:${entry.model.id}`);

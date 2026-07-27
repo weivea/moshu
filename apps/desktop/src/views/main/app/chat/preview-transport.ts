@@ -282,7 +282,7 @@ export function createPreviewChatTransport(): ChatTransport {
 		async listAvailableModels() {
 			const models: AvailableModel[] = [];
 			for (const provider of providers) {
-				if (!provider.enabled) {
+				if (!provider.enabled || !provider.credential.configured) {
 					continue;
 				}
 				for (const model of provider.models) {

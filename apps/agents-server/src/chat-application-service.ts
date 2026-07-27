@@ -411,7 +411,7 @@ export class ChatApplicationService {
 	listAvailableModels(): ListAvailableModelsOutput {
 		const models: AvailableModel[] = [];
 		for (const record of this.#providers.list()) {
-			if (!record.enabled) {
+			if (!record.enabled || !record.credential.configured) {
 				continue;
 			}
 			for (const model of record.models) {

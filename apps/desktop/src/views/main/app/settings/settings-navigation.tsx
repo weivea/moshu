@@ -5,10 +5,11 @@ import { type MessageKey, useI18n } from "../i18n";
 
 const settingsGroups = [
 	{
-		label: "settings.group.models",
+		label: "settings.group.application",
 		items: [
-			{ to: "/settings/providers", icon: "agents", label: "settings.providers" },
-			{ to: "/settings/default-model", icon: "check", label: "settings.defaultModel" },
+			{ to: "/settings/general", icon: "person", label: "settings.general" },
+			{ to: "/settings/usage", icon: "tasks", label: "settings.usage" },
+			{ to: "/settings/security", icon: "globe", label: "settings.security" },
 		],
 	},
 	{
@@ -19,11 +20,10 @@ const settingsGroups = [
 		],
 	},
 	{
-		label: "settings.group.application",
+		label: "settings.group.models",
 		items: [
-			{ to: "/settings/general", icon: "person", label: "settings.general" },
-			{ to: "/settings/usage", icon: "tasks", label: "settings.usage" },
-			{ to: "/settings/security", icon: "globe", label: "settings.security" },
+			{ to: "/settings/providers", icon: "agents", label: "settings.providers" },
+			{ to: "/settings/default-model", icon: "check", label: "settings.defaultModel" },
 		],
 	},
 ] as const satisfies readonly {

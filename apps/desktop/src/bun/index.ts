@@ -1,7 +1,8 @@
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
-import Electrobun, { BrowserWindow, Updater, Utils } from "electrobun/bun";
+import Electrobun, { ApplicationMenu, BrowserWindow, Updater, Utils } from "electrobun/bun";
 import { logChatRpcDiagnostic } from "../shared/chat-rpc-diagnostics";
+import { macApplicationMenu } from "./application-menu";
 import { startCompanionRuntime } from "./companion-poc";
 import type { CompanionProcessSupervisor } from "./companion-process-supervisor";
 import { DesktopAgentsClient } from "./desktop-agents-client";
@@ -70,6 +71,10 @@ const shutdownCoordinator = createDesktopShutdownCoordinator({
 Electrobun.events.on("before-quit", (event) => {
 	shutdownCoordinator.handleBeforeQuit(event);
 });
+
+if (process.platform === "darwin") {
+	ApplicationMenu.setApplicationMenu(macApplicationMenu);
+}
 
 const mainWindow = new BrowserWindow({
 	title: "墨枢",

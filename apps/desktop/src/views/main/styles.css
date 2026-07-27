@@ -1285,20 +1285,6 @@ a {
 	box-shadow: inset 0 0 0 1px var(--line);
 }
 
-.settings-page__header {
-	display: flex;
-	align-items: flex-start;
-	justify-content: space-between;
-	gap: 24px;
-	margin: 0 0 24px;
-}
-
-.settings-page__header h1 {
-	margin: 7px 0 0;
-	font-size: clamp(26px, 3vw, 34px);
-	letter-spacing: -0.04em;
-}
-
 .settings-section__header {
 	margin: 0 0 20px;
 }
