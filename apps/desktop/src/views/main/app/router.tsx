@@ -1,10 +1,11 @@
 import { createHashRouter, Navigate } from "react-router-dom";
 import {
-	ChatsPage,
 	ChatHomePage,
 	ChatSessionPage,
+	ChatsPage,
 	NewChatPage,
 	PlaceholderPage,
+	ProfileSettingsRoutePage,
 	ProviderSettingsRoutePage,
 } from "./pages";
 import { AppShell } from "./shell";
@@ -64,7 +65,11 @@ export const router = createHashRouter([
 				path: "canvas/:canvasId",
 				element: <PlaceholderPage titleKey="page.canvasDetail.title" icon="canvas" />,
 			},
-			{ path: "settings", element: <Navigate to="/settings/providers" replace /> },
+			{ path: "settings", element: <Navigate to="/settings/profile" replace /> },
+			{
+				path: "settings/profile",
+				element: <ProfileSettingsRoutePage />,
+			},
 			{
 				path: "settings/providers",
 				element: <ProviderSettingsRoutePage />,

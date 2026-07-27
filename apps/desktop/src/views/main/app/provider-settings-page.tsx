@@ -5,6 +5,7 @@ import type { ChatProviderStatus, ChatTransport } from "./chat/transport";
 import { DEFAULT_PROVIDER_ENDPOINT } from "./chat/transport";
 import { ConfirmationDialog } from "./confirmation-dialog";
 import { type MessageKey, useI18n } from "./i18n";
+import { SettingsNavigation } from "./settings-navigation";
 
 export interface ProviderSettingsPageProps {
 	transport: ChatTransport;
@@ -159,6 +160,8 @@ export function ProviderSettingsPage({ transport, onBackToChat }: ProviderSettin
 
 	return (
 		<section className="provider-settings-page">
+			<SettingsNavigation />
+
 			<header className="provider-settings-page__header">
 				<div>
 					<span className="chat-page__eyebrow">{t("providers.eyebrow")}</span>

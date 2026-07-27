@@ -116,7 +116,9 @@ describe("ChatPage", () => {
 
 		const prompt = await screen.findByLabelText("Prompt");
 		fireEvent.change(prompt, { target: { value: "Answer immediately" } });
-		fireEvent.click(screen.getByRole("button", { name: "Send" }));
+		const sendButton = screen.getByRole("button", { name: "Send" });
+		expect(sendButton).toHaveAttribute("title", "Send");
+		fireEvent.click(sendButton);
 
 		expect(await screen.findByText("Fast answer")).toBeVisible();
 		expect(await screen.findByText("Complete")).toBeVisible();
@@ -499,6 +501,7 @@ describe("ChatPage", () => {
 		});
 		expect(await screen.findByText(/This chat is archived and read-only/)).toBeVisible();
 
+		fireEvent.click(screen.getByRole("button", { name: "Filter chats" }));
 		fireEvent.click(screen.getByRole("button", { name: "Archived" }));
 		const sessionItem = (
 			await screen.findByText("Archived conversation", {

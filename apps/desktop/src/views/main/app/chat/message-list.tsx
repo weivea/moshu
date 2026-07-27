@@ -1,14 +1,16 @@
+import { AppIcon } from "@moshu/ui";
 import { useEffect, useRef } from "react";
 import { useI18n } from "../i18n";
 import type { ChatMessage } from "./transport";
 
 export interface MessageListProps {
+	compact?: boolean;
 	isLoading: boolean;
 	messages: ChatMessage[];
 	sessionId?: string;
 }
 
-export function MessageList({ isLoading, messages, sessionId }: MessageListProps) {
+export function MessageList({ compact = false, isLoading, messages, sessionId }: MessageListProps) {
 	const { t } = useI18n();
 	const scrollAnchorRef = useRef<HTMLDivElement | null>(null);
 
@@ -17,23 +19,27 @@ export function MessageList({ isLoading, messages, sessionId }: MessageListProps
 	});
 
 	return (
-		<section className="chat-card chat-card--transcript">
-			<div className="chat-card__header chat-card__header--compact">
-				<div>
-					<span className="chat-card__eyebrow">{t("chat.transcript.eyebrow")}</span>
-					<h2>{t("chat.transcript.title")}</h2>
+		<section className={compact ? "chat-transcript-shell" : "chat-card chat-card--transcript"}>
+			{compact ? null : (
+				<div className="chat-card__header chat-card__header--compact">
+					<div>
+						<span className="chat-card__eyebrow">{t("chat.transcript.eyebrow")}</span>
+						<h2>{t("chat.transcript.title")}</h2>
+					</div>
+					{sessionId ? <p>{t("chat.transcript.sessionLabel", sessionId)}</p> : null}
 				</div>
-				{sessionId ? <p>{t("chat.transcript.sessionLabel", sessionId)}</p> : null}
-			</div>
+			)}
 
 			<div className="chat-transcript" aria-live="polite">
 				{isLoading ? (
 					<div className="chat-empty">
+						<AppIcon name="agents" size={40} />
 						<strong>{t("chat.transcript.loading")}</strong>
 						<p>{t("chat.transcript.loadingDetail")}</p>
 					</div>
 				) : messages.length === 0 ? (
 					<div className="chat-empty">
+						<AppIcon name="agents" size={40} />
 						<strong>{t("chat.transcript.emptyTitle")}</strong>
 						<p>{t("chat.transcript.emptyDescription")}</p>
 					</div>

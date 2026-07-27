@@ -1,4 +1,5 @@
 import { fireEvent, render, screen, within } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import { beforeEach, describe, expect, test, vi } from "vitest";
 
 import type {
@@ -23,6 +24,10 @@ describe("ProviderSettingsPage", () => {
 
 		renderProviderSettings(transport);
 
+		expect(screen.getByRole("link", { name: "Profile" })).toHaveAttribute(
+			"href",
+			"/settings/profile",
+		);
 		expect(await screen.findByText("Configured")).toBeVisible();
 		const apiKeyInput = screen.getByLabelText("API key");
 		expect(apiKeyInput).toHaveAttribute("type", "password");
@@ -122,8 +127,10 @@ describe("ProviderSettingsPage", () => {
 function renderProviderSettings(transport: ChatTransport, showLocaleToggle = false) {
 	return render(
 		<I18nProvider>
-			{showLocaleToggle ? <LocaleToggle /> : null}
-			<ProviderSettingsPage transport={transport} onBackToChat={() => {}} />
+			<MemoryRouter initialEntries={["/settings/providers"]}>
+				{showLocaleToggle ? <LocaleToggle /> : null}
+				<ProviderSettingsPage transport={transport} onBackToChat={() => {}} />
+			</MemoryRouter>
 		</I18nProvider>,
 	);
 }

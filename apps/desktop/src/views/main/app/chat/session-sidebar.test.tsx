@@ -33,6 +33,14 @@ describe("SessionSidebar", () => {
 
 		expect(await screen.findByText("Architecture notes")).toBeVisible();
 		expect(screen.getByText("Launch plan")).toBeVisible();
+		expect(screen.queryByPlaceholderText("Search chats")).not.toBeInTheDocument();
+		const filterButton = screen.getByRole("button", { name: "Filter chats" });
+		expect(filterButton).toHaveAttribute("title", "Filter chats");
+		expect(screen.getByRole("button", { name: "New session" })).toHaveAttribute(
+			"title",
+			"New session",
+		);
+		fireEvent.click(filterButton);
 		fireEvent.change(screen.getByPlaceholderText("Search chats"), {
 			target: { value: "launch" },
 		});
@@ -60,7 +68,9 @@ describe("SessionSidebar", () => {
 		if (initialItem === null) {
 			throw new Error("Session item was not rendered.");
 		}
-		fireEvent.click(within(initialItem).getByLabelText("Chat actions"));
+		const actionsButton = within(initialItem).getByLabelText("Chat actions");
+		expect(actionsButton).toHaveAttribute("title", "Chat actions");
+		fireEvent.click(actionsButton);
 		fireEvent.click(within(initialItem).getByRole("button", { name: "Rename" }));
 		fireEvent.change(screen.getByLabelText("Chat title"), {
 			target: { value: "System design" },
@@ -77,6 +87,7 @@ describe("SessionSidebar", () => {
 		await waitFor(() => expect(screen.queryByText("System design")).not.toBeInTheDocument());
 		expect(onNewSession).toHaveBeenCalledOnce();
 
+		fireEvent.click(screen.getByRole("button", { name: "Filter chats" }));
 		fireEvent.click(screen.getByRole("button", { name: "Archived" }));
 		expect(await screen.findByText("System design")).toBeVisible();
 		const archivedItem = screen.getByText("System design").closest("li");

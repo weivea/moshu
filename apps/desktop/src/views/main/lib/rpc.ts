@@ -68,13 +68,18 @@ const rpc = Electroview.defineRPC<DesktopRpc>({
 	},
 });
 
-const electroview = new Electrobun.Electroview({ rpc });
+const electroview = "__electrobun" in window ? new Electrobun.Electroview({ rpc }) : undefined;
 
-if (!electroview.rpc) {
+if (electroview !== undefined && !electroview.rpc) {
 	throw new Error("Electrobun RPC was not initialized.");
 }
 
-const request = electroview.rpc.request;
+function getRequest() {
+	if (!electroview?.rpc) {
+		throw new Error("Electrobun RPC is unavailable outside the desktop runtime.");
+	}
+	return electroview.rpc.request;
+}
 
 export const desktopClient = {
 	subscribeAgentsReady(listener: () => void) {
@@ -84,28 +89,28 @@ export const desktopClient = {
 		};
 	},
 	async getRuntimeInfo() {
-		return runtimeInfoSchema.parse(await requestDesktop(() => request.getRuntimeInfo({})));
+		return runtimeInfoSchema.parse(await requestDesktop(() => getRequest().getRuntimeInfo({})));
 	},
 	async getChatProviderStatus() {
 		return chatProviderStatusSchema.parse(
-			await requestDesktop(() => request.getChatProviderStatus({})),
+			await requestDesktop(() => getRequest().getChatProviderStatus({})),
 		);
 	},
 	async configureChatProvider(input: ConfigureChatProviderInput) {
 		const parsedInput = configureChatProviderInputSchema.parse(input);
 		return chatProviderStatusSchema.parse(
-			await requestDesktop(() => request.configureChatProvider(parsedInput)),
+			await requestDesktop(() => getRequest().configureChatProvider(parsedInput)),
 		);
 	},
 	async testChatProvider(input: TestChatProviderInput) {
 		const parsedInput = testChatProviderInputSchema.parse(input);
 		return testChatProviderOutputSchema.parse(
-			await requestDesktop(() => request.testChatProvider(parsedInput)),
+			await requestDesktop(() => getRequest().testChatProvider(parsedInput)),
 		);
 	},
 	async deleteChatProvider() {
 		return chatProviderStatusSchema.parse(
-			await requestDesktop(() => request.deleteChatProvider({})),
+			await requestDesktop(() => getRequest().deleteChatProvider({})),
 		);
 	},
 	async createChatSession() {
@@ -115,7 +120,7 @@ export const desktopClient = {
 			input: {},
 			execute: async () =>
 				createChatSessionOutputSchema.parse(
-					await requestDesktop(() => request.createChatSession({})),
+					await requestDesktop(() => getRequest().createChatSession({})),
 				),
 		});
 	},
@@ -127,20 +132,20 @@ export const desktopClient = {
 			input,
 			execute: async () =>
 				getChatSessionSnapshotOutputSchema.parse(
-					await requestDesktop(() => request.getChatSession(input)),
+					await requestDesktop(() => getRequest().getChatSession(input)),
 				),
 		});
 	},
 	async listChatSessions(input: { query?: string; archived?: boolean; limit?: number } = {}) {
 		const parsedInput = listChatSessionsInputSchema.parse(input);
 		return listChatSessionsOutputSchema.parse(
-			await requestDesktop(() => request.listChatSessions(parsedInput)),
+			await requestDesktop(() => getRequest().listChatSessions(parsedInput)),
 		);
 	},
 	async updateChatSession(sessionId: string, title: string) {
 		const input = updateChatSessionInputSchema.parse({ sessionId, title });
 		return updateChatSessionOutputSchema.parse(
-			await requestDesktop(() => request.updateChatSession(input)),
+			await requestDesktop(() => getRequest().updateChatSession(input)),
 		);
 	},
 	async setChatSessionArchived(sessionId: string, archived: boolean) {
@@ -149,13 +154,13 @@ export const desktopClient = {
 			archived,
 		});
 		return setChatSessionArchivedOutputSchema.parse(
-			await requestDesktop(() => request.setChatSessionArchived(input)),
+			await requestDesktop(() => getRequest().setChatSessionArchived(input)),
 		);
 	},
 	async deleteChatSession(sessionId: string) {
 		const input = deleteChatSessionInputSchema.parse({ sessionId });
 		return deleteChatSessionOutputSchema.parse(
-			await requestDesktop(() => request.deleteChatSession(input)),
+			await requestDesktop(() => getRequest().deleteChatSession(input)),
 		);
 	},
 	async sendChatMessage(input: { requestId?: string; sessionId: string; content: string }) {
@@ -165,7 +170,7 @@ export const desktopClient = {
 			input,
 			execute: async () =>
 				chatSendAcceptedOutputSchema.parse(
-					await requestDesktop(() => request.sendChatMessage(input)),
+					await requestDesktop(() => getRequest().sendChatMessage(input)),
 				),
 		});
 	},
@@ -182,7 +187,7 @@ export const desktopClient = {
 			execute: async () =>
 				cancelChatRunOutputSchema.parse(
 					await requestDesktop(() =>
-						request.cancelChatRun({
+						getRequest().cancelChatRun({
 							sessionId: input.sessionId,
 							runId,
 							reason,
@@ -210,7 +215,7 @@ async function acknowledgeChatSessionInvalidation(
 ): Promise<void> {
 	const accepted = await chatSessionInvalidationBridge.handle(invalidation);
 	try {
-		await request.acknowledgeChatSessionInvalidation({
+		await getRequest().acknowledgeChatSessionInvalidation({
 			schemaVersion: 1,
 			invalidationId: invalidation.invalidationId,
 			sessionId: invalidation.sessionId,

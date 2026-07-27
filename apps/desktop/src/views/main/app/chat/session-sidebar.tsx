@@ -1,4 +1,4 @@
-import { Button } from "@heroui/react";
+import { AppIcon } from "@moshu/ui";
 import { type FormEvent, useCallback, useEffect, useRef, useState } from "react";
 import { ConfirmationDialog } from "../confirmation-dialog";
 import { useI18n } from "../i18n";
@@ -24,13 +24,15 @@ export function SessionSidebar({
 	onSessionUpdated,
 	onSelectSession,
 }: SessionSidebarProps) {
-	const { locale, t } = useI18n();
+	const { t } = useI18n();
 	const { coordinator: sessionRecoveryCoordinator } = useChatSessionRecovery(
 		transport,
 		selectedSessionId,
 	);
 	const [query, setQuery] = useState("");
 	const [showArchived, setShowArchived] = useState(false);
+	const [isFilterOpen, setIsFilterOpen] = useState(false);
+	const [showAllSessions, setShowAllSessions] = useState(false);
 	const [sessions, setSessions] = useState<ChatSessionSummary[]>([]);
 	const [isLoading, setIsLoading] = useState(true);
 	const [errorMessage, setErrorMessage] = useState<string>();
@@ -202,52 +204,81 @@ export function SessionSidebar({
 	return (
 		<aside className="session-sidebar" aria-label={t("sessions.title")}>
 			<header className="session-sidebar__header">
-				<div>
-					<span className="chat-page__eyebrow">{t("sessions.eyebrow")}</span>
-					<h2>{t("sessions.title")}</h2>
+				<h2>{t("sessions.title")}</h2>
+				<div className="session-sidebar__header-actions">
+					<button
+						type="button"
+						aria-label={t("sessions.filter.toggle")}
+						aria-expanded={isFilterOpen}
+						title={t("sessions.filter.toggle")}
+						className={isFilterOpen || showArchived || query.trim().length > 0 ? "is-active" : ""}
+						onClick={() => setIsFilterOpen((current) => !current)}
+					>
+						<AppIcon name="filter" size={17} />
+					</button>
+					<button
+						type="button"
+						aria-label={t("sessions.new")}
+						title={t("sessions.new")}
+						disabled={isNewSessionDisabled}
+						onClick={onNewSession}
+					>
+						<AppIcon name="plus" size={18} />
+					</button>
 				</div>
-				<Button
-					className="chat-button chat-button--primary"
-					isDisabled={isNewSessionDisabled}
-					onPress={onNewSession}
-				>
-					{t("sessions.new")}
-				</Button>
 			</header>
 
-			<label className="session-search">
-				<span className="chat-live-region">{t("sessions.search.label")}</span>
-				<input
-					type="search"
-					value={query}
-					placeholder={t("sessions.search.placeholder")}
-					onChange={(event) => setQuery(event.currentTarget.value)}
-				/>
-			</label>
+			{isFilterOpen ? (
+				<div className="session-filter-panel">
+					<label className="session-search">
+						<span className="chat-live-region">{t("sessions.search.label")}</span>
+						<input
+							type="search"
+							value={query}
+							placeholder={t("sessions.search.placeholder")}
+							onChange={(event) => {
+								setQuery(event.currentTarget.value);
+								setShowAllSessions(false);
+							}}
+						/>
+					</label>
 
-			<fieldset className="session-tabs">
-				<legend className="chat-live-region">{t("sessions.filter.label")}</legend>
-				<button
-					type="button"
-					className={showArchived ? "" : "is-active"}
-					onClick={() => setShowArchived(false)}
-				>
-					{t("sessions.filter.active")}
-				</button>
-				<button
-					type="button"
-					className={showArchived ? "is-active" : ""}
-					onClick={() => setShowArchived(true)}
-				>
-					{t("sessions.filter.archived")}
-				</button>
-			</fieldset>
+					<fieldset className="session-tabs">
+						<legend className="chat-live-region">{t("sessions.filter.label")}</legend>
+						<button
+							type="button"
+							className={showArchived ? "" : "is-active"}
+							onClick={() => {
+								setShowArchived(false);
+								setShowAllSessions(false);
+							}}
+						>
+							{t("sessions.filter.active")}
+						</button>
+						<button
+							type="button"
+							className={showArchived ? "is-active" : ""}
+							onClick={() => {
+								setShowArchived(true);
+								setShowAllSessions(false);
+							}}
+						>
+							{t("sessions.filter.archived")}
+						</button>
+					</fieldset>
+				</div>
+			) : null}
 
 			{errorMessage ? (
 				<p className="session-sidebar__error" role="alert">
 					{errorMessage}
 				</p>
 			) : null}
+
+			<div className="session-sidebar__group-title">
+				<AppIcon name="chat" size={18} />
+				<h3>{t("nav.chats")}</h3>
+			</div>
 
 			<div className="session-sidebar__list">
 				{isLoading ? (
@@ -263,125 +294,130 @@ export function SessionSidebar({
 								: t("sessions.empty.active")}
 					</p>
 				) : (
-					<ul className="session-list">
-						{sessions.map((session) => {
-							const isPending = pendingSessionId === session.id;
-							return (
-								<li
-									key={session.id}
-									className={
-										session.id === selectedSessionId ? "session-item is-selected" : "session-item"
-									}
-								>
-									{editingSessionId === session.id ? (
-										<form className="session-rename" onSubmit={(event) => void submitRename(event)}>
-											<input
-												maxLength={200}
-												aria-label={t("sessions.rename.label")}
-												value={editingTitle}
-												onChange={(event) => setEditingTitle(event.currentTarget.value)}
-											/>
-											<div>
-												<button
-													type="submit"
-													disabled={isPending || editingTitle.trim().length === 0}
-												>
-													{t("sessions.rename.save")}
-												</button>
+					<>
+						<ul className="session-list">
+							{(showAllSessions ? sessions : sessions.slice(0, 8)).map((session) => {
+								const isPending = pendingSessionId === session.id;
+								return (
+									<li
+										key={session.id}
+										className={
+											session.id === selectedSessionId ? "session-item is-selected" : "session-item"
+										}
+									>
+										{editingSessionId === session.id ? (
+											<form
+												className="session-rename"
+												onSubmit={(event) => void submitRename(event)}
+											>
+												<input
+													maxLength={200}
+													aria-label={t("sessions.rename.label")}
+													value={editingTitle}
+													onChange={(event) => setEditingTitle(event.currentTarget.value)}
+												/>
+												<div>
+													<button
+														type="submit"
+														disabled={isPending || editingTitle.trim().length === 0}
+													>
+														{t("sessions.rename.save")}
+													</button>
+													<button
+														type="button"
+														disabled={isPending}
+														onClick={() => setEditingSessionId(undefined)}
+													>
+														{t("sessions.rename.cancel")}
+													</button>
+												</div>
+											</form>
+										) : (
+											<>
 												<button
 													type="button"
-													disabled={isPending}
-													onClick={() => setEditingSessionId(undefined)}
+													className="session-item__main"
+													onClick={() => onSelectSession(session.id)}
 												>
-													{t("sessions.rename.cancel")}
+													<strong>{session.title}</strong>
 												</button>
-											</div>
-										</form>
-									) : (
-										<>
-											<button
-												type="button"
-												className="session-item__main"
-												onClick={() => onSelectSession(session.id)}
-											>
-												<strong>{session.title}</strong>
-												<small>{formatSessionDate(session.updatedAt, locale)}</small>
-											</button>
-											<div
-												className={
-													openMenuSessionId === session.id
-														? "session-item__menu is-open"
-														: "session-item__menu"
-												}
-											>
-												<button
-													type="button"
-													className="session-item__menu-trigger"
-													aria-label={t("sessions.actions")}
-													aria-expanded={openMenuSessionId === session.id}
-													onClick={(event) => {
-														event.preventDefault();
-														setOpenMenuSessionId((current) =>
-															current === session.id ? undefined : session.id,
-														);
-													}}
+												<div
+													className={
+														openMenuSessionId === session.id
+															? "session-item__menu is-open"
+															: "session-item__menu"
+													}
 												>
-													...
-												</button>
-												{openMenuSessionId === session.id ? (
-													<div>
-														<button
-															type="button"
-															disabled={isPending}
-															onClick={() => startRename(session)}
-														>
-															{t("sessions.rename.action")}
-														</button>
-														<button
-															type="button"
-															disabled={isPending}
-															onClick={() => void toggleArchived(session)}
-														>
-															{session.archivedAt === undefined
-																? t("sessions.archive")
-																: t("sessions.restore")}
-														</button>
-														<ConfirmationDialog
-															isOpen={sessionToDelete?.id === session.id}
-															isPending={isPending}
-															isTriggerDisabled={isPending}
-															triggerLabel={t("sessions.delete.action")}
-															triggerClassName="confirmation-dialog-trigger confirmation-dialog-trigger--menu session-item__delete"
-															title={t("sessions.delete.title")}
-															description={t("sessions.delete.confirm", session.title)}
-															cancelLabel={t("action.cancel")}
-															confirmLabel={t("sessions.delete.action")}
-															pendingLabel={t("sessions.deleting")}
-															onOpenChange={(isOpen) =>
-																setSessionToDelete(isOpen ? session : undefined)
-															}
-															onConfirm={deleteSession}
-														/>
-													</div>
-												) : null}
-											</div>
-										</>
-									)}
-								</li>
-							);
-						})}
-					</ul>
+													<button
+														type="button"
+														className="session-item__menu-trigger"
+														aria-label={t("sessions.actions")}
+														aria-expanded={openMenuSessionId === session.id}
+														title={t("sessions.actions")}
+														onClick={(event) => {
+															event.preventDefault();
+															setOpenMenuSessionId((current) =>
+																current === session.id ? undefined : session.id,
+															);
+														}}
+													>
+														<AppIcon name="menu" size={16} />
+													</button>
+													{openMenuSessionId === session.id ? (
+														<div>
+															<button
+																type="button"
+																disabled={isPending}
+																onClick={() => startRename(session)}
+															>
+																{t("sessions.rename.action")}
+															</button>
+															<button
+																type="button"
+																disabled={isPending}
+																onClick={() => void toggleArchived(session)}
+															>
+																{session.archivedAt === undefined
+																	? t("sessions.archive")
+																	: t("sessions.restore")}
+															</button>
+															<ConfirmationDialog
+																isOpen={sessionToDelete?.id === session.id}
+																isPending={isPending}
+																isTriggerDisabled={isPending}
+																triggerLabel={t("sessions.delete.action")}
+																triggerClassName="confirmation-dialog-trigger confirmation-dialog-trigger--menu session-item__delete"
+																title={t("sessions.delete.title")}
+																description={t("sessions.delete.confirm", session.title)}
+																cancelLabel={t("action.cancel")}
+																confirmLabel={t("sessions.delete.action")}
+																pendingLabel={t("sessions.deleting")}
+																onOpenChange={(isOpen) =>
+																	setSessionToDelete(isOpen ? session : undefined)
+																}
+																onConfirm={deleteSession}
+															/>
+														</div>
+													) : null}
+												</div>
+											</>
+										)}
+									</li>
+								);
+							})}
+						</ul>
+						{sessions.length > 8 ? (
+							<button
+								type="button"
+								className="session-list__more"
+								onClick={() => setShowAllSessions((current) => !current)}
+							>
+								{showAllSessions ? t("sessions.showLess") : t("sessions.showMore")}
+							</button>
+						) : null}
+					</>
 				)}
 			</div>
 		</aside>
 	);
-}
-
-function formatSessionDate(isoDate: string, locale: string): string {
-	return new Intl.DateTimeFormat(locale, {
-		month: "short",
-		day: "numeric",
-		hour: "2-digit",
-		minute: "2-digit",
-	}).format(new Date(isoDate));
 }

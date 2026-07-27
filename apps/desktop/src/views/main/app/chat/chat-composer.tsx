@@ -1,4 +1,5 @@
 import { Button } from "@heroui/react";
+import { AppIcon } from "@moshu/ui";
 import { type KeyboardEvent, useId } from "react";
 import { useI18n } from "../i18n";
 
@@ -38,11 +39,11 @@ export function ChatComposer({
 	return (
 		<section className="chat-card chat-card--composer">
 			<label className="chat-field chat-field--composer" htmlFor={textareaId}>
-				<span>{t("chat.composer.label")}</span>
+				<span className="chat-live-region">{t("chat.composer.label")}</span>
 				<textarea
 					id={textareaId}
 					name="message"
-					rows={4}
+					rows={3}
 					value={draft}
 					onChange={(event) => onDraftChange(event.target.value)}
 					onKeyDown={handleKeyDown}
@@ -62,13 +63,16 @@ export function ChatComposer({
 							{isStopping ? t("chat.composer.stopping") : t("chat.composer.stop")}
 						</Button>
 					) : (
-						<Button
+						<button
+							type="button"
 							className="chat-button chat-button--primary"
-							onPress={onSend}
-							isDisabled={!canSend}
+							aria-label={t("chat.composer.send")}
+							title={t("chat.composer.send")}
+							onClick={onSend}
+							disabled={!canSend}
 						>
-							{t("chat.composer.send")}
-						</Button>
+							<AppIcon name="send" size={17} />
+						</button>
 					)}
 				</div>
 			</div>

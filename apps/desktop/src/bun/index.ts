@@ -75,6 +75,7 @@ const mainWindow = new BrowserWindow({
 	title: "墨枢",
 	url: await getMainViewUrl(),
 	rpc: desktopRpc,
+	titleBarStyle: process.platform === "darwin" ? "hiddenInset" : "default",
 	frame: {
 		width: 1180,
 		height: 760,
@@ -82,6 +83,9 @@ const mainWindow = new BrowserWindow({
 		y: 80,
 	},
 });
+if (process.platform === "darwin") {
+	mainWindow.setWindowButtonPosition(14, 12);
+}
 mainWindow.on("close", () => {
 	console.info("墨枢 main window closed.");
 	shutdownCoordinator.handleWindowClose();

@@ -1,5 +1,8 @@
 import { Button } from "@heroui/react";
+import { useEffect, useRef } from "react";
+import { createPortal } from "react-dom";
 import { useI18n } from "../i18n";
+import { useAppShellContext } from "../shell-context";
 import { ChatComposer } from "./chat-composer";
 import { MessageList } from "./message-list";
 import { SessionSidebar } from "./session-sidebar";
@@ -39,6 +42,7 @@ export function ChatPage({
 	onOpenProviderSettings = () => {},
 }: ChatPageProps) {
 	const { t } = useI18n();
+	const shell = useAppShellContext();
 	const controller = useChatController({
 		transport,
 		sessionId,
@@ -53,6 +57,27 @@ export function ChatPage({
 		controller.isResponding ? "responding" : "idle",
 	].join(":");
 	const isArchived = controller.session?.archivedAt !== undefined;
+	const title = controller.session?.title ?? t("chat.header.title");
+	const activeSessionId = controller.session?.id ?? sessionId;
+	const updateSessionSummaryRef = useRef(controller.updateSessionSummary);
+	updateSessionSummaryRef.current = controller.updateSessionSummary;
+
+	useEffect(() => {
+		const setNewSessionDisabled = shell?.setNewSessionDisabled;
+		if (setNewSessionDisabled === undefined) {
+			return;
+		}
+		setNewSessionDisabled(controller.isSending);
+		return () => setNewSessionDisabled(false);
+	}, [controller.isSending, shell?.setNewSessionDisabled]);
+
+	useEffect(() => {
+		const updatedSession = shell?.sessionUpdate?.session;
+		if (updatedSession !== undefined && updatedSession.id === activeSessionId) {
+			updateSessionSummaryRef.current(updatedSession);
+		}
+	}, [activeSessionId, shell?.sessionUpdate]);
+
 	const providerCta = (
 		<section
 			className={
@@ -73,34 +98,33 @@ export function ChatPage({
 	);
 
 	return (
-		<section className="chat-page">
-			<SessionSidebar
-				transport={transport}
-				selectedSessionId={controller.session?.id ?? sessionId}
-				refreshKey={sessionRefreshKey}
-				isNewSessionDisabled={controller.isSending}
-				onNewSession={onNewSession}
-				onSessionUpdated={controller.updateSessionSummary}
-				onSelectSession={onSelectSession}
-			/>
+		<section className={shell === null ? "chat-page" : "chat-page chat-page--embedded"}>
+			{shell === null ? (
+				<SessionSidebar
+					transport={transport}
+					selectedSessionId={activeSessionId}
+					refreshKey={sessionRefreshKey}
+					isNewSessionDisabled={controller.isSending}
+					onNewSession={onNewSession}
+					onSessionUpdated={controller.updateSessionSummary}
+					onSelectSession={onSelectSession}
+				/>
+			) : null}
+
+			{shell?.titlebarTarget
+				? createPortal(<h1 className="workspace-session-title">{title}</h1>, shell.titlebarTarget)
+				: null}
 
 			<div className="chat-workspace">
 				<p className="chat-live-region" aria-live="polite">
 					{controller.announcement}
 				</p>
 
-				<header className="chat-page__header">
-					<div>
-						<span className="chat-page__eyebrow">{t("chat.header.eyebrow")}</span>
-						<h1>{controller.session?.title ?? t("chat.header.title")}</h1>
-						<p>
-							{controller.meta.model} / {controller.meta.askMode}
-						</p>
-					</div>
-					<Button className="chat-button" onPress={onOpenProviderSettings}>
-						{t("chat.action.providerSettings")}
-					</Button>
-				</header>
+				{shell === null ? (
+					<header className="chat-page__header">
+						<h1>{title}</h1>
+					</header>
+				) : null}
 
 				{controller.isProviderLoading && !controller.providerStatus && !controller.providerError ? (
 					<p className="chat-loading" role="status">
@@ -154,9 +178,10 @@ export function ChatPage({
 						) : null}
 
 						<MessageList
+							compact={shell !== null}
 							isLoading={controller.isSessionLoading && controller.session === null}
 							messages={controller.session?.messages ?? []}
-							sessionId={controller.session?.id ?? sessionId}
+							sessionId={activeSessionId}
 						/>
 						{controller.hasConfiguredProvider ? (
 							<ChatComposer

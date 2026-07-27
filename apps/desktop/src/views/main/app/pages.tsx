@@ -11,6 +11,7 @@ import {
 import type { ChatSession, ChatTransport } from "./chat/transport";
 import { EmptyState } from "./empty-state";
 import { type MessageKey, useI18n } from "./i18n";
+import { ProfileSettingsPage } from "./profile-settings-page";
 import { ProviderSettingsPage } from "./provider-settings-page";
 
 const lastChatSessionStorageKey = "moshu.lastChatSessionId";
@@ -232,6 +233,10 @@ export function ProviderSettingsRoutePage() {
 	const navigate = useNavigate();
 
 	return <ProviderSettingsPage transport={chatTransport} onBackToChat={() => navigate(-1)} />;
+}
+
+export function ProfileSettingsRoutePage() {
+	return <ProfileSettingsPage />;
 }
 
 export function PlaceholderPage({ titleKey, icon }: { titleKey: MessageKey; icon: AppIconName }) {
