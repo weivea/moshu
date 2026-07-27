@@ -1,10 +1,18 @@
 import type { BaseLanguageModel } from "@langchain/core/language_models/base";
-import { AIMessage, AIMessageChunk, BaseMessage, HumanMessage } from "@langchain/core/messages";
+import {
+	AIMessage,
+	AIMessageChunk,
+	BaseMessage,
+	HumanMessage,
+	HumanMessageChunk,
+	SystemMessage,
+	SystemMessageChunk,
+} from "@langchain/core/messages";
 import type { BaseCheckpointSaver } from "@langchain/langgraph-checkpoint";
-import { ChatOpenAI } from "@langchain/openai";
 import { createDeepAgent } from "@moshu/deepagents/browser";
 import { createMiddleware } from "langchain";
-import type { AskProviderConfigStore, AskProviderConfiguration } from "./ask-provider-config";
+import { createProviderChatModel } from "./provider-model-factory";
+import type { ResolvedProviderConfiguration } from "./provider-registry";
 
 export interface AskChatMessage {
 	role: "user" | "assistant";
@@ -27,6 +35,7 @@ export interface AskChatMessageDeltaEvent {
 export interface AskChatRunInput {
 	runId: string;
 	threadId?: string;
+	provider: ResolvedProviderConfiguration;
 	messages: readonly AskChatMessage[];
 	signal?: AbortSignal;
 	onEvent?: (event: AskChatMessageDeltaEvent) => void | Promise<void>;
@@ -66,11 +75,11 @@ export interface AskAgent {
 }
 
 export type AskAgentFactory = (
-	configuration: AskProviderConfiguration,
+	configuration: ResolvedProviderConfiguration,
 ) => AskAgent | Promise<AskAgent>;
 
 export type AskModelFactory = (
-	configuration: AskProviderConfiguration,
+	configuration: ResolvedProviderConfiguration,
 ) => BaseLanguageModel | Promise<BaseLanguageModel>;
 
 export interface AskChatRuntime {
@@ -83,7 +92,6 @@ export interface AskChatRuntime {
 }
 
 export interface AskChatRuntimeOptions {
-	providerConfigStore: AskProviderConfigStore;
 	checkpointer?: BaseCheckpointSaver;
 	agentFactory?: AskAgentFactory;
 	modelFactory?: AskModelFactory;
@@ -116,8 +124,9 @@ export class AskChatRuntimeError extends Error {
 		retryable: boolean;
 		runId?: string;
 		statusCode?: number;
+		cause?: unknown;
 	}) {
-		super(options.message);
+		super(options.message, options.cause === undefined ? undefined : { cause: options.cause });
 		this.name = "AskChatRuntimeError";
 		this.kind = options.kind;
 		this.retryable = options.retryable;
@@ -150,7 +159,6 @@ export class AskChatCancelledError extends AskChatRuntimeError {
 }
 
 export class DeepAgentsAskChatRuntime implements AskChatRuntime {
-	readonly #providerConfigStore: AskProviderConfigStore;
 	readonly #agentFactory: AskAgentFactory;
 	readonly #checkpointer: BaseCheckpointSaver | undefined;
 	readonly #activeRuns = new Map<string, ActiveRun>();
@@ -161,7 +169,6 @@ export class DeepAgentsAskChatRuntime implements AskChatRuntime {
 	#shuttingDown = false;
 
 	constructor(options: AskChatRuntimeOptions) {
-		this.#providerConfigStore = options.providerConfigStore;
 		this.#checkpointer = options.checkpointer;
 		this.#threadCleanupWaitTimeoutMs = requirePositiveSafeInteger(
 			options.threadCleanupWaitTimeoutMs ?? 5_000,
@@ -177,7 +184,7 @@ export class DeepAgentsAskChatRuntime implements AskChatRuntime {
 				createDefaultAskAgent(
 					configuration,
 					options.checkpointer,
-					options.modelFactory ?? createOpenAiCompatibleModel,
+					options.modelFactory ?? createProviderChatModel,
 				));
 	}
 
@@ -417,21 +424,7 @@ export class DeepAgentsAskChatRuntime implements AskChatRuntime {
 		try {
 			throwIfCancelled(signal, input.runId);
 
-			const providerConfiguration = this.#providerConfigStore.get();
-			if (providerConfiguration === null) {
-				throw new AskChatRuntimeError({
-					kind: "not_configured",
-					message: "Ask provider is not configured.",
-					retryable: false,
-					runId: input.runId,
-				});
-			}
-
-			const agent = await waitForAbortable(
-				this.#agentFactory(providerConfiguration),
-				signal,
-				input.runId,
-			);
+			const agent = await waitForAbortable(this.#agentFactory(input.provider), signal, input.runId);
 			const messageHistory = toLangChainMessages(input.messages);
 			const streamAcquisition = Promise.resolve().then(() =>
 				agent.stream(
@@ -494,7 +487,7 @@ function createCheckpointThreadId(threadId: string): string {
 }
 
 async function createDefaultAskAgent(
-	configuration: AskProviderConfiguration,
+	configuration: ResolvedProviderConfiguration,
 	checkpointer: BaseCheckpointSaver | undefined,
 	modelFactory: AskModelFactory,
 ): Promise<AskAgent> {
@@ -510,6 +503,7 @@ async function createDefaultAskAgent(
 			createMiddleware({ name: "todoListMiddleware" }),
 			createMiddleware({ name: "FilesystemMiddleware" }),
 			createMiddleware({ name: "subAgentMiddleware" }),
+			...(configuration.protocol === "openai-responses" ? [createResponsesV1Middleware()] : []),
 			createAskToolPolicyMiddleware(),
 		],
 		...(checkpointer === undefined ? {} : { checkpointer }),
@@ -527,16 +521,66 @@ async function createDefaultAskAgent(
 	};
 }
 
-function createOpenAiCompatibleModel(configuration: AskProviderConfiguration): ChatOpenAI {
-	return new ChatOpenAI({
-		apiKey: configuration.apiKey,
-		model: configuration.model,
-		maxRetries: 0,
-		useResponsesApi: false,
-		...(configuration.baseUrl === undefined
-			? {}
-			: { configuration: { baseURL: configuration.baseUrl } }),
+function createResponsesV1Middleware() {
+	return createMiddleware({
+		name: "MoshuResponsesV1Middleware",
+		wrapModelCall: (request, handler) =>
+			handler({
+				...request,
+				messages: request.messages.map(toStandardResponsesMessage),
+			}),
 	});
+}
+
+function toStandardResponsesMessage(message: BaseMessage): BaseMessage {
+	if (message.response_metadata.output_version === "v1") {
+		return message;
+	}
+
+	const commonFields = {
+		contentBlocks: message.contentBlocks,
+		additional_kwargs: { ...message.additional_kwargs },
+		response_metadata: {
+			...message.response_metadata,
+			output_version: "v1" as const,
+		},
+		...(message.id === undefined ? {} : { id: message.id }),
+		...(message.name === undefined ? {} : { name: message.name }),
+	};
+	if (HumanMessageChunk.isInstance(message)) {
+		return new HumanMessageChunk(commonFields);
+	}
+	if (HumanMessage.isInstance(message)) {
+		return new HumanMessage(commonFields);
+	}
+	if (SystemMessageChunk.isInstance(message)) {
+		return new SystemMessageChunk(commonFields);
+	}
+	if (SystemMessage.isInstance(message)) {
+		return new SystemMessage(commonFields);
+	}
+
+	const isChunk = AIMessageChunk.isInstance(message);
+	if (!isChunk && !AIMessage.isInstance(message)) {
+		return message;
+	}
+	const fields = {
+		...commonFields,
+		...(message.tool_calls === undefined ? {} : { tool_calls: [...message.tool_calls] }),
+		...(message.invalid_tool_calls === undefined
+			? {}
+			: { invalid_tool_calls: [...message.invalid_tool_calls] }),
+		...(message.usage_metadata === undefined ? {} : { usage_metadata: message.usage_metadata }),
+	};
+
+	return isChunk
+		? new AIMessageChunk({
+				...fields,
+				...(message.tool_call_chunks === undefined
+					? {}
+					: { tool_call_chunks: [...message.tool_call_chunks] }),
+			})
+		: new AIMessage(fields);
 }
 
 function createAskToolPolicyMiddleware() {
@@ -994,6 +1038,7 @@ function mapAskChatError(error: unknown, runId: string, signal: AbortSignal): As
 			message: "Provider authentication failed.",
 			retryable: false,
 			runId,
+			cause: error,
 			...(statusCode === undefined ? {} : { statusCode }),
 		});
 	}
@@ -1004,6 +1049,7 @@ function mapAskChatError(error: unknown, runId: string, signal: AbortSignal): As
 			message: "Provider rate limited the request.",
 			retryable: true,
 			runId,
+			cause: error,
 			...(statusCode === undefined ? {} : { statusCode }),
 		});
 	}
@@ -1014,6 +1060,7 @@ function mapAskChatError(error: unknown, runId: string, signal: AbortSignal): As
 			message: "Provider rejected the configured model request.",
 			retryable: false,
 			runId,
+			cause: error,
 			...(statusCode === undefined ? {} : { statusCode }),
 		});
 	}
@@ -1024,6 +1071,7 @@ function mapAskChatError(error: unknown, runId: string, signal: AbortSignal): As
 			message: "Provider request failed due to a network error.",
 			retryable: true,
 			runId,
+			cause: error,
 			...(statusCode === undefined ? {} : { statusCode }),
 		});
 	}
@@ -1033,22 +1081,44 @@ function mapAskChatError(error: unknown, runId: string, signal: AbortSignal): As
 		message: "Provider request failed.",
 		retryable: statusCode !== undefined && statusCode >= 500,
 		runId,
+		cause: error,
 		...(statusCode === undefined ? {} : { statusCode }),
 	});
 }
 
+const maxErrorCauseDepth = 8;
+
+/**
+ * Agent middleware wraps provider failures, so the HTTP status and the original message only
+ * exist further down the `cause` chain. Every classifier walks that chain.
+ */
+function collectErrorChain(error: unknown): unknown[] {
+	const chain: unknown[] = [];
+	let current = error;
+	while (current !== undefined && current !== null && chain.length < maxErrorCauseDepth) {
+		if (chain.includes(current)) {
+			break;
+		}
+		chain.push(current);
+		current = isRecord(current) ? current.cause : undefined;
+	}
+	return chain;
+}
+
 function getOptionalStatusCode(error: unknown): number | undefined {
-	if (!isRecord(error)) {
-		return undefined;
-	}
-
-	const directStatus = error.status;
-	if (typeof directStatus === "number") {
-		return directStatus;
-	}
-
-	if (isRecord(error.response) && typeof error.response.status === "number") {
-		return error.response.status;
+	for (const candidate of collectErrorChain(error)) {
+		if (!isRecord(candidate)) {
+			continue;
+		}
+		if (typeof candidate.status === "number") {
+			return candidate.status;
+		}
+		if (typeof candidate.statusCode === "number") {
+			return candidate.statusCode;
+		}
+		if (isRecord(candidate.response) && typeof candidate.response.status === "number") {
+			return candidate.response.status;
+		}
 	}
 
 	return undefined;
@@ -1076,25 +1146,20 @@ function hasNetworkSignal(error: unknown): boolean {
 }
 
 function isAbortLikeError(error: unknown): boolean {
-	if (error instanceof DOMException) {
-		return error.name === "AbortError";
-	}
-
-	if (!isRecord(error) || typeof error.name !== "string") {
-		return false;
-	}
-
-	return error.name === "AbortError";
+	return collectErrorChain(error).some(
+		(candidate) => isRecord(candidate) && candidate.name === "AbortError",
+	);
 }
 
 function matchesErrorText(error: unknown, needles: readonly string[]): boolean {
-	const message = getErrorMessage(error);
-	if (message === undefined) {
-		return false;
-	}
-
-	const normalized = message.toLowerCase();
-	return needles.some((needle) => normalized.includes(needle));
+	return collectErrorChain(error).some((candidate) => {
+		const message = getErrorMessage(candidate);
+		if (message === undefined) {
+			return false;
+		}
+		const normalized = message.toLowerCase();
+		return needles.some((needle) => normalized.includes(needle));
+	});
 }
 
 function getErrorMessage(error: unknown): string | undefined {

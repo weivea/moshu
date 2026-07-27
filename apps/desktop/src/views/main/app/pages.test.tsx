@@ -5,6 +5,11 @@ import { MemoryRouter, Route, Routes, useLocation, useNavigate } from "react-rou
 import { beforeEach, describe, expect, test, vi } from "vitest";
 import { AgentsUnavailableError, ChatSessionNotFoundError } from "../../../shared/rpc-errors";
 import { getChatSessionRecoveryCoordinator } from "./chat/session-recovery-coordinator";
+import {
+	modelSelectionFor,
+	testAvailableModel,
+	testDefaultModel,
+} from "./chat/test-transport-defaults";
 import type {
 	ChatSession,
 	ChatSessionInvalidation,
@@ -532,13 +537,8 @@ class SessionRouteTransport {
 		this.#session = session;
 	}
 
-	async getProviderStatus() {
-		return {
-			configured: true,
-			endpoint: "https://api.openai.com/v1",
-			model: "gpt-5.4",
-			askMode: "Ask",
-		};
+	async listAvailableModels() {
+		return { models: [testAvailableModel], defaultModel: testDefaultModel };
 	}
 
 	async getSession(sessionId: string): Promise<ChatSession> {
@@ -676,7 +676,7 @@ function createSessionForId(id: string, title: string): ChatSession {
 		id,
 		title,
 		updatedAt: "2026-07-26T00:00:00.000Z",
-		model: "gpt-5.4",
+		model: modelSelectionFor("gpt-5.4"),
 		askMode: "Ask",
 		messages: [],
 	};

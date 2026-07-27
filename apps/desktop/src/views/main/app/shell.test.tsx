@@ -156,7 +156,7 @@ describe("AppShell", () => {
 							<Routes>
 								<Route element={<AppShell />}>
 									<Route path="/chat/new" element={<div>Chat route</div>} />
-									<Route path="/settings/profile" element={<div>Profile route</div>} />
+									<Route path="/settings/general" element={<div>General route</div>} />
 								</Route>
 							</Routes>
 						</MemoryRouter>
@@ -173,7 +173,7 @@ describe("AppShell", () => {
 		expect(screen.queryByRole("complementary", { name: "Canvas" })).not.toBeInTheDocument();
 
 		fireEvent.click(screen.getByRole("link", { name: "Local user" }));
-		expect(await screen.findByText("Profile route")).toBeVisible();
+		expect(await screen.findByText("General route")).toBeVisible();
 		expect(screen.queryByRole("button", { name: "Open Canvas" })).not.toBeInTheDocument();
 		expect(screen.queryByRole("button", { name: "Close Canvas" })).not.toBeInTheDocument();
 		expect(screen.queryByRole("complementary", { name: "Canvas" })).not.toBeInTheDocument();
@@ -186,7 +186,7 @@ describe("AppShell", () => {
 		expect(backButton).toBeDisabled();
 
 		fireEvent.click(forwardButton);
-		expect(await screen.findByText("Profile route")).toBeVisible();
+		expect(await screen.findByText("General route")).toBeVisible();
 		await waitFor(() => expect(backButton).toBeEnabled());
 		expect(forwardButton).toBeDisabled();
 	});

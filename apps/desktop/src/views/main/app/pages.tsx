@@ -11,8 +11,9 @@ import {
 import type { ChatSession, ChatTransport } from "./chat/transport";
 import { EmptyState } from "./empty-state";
 import { type MessageKey, useI18n } from "./i18n";
-import { ProfileSettingsPage } from "./profile-settings-page";
-import { ProviderSettingsPage } from "./provider-settings-page";
+import { DefaultModelSettingsPage } from "./settings/default-model-page";
+import { GeneralSettingsPage } from "./settings/general-page";
+import { ProvidersSettingsPage } from "./settings/providers/providers-page";
 
 const lastChatSessionStorageKey = "moshu.lastChatSessionId";
 const initialHydrationRetryDelayMs = 100;
@@ -229,18 +230,40 @@ function readHydratedSession(state: unknown, sessionId: string): ChatSession | u
 		: undefined;
 }
 
-export function ProviderSettingsRoutePage() {
-	const navigate = useNavigate();
-
-	return <ProviderSettingsPage transport={chatTransport} onBackToChat={() => navigate(-1)} />;
+export function ProviderSettingsRoutePage({
+	transport = chatTransport,
+}: {
+	transport?: ChatTransport;
+} = {}) {
+	return <ProvidersSettingsPage transport={transport} />;
 }
 
-export function ProfileSettingsRoutePage() {
-	return <ProfileSettingsPage />;
+export function DefaultModelSettingsRoutePage({
+	transport = chatTransport,
+}: {
+	transport?: ChatTransport;
+} = {}) {
+	return <DefaultModelSettingsPage transport={transport} />;
+}
+
+export function GeneralSettingsRoutePage() {
+	return <GeneralSettingsPage />;
 }
 
 export function PlaceholderPage({ titleKey, icon }: { titleKey: MessageKey; icon: AppIconName }) {
 	const { t } = useI18n();
 
 	return <EmptyState icon={icon} title={t(titleKey)} description={t("page.placeholder")} />;
+}
+
+export function SettingsPlaceholderPage() {
+	const { t } = useI18n();
+
+	return (
+		<EmptyState
+			icon="settings"
+			title={t("page.settings.title")}
+			description={t("settings.sectionPlaceholder")}
+		/>
+	);
 }

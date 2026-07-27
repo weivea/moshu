@@ -5,17 +5,23 @@ import { I18nProvider } from "../i18n";
 import { ChatPage, type ChatPageProps } from "./chat-page";
 import { isRendererSessionRetired } from "./session-recovery-coordinator";
 import {
-	type ChatMessage,
-	type ChatProviderConfiguration,
-	type ChatProviderStatus,
-	type ChatSession,
-	type ChatSessionInvalidation,
-	type ChatSessionInvalidationListener,
-	type ChatTransport,
-	type ChatTransportEvent,
-	type ChatTransportListener,
-	DEFAULT_PROVIDER_ENDPOINT,
+	availableModelFor,
+	modelSelectionFor,
+	ProviderModelTransportDefaults,
+	testProviderId,
+} from "./test-transport-defaults";
+import type {
+	ChatMessage,
+	ChatSession,
+	ChatSessionInvalidation,
+	ChatSessionInvalidationListener,
+	ChatTransport,
+	ChatTransportEvent,
+	ChatTransportListener,
+	SessionModelSelection,
 } from "./transport";
+
+const sessionModel = modelSelectionFor("gpt-4.1-mini");
 
 beforeEach(() => {
 	Object.defineProperty(window.navigator, "language", {
@@ -29,6 +35,28 @@ beforeEach(() => {
 });
 
 describe("ChatPage", () => {
+	test("creates a new chat with the model picked in the composer", async () => {
+		const transport = new FakeChatTransport({ configured: true, model: "gpt-5.4" });
+		transport.availableModels = [
+			availableModelFor("gpt-5.4"),
+			availableModelFor("claude-opus-4.6"),
+		];
+		renderChatPage({ transport });
+
+		const picker = await screen.findByRole("combobox", { name: "Model" });
+		fireEvent.change(picker, {
+			target: { value: `${testProviderId}\u0000claude-opus-4.6` },
+		});
+
+		const prompt = await screen.findByLabelText("Prompt");
+		fireEvent.change(prompt, { target: { value: "Hello" } });
+		fireEvent.keyDown(prompt, { key: "Enter" });
+
+		await waitFor(() =>
+			expect(transport.createSessionModels).toEqual([modelSelectionFor("claude-opus-4.6")]),
+		);
+	});
+
 	test("routes Provider setup to settings and keeps credentials out of the Chat page", async () => {
 		const transport = new FakeChatTransport({
 			configured: false,
@@ -53,7 +81,7 @@ describe("ChatPage", () => {
 		const transport = new FakeChatTransport({
 			configured: false,
 		});
-		transport.nextProviderStatusError = new Error("Provider status offline.");
+		transport.nextListAvailableModelsError = new Error("Provider status offline.");
 
 		renderChatPage({ transport });
 
@@ -174,7 +202,7 @@ describe("ChatPage", () => {
 			id: "missing-send-session",
 			title: "Missing send chat",
 			updatedAt: "2026-01-01T00:00:00.000Z",
-			model: "gpt-4.1-mini",
+			model: sessionModel,
 			askMode: "Ask",
 			messages: [createMessage("existing-message", "user", "Existing transcript")],
 		});
@@ -263,7 +291,7 @@ describe("ChatPage", () => {
 			id: "missing-cancel-session",
 			title: "Missing cancel chat",
 			updatedAt: "2026-01-01T00:00:00.000Z",
-			model: "gpt-4.1-mini",
+			model: sessionModel,
 			askMode: "Ask",
 			messages: [
 				createMessage("cancel-user", "user", "Question"),
@@ -298,7 +326,7 @@ describe("ChatPage", () => {
 			id: "stop-session-a",
 			title: "Stop Session A",
 			updatedAt: "2026-01-01T00:00:00.000Z",
-			model: "gpt-4.1-mini",
+			model: sessionModel,
 			askMode: "Ask",
 			messages: [
 				createMessage("stop-a-user", "user", "Question A"),
@@ -317,7 +345,7 @@ describe("ChatPage", () => {
 			id: "stop-session-b",
 			title: "Stop Session B",
 			updatedAt: "2026-01-01T00:00:00.000Z",
-			model: "gpt-4.1-mini",
+			model: sessionModel,
 			askMode: "Ask",
 			messages: [createMessage("stop-b-user", "user", "Question B")],
 		});
@@ -353,7 +381,7 @@ describe("ChatPage", () => {
 			id: "existing-session",
 			title: "Existing session",
 			updatedAt: "2026-01-01T00:00:00.000Z",
-			model: "gpt-4.1-mini",
+			model: sessionModel,
 			askMode: "Ask",
 			messages: [
 				createMessage("user-1", "user", "Earlier question"),
@@ -392,7 +420,7 @@ describe("ChatPage", () => {
 			id: "missing-hydration-a",
 			title: "Missing hydration A",
 			updatedAt: "2026-01-01T00:00:00.000Z",
-			model: "gpt-4.1-mini",
+			model: sessionModel,
 			askMode: "Ask",
 			messages: [],
 		});
@@ -400,7 +428,7 @@ describe("ChatPage", () => {
 			id: "replacement-hydration-b",
 			title: "Replacement hydration B",
 			updatedAt: "2026-01-01T00:00:00.000Z",
-			model: "gpt-4.1-mini",
+			model: sessionModel,
 			askMode: "Ask",
 			messages: [createMessage("replacement-hydration-message", "user", "Hydration B stays")],
 		});
@@ -442,7 +470,7 @@ describe("ChatPage", () => {
 			id: "offline-session",
 			title: "Saved conversation",
 			updatedAt: "2026-01-01T00:00:00.000Z",
-			model: "gpt-4.1-mini",
+			model: sessionModel,
 			askMode: "Ask",
 			messages: [
 				createMessage("offline-user", "user", "Saved question"),
@@ -489,7 +517,7 @@ describe("ChatPage", () => {
 			title: "Archived conversation",
 			updatedAt: "2026-01-01T00:00:00.000Z",
 			archivedAt: "2026-01-02T00:00:00.000Z",
-			model: "gpt-4.1-mini",
+			model: sessionModel,
 			askMode: "Ask",
 			messages: [createMessage("archived-user", "user", "Archived question")],
 		});
@@ -530,7 +558,7 @@ describe("ChatPage", () => {
 			id: "hydrating-session",
 			title: "Hydrating session",
 			updatedAt: "2026-01-01T00:00:00.000Z",
-			model: "gpt-4.1-mini",
+			model: sessionModel,
 			askMode: "Ask",
 			messages: [
 				createMessage("hydrating-user", "user", "Earlier question"),
@@ -573,7 +601,7 @@ describe("ChatPage", () => {
 			id: "initial-hydration-session",
 			title: "Stale initial title",
 			updatedAt: "2026-01-01T00:00:00.000Z",
-			model: "gpt-4.1-mini",
+			model: sessionModel,
 			askMode: "Ask",
 			messages: [
 				createMessage("initial-user", "user", "Initial question"),
@@ -628,7 +656,7 @@ describe("ChatPage", () => {
 			id: "subscribe-first-session",
 			title: "Subscribe first",
 			updatedAt: "2026-01-01T00:00:00.000Z",
-			model: "gpt-4.1-mini",
+			model: sessionModel,
 			askMode: "Ask",
 			messages: [
 				createMessage("subscribe-user", "user", "Question"),
@@ -673,7 +701,7 @@ describe("ChatPage", () => {
 			id: "serialized-hydration-session",
 			title: "Serialized hydration",
 			updatedAt: "2026-01-01T00:00:00.000Z",
-			model: "gpt-4.1-mini",
+			model: sessionModel,
 			askMode: "Ask",
 			messages: [],
 		});
@@ -713,7 +741,7 @@ describe("ChatPage", () => {
 			id: "cursor-session",
 			title: "Cursor reconciliation",
 			updatedAt: "2026-01-01T00:00:00.000Z",
-			model: "gpt-4.1-mini",
+			model: sessionModel,
 			askMode: "Ask",
 			messages: [
 				createMessage("cursor-user", "user", "Question"),
@@ -774,7 +802,7 @@ describe("ChatPage", () => {
 			id: "back-session",
 			title: "Stale history title",
 			updatedAt: "2026-01-01T00:00:00.000Z",
-			model: "gpt-4.1-mini",
+			model: sessionModel,
 			askMode: "Ask",
 			messages: [createMessage("stale-back-message", "user", "Stale history")],
 		};
@@ -787,7 +815,7 @@ describe("ChatPage", () => {
 			id: "other-session",
 			title: "Other Session",
 			updatedAt: "2026-01-01T00:00:00.000Z",
-			model: "gpt-4.1-mini",
+			model: sessionModel,
 			askMode: "Ask",
 			messages: [createMessage("other-message", "user", "Other content")],
 		});
@@ -832,7 +860,7 @@ describe("ChatPage", () => {
 			id: "session-a",
 			title: "Session A title",
 			updatedAt: "2026-01-01T00:00:00.000Z",
-			model: "gpt-4.1-mini",
+			model: sessionModel,
 			askMode: "Ask",
 			messages: [
 				createMessage("a-user", "user", "Session A"),
@@ -852,7 +880,7 @@ describe("ChatPage", () => {
 			id: "session-b",
 			title: "Session B title",
 			updatedAt: "2026-01-01T00:00:00.000Z",
-			model: "gpt-4.1-mini",
+			model: sessionModel,
 			askMode: "Ask",
 			messages: [
 				createMessage("b-user", "user", "Session B"),
@@ -901,7 +929,7 @@ describe("ChatPage", () => {
 			id: "send-session-a",
 			title: "Send Session A",
 			updatedAt: "2026-01-01T00:00:00.000Z",
-			model: "gpt-4.1-mini",
+			model: sessionModel,
 			askMode: "Ask",
 			messages: [],
 		});
@@ -909,7 +937,7 @@ describe("ChatPage", () => {
 			id: "send-session-b",
 			title: "Send Session B",
 			updatedAt: "2026-01-01T00:00:00.000Z",
-			model: "gpt-4.1-mini",
+			model: sessionModel,
 			askMode: "Ask",
 			messages: [createMessage("b-existing", "user", "Session B stays selected")],
 		});
@@ -945,7 +973,7 @@ describe("ChatPage", () => {
 			id: "missing-send-a",
 			title: "Missing Session A",
 			updatedAt: "2026-01-01T00:00:00.000Z",
-			model: "gpt-4.1-mini",
+			model: sessionModel,
 			askMode: "Ask",
 			messages: [],
 		});
@@ -953,7 +981,7 @@ describe("ChatPage", () => {
 			id: "replacement-send-b",
 			title: "Replacement Session B",
 			updatedAt: "2026-01-01T00:00:00.000Z",
-			model: "gpt-4.1-mini",
+			model: sessionModel,
 			askMode: "Ask",
 			messages: [createMessage("replacement-message", "user", "Keep replacement state")],
 		});
@@ -999,7 +1027,7 @@ describe("ChatPage", () => {
 			id: "retired-session",
 			title: "Retired chat",
 			updatedAt: "2026-01-01T00:00:00.000Z",
-			model: "gpt-4.1-mini",
+			model: sessionModel,
 			askMode: "Ask",
 			messages: [createMessage("old-message", "user", "Stale content")],
 		});
@@ -1035,7 +1063,7 @@ describe("ChatPage", () => {
 			id: "expired-session",
 			title: "Expired chat",
 			updatedAt: "2026-01-01T00:00:00.000Z",
-			model: "gpt-4.1-mini",
+			model: sessionModel,
 			askMode: "Ask",
 			messages: [createMessage("old-message", "user", "Stale snapshot")],
 		});
@@ -1067,7 +1095,7 @@ describe("ChatPage", () => {
 			id: "navigation-session-a",
 			title: "Navigation Session A",
 			updatedAt: "2026-01-01T00:00:00.000Z",
-			model: "gpt-4.1-mini",
+			model: sessionModel,
 			askMode: "Ask",
 			messages: [],
 		});
@@ -1075,7 +1103,7 @@ describe("ChatPage", () => {
 			id: "navigation-session-b",
 			title: "Navigation Session B",
 			updatedAt: "2026-01-01T00:00:00.000Z",
-			model: "gpt-4.1-mini",
+			model: sessionModel,
 			askMode: "Ask",
 			messages: [],
 		});
@@ -1111,7 +1139,7 @@ describe("ChatPage", () => {
 			id: "deleted-session",
 			title: "Deleted chat",
 			updatedAt: "2026-01-01T00:00:00.000Z",
-			model: "gpt-4.1-mini",
+			model: sessionModel,
 			askMode: "Ask",
 			messages: [createMessage("deleted-message", "user", "Must be removed")],
 		});
@@ -1140,7 +1168,7 @@ describe("ChatPage", () => {
 			id: "failed-session",
 			title: "Failed chat",
 			updatedAt: "2026-01-01T00:00:00.000Z",
-			model: "gpt-4.1-mini",
+			model: sessionModel,
 			askMode: "Ask",
 			messages: [],
 		});
@@ -1164,7 +1192,7 @@ describe("ChatPage", () => {
 			id: "expired-session",
 			title: "Expired chat",
 			updatedAt: "2026-01-01T00:00:00.000Z",
-			model: "gpt-4.1-mini",
+			model: sessionModel,
 			askMode: "Ask",
 			messages: [],
 		});
@@ -1198,19 +1226,17 @@ async function waitForRequest(transport: FakeChatTransport) {
 	return transport.lastRequestId;
 }
 
-class FakeChatTransport implements ChatTransport {
-	configureCalls: ChatProviderConfiguration[] = [];
+class FakeChatTransport extends ProviderModelTransportDefaults implements ChatTransport {
 	sendCalls: Array<{ requestId: string; sessionId: string; message: string }> = [];
 	cancelCalls: Array<{ sessionId: string; requestId: string }> = [];
 	getSessionCalls: string[] = [];
+	createSessionModels: Array<SessionModelSelection | undefined> = [];
 	listenerCountsAtSessionLoad: number[] = [];
 	listSessionCalls = 0;
 	listeners = new Set<ChatTransportListener>();
 	invalidationListeners = new Set<ChatSessionInvalidationListener>();
 	sessions = new Map<string, ChatSession>();
 	pending = new Map<string, { sessionId: string; messageId: string }>();
-	nextProviderStatusError: Error | null = null;
-	nextConfigureError: Error | null = null;
 	nextSendError: Error | null = null;
 	nextCancelError: Error | null = null;
 	nextGetSessionError: Error | null = null;
@@ -1223,7 +1249,7 @@ class FakeChatTransport implements ChatTransport {
 	sendReturnGate: Promise<void> | null = null;
 	cancelReturnGate: Promise<void> | null = null;
 	eventOnSubscribe: ChatTransportEvent | null = null;
-	private providerStatus: ChatProviderStatus;
+	private readonly configuredModel: string;
 	private eventSequences = new Map<string, number>();
 	private nextSessionNumber = 1;
 	private nextMessageNumber = 1;
@@ -1236,59 +1262,24 @@ class FakeChatTransport implements ChatTransport {
 		configured: boolean;
 		model?: string;
 	}) {
-		this.providerStatus = {
-			configured,
-			endpoint: DEFAULT_PROVIDER_ENDPOINT,
-			model,
-			askMode: "Ask",
-		};
+		super(
+			configured
+				? { models: [availableModelFor(model)], defaultModel: modelSelectionFor(model) }
+				: { models: [], defaultModel: null },
+		);
+		this.configuredModel = model;
 	}
 
-	async getProviderStatus() {
-		const error = this.consume("nextProviderStatusError");
-		if (error) {
-			throw error;
-		}
-		return { ...this.providerStatus };
-	}
-
-	async configureProvider(input: ChatProviderConfiguration) {
-		this.configureCalls.push(input);
-		const error = this.consume("nextConfigureError");
-		if (error) {
-			throw error;
-		}
-
-		this.providerStatus = {
-			configured: true,
-			endpoint: input.endpoint,
-			model: input.model,
-			askMode: "Ask",
-		};
-		return { ...this.providerStatus };
-	}
-
-	async testProvider() {
-		return { ok: true, latencyMs: 1 };
-	}
-
-	async deleteProvider() {
-		this.providerStatus = {
-			configured: false,
-			endpoint: DEFAULT_PROVIDER_ENDPOINT,
-			model: "",
-			askMode: "Ask",
-		};
-		return { ...this.providerStatus };
-	}
-
-	async createSession() {
+	async createSession(model?: SessionModelSelection) {
+		this.createSessionModels.push(model);
+		const resolvedModel =
+			model ?? (this.configuredModel === "" ? undefined : modelSelectionFor(this.configuredModel));
 		const session: ChatSession = {
 			id: `session-${this.nextSessionNumber}`,
 			title: "New chat",
 			updatedAt: "2026-01-01T00:00:00.000Z",
-			model: this.providerStatus.model,
-			askMode: this.providerStatus.askMode,
+			...(resolvedModel === undefined ? {} : { model: resolvedModel }),
+			askMode: "Ask",
 			messages: [],
 		};
 		this.nextSessionNumber += 1;
@@ -1547,13 +1538,7 @@ class FakeChatTransport implements ChatTransport {
 	}
 
 	private consume(
-		key:
-			| "nextProviderStatusError"
-			| "nextConfigureError"
-			| "nextSendError"
-			| "nextCancelError"
-			| "nextGetSessionError"
-			| "nextListSessionsError",
+		key: "nextSendError" | "nextCancelError" | "nextGetSessionError" | "nextListSessionsError",
 	) {
 		const error = this[key];
 		this[key] = null;

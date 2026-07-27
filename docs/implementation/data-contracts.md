@@ -101,7 +101,7 @@ interface AppError {
 | `agent_definitions` | id, name, executor_id, current_version_id, disabled_at | 多个 Agent 可绑定同一 executor |
 | `agent_versions` | id, agent_id, version, config_json, config_hash | 不可变配置快照 |
 | `agent_resource_refs` | agent_version_id, executor_id, kind, resource_id, resource_version, content_hash | 只保存 assigned executor 的稳定 MCP/Skill 引用 |
-| `provider_connections` | id, type, endpoint, secret_ref, status | Provider connection config |
+| `provider_connections` | id, type, endpoint, secret_ref, status | Provider connection config（规划中；当前 Provider 配置存于 `provider.json`） |
 | `executor_inventory_snapshots` | executor_id, generation, inventory_epoch, inventory_revision, stale, redacted_json, observed_at | 原子替换、可丢弃、非权威的 capability/inventory cache |
 | `sessions` | id, project_id, agent_version_id, mode, title, status, revision | 产品会话目录 |
 | `runs` | id, session_id, executor_id, mode, status, config_snapshot_json | 一次 Agent 执行；snapshot 只含 resource refs/hashes，不含 Skill 正文 |
@@ -311,9 +311,12 @@ registry.clients.get
 registry.executors.list / registry.executors.get
 agents.list / agents.get
 settings.get / settings.update
-providers.list / providers.save / providers.test / models.list
+providers.list / providers.create / providers.update / providers.delete
+providers.test / providers.fetchModels / providers.setModelsEnabled
+models.listAvailable / settings.defaultModel.get / settings.defaultModel.set
 projects.list / projects.add / projects.get / projects.update / projects.remove
 sessions.list / sessions.create / sessions.get / sessions.update
+sessions.setModel
 sessions.archive / sessions.restore / sessions.delete / sessions.export
 messages.list
 runs.start / runs.stop / runs.resume / runs.retry / runs.get
@@ -327,6 +330,40 @@ skills.list / skills.get / skills.install / skills.update / skills.remove / skil
 usage.summary
 diagnostics.export
 ```
+
+#### 8.3.1 Provider 与模型选择（当前实现）
+
+当前已实现的 Provider 方法集为 `moshu.v1.providers.{list,create,update,delete,test,fetchModels,setModelsEnabled}`、
+`moshu.v1.models.listAvailable`、`moshu.v1.settings.defaultModel.{get,set}` 和 `moshu.v1.session.setModel`。
+
+- Provider `type` 只表示兼容协议族：`openai-compatible` 或 `anthropic-compatible`。
+- 每个 Provider 记录 `displayName`、`type`、`baseUrl`、`apiKey`、`customHeaders` 和拉取到的 model 目录；
+  `providers.list` 返回的 `ProviderSummary` 只含 `apiKeyMask` 与 `customHeaderNames`，**不含** `apiKey`
+  或任何 header 值。
+- `providers.fetchModels` 请求 `{baseUrl}/models`（Anthropic 类型带 `x-api-key` 与 `anthropic-version`），
+  宽松解析 OpenAI、GitHub Copilot、Anthropic 和 OpenRouter 四种响应形态；响应未声明的字段一律省略，
+  UI 不渲染。保留上一次的勾选状态。
+- 模型声明 `supported_endpoints` 时，运行时识别 `/chat/completions`、`/responses` 和 `/v1/messages`
+  （同时接受带 `/v1` 或完整 URL 的等价路径）。多种协议并存时先选与 Provider `type` 同族的 endpoint，
+  同族内保持数组顺序；没有同族 endpoint 时取首个可识别 endpoint。字段缺失或没有可识别值时，
+  `openai-compatible` 回退 Chat Completions，`anthropic-compatible` 回退 Messages。
+- 三种实际 wire protocol 分别使用 `ChatOpenAICompletions`、`ChatOpenAIResponses` 和 `ChatAnthropic`
+  显式 adapter，不使用 `ChatOpenAI` 的自动协议切换。
+- Responses 请求统一使用 LangChain v1 content blocks；user/system 文本发送为 `input_text`，
+  assistant 历史发送为 `output_text`，同时保留 message metadata、tool call 和 usage 信息。
+- 推理控制按目录声明推导：`capabilities.supports.reasoning_effort[]` → effort 档位；
+  `adaptive_thinking` / `min_thinking_budget` / `max_thinking_budget` → thinking budget；两者都声明时都提供；
+  都未声明但模型实际解析为 Anthropic Messages 时提供一个默认关闭的 budget 控件（协议固有能力）；
+  其余情况不提供。
+  未声明或未开启的推理参数不会下发。
+- Session 通过 `session.setModel` 记录 `{providerId, modelId, reasoning}`；`chat.send` 的解析顺序为
+  Session 选择 → 全局默认 → `not_configured`，引用已删除或已停用的 Provider/模型时自动降级。
+
+Provider 配置持久化在 `{userData}/provider.json`（`schemaVersion: 3`，0600，`.tmp` + rename 原子写）。
+`schemaVersion: 1` 的单 Provider 文档会迁移成一条 Provider 记录；`schemaVersion: 2` 的三种旧 Type
+会迁移成两个兼容协议族，旧 Responses Provider 在模型没有 endpoint 元数据时保留 `/responses` 路由。
+业务数据库不保存任何 Provider 凭据：`chat_runs.provider_json` 在落盘前经 `toSafeProviderState()`
+剥除 `apiKey` 与 `customHeaders`。
 
 client 只暴露领域方法，不提供通用 method forwarding。MCP/Skill query/command 先由 server 校验 client/executor identity、Agent binding 和产品授权，再路由到 selected executor：
 

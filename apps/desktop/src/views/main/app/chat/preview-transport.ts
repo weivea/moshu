@@ -1,15 +1,17 @@
-import {
-	type ChatMessage,
-	type ChatProviderConfiguration,
-	type ChatProviderConnectionTestResult,
-	type ChatProviderStatus,
-	type ChatSendResult,
-	type ChatSession,
-	type ChatSessionSummary,
-	type ChatTransport,
-	type ChatTransportEvent,
-	type ChatTransportListener,
-	DEFAULT_PROVIDER_ENDPOINT,
+import type { CreateProviderInput, UpdateProviderInput } from "@moshu/contracts";
+import type {
+	AvailableModel,
+	ChatMessage,
+	ChatSendResult,
+	ChatSession,
+	ChatSessionSummary,
+	ChatTransport,
+	ChatTransportEvent,
+	ChatTransportListener,
+	DefaultModelSelection,
+	ProviderConnectionTestResult,
+	ProviderSummary,
+	SessionModelSelection,
 } from "./transport";
 
 interface PendingPreviewResponse {
@@ -19,16 +21,12 @@ interface PendingPreviewResponse {
 }
 
 export function createPreviewChatTransport(): ChatTransport {
-	let providerStatus: ChatProviderStatus = {
-		configured: false,
-		endpoint: DEFAULT_PROVIDER_ENDPOINT,
-		model: "",
-		askMode: "Ask",
-	};
+	const providers: ProviderSummary[] = [];
+	let defaultModel: DefaultModelSelection | undefined;
 	let nextSessionNumber = 1;
 	let nextMessageNumber = 1;
 	let nextRequestNumber = 1;
-	let providerApiKey: string | undefined;
+	let nextProviderNumber = 1;
 	const listeners = new Set<ChatTransportListener>();
 	const sessions = new Map<string, ChatSession>();
 	const pendingResponses = new Map<string, PendingPreviewResponse>();
@@ -50,10 +48,19 @@ export function createPreviewChatTransport(): ChatTransport {
 		}
 	}
 
-	function requireConfiguredProvider() {
-		if (!providerStatus.configured) {
-			throw new Error("Configure an OpenAI-compatible provider before sending messages.");
+	function requireConfiguredProvider(): SessionModelSelection {
+		if (defaultModel === undefined) {
+			throw new Error("Configure a Provider and select a model before sending messages.");
 		}
+		return defaultModel;
+	}
+
+	function requireProvider(providerId: string): ProviderSummary {
+		const provider = providers.find((candidate) => candidate.id === providerId);
+		if (provider === undefined) {
+			throw new Error(`Provider ${providerId} was not found.`);
+		}
+		return provider;
 	}
 
 	function requireNoPendingResponse(sessionId?: string) {
@@ -100,7 +107,7 @@ export function createPreviewChatTransport(): ChatTransport {
 		messageId: string,
 		userPrompt: string,
 	) {
-		const response = buildPreviewResponse(userPrompt, providerStatus.model);
+		const response = buildPreviewResponse(userPrompt, defaultModel?.modelId ?? "preview-model");
 		const chunks = splitIntoChunks(response);
 		const timers = chunks.map((chunk, index) =>
 			window.setTimeout(
@@ -150,93 +157,134 @@ export function createPreviewChatTransport(): ChatTransport {
 	}
 
 	return {
-		async getProviderStatus() {
-			return { ...providerStatus };
+		async listProviders() {
+			return providers.map((provider) => structuredClone(provider));
 		},
-		async configureProvider(input: ChatProviderConfiguration) {
-			requireNoPendingResponse();
-			if (!input.endpoint.trim()) {
-				throw new Error("Endpoint is required.");
-			}
-			if (!URL.canParse(input.endpoint.trim())) {
-				throw new Error("Endpoint must be a valid URL.");
-			}
-			if (!input.model.trim()) {
-				throw new Error("Model is required.");
-			}
-			if (!input.apiKey?.trim() && providerApiKey === undefined) {
-				throw new Error("API key is required.");
-			}
-			if (
-				!input.apiKey?.trim() &&
-				providerStatus.configured &&
-				new URL(providerStatus.endpoint).origin !== new URL(input.endpoint.trim()).origin
-			) {
-				throw new Error("A new API key is required for a different Endpoint origin.");
-			}
-			providerApiKey = input.apiKey?.trim() || providerApiKey;
-
-			providerStatus = {
-				configured: true,
-				endpoint: input.endpoint.trim(),
-				model: input.model.trim(),
-				askMode: "Ask",
-				...(providerApiKey === undefined
-					? {}
-					: {
-							apiKeyMask: `********${providerApiKey.length > 4 ? providerApiKey.slice(-4) : ""}`,
-						}),
+		async createProvider(input: CreateProviderInput) {
+			const provider: ProviderSummary = {
+				schemaVersion: 1,
+				id: `preview-provider-${nextProviderNumber}`,
+				displayName: input.displayName,
+				type: input.type,
+				baseUrl: input.baseUrl,
+				enabled: true,
+				apiKeyMask: `••••••••${input.apiKey.slice(-4)}`,
+				customHeaderNames: Object.keys(input.customHeaders ?? {}).sort(),
+				models: [],
 			};
-
-			return { ...providerStatus };
+			nextProviderNumber += 1;
+			providers.push(provider);
+			return structuredClone(provider);
 		},
-		async testProvider(
-			input: ChatProviderConfiguration,
-		): Promise<ChatProviderConnectionTestResult> {
-			if (
-				!input.endpoint.trim() ||
-				!URL.canParse(input.endpoint.trim()) ||
-				!input.model.trim() ||
-				(!input.apiKey?.trim() && providerApiKey === undefined)
-			) {
-				return {
-					ok: false,
-					latencyMs: 0,
-					errorMessage: "Endpoint, model, and API key are required.",
-				};
+		async updateProvider(input: UpdateProviderInput) {
+			const provider = requireProvider(input.providerId);
+			if (input.displayName !== undefined) {
+				provider.displayName = input.displayName;
 			}
-			if (
-				!input.apiKey?.trim() &&
-				providerStatus.configured &&
-				new URL(providerStatus.endpoint).origin !== new URL(input.endpoint.trim()).origin
-			) {
-				return {
-					ok: false,
-					latencyMs: 0,
-					errorMessage: "A new API key is required for a different Endpoint origin.",
-				};
+			if (input.type !== undefined) {
+				provider.type = input.type;
 			}
+			if (input.baseUrl !== undefined) {
+				provider.baseUrl = input.baseUrl;
+			}
+			if (input.apiKey !== undefined) {
+				provider.apiKeyMask = `••••••••${input.apiKey.slice(-4)}`;
+			}
+			if (input.customHeaders !== undefined) {
+				provider.customHeaderNames = Object.keys(input.customHeaders).sort();
+			}
+			if (input.enabled !== undefined) {
+				provider.enabled = input.enabled;
+			}
+			return structuredClone(provider);
+		},
+		async deleteProvider(providerId: string) {
+			requireNoPendingResponse();
+			const index = providers.findIndex((provider) => provider.id === providerId);
+			if (index >= 0) {
+				providers.splice(index, 1);
+			}
+			if (defaultModel?.providerId === providerId) {
+				defaultModel = undefined;
+			}
+		},
+		async testProvider(): Promise<ProviderConnectionTestResult> {
 			return { ok: true, latencyMs: 12 };
 		},
-		async deleteProvider() {
-			requireNoPendingResponse();
-			providerApiKey = undefined;
-			providerStatus = {
-				configured: false,
-				endpoint: DEFAULT_PROVIDER_ENDPOINT,
-				model: "",
-				askMode: "Ask",
-			};
-			return { ...providerStatus };
+		async fetchProviderModels(providerId: string) {
+			const provider = requireProvider(providerId);
+			const enabled = new Set(provider.models.filter((model) => model.enabled).map((m) => m.id));
+			provider.models = previewCatalog(provider.type).map((model) => ({
+				...model,
+				enabled: enabled.has(model.id),
+			}));
+			provider.modelsFetchedAt = new Date().toISOString();
+			return structuredClone(provider);
 		},
-		async createSession() {
-			requireConfiguredProvider();
+		async setProviderModelsEnabled(providerId: string, enabledModelIds: string[]) {
+			const provider = requireProvider(providerId);
+			const enabled = new Set(enabledModelIds);
+			provider.models = provider.models.map((model) => ({
+				...model,
+				enabled: enabled.has(model.id),
+			}));
+			if (defaultModel?.providerId === providerId && !enabled.has(defaultModel.modelId)) {
+				defaultModel = undefined;
+			}
+			return structuredClone(provider);
+		},
+		async listAvailableModels() {
+			const models: AvailableModel[] = [];
+			for (const provider of providers) {
+				if (!provider.enabled) {
+					continue;
+				}
+				for (const model of provider.models) {
+					if (!model.enabled) {
+						continue;
+					}
+					models.push({
+						providerId: provider.id,
+						providerDisplayName: provider.displayName,
+						providerType: provider.type,
+						model: structuredClone(model),
+						reasoning:
+							model.reasoningEfforts === undefined
+								? { kind: "none" }
+								: { kind: "effort", levels: [...model.reasoningEfforts] },
+					});
+				}
+			}
+			return {
+				models,
+				...(defaultModel === undefined ? {} : { defaultModel: structuredClone(defaultModel) }),
+			};
+		},
+		async getDefaultModel() {
+			return defaultModel === undefined ? undefined : structuredClone(defaultModel);
+		},
+		async setDefaultModel(selection: DefaultModelSelection | null) {
+			defaultModel = selection === null ? undefined : structuredClone(selection);
+			return defaultModel === undefined ? undefined : structuredClone(defaultModel);
+		},
+		async setSessionModel(sessionId: string, selection: SessionModelSelection | null) {
+			const session = getStoredSession(sessionId);
+			if (selection === null) {
+				delete session.model;
+				return undefined;
+			}
+			session.model = structuredClone(selection);
+			return structuredClone(selection);
+		},
+
+		async createSession(model?: SessionModelSelection) {
+			const selection = model ?? requireConfiguredProvider();
 			const session: ChatSession = {
 				id: `preview-session-${nextSessionNumber}`,
 				title: "New chat",
 				updatedAt: new Date().toISOString(),
-				model: providerStatus.model,
-				askMode: providerStatus.askMode,
+				model: structuredClone(selection),
+				askMode: "Ask",
 				messages: [],
 			};
 			nextSessionNumber += 1;
@@ -396,4 +444,32 @@ function splitIntoChunks(response: string) {
 	}
 
 	return chunks.length > 0 ? chunks : [response];
+}
+
+function previewCatalog(type: ProviderSummary["type"]): ProviderSummary["models"] {
+	if (type === "anthropic-compatible") {
+		return [
+			{
+				id: "claude-opus-4.6",
+				enabled: false,
+				displayName: "Claude Opus 4.6",
+				contextWindowTokens: 200_000,
+				maxOutputTokens: 64_000,
+				supportedEndpoints: ["/v1/messages"],
+			},
+		];
+	}
+
+	return [
+		{
+			id: "gpt-5.5",
+			enabled: false,
+			displayName: "GPT-5.5",
+			contextWindowTokens: 272_000,
+			maxOutputTokens: 128_000,
+			supportedEndpoints: ["/chat/completions", "/responses"],
+			reasoningEfforts: ["none", "low", "medium", "high", "xhigh"],
+		},
+		{ id: "gpt-4.1-mini", enabled: false, displayName: "GPT-4.1 mini" },
+	];
 }

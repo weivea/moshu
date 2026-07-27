@@ -3218,6 +3218,7 @@ function createAcceptedPayload(
 				schemaVersion: 1,
 				providerId: "01984df0-cf16-7df0-8a4a-a1fc9dc9299d",
 				name: "OpenAI",
+				type: "openai-compatible",
 				baseUrl: "https://api.openai.com/v1",
 				model: "gpt-4.1-mini",
 				status: "ready",

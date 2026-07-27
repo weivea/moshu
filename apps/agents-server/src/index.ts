@@ -14,7 +14,10 @@ import { type CreateAgentsServerOptions, createAgentsServer } from "./create-age
 const PROCESS_VERSION = "0.0.1";
 
 export async function runAgentsServerProcess(
-	options: Pick<CreateAgentsServerOptions, "createRuntime" | "testProviderConnection"> = {},
+	options: Pick<
+		CreateAgentsServerOptions,
+		"createRuntime" | "testProviderConnection" | "fetchProviderModels"
+	> = {},
 ): Promise<void> {
 	const controlChannel = await openBootstrapControlChannel(Bun.stdin.stream());
 	const bootstrap = parseAgentsServerBootstrapRecord(controlChannel.input);

@@ -1,4 +1,10 @@
-import { AskChatRuntimeError, probeAgentRuntime } from "@moshu/agent-runtime";
+import {
+	AskChatRuntimeError,
+	ProviderCapacityError,
+	ProviderModelNotFoundError,
+	ProviderNotFoundError,
+	probeAgentRuntime,
+} from "@moshu/agent-runtime";
 import {
 	agentsProductEventMethods,
 	agentsRuntimeInfoSchema,
@@ -30,6 +36,7 @@ import { ZodError, type ZodType, type z } from "zod";
 
 import type { ChatApplicationService } from "./chat-application-service";
 import type { ExecutorReadiness } from "./executor-readiness";
+import { ProviderCatalogError } from "./provider-catalog";
 
 export interface ProductRpcDependencies {
 	chatService: ChatApplicationService;
@@ -166,21 +173,45 @@ export function createProductRpcHandlers(dependencies: ProductRpcDependencies): 
 						executor: executorReadiness.getInfo(),
 					}),
 			),
-			[productRpcMethods.providerStatus]: createRequestHandler(
-				productRpcRequestSchemas[productRpcMethods.providerStatus],
-				() => chatService.getProviderStatus(),
+			[productRpcMethods.providersList]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.providersList],
+				() => chatService.listProviders(),
 			),
-			[productRpcMethods.providerConfigure]: createRequestHandler(
-				productRpcRequestSchemas[productRpcMethods.providerConfigure],
-				(input) => chatService.configureProvider(input),
+			[productRpcMethods.providersCreate]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.providersCreate],
+				(input) => chatService.createProvider(input),
 			),
-			[productRpcMethods.providerTest]: createRequestHandler(
-				productRpcRequestSchemas[productRpcMethods.providerTest],
+			[productRpcMethods.providersUpdate]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.providersUpdate],
+				(input) => chatService.updateProvider(input),
+			),
+			[productRpcMethods.providersDelete]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.providersDelete],
+				(input) => chatService.deleteProvider(input),
+			),
+			[productRpcMethods.providersTest]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.providersTest],
 				(input) => chatService.testProvider(input),
 			),
-			[productRpcMethods.providerDelete]: createRequestHandler(
-				productRpcRequestSchemas[productRpcMethods.providerDelete],
-				() => chatService.deleteProvider(),
+			[productRpcMethods.providersFetchModels]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.providersFetchModels],
+				(input) => chatService.fetchProviderModels(input),
+			),
+			[productRpcMethods.providersSetModelsEnabled]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.providersSetModelsEnabled],
+				(input) => chatService.setProviderModelsEnabled(input),
+			),
+			[productRpcMethods.modelsListAvailable]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.modelsListAvailable],
+				() => chatService.listAvailableModels(),
+			),
+			[productRpcMethods.defaultModelGet]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.defaultModelGet],
+				() => chatService.getDefaultModel(),
+			),
+			[productRpcMethods.defaultModelSet]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.defaultModelSet],
+				(input) => chatService.setDefaultModel(input),
 			),
 			[productRpcMethods.sessionCreate]: createRequestHandler(
 				productRpcRequestSchemas[productRpcMethods.sessionCreate],
@@ -201,6 +232,10 @@ export function createProductRpcHandlers(dependencies: ProductRpcDependencies): 
 			[productRpcMethods.sessionArchive]: createRequestHandler(
 				productRpcRequestSchemas[productRpcMethods.sessionArchive],
 				(input) => chatService.setSessionArchived(input),
+			),
+			[productRpcMethods.sessionSetModel]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.sessionSetModel],
+				(input) => chatService.setSessionModel(input),
 			),
 			[productRpcMethods.sessionDelete]: createRequestHandler(
 				productRpcRequestSchemas[productRpcMethods.sessionDelete],
@@ -315,6 +350,18 @@ function rethrowProductHandlerError(error: unknown): never {
 	}
 	if (error instanceof ChatSessionNotFoundError) {
 		throw new RpcHandlerError("SESSION_NOT_FOUND", "The chat Session was not found.");
+	}
+	if (error instanceof ProviderNotFoundError) {
+		throw new RpcHandlerError("PROVIDER_NOT_FOUND", "The Provider was not found.");
+	}
+	if (error instanceof ProviderModelNotFoundError) {
+		throw new RpcHandlerError("PROVIDER_MODEL_NOT_FOUND", "The Provider model was not found.");
+	}
+	if (error instanceof ProviderCapacityError) {
+		throw new RpcHandlerError("PROVIDER_CAPACITY", error.message);
+	}
+	if (error instanceof ProviderCatalogError) {
+		throw new RpcHandlerError("PROVIDER_MODEL_LIST_FAILED", error.message);
 	}
 	if (error instanceof SessionCreateKeyConflictError) {
 		throw new RpcHandlerError(

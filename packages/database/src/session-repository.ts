@@ -19,10 +19,15 @@ import {
 	listChatSessionsOutputSchema,
 	type ProcessPeerIdentity,
 	processPeerIdentitySchema,
+	type SessionModelSelection,
 	type SetChatSessionArchivedInput,
 	type SetChatSessionArchivedOutput,
+	type SetChatSessionModelInput,
+	type SetChatSessionModelOutput,
 	setChatSessionArchivedInputSchema,
 	setChatSessionArchivedOutputSchema,
+	setChatSessionModelInputSchema,
+	setChatSessionModelOutputSchema,
 	type UpdateChatSessionInput,
 	type UpdateChatSessionOutput,
 	updateChatSessionInputSchema,
@@ -79,11 +84,42 @@ export interface SessionRepository {
 	get(input: GetChatSessionInput): ChatSession;
 	update(input: UpdateChatSessionInput): UpdateChatSessionOutput;
 	setArchived(input: SetChatSessionArchivedInput): SetChatSessionArchivedOutput;
+	setModel(input: SetChatSessionModelInput): SetChatSessionModelOutput;
 	delete(input: DeleteChatSessionInput): DeleteChatSessionOutput;
 }
 
 function toIsoDateTime(epochMs: number): string {
 	return new Date(epochMs).toISOString();
+}
+
+function buildSessionModel(row: SessionRow): SessionModelSelection | undefined {
+	if (row.providerId === null || row.modelId === null) {
+		return undefined;
+	}
+	const reasoning = {
+		...(row.reasoningEffort === null ? {} : { effort: row.reasoningEffort }),
+		...(row.reasoningBudgetTokens === null ? {} : { budgetTokens: row.reasoningBudgetTokens }),
+	};
+
+	return {
+		providerId: row.providerId,
+		modelId: row.modelId,
+		...(Object.keys(reasoning).length === 0 ? {} : { reasoning }),
+	};
+}
+
+function toModelColumns(model: SessionModelSelection | null): {
+	providerId: string | null;
+	modelId: string | null;
+	reasoningEffort: string | null;
+	reasoningBudgetTokens: number | null;
+} {
+	return {
+		providerId: model === null ? null : model.providerId,
+		modelId: model === null ? null : model.modelId,
+		reasoningEffort: model?.reasoning?.effort ?? null,
+		reasoningBudgetTokens: model?.reasoning?.budgetTokens ?? null,
+	};
 }
 
 function buildSession(row: SessionRow): ChatSession {
@@ -92,6 +128,7 @@ function buildSession(row: SessionRow): ChatSession {
 		id: row.id,
 		title: row.title,
 		defaultMode: row.defaultMode,
+		model: buildSessionModel(row),
 		createdAt: toIsoDateTime(row.createdAtMs),
 		updatedAt: toIsoDateTime(row.updatedAtMs),
 		lastMessageAt: row.lastMessageAtMs === null ? undefined : toIsoDateTime(row.lastMessageAtMs),
@@ -113,6 +150,7 @@ export class SqliteSessionRepository implements SessionRepository {
 			id: this.idGenerator.create(nowMs),
 			title: parsedInput.title,
 			defaultMode: parsedInput.defaultMode ?? "ask",
+			...toModelColumns(parsedInput.model ?? null),
 			createdAtMs: nowMs,
 			updatedAtMs: nowMs,
 			lastMessageAtMs: null,
@@ -172,6 +210,7 @@ export class SqliteSessionRepository implements SessionRepository {
 				id: this.idGenerator.create(nowMs),
 				title: request.title,
 				defaultMode: request.defaultMode,
+				...toModelColumns(request.model ?? null),
 				createdAtMs: nowMs,
 				updatedAtMs: nowMs,
 				lastMessageAtMs: null,
@@ -250,6 +289,20 @@ export class SqliteSessionRepository implements SessionRepository {
 			.run();
 
 		return setChatSessionArchivedOutputSchema.parse({
+			session: buildSession(this.selectRow(parsedInput.sessionId)),
+		});
+	}
+
+	setModel(input: SetChatSessionModelInput): SetChatSessionModelOutput {
+		const parsedInput = setChatSessionModelInputSchema.parse(input);
+		this.selectRow(parsedInput.sessionId);
+		this.orm
+			.update(chatSessionsTable)
+			.set({ ...toModelColumns(parsedInput.model), updatedAtMs: this.clock.now() })
+			.where(eq(chatSessionsTable.id, parsedInput.sessionId))
+			.run();
+
+		return setChatSessionModelOutputSchema.parse({
 			session: buildSession(this.selectRow(parsedInput.sessionId)),
 		});
 	}

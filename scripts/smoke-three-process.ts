@@ -14,16 +14,22 @@ import {
 	type ChatRunEvent,
 	cancelChatRunInputSchema,
 	cancelChatRunOutputSchema,
-	chatProviderStatusSchema,
 	chatRunEventSchema,
 	chatSendAcceptedOutputSchema,
-	configureChatProviderInputSchema,
+	createProviderInputSchema,
 	emptyParamsSchema,
+	fetchProviderModelsInputSchema,
+	fetchProviderModelsOutputSchema,
 	getChatSessionPageInputSchema,
 	getChatSessionPageOutputSchema,
 	maxAppErrorSafeMessageCharacters,
 	productRpcMethods,
+	providerMutationOutputSchema,
 	sendAskChatMessageInputSchema,
+	setDefaultModelInputSchema,
+	setDefaultModelOutputSchema,
+	setProviderModelsEnabledInputSchema,
+	setProviderModelsEnabledOutputSchema,
 } from "../packages/contracts/src";
 import { createUuidV7 } from "../packages/database/src";
 import {
@@ -141,19 +147,46 @@ try {
 		generation: 0,
 	});
 
-	const providerStatus = await agentsClient.request(
-		productRpcMethods.providerConfigure,
+	const created_provider = await agentsClient.request(
+		productRpcMethods.providersCreate,
 		{
 			schemaVersion: 1,
+			displayName: "Smoke provider",
+			type: "openai-compatible",
 			baseUrl: "https://smoke.invalid/v1",
-			model: "smoke-model",
 			apiKey: "smoke-secret",
 		},
-		configureChatProviderInputSchema,
-		chatProviderStatusSchema,
+		createProviderInputSchema,
+		providerMutationOutputSchema,
 	);
-	if (!providerStatus.configured) {
-		throw new Error("Smoke Provider was not configured.");
+	if (JSON.stringify(created_provider).includes("smoke-secret")) {
+		throw new Error("Provider RPC output leaked the API key.");
+	}
+	const providerId = created_provider.provider.id;
+	const withModels = await agentsClient.request(
+		productRpcMethods.providersFetchModels,
+		{ schemaVersion: 1, providerId },
+		fetchProviderModelsInputSchema,
+		fetchProviderModelsOutputSchema,
+	);
+	const smokeModelId = withModels.provider.models[0]?.id;
+	if (smokeModelId === undefined) {
+		throw new Error("Smoke Provider returned no models.");
+	}
+	await agentsClient.request(
+		productRpcMethods.providersSetModelsEnabled,
+		{ schemaVersion: 1, providerId, enabledModelIds: [smokeModelId] },
+		setProviderModelsEnabledInputSchema,
+		setProviderModelsEnabledOutputSchema,
+	);
+	const defaultModel = await agentsClient.request(
+		productRpcMethods.defaultModelSet,
+		{ schemaVersion: 1, defaultModel: { providerId, modelId: smokeModelId } },
+		setDefaultModelInputSchema,
+		setDefaultModelOutputSchema,
+	);
+	if (defaultModel.defaultModel?.modelId !== smokeModelId) {
+		throw new Error("Smoke default model was not stored.");
 	}
 
 	const events: ChatRunEvent[] = [];

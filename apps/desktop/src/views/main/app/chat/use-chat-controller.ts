@@ -1,14 +1,14 @@
+import type { AvailableModel, DefaultModelSelection, ReasoningSelection } from "@moshu/contracts";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { type MessageKey, useI18n } from "../i18n";
 import { useChatSessionRecovery } from "./session-recovery-coordinator";
-import {
-	type ChatMessage,
-	type ChatProviderStatus,
-	type ChatSession,
-	type ChatSessionSummary,
-	type ChatTransport,
-	type ChatTransportEvent,
-	DEFAULT_PROVIDER_ENDPOINT,
+import type {
+	ChatMessage,
+	ChatSession,
+	ChatSessionSummary,
+	ChatTransport,
+	ChatTransportEvent,
+	SessionModelSelection,
 } from "./transport";
 
 interface UseChatControllerOptions {
@@ -52,7 +52,9 @@ export function useChatController({
 		sessionId,
 	);
 	const { t } = useI18n();
-	const [providerStatus, setProviderStatus] = useState<ChatProviderStatus | null>(null);
+	const [availableModels, setAvailableModels] = useState<AvailableModel[]>([]);
+	const [defaultModel, setDefaultModel] = useState<DefaultModelSelection | null>(null);
+	const [pendingModel, setPendingModel] = useState<SessionModelSelection | null>(null);
 	const [isProviderLoading, setIsProviderLoading] = useState(true);
 	const [providerError, setProviderError] = useState<string | null>(null);
 	const [session, setSession] = useState<ChatSession | null>(providedSession ?? null);
@@ -363,22 +365,24 @@ export function useChatController({
 		setAnnouncement(t("chat.status.loadingProvider"));
 
 		try {
-			const nextStatus = await transport.getProviderStatus();
+			const output = await transport.listAvailableModels();
 			if (providerLoadToken.current !== loadToken) {
 				return;
 			}
 
-			setProviderStatus(nextStatus);
+			setAvailableModels(output.models);
+			setDefaultModel(output.defaultModel ?? null);
 			setAnnouncement(
-				nextStatus.configured ? t("chat.status.providerReady") : t("chat.status.providerNeeded"),
+				output.models.length > 0 ? t("chat.status.providerReady") : t("chat.status.providerNeeded"),
 			);
 		} catch (error) {
 			if (providerLoadToken.current !== loadToken) {
 				return;
 			}
 
-			setProviderStatus(null);
-			setProviderError(getErrorMessage(error, t("chat.error.providerStatus")));
+			setAvailableModels([]);
+			setDefaultModel(null);
+			setProviderError(getErrorMessage(error, t("model.error.load")));
 			setAnnouncement(t("chat.status.providerFailed"));
 		} finally {
 			if (providerLoadToken.current === loadToken) {
@@ -450,14 +454,49 @@ export function useChatController({
 		sessionRecoveryCoordinator,
 	]);
 
-	const hasConfiguredProvider = providerStatus?.configured ?? false;
+	const hasConfiguredProvider = availableModels.length > 0;
+	/**
+	 * A chat runs against its own selection, falling back to the global default. Before the
+	 * Session exists the picker edits a pending selection that is handed to `createSession`.
+	 */
+	const modelSelection = useMemo(
+		() => session?.model ?? pendingModel ?? defaultModel ?? undefined,
+		[defaultModel, pendingModel, session?.model],
+	);
+	const selectedModel = useMemo(
+		() => resolveSelectedModel(availableModels, modelSelection),
+		[availableModels, modelSelection],
+	);
 	const meta = useMemo(
 		() => ({
-			model: session?.model || providerStatus?.model || t("chat.meta.pending"),
-			askMode: session?.askMode || providerStatus?.askMode || t("chat.meta.pending"),
-			endpoint: providerStatus?.endpoint || DEFAULT_PROVIDER_ENDPOINT,
+			model: selectedModel?.model.displayName ?? selectedModel?.model.id ?? t("chat.meta.pending"),
+			askMode: session?.askMode ?? "Ask",
+			endpoint: selectedModel?.providerDisplayName ?? t("chat.meta.pending"),
 		}),
-		[providerStatus?.askMode, providerStatus?.endpoint, providerStatus?.model, session, t],
+		[selectedModel, session?.askMode, t],
+	);
+
+	const changeSessionModel = useCallback(
+		async (selection: SessionModelSelection | null) => {
+			const targetSessionId = session?.id ?? sessionId;
+			if (targetSessionId === undefined) {
+				setPendingModel(selection);
+				return;
+			}
+			try {
+				const stored = await transport.setSessionModel(targetSessionId, selection);
+				setSession((current) =>
+					current === null || current.id !== targetSessionId
+						? current
+						: stored === undefined
+							? { ...current, model: undefined }
+							: { ...current, model: stored },
+				);
+			} catch (error) {
+				setNotice({ tone: "danger", message: getErrorMessage(error, t("model.error.save")) });
+			}
+		},
+		[session?.id, sessionId, t, transport],
 	);
 
 	const canSend =
@@ -504,7 +543,7 @@ export function useChatController({
 				let activeSession = session;
 				let createdSession = false;
 				if (!activeSession) {
-					activeSession = await transport.createSession();
+					activeSession = await transport.createSession(modelSelection);
 					if (
 						sendGenerationRef.current !== sendGeneration ||
 						activeSessionIdRef.current !== startingSessionId
@@ -620,6 +659,7 @@ export function useChatController({
 			draft,
 			hasConfiguredProvider,
 			isSessionLoading,
+			modelSelection,
 			onSessionChange,
 			session,
 			sessionId,
@@ -688,7 +728,10 @@ export function useChatController({
 
 	return {
 		announcement,
+		availableModels,
 		canSend,
+		changeSessionModel,
+		modelSelection,
 		draft,
 		hasConfiguredProvider,
 		isProviderLoading,
@@ -699,8 +742,8 @@ export function useChatController({
 		meta,
 		notice,
 		providerError,
-		providerStatus,
 		reloadProviderStatus: loadProviderStatus,
+		selectedModel,
 		retryNoticeAction,
 		sendMessage,
 		session,
@@ -710,6 +753,18 @@ export function useChatController({
 			setSession((currentSession) => mergeSessionSummary(currentSession, updatedSession));
 		},
 	};
+}
+
+function resolveSelectedModel(
+	models: readonly AvailableModel[],
+	selection: { providerId: string; modelId: string; reasoning?: ReasoningSelection } | undefined,
+): AvailableModel | undefined {
+	if (selection === undefined) {
+		return undefined;
+	}
+	return models.find(
+		(entry) => entry.providerId === selection.providerId && entry.model.id === selection.modelId,
+	);
 }
 
 function mergeSessionSummary(

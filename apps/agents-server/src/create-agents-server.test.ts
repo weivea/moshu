@@ -160,7 +160,29 @@ describe("createAgentsServer", () => {
 				checkpoint.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version,
 			).toBe(1);
 			checkpoint.close();
-			expect(readFileSync(bootstrap.paths.providerConfig, "utf8")).toBe(providerDocument);
+			// The coordinated reset leaves the Provider store untouched; constructing the registry
+			// then migrates the legacy v1 document in place while preserving its credentials.
+			const migratedProviderConfig = JSON.parse(
+				readFileSync(bootstrap.paths.providerConfig, "utf8"),
+			) as {
+				schemaVersion: number;
+				providers: Array<{
+					apiKey: string;
+					baseUrl: string;
+					type: string;
+					models: Array<{ id: string; enabled: boolean }>;
+				}>;
+				defaultModel?: { modelId: string };
+			};
+			expect(migratedProviderConfig.schemaVersion).toBe(3);
+			expect(migratedProviderConfig.providers).toHaveLength(1);
+			expect(migratedProviderConfig.providers[0]?.apiKey).toBe("sk-preserved");
+			expect(migratedProviderConfig.providers[0]?.baseUrl).toBe("https://api.openai.com/v1");
+			expect(migratedProviderConfig.providers[0]?.type).toBe("openai-compatible");
+			expect(migratedProviderConfig.providers[0]?.models).toEqual([
+				{ id: "gpt-4.1-mini", enabled: true },
+			]);
+			expect(migratedProviderConfig.defaultModel?.modelId).toBe("gpt-4.1-mini");
 			expect(diagnostics).toEqual([
 				"Reset local product and checkpoint stores (product-schema-cutover, previous product schema 6).",
 			]);

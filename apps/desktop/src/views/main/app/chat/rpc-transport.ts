@@ -3,14 +3,28 @@ import type {
 	ChatRunEvent,
 	ChatSendAcceptedOutput,
 	ChatMessage as ContractChatMessage,
-	ChatProviderStatus as ContractChatProviderStatus,
 	CreateChatSessionOutput,
+	CreateProviderInput,
 	DeleteChatSessionOutput,
+	DeleteProviderOutput,
+	FetchProviderModelsOutput,
 	GetChatSessionSnapshotOutput,
+	GetDefaultModelOutput,
+	ListAvailableModelsOutput,
 	ListChatSessionsOutput,
+	ListProvidersOutput,
+	ProviderMutationOutput,
 	SetChatSessionArchivedOutput,
-	TestChatProviderOutput,
+	SetChatSessionModelInput,
+	SetChatSessionModelOutput,
+	SetDefaultModelInput,
+	SetDefaultModelOutput,
+	SetProviderModelsEnabledInput,
+	SetProviderModelsEnabledOutput,
+	TestProviderInput,
+	TestProviderOutput,
 	UpdateChatSessionOutput,
+	UpdateProviderInput,
 } from "@moshu/contracts";
 import { AgentsUnavailableError, ChatSessionNotFoundError } from "../../../../shared/rpc-errors";
 import {
@@ -18,10 +32,8 @@ import {
 	SessionRetirementCapacityError,
 } from "../../../../shared/session-retirement-cache";
 import type {
+	AvailableModel,
 	ChatMessage,
-	ChatProviderConfiguration,
-	ChatProviderConnectionTestResult,
-	ChatProviderStatus,
 	ChatSession,
 	ChatSessionInvalidation,
 	ChatSessionInvalidationSubscriptionOptions,
@@ -29,25 +41,28 @@ import type {
 	ChatTransport,
 	ChatTransportEvent,
 	ChatTransportListener,
+	DefaultModelSelection,
+	ProviderConnectionTestResult,
+	ProviderSummary,
+	SessionModelSelection,
 } from "./transport";
 
 export interface RpcChatClient {
 	subscribeAgentsReady?(listener: () => void): () => void;
-	getChatProviderStatus(): Promise<ContractChatProviderStatus>;
-	configureChatProvider(input: {
-		schemaVersion: 1;
-		baseUrl: string;
-		model: string;
-		apiKey?: string;
-	}): Promise<ContractChatProviderStatus>;
-	testChatProvider(input: {
-		schemaVersion: 1;
-		baseUrl: string;
-		model: string;
-		apiKey?: string;
-	}): Promise<TestChatProviderOutput>;
-	deleteChatProvider(): Promise<ContractChatProviderStatus>;
-	createChatSession(): Promise<CreateChatSessionOutput>;
+	listProviders(): Promise<ListProvidersOutput>;
+	createProvider(input: CreateProviderInput): Promise<ProviderMutationOutput>;
+	updateProvider(input: UpdateProviderInput): Promise<ProviderMutationOutput>;
+	deleteProvider(providerId: string): Promise<DeleteProviderOutput>;
+	testProvider(input: TestProviderInput): Promise<TestProviderOutput>;
+	fetchProviderModels(providerId: string): Promise<FetchProviderModelsOutput>;
+	setProviderModelsEnabled(
+		input: SetProviderModelsEnabledInput,
+	): Promise<SetProviderModelsEnabledOutput>;
+	listAvailableModels(): Promise<ListAvailableModelsOutput>;
+	getDefaultModel(): Promise<GetDefaultModelOutput>;
+	setDefaultModel(input: SetDefaultModelInput): Promise<SetDefaultModelOutput>;
+	setChatSessionModel(input: SetChatSessionModelInput): Promise<SetChatSessionModelOutput>;
+	createChatSession(model?: SessionModelSelection): Promise<CreateChatSessionOutput>;
 	getChatSession(sessionId: string): Promise<GetChatSessionSnapshotOutput>;
 	listChatSessions(input?: {
 		query?: string;
@@ -86,7 +101,6 @@ export function createRpcChatTransport(
 	const activeRequests = new Map<string, ActiveRequest>();
 	const retiredSessions = new SessionRetirementCache<undefined>({ now: options.now });
 	let backpressuredRetirementSessionId: string | undefined;
-	let providerStatus: ChatProviderStatus | undefined;
 	const assertSessionSnapshotAllowed = (sessionId: string): void => {
 		if (backpressuredRetirementSessionId !== undefined) {
 			throw new AgentsUnavailableError("The renderer retirement cache is at capacity.");
@@ -119,49 +133,74 @@ export function createRpcChatTransport(
 	});
 
 	return {
-		async getProviderStatus() {
-			providerStatus = mapProviderStatus(await client.getChatProviderStatus());
-			return providerStatus;
+		async listProviders(): Promise<ProviderSummary[]> {
+			return (await client.listProviders()).providers;
 		},
-		async configureProvider(input: ChatProviderConfiguration) {
-			providerStatus = mapProviderStatus(
-				await client.configureChatProvider({
-					schemaVersion: 1,
-					baseUrl: input.endpoint,
-					model: input.model,
-					...(input.apiKey === undefined ? {} : { apiKey: input.apiKey }),
-				}),
-			);
-			return providerStatus;
+		async createProvider(input: CreateProviderInput): Promise<ProviderSummary> {
+			return (await client.createProvider(input)).provider;
 		},
-		async testProvider(
-			input: ChatProviderConfiguration,
-		): Promise<ChatProviderConnectionTestResult> {
-			const result = await client.testChatProvider({
-				schemaVersion: 1,
-				baseUrl: input.endpoint,
-				model: input.model,
-				...(input.apiKey === undefined ? {} : { apiKey: input.apiKey }),
-			});
+		async updateProvider(input: UpdateProviderInput): Promise<ProviderSummary> {
+			return (await client.updateProvider(input)).provider;
+		},
+		async deleteProvider(providerId: string): Promise<void> {
+			await client.deleteProvider(providerId);
+		},
+		async testProvider(input: TestProviderInput): Promise<ProviderConnectionTestResult> {
+			const result = await client.testProvider(input);
 			return {
 				ok: result.ok,
 				latencyMs: result.latencyMs,
 				...(result.error === undefined ? {} : { errorMessage: result.error.safeMessage }),
 			};
 		},
-		async deleteProvider() {
-			providerStatus = mapProviderStatus(await client.deleteChatProvider());
-			return providerStatus;
+		async fetchProviderModels(providerId: string): Promise<ProviderSummary> {
+			return (await client.fetchProviderModels(providerId)).provider;
 		},
-		async createSession() {
-			const { session } = await client.createChatSession();
-			const status = providerStatus ?? mapProviderStatus(await client.getChatProviderStatus());
+		async setProviderModelsEnabled(
+			providerId: string,
+			enabledModelIds: string[],
+		): Promise<ProviderSummary> {
+			const output = await client.setProviderModelsEnabled({
+				schemaVersion: 1,
+				providerId,
+				enabledModelIds,
+			});
+			return output.provider;
+		},
+		async listAvailableModels(): Promise<{
+			models: AvailableModel[];
+			defaultModel?: DefaultModelSelection;
+		}> {
+			const output = await client.listAvailableModels();
+			return {
+				models: output.models,
+				...(output.defaultModel === undefined ? {} : { defaultModel: output.defaultModel }),
+			};
+		},
+		async getDefaultModel(): Promise<DefaultModelSelection | undefined> {
+			return (await client.getDefaultModel()).defaultModel;
+		},
+		async setDefaultModel(
+			selection: DefaultModelSelection | null,
+		): Promise<DefaultModelSelection | undefined> {
+			const output = await client.setDefaultModel({ schemaVersion: 1, defaultModel: selection });
+			return output.defaultModel;
+		},
+		async setSessionModel(
+			sessionId: string,
+			selection: SessionModelSelection | null,
+		): Promise<SessionModelSelection | undefined> {
+			const output = await client.setChatSessionModel({ sessionId, model: selection });
+			return output.session.model;
+		},
+		async createSession(model?: SessionModelSelection) {
+			const { session } = await client.createChatSession(model);
 			return {
 				id: session.id,
 				title: session.title,
 				updatedAt: session.updatedAt,
-				model: status.model,
-				askMode: status.askMode,
+				...(session.model === undefined ? {} : { model: session.model }),
+				askMode: "Ask",
 				messages: [],
 			};
 		},
@@ -172,7 +211,6 @@ export function createRpcChatTransport(
 			const activeRun = snapshot.runs.find(
 				(run) => run.status === "queued" || run.status === "running" || run.status === "cancelling",
 			);
-			const latestRun = snapshot.runs[0];
 			const session: ChatSession = {
 				id: snapshot.session.id,
 				title: snapshot.session.title,
@@ -180,7 +218,7 @@ export function createRpcChatTransport(
 				...(snapshot.session.archivedAt === undefined
 					? {}
 					: { archivedAt: snapshot.session.archivedAt }),
-				model: latestRun?.provider.model ?? providerStatus?.model ?? "",
+				...(snapshot.session.model === undefined ? {} : { model: snapshot.session.model }),
 				askMode: "Ask",
 				messages: snapshot.messages.map(mapMessage),
 				eventCursors: Object.fromEntries(
@@ -272,16 +310,6 @@ export function createRpcChatTransport(
 		subscribeSessionInvalidations(listener, options) {
 			return client.subscribeChatSessionInvalidations?.(listener, options) ?? (() => undefined);
 		},
-	};
-}
-
-function mapProviderStatus(status: ContractChatProviderStatus): ChatProviderStatus {
-	return {
-		configured: status.configured,
-		endpoint: status.baseUrl,
-		model: status.model,
-		askMode: "Ask",
-		...(status.apiKeyMask === undefined ? {} : { apiKeyMask: status.apiKeyMask }),
 	};
 }
 

@@ -5,8 +5,8 @@ import { ChatSessionNotFoundError } from "../../../../shared/rpc-errors";
 import { I18nProvider } from "../i18n";
 import { isRendererSessionRetired } from "./session-recovery-coordinator";
 import { SessionSidebar } from "./session-sidebar";
+import { ProviderModelTransportDefaults } from "./test-transport-defaults";
 import type {
-	ChatProviderConfiguration,
 	ChatSession,
 	ChatSessionSummary,
 	ChatTransport,
@@ -249,7 +249,7 @@ function renderSidebar(
 	);
 }
 
-class FakeSessionTransport implements ChatTransport {
+class FakeSessionTransport extends ProviderModelTransportDefaults implements ChatTransport {
 	readonly deletedSessionIds: string[] = [];
 	readonly #sessions: ChatSessionSummary[] = [
 		{
@@ -265,27 +265,6 @@ class FakeSessionTransport implements ChatTransport {
 			updatedAt: "2026-01-03T00:00:00.000Z",
 		},
 	];
-
-	async getProviderStatus() {
-		return {
-			configured: true,
-			endpoint: "https://api.openai.com/v1",
-			model: "gpt-4.1-mini",
-			askMode: "Ask",
-		};
-	}
-
-	async configureProvider(_input: ChatProviderConfiguration) {
-		return this.getProviderStatus();
-	}
-
-	async testProvider() {
-		return { ok: true, latencyMs: 1 };
-	}
-
-	async deleteProvider() {
-		return this.getProviderStatus();
-	}
 
 	async createSession(): Promise<ChatSession> {
 		throw new Error("Not used.");

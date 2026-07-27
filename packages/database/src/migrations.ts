@@ -1,6 +1,6 @@
 import type Database from "bun:sqlite";
 
-export const currentAppDatabaseVersion = 8;
+export const currentAppDatabaseVersion = 9;
 
 export class AppDatabaseResetRequiredError extends Error {
 	readonly currentVersion: number;
@@ -66,6 +66,10 @@ export function applyAppMigrations(client: Database): void {
 				id TEXT PRIMARY KEY NOT NULL,
 				title TEXT NOT NULL,
 				default_mode TEXT NOT NULL,
+				provider_id TEXT,
+				model_id TEXT,
+				reasoning_effort TEXT,
+				reasoning_budget_tokens INTEGER,
 				created_at_ms INTEGER NOT NULL,
 				updated_at_ms INTEGER NOT NULL,
 				last_message_at_ms INTEGER,

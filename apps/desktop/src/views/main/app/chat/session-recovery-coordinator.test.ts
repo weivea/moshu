@@ -5,6 +5,7 @@ import {
 	ChatSessionRecoveryCoordinator,
 	isRendererSessionRetired,
 } from "./session-recovery-coordinator";
+import { modelSelectionFor } from "./test-transport-defaults";
 import type {
 	ChatSession,
 	ChatSessionInvalidation,
@@ -348,7 +349,7 @@ function makeSession(sessionId: string): ChatSession {
 		id: sessionId,
 		title: sessionId,
 		updatedAt: "2026-01-01T00:00:00.000Z",
-		model: "gpt-5.4",
+		model: modelSelectionFor("gpt-5.4"),
 		askMode: "Ask",
 		messages: [],
 	};

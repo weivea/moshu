@@ -1,31 +1,50 @@
 import {
 	type CancelChatRunInput,
 	type CancelChatRunOutput,
-	type ChatProviderStatus,
 	type ChatRunEvent,
 	type ChatSendAcceptedOutput,
-	type ConfigureChatProviderInput,
 	type CreateChatSessionOutput,
+	type CreateProviderInput,
 	type DeleteChatSessionInput,
 	type DeleteChatSessionOutput,
+	type DeleteProviderInput,
+	type DeleteProviderOutput,
 	type EmptyParams,
+	type FetchProviderModelsInput,
+	type FetchProviderModelsOutput,
 	type GetChatSessionInput,
 	type GetChatSessionSnapshotOutput,
+	type GetDefaultModelOutput,
+	type ListAvailableModelsOutput,
 	type ListChatSessionsInput,
 	type ListChatSessionsOutput,
+	type ListProvidersOutput,
+	type ProviderMutationOutput,
 	type RuntimeInfo,
+	type SessionModelSelection,
 	type SetChatSessionArchivedInput,
 	type SetChatSessionArchivedOutput,
-	type TestChatProviderInput,
-	type TestChatProviderOutput,
+	type SetChatSessionModelInput,
+	type SetChatSessionModelOutput,
+	type SetDefaultModelInput,
+	type SetDefaultModelOutput,
+	type SetProviderModelsEnabledInput,
+	type SetProviderModelsEnabledOutput,
+	type TestProviderInput,
+	type TestProviderOutput,
 	type UpdateChatSessionInput,
 	type UpdateChatSessionOutput,
+	type UpdateProviderInput,
 	uuidV7Schema,
 } from "@moshu/contracts";
 import type { RPCSchema } from "electrobun/bun";
 import { z } from "zod";
 
 type EmptyRpcMap = Record<never, never>;
+
+export interface CreateDesktopChatSessionInput {
+	model?: SessionModelSelection;
+}
 
 export interface SendDesktopChatMessageInput {
 	requestId?: string;
@@ -67,24 +86,48 @@ export type DesktopRpc = {
 				params: EmptyParams;
 				response: RuntimeInfo;
 			};
-			getChatProviderStatus: {
+			listProviders: {
 				params: EmptyParams;
-				response: ChatProviderStatus;
+				response: ListProvidersOutput;
 			};
-			configureChatProvider: {
-				params: ConfigureChatProviderInput;
-				response: ChatProviderStatus;
+			createProvider: {
+				params: CreateProviderInput;
+				response: ProviderMutationOutput;
 			};
-			testChatProvider: {
-				params: TestChatProviderInput;
-				response: TestChatProviderOutput;
+			updateProvider: {
+				params: UpdateProviderInput;
+				response: ProviderMutationOutput;
 			};
-			deleteChatProvider: {
+			deleteProvider: {
+				params: DeleteProviderInput;
+				response: DeleteProviderOutput;
+			};
+			testProvider: {
+				params: TestProviderInput;
+				response: TestProviderOutput;
+			};
+			fetchProviderModels: {
+				params: FetchProviderModelsInput;
+				response: FetchProviderModelsOutput;
+			};
+			setProviderModelsEnabled: {
+				params: SetProviderModelsEnabledInput;
+				response: SetProviderModelsEnabledOutput;
+			};
+			listAvailableModels: {
 				params: EmptyParams;
-				response: ChatProviderStatus;
+				response: ListAvailableModelsOutput;
+			};
+			getDefaultModel: {
+				params: EmptyParams;
+				response: GetDefaultModelOutput;
+			};
+			setDefaultModel: {
+				params: SetDefaultModelInput;
+				response: SetDefaultModelOutput;
 			};
 			createChatSession: {
-				params: EmptyParams;
+				params: CreateDesktopChatSessionInput;
 				response: CreateChatSessionOutput;
 			};
 			getChatSession: {
@@ -102,6 +145,10 @@ export type DesktopRpc = {
 			setChatSessionArchived: {
 				params: SetChatSessionArchivedInput;
 				response: SetChatSessionArchivedOutput;
+			};
+			setChatSessionModel: {
+				params: SetChatSessionModelInput;
+				response: SetChatSessionModelOutput;
 			};
 			deleteChatSession: {
 				params: DeleteChatSessionInput;

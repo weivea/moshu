@@ -11,11 +11,10 @@ import { useChatController } from "./use-chat-controller";
 
 export type {
 	ChatMessage,
-	ChatProviderConfiguration,
-	ChatProviderStatus,
 	ChatSession,
 	ChatTransport,
 	ChatTransportEvent,
+	ProviderSummary,
 } from "./transport";
 
 export interface ChatPageProps {
@@ -126,7 +125,9 @@ export function ChatPage({
 					</header>
 				) : null}
 
-				{controller.isProviderLoading && !controller.providerStatus && !controller.providerError ? (
+				{controller.isProviderLoading &&
+				!controller.hasConfiguredProvider &&
+				!controller.providerError ? (
 					<p className="chat-loading" role="status">
 						{t("chat.status.loadingProvider")}
 					</p>
@@ -189,7 +190,15 @@ export function ChatPage({
 								draft={controller.draft}
 								isResponding={controller.isResponding}
 								isStopping={controller.isStopping}
+								availableModels={controller.availableModels}
+								{...(controller.selectedModel === undefined
+									? {}
+									: { selectedModel: controller.selectedModel })}
+								{...(controller.modelSelection?.reasoning === undefined
+									? {}
+									: { reasoning: controller.modelSelection.reasoning })}
 								onDraftChange={controller.setDraft}
+								onModelChange={(selection) => void controller.changeSessionModel(selection)}
 								onSend={() => void controller.sendMessage()}
 								onStop={() => void controller.stopMessage()}
 							/>

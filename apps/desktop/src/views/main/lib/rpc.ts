@@ -1,27 +1,46 @@
 import {
 	type ChatRunEvent,
-	type ConfigureChatProviderInput,
+	type CreateProviderInput,
 	cancelChatRunOutputSchema,
-	chatProviderStatusSchema,
 	chatRunEventSchema,
 	chatSendAcceptedOutputSchema,
-	configureChatProviderInputSchema,
 	createChatSessionOutputSchema,
+	createProviderInputSchema,
 	deleteChatSessionInputSchema,
 	deleteChatSessionOutputSchema,
+	deleteProviderInputSchema,
+	deleteProviderOutputSchema,
 	emptyParamsSchema,
+	fetchProviderModelsInputSchema,
+	fetchProviderModelsOutputSchema,
 	getChatSessionInputSchema,
 	getChatSessionSnapshotOutputSchema,
+	getDefaultModelOutputSchema,
+	listAvailableModelsOutputSchema,
 	listChatSessionsInputSchema,
 	listChatSessionsOutputSchema,
+	listProvidersOutputSchema,
+	providerMutationOutputSchema,
 	runtimeInfoSchema,
+	type SessionModelSelection,
+	type SetChatSessionModelInput,
+	type SetDefaultModelInput,
+	type SetProviderModelsEnabledInput,
 	setChatSessionArchivedInputSchema,
 	setChatSessionArchivedOutputSchema,
-	type TestChatProviderInput,
-	testChatProviderInputSchema,
-	testChatProviderOutputSchema,
+	setChatSessionModelInputSchema,
+	setChatSessionModelOutputSchema,
+	setDefaultModelInputSchema,
+	setDefaultModelOutputSchema,
+	setProviderModelsEnabledInputSchema,
+	setProviderModelsEnabledOutputSchema,
+	type TestProviderInput,
+	testProviderInputSchema,
+	testProviderOutputSchema,
+	type UpdateProviderInput,
 	updateChatSessionInputSchema,
 	updateChatSessionOutputSchema,
+	updateProviderInputSchema,
 	uuidV7Schema,
 } from "@moshu/contracts";
 import Electrobun, { Electroview } from "electrobun/view";
@@ -91,36 +110,78 @@ export const desktopClient = {
 	async getRuntimeInfo() {
 		return runtimeInfoSchema.parse(await requestDesktop(() => getRequest().getRuntimeInfo({})));
 	},
-	async getChatProviderStatus() {
-		return chatProviderStatusSchema.parse(
-			await requestDesktop(() => getRequest().getChatProviderStatus({})),
+	async listProviders() {
+		return listProvidersOutputSchema.parse(
+			await requestDesktop(() => getRequest().listProviders({})),
 		);
 	},
-	async configureChatProvider(input: ConfigureChatProviderInput) {
-		const parsedInput = configureChatProviderInputSchema.parse(input);
-		return chatProviderStatusSchema.parse(
-			await requestDesktop(() => getRequest().configureChatProvider(parsedInput)),
+	async createProvider(input: CreateProviderInput) {
+		const parsedInput = createProviderInputSchema.parse(input);
+		return providerMutationOutputSchema.parse(
+			await requestDesktop(() => getRequest().createProvider(parsedInput)),
 		);
 	},
-	async testChatProvider(input: TestChatProviderInput) {
-		const parsedInput = testChatProviderInputSchema.parse(input);
-		return testChatProviderOutputSchema.parse(
-			await requestDesktop(() => getRequest().testChatProvider(parsedInput)),
+	async updateProvider(input: UpdateProviderInput) {
+		const parsedInput = updateProviderInputSchema.parse(input);
+		return providerMutationOutputSchema.parse(
+			await requestDesktop(() => getRequest().updateProvider(parsedInput)),
 		);
 	},
-	async deleteChatProvider() {
-		return chatProviderStatusSchema.parse(
-			await requestDesktop(() => getRequest().deleteChatProvider({})),
+	async deleteProvider(providerId: string) {
+		const parsedInput = deleteProviderInputSchema.parse({ schemaVersion: 1, providerId });
+		return deleteProviderOutputSchema.parse(
+			await requestDesktop(() => getRequest().deleteProvider(parsedInput)),
 		);
 	},
-	async createChatSession() {
+	async testProvider(input: TestProviderInput) {
+		const parsedInput = testProviderInputSchema.parse(input);
+		return testProviderOutputSchema.parse(
+			await requestDesktop(() => getRequest().testProvider(parsedInput)),
+		);
+	},
+	async fetchProviderModels(providerId: string) {
+		const parsedInput = fetchProviderModelsInputSchema.parse({ schemaVersion: 1, providerId });
+		return fetchProviderModelsOutputSchema.parse(
+			await requestDesktop(() => getRequest().fetchProviderModels(parsedInput)),
+		);
+	},
+	async setProviderModelsEnabled(input: SetProviderModelsEnabledInput) {
+		const parsedInput = setProviderModelsEnabledInputSchema.parse(input);
+		return setProviderModelsEnabledOutputSchema.parse(
+			await requestDesktop(() => getRequest().setProviderModelsEnabled(parsedInput)),
+		);
+	},
+	async listAvailableModels() {
+		return listAvailableModelsOutputSchema.parse(
+			await requestDesktop(() => getRequest().listAvailableModels({})),
+		);
+	},
+	async getDefaultModel() {
+		return getDefaultModelOutputSchema.parse(
+			await requestDesktop(() => getRequest().getDefaultModel({})),
+		);
+	},
+	async setDefaultModel(input: SetDefaultModelInput) {
+		const parsedInput = setDefaultModelInputSchema.parse(input);
+		return setDefaultModelOutputSchema.parse(
+			await requestDesktop(() => getRequest().setDefaultModel(parsedInput)),
+		);
+	},
+	async setChatSessionModel(input: SetChatSessionModelInput) {
+		const parsedInput = setChatSessionModelInputSchema.parse(input);
+		return setChatSessionModelOutputSchema.parse(
+			await requestDesktop(() => getRequest().setChatSessionModel(parsedInput)),
+		);
+	},
+	async createChatSession(model?: SessionModelSelection) {
+		const input = model === undefined ? {} : { model };
 		return traceChatRpcRequest({
 			side: "web",
 			operation: "createChatSession",
-			input: {},
+			input,
 			execute: async () =>
 				createChatSessionOutputSchema.parse(
-					await requestDesktop(() => getRequest().createChatSession({})),
+					await requestDesktop(() => getRequest().createChatSession(input)),
 				),
 		});
 	},

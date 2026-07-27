@@ -4,20 +4,30 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AIMessage, AIMessageChunk, HumanMessage } from "@langchain/core/messages";
-import type { BaseCheckpointSaver } from "@langchain/langgraph-checkpoint";
 import { FakeListChatModel, FakeStreamingChatModel } from "@langchain/core/utils/testing";
+import type { BaseCheckpointSaver } from "@langchain/langgraph-checkpoint";
 import {
 	type AskAgentFactory,
 	type AskAgentStreamInput,
 	type AskAgentStreamOptions,
 	AskChatCancelledError,
-	type AskChatRuntimeOptions,
 	AskChatRuntimeError,
+	type AskChatRuntimeOptions,
 	type AskModelFactory,
 	BunSqliteSaver,
 	DeepAgentsAskChatRuntime,
-	InMemoryAskProviderConfigStore,
+	type ResolvedProviderConfiguration,
 } from "../src";
+
+const askTestProvider: ResolvedProviderConfiguration = {
+	providerId: "0192f0aa-0000-7000-8000-000000000001",
+	providerName: "Test provider",
+	type: "openai-compatible",
+	protocol: "openai-chat-completions",
+	baseUrl: "https://example.com/v1",
+	apiKey: "sk-test",
+	model: "gpt-4.1-mini",
+};
 
 describe("DeepAgentsAskChatRuntime", () => {
 	test("streams normalized deltas in order and returns final text with usage", async () => {
@@ -38,6 +48,7 @@ describe("DeepAgentsAskChatRuntime", () => {
 
 		const run = runtime.stream({
 			runId: "ordered-run",
+			provider: askTestProvider,
 			messages: [{ role: "user", content: "Say hello" }],
 			onEvent: async (event) => {
 				callbackEvents.push(event.delta);
@@ -76,6 +87,7 @@ describe("DeepAgentsAskChatRuntime", () => {
 
 		const result = await runtime.run({
 			runId: "history-run",
+			provider: askTestProvider,
 			threadId: "history-thread",
 			messages: [
 				{ role: "user", content: "Hello" },
@@ -125,6 +137,7 @@ describe("DeepAgentsAskChatRuntime", () => {
 
 		const run = runtime.stream({
 			runId: "structured-run",
+			provider: askTestProvider,
 			messages: [{ role: "user", content: "Say hello" }],
 		});
 
@@ -153,6 +166,7 @@ describe("DeepAgentsAskChatRuntime", () => {
 		await expect(
 			runtime.run({
 				runId: "empty-run",
+				provider: askTestProvider,
 				messages: [{ role: "user", content: "Respond with nothing" }],
 			}),
 		).resolves.toEqual({
@@ -178,6 +192,7 @@ describe("DeepAgentsAskChatRuntime", () => {
 			try {
 				const run = runtime.stream({
 					runId: "fake-model-run",
+					provider: askTestProvider,
 					threadId: "fake-model-thread",
 					messages: [{ role: "user", content: "Hi" }],
 				});
@@ -239,11 +254,13 @@ describe("DeepAgentsAskChatRuntime", () => {
 		try {
 			await runtime.run({
 				runId: "first-run",
+				provider: askTestProvider,
 				threadId: "persistent-thread",
 				messages: [{ role: "user", content: "First question", id: "first-message" }],
 			});
 			await runtime.run({
 				runId: "second-run",
+				provider: askTestProvider,
 				threadId: "persistent-thread",
 				messages: [{ role: "user", content: "Second question" }],
 			});
@@ -283,6 +300,7 @@ describe("DeepAgentsAskChatRuntime", () => {
 		try {
 			await runtime.run({
 				runId: "delete-run",
+				provider: askTestProvider,
 				threadId: "delete-thread",
 				messages: [{ role: "user", content: "Delete this conversation" }],
 			});
@@ -328,6 +346,7 @@ describe("DeepAgentsAskChatRuntime", () => {
 			try {
 				await firstRuntime.run({
 					runId: "persisted-run",
+					provider: askTestProvider,
 					threadId: "persisted-thread",
 					messages: [
 						{
@@ -400,20 +419,17 @@ describe("DeepAgentsAskChatRuntime", () => {
 				});
 			},
 		});
-		const store = new InMemoryAskProviderConfigStore();
-		store.set({
-			provider: "openai-compatible",
-			apiKey: "local-test-key",
-			baseUrl: `http://127.0.0.1:${server.port}/v1`,
-			model: "moshu-smoke",
-		});
-		const runtime = new DeepAgentsAskChatRuntime({
-			providerConfigStore: store,
-		});
+		const runtime = new DeepAgentsAskChatRuntime({});
 
 		try {
 			const result = await runtime.run({
 				runId: "openai-compatible-smoke",
+				provider: {
+					...askTestProvider,
+					apiKey: "local-test-key",
+					baseUrl: `http://127.0.0.1:${server.port}/v1`,
+					model: "moshu-smoke",
+				},
 				messages: [{ role: "user", content: "Say hello" }],
 			});
 
@@ -427,6 +443,87 @@ describe("DeepAgentsAskChatRuntime", () => {
 			expect(JSON.stringify(observedRequest.body)).not.toContain('"tools"');
 		} finally {
 			await runtime.shutdown();
+			server.stop(true);
+		}
+	});
+
+	test("replays legacy Responses assistant strings as output_text without losing history", async () => {
+		const observedBodies: unknown[] = [];
+		const server = Bun.serve({
+			hostname: "127.0.0.1",
+			port: 0,
+			async fetch(request) {
+				observedBodies.push(await request.json());
+				return new Response(createOpenAiResponsesStream("Second reply"), {
+					headers: {
+						"content-type": "text/event-stream",
+					},
+				});
+			},
+		});
+		const saver = new BunSqliteSaver(":memory:");
+		const provider: ResolvedProviderConfiguration = {
+			...askTestProvider,
+			protocol: "openai-responses",
+			baseUrl: `http://127.0.0.1:${server.port}/v1`,
+			apiKey: "local-test-key",
+			model: "moshu-responses",
+		};
+		const legacyRuntime = createDeepAgentsRuntime(
+			() =>
+				new FakeListChatModel({
+					responses: ["First reply"],
+					generationInfo: {
+						model_provider: "openai",
+						gateway_marker: "preserved",
+					},
+				}),
+			saver,
+		);
+		const upgradedRuntime = new DeepAgentsAskChatRuntime({ checkpointer: saver });
+
+		try {
+			await legacyRuntime.run({
+				runId: "responses-legacy-first",
+				threadId: "responses-legacy-thread",
+				provider,
+				messages: [{ role: "user", content: "First question" }],
+			});
+			await legacyRuntime.shutdown();
+
+			await expect(
+				upgradedRuntime.run({
+					runId: "responses-legacy-second",
+					threadId: "responses-legacy-thread",
+					provider,
+					messages: [{ role: "user", content: "Follow-up question" }],
+				}),
+			).resolves.toMatchObject({ text: "Second reply" });
+
+			expect(observedBodies[0]).toMatchObject({
+				input: [
+					{ role: "system", content: [{ type: "input_text" }] },
+					{
+						role: "user",
+						content: [{ type: "input_text", text: "First question" }],
+					},
+					{
+						role: "assistant",
+						content: [{ type: "output_text", text: "First reply" }],
+					},
+					{
+						role: "user",
+						content: [{ type: "input_text", text: "Follow-up question" }],
+					},
+				],
+			});
+			expect(JSON.stringify(observedBodies[0])).not.toContain(
+				'"role":"assistant","content":[{"type":"input_text"',
+			);
+		} finally {
+			await legacyRuntime.shutdown();
+			await upgradedRuntime.shutdown();
+			saver.close();
 			server.stop(true);
 		}
 	});
@@ -462,6 +559,7 @@ describe("DeepAgentsAskChatRuntime", () => {
 				await expect(
 					runtime.run({
 						runId: "unauthorized-tool-run",
+						provider: askTestProvider,
 						threadId: "unauthorized-tool-thread",
 						messages: [{ role: "user", content: "Write a file" }],
 					}),
@@ -485,12 +583,14 @@ describe("DeepAgentsAskChatRuntime", () => {
 
 		const run = runtime.stream({
 			runId: "active-run",
+			provider: askTestProvider,
 			messages: [{ role: "user", content: "Wait" }],
 		});
 
 		expect(() =>
 			runtime.stream({
 				runId: "active-run",
+				provider: askTestProvider,
 				messages: [{ role: "user", content: "Duplicate" }],
 			}),
 		).toThrow('An ask chat run with id "active-run" is already active.');
@@ -545,6 +645,7 @@ describe("DeepAgentsAskChatRuntime", () => {
 		}));
 		const result = runtime.run({
 			runId: "nested-500-cancel",
+			provider: askTestProvider,
 			messages: [{ role: "user", content: "stop quickly" }],
 			onEvent: () => {
 				runtime.cancel("nested-500-cancel", "first item received");
@@ -584,6 +685,7 @@ describe("DeepAgentsAskChatRuntime", () => {
 		}));
 		const result = runtime.run({
 			runId: "infinite-cancel",
+			provider: askTestProvider,
 			messages: [{ role: "user", content: "stop" }],
 			onEvent: resolveFirstDelta,
 		});
@@ -618,6 +720,7 @@ describe("DeepAgentsAskChatRuntime", () => {
 		}));
 		const result = runtime.run({
 			runId: "hanging-return-cancel",
+			provider: askTestProvider,
 			messages: [{ role: "user", content: "stop" }],
 			onEvent: () => {
 				runtime.cancel("hanging-return-cancel", "done");
@@ -664,6 +767,7 @@ describe("DeepAgentsAskChatRuntime", () => {
 		);
 		const first = runtime.run({
 			runId: "pending-acquire-first",
+			provider: askTestProvider,
 			threadId: "pending-acquire",
 			messages: [{ role: "user", content: "cancel while acquiring" }],
 		});
@@ -675,6 +779,7 @@ describe("DeepAgentsAskChatRuntime", () => {
 		const sameThread = runtime
 			.run({
 				runId: "pending-acquire-second",
+				provider: askTestProvider,
 				threadId: "pending-acquire",
 				messages: [{ role: "user", content: "wait for close" }],
 			})
@@ -684,6 +789,7 @@ describe("DeepAgentsAskChatRuntime", () => {
 		await expect(
 			runtime.run({
 				runId: "pending-acquire-unrelated",
+				provider: askTestProvider,
 				threadId: "pending-acquire-other",
 				messages: [{ role: "user", content: "continue" }],
 			}),
@@ -739,6 +845,7 @@ describe("DeepAgentsAskChatRuntime", () => {
 		try {
 			const first = runtime.run({
 				runId: "rejected-acquire-first",
+				provider: askTestProvider,
 				threadId: "rejected-acquire",
 				messages: [{ role: "user", content: "cancel while acquiring" }],
 			});
@@ -749,6 +856,7 @@ describe("DeepAgentsAskChatRuntime", () => {
 			await expect(
 				runtime.run({
 					runId: "rejected-acquire-second",
+					provider: askTestProvider,
 					threadId: "rejected-acquire",
 					messages: [{ role: "user", content: "continue after rejection" }],
 				}),
@@ -785,6 +893,7 @@ describe("DeepAgentsAskChatRuntime", () => {
 		);
 		const first = runtime.run({
 			runId: "never-acquire-first",
+			provider: askTestProvider,
 			threadId: "never-acquire",
 			messages: [{ role: "user", content: "cancel while acquiring" }],
 		});
@@ -795,6 +904,7 @@ describe("DeepAgentsAskChatRuntime", () => {
 			withDeadline(
 				runtime.run({
 					runId: "never-acquire-second",
+					provider: askTestProvider,
 					threadId: "never-acquire",
 					messages: [{ role: "user", content: "must not overlap" }],
 				}),
@@ -805,6 +915,7 @@ describe("DeepAgentsAskChatRuntime", () => {
 		await expect(
 			runtime.run({
 				runId: "never-acquire-unrelated",
+				provider: askTestProvider,
 				threadId: "never-acquire-other",
 				messages: [{ role: "user", content: "unrelated" }],
 			}),
@@ -858,6 +969,7 @@ describe("DeepAgentsAskChatRuntime", () => {
 		);
 		const first = runtime.run({
 			runId: "slow-cleanup-first",
+			provider: askTestProvider,
 			threadId: "shared-thread",
 			messages: [{ role: "user", content: "cancel" }],
 			onEvent: () => {
@@ -870,6 +982,7 @@ describe("DeepAgentsAskChatRuntime", () => {
 		const sameThread = runtime
 			.run({
 				runId: "slow-cleanup-second",
+				provider: askTestProvider,
 				threadId: "shared-thread",
 				messages: [{ role: "user", content: "wait for cleanup" }],
 			})
@@ -883,6 +996,7 @@ describe("DeepAgentsAskChatRuntime", () => {
 		await expect(
 			runtime.run({
 				runId: "unrelated-thread",
+				provider: askTestProvider,
 				threadId: "other-thread",
 				messages: [{ role: "user", content: "continue" }],
 			}),
@@ -930,6 +1044,7 @@ describe("DeepAgentsAskChatRuntime", () => {
 		);
 		const first = runtime.run({
 			runId: "never-cleanup-first",
+			provider: askTestProvider,
 			threadId: "never-cleanup-thread",
 			messages: [{ role: "user", content: "cancel" }],
 			onEvent: () => {
@@ -942,6 +1057,7 @@ describe("DeepAgentsAskChatRuntime", () => {
 			withDeadline(
 				runtime.run({
 					runId: "never-cleanup-second",
+					provider: askTestProvider,
 					threadId: "never-cleanup-thread",
 					messages: [{ role: "user", content: "must not overlap" }],
 				}),
@@ -952,6 +1068,7 @@ describe("DeepAgentsAskChatRuntime", () => {
 		await expect(
 			runtime.run({
 				runId: "never-cleanup-unrelated",
+				provider: askTestProvider,
 				threadId: "never-cleanup-other",
 				messages: [{ role: "user", content: "unrelated" }],
 			}),
@@ -962,6 +1079,7 @@ describe("DeepAgentsAskChatRuntime", () => {
 		expect(() =>
 			runtime.run({
 				runId: "after-shutdown",
+				provider: askTestProvider,
 				messages: [{ role: "user", content: "closed" }],
 			}),
 		).toThrow("shutting down");
@@ -995,6 +1113,7 @@ describe("DeepAgentsAskChatRuntime", () => {
 		const result = runtime
 			.run({
 				runId: "yielding-shutdown",
+				provider: askTestProvider,
 				messages: [{ role: "user", content: "shutdown" }],
 				onEvent: resolveFirstDelta,
 			})
@@ -1025,6 +1144,7 @@ describe("DeepAgentsAskChatRuntime", () => {
 		try {
 			const result = runtime.run({
 				runId: "deep-cancel-run",
+				provider: askTestProvider,
 				threadId: "deep-cancel-thread",
 				messages: [{ role: "user", content: "Keep talking" }],
 				onEvent: () => {
@@ -1088,6 +1208,7 @@ describe("DeepAgentsAskChatRuntime", () => {
 					contextStorage.run({ runId }, () =>
 						runtime.run({
 							runId,
+							provider: askTestProvider,
 							threadId: `session-${runId}`,
 							messages: [{ role: "user", content: `prompt:${runId}` }],
 							onEvent: () => {
@@ -1143,25 +1264,26 @@ describe("DeepAgentsAskChatRuntime", () => {
 		}
 	});
 
-	test("rejects when the provider is not configured", async () => {
-		const store = new InMemoryAskProviderConfigStore();
+	test("builds the agent from the provider supplied with the run", async () => {
+		const observedProviders: string[] = [];
 		const runtime = new DeepAgentsAskChatRuntime({
-			providerConfigStore: store,
-			agentFactory: async () => ({
-				stream: async () => createAsyncIterable([]),
-			}),
+			agentFactory: async (configuration) => {
+				observedProviders.push(`${configuration.providerId}:${configuration.model}`);
+				return { stream: async () => createAsyncIterable([]) };
+			},
 		});
 
-		await expect(
-			runtime.run({
-				runId: "unconfigured-run",
+		try {
+			await runtime.run({
+				runId: "per-run-provider",
+				provider: { ...askTestProvider, model: "gpt-per-run" },
 				messages: [{ role: "user", content: "Hello" }],
-			}),
-		).rejects.toMatchObject({
-			kind: "not_configured",
-			message: "Ask provider is not configured.",
-			retryable: false,
-		});
+			});
+		} finally {
+			await runtime.shutdown();
+		}
+
+		expect(observedProviders).toEqual([`${askTestProvider.providerId}:gpt-per-run`]);
 	});
 
 	test("sanitizes provider authentication failures", async () => {
@@ -1178,6 +1300,7 @@ describe("DeepAgentsAskChatRuntime", () => {
 		await expect(
 			runtime.run({
 				runId: "auth-run",
+				provider: askTestProvider,
 				messages: [{ role: "user", content: "Hello" }],
 			}),
 		).rejects.toMatchObject({
@@ -1190,6 +1313,7 @@ describe("DeepAgentsAskChatRuntime", () => {
 		const error = await captureRejection(
 			runtime.run({
 				runId: "auth-run-2",
+				provider: askTestProvider,
 				messages: [{ role: "user", content: "Hello again" }],
 			}),
 		);
@@ -1236,6 +1360,7 @@ describe("DeepAgentsAskChatRuntime", () => {
 			await expect(
 				runtime.run({
 					runId: testCase.runId,
+					provider: askTestProvider,
 					messages: [{ role: "user", content: "Hello" }],
 				}),
 			).rejects.toMatchObject({
@@ -1252,10 +1377,12 @@ describe("DeepAgentsAskChatRuntime", () => {
 
 		const firstRun = runtime.stream({
 			runId: "shutdown-1",
+			provider: askTestProvider,
 			messages: [{ role: "user", content: "One" }],
 		});
 		const secondRun = runtime.stream({
 			runId: "shutdown-2",
+			provider: askTestProvider,
 			messages: [{ role: "user", content: "Two" }],
 		});
 
@@ -1287,6 +1414,50 @@ function createOpenAiChunk(content: string, finishReason: "stop" | null, role?: 
 	};
 }
 
+function createOpenAiResponsesStream(text: string): string {
+	const message = {
+		id: "msg_moshu_responses",
+		type: "message",
+		status: "completed",
+		role: "assistant",
+		content: [{ type: "output_text", text, annotations: [] }],
+	};
+	const response = {
+		id: "resp_moshu_responses",
+		object: "response",
+		created_at: 1_753_418_400,
+		status: "completed",
+		model: "moshu-responses",
+		output: [message],
+		output_text: text,
+		usage: {
+			input_tokens: 1,
+			output_tokens: 1,
+			total_tokens: 2,
+			input_tokens_details: { cached_tokens: 0 },
+			output_tokens_details: { reasoning_tokens: 0 },
+		},
+	};
+	const events = [
+		{
+			type: "response.output_text.delta",
+			sequence_number: 0,
+			item_id: message.id,
+			output_index: 0,
+			content_index: 0,
+			delta: text,
+			logprobs: [],
+		},
+		{
+			type: "response.completed",
+			sequence_number: 1,
+			response,
+		},
+	];
+
+	return events.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join("");
+}
+
 function createRuntime(
 	agentFactory: AskAgentFactory,
 	options: Pick<
@@ -1294,16 +1465,7 @@ function createRuntime(
 		"checkpointer" | "threadCleanupWaitTimeoutMs" | "shutdownCleanupTimeoutMs"
 	> = {},
 ): DeepAgentsAskChatRuntime {
-	const store = new InMemoryAskProviderConfigStore();
-	store.set({
-		provider: "openai-compatible",
-		apiKey: "sk-test",
-		model: "gpt-4.1-mini",
-		baseUrl: "https://example.com/v1",
-	});
-
 	return new DeepAgentsAskChatRuntime({
-		providerConfigStore: store,
 		agentFactory,
 		...options,
 	});
@@ -1313,16 +1475,7 @@ function createDeepAgentsRuntime(
 	modelFactory: AskModelFactory,
 	checkpointer: BunSqliteSaver,
 ): DeepAgentsAskChatRuntime {
-	const store = new InMemoryAskProviderConfigStore();
-	store.set({
-		provider: "openai-compatible",
-		apiKey: "sk-test",
-		model: "test-model",
-		baseUrl: "https://example.com/v1",
-	});
-
 	return new DeepAgentsAskChatRuntime({
-		providerConfigStore: store,
 		modelFactory,
 		checkpointer,
 	});
@@ -1439,3 +1592,53 @@ async function withTempDirectory(run: (directoryPath: string) => Promise<void>):
 		rmSync(directoryPath, { force: true, recursive: true });
 	}
 }
+
+describe("provider error classification", () => {
+	test("reads the status code and message through a wrapped cause chain", async () => {
+		const wrapped = new Error("Middleware failed", {
+			cause: Object.assign(new Error("429 rate limit exceeded"), { status: 429 }),
+		});
+		const runtime = createRuntime(async () => ({
+			stream: async () => {
+				throw wrapped;
+			},
+		}));
+
+		try {
+			await expect(
+				runtime.run({
+					runId: "wrapped-rate-limit",
+					provider: askTestProvider,
+					messages: [{ role: "user", content: "Hello" }],
+				}),
+			).rejects.toMatchObject({ kind: "provider_rate_limited", statusCode: 429, retryable: true });
+		} finally {
+			await runtime.shutdown();
+		}
+	});
+
+	test("keeps the original provider failure attached as the error cause", async () => {
+		const upstream = Object.assign(new Error("500 upstream exploded"), { status: 500 });
+		const runtime = createRuntime(async () => ({
+			stream: async () => {
+				throw new Error("Middleware failed", { cause: upstream });
+			},
+		}));
+
+		try {
+			const error = await runtime
+				.run({
+					runId: "wrapped-server-error",
+					provider: askTestProvider,
+					messages: [{ role: "user", content: "Hello" }],
+				})
+				.catch((thrown: unknown) => thrown);
+
+			expect(error).toBeInstanceOf(AskChatRuntimeError);
+			expect((error as AskChatRuntimeError).statusCode).toBe(500);
+			expect(String((error as Error).cause)).toContain("Middleware failed");
+		} finally {
+			await runtime.shutdown();
+		}
+	});
+});

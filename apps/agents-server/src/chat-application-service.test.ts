@@ -8,16 +8,22 @@ import {
 	type AskChatRunStream,
 	type AskChatRuntime,
 	AskChatRuntimeError,
-	type AskProviderConfigStore,
-	type AskProviderConfiguration,
-	InMemoryAskProviderConfigStore,
+	ProviderCapacityError,
+	ProviderModelNotFoundError,
+	ProviderNotFoundError,
+	type ProviderRecord,
+	type ProviderRegistry,
+	type ResolvedProviderConfiguration,
 } from "@moshu/agent-runtime";
 import {
 	type ChatRunEvent,
+	type DefaultModelSelection,
 	maxAppErrorSafeMessageCharacters,
 	maxAssistantMessageContentCharacters,
+	maxProviderCount,
 	maxReplayEventBytesPerPage,
 	maxReplayEventsPerPage,
+	type ProviderModel,
 	retiredSessionTombstoneTtlMs,
 } from "@moshu/contracts";
 import {
@@ -30,6 +36,7 @@ import {
 import { ZodError } from "zod";
 
 import { ChatApplicationService } from "./chat-application-service";
+import type { ProviderCatalogRequest } from "./provider-catalog";
 
 describe("ChatApplicationService", () => {
 	test("persists every streamed event before publishing it", async () => {
@@ -43,7 +50,6 @@ describe("ChatApplicationService", () => {
 		const publishedEvents: ChatRunEvent[] = [];
 
 		try {
-			configureProvider(service);
 			const { session } = service.createSession();
 			service.subscribe((event) => {
 				const persistedIds = database.runs
@@ -110,7 +116,6 @@ describe("ChatApplicationService", () => {
 		const published: ChatRunEvent[] = [];
 
 		try {
-			configureProvider(service);
 			const { session } = service.createSession();
 			service.subscribe((event) => {
 				published.push(event);
@@ -152,7 +157,6 @@ describe("ChatApplicationService", () => {
 		let cancellation: Promise<void> | undefined;
 
 		try {
-			configureProvider(service);
 			const { session } = service.createSession();
 			service.subscribe((event) => {
 				published.push(event);
@@ -193,7 +197,6 @@ describe("ChatApplicationService", () => {
 		const delivered: ChatRunEvent[] = [];
 
 		try {
-			configureProvider(service);
 			const { session } = service.createSession();
 			service.subscribe(() => {
 				throw new Error("synchronous listener failure");
@@ -228,7 +231,6 @@ describe("ChatApplicationService", () => {
 		const published = new Map<string, number[]>();
 
 		try {
-			configureProvider(service);
 			const firstSession = service.createSession().session;
 			const secondSession = service.createSession().session;
 			service.subscribe((event) => {
@@ -261,7 +263,6 @@ describe("ChatApplicationService", () => {
 		const service = createService(database, runtime, scheduler);
 
 		try {
-			configureProvider(service);
 			const { session } = service.createSession();
 			const accepted = service.sendMessage({ sessionId: session.id, content: "fill boundary" });
 			scheduler.runAll();
@@ -290,7 +291,6 @@ describe("ChatApplicationService", () => {
 		const service = createService(database, runtime, scheduler);
 
 		try {
-			configureProvider(service);
 			const { session } = service.createSession();
 			const accepted = service.sendMessage({ sessionId: session.id, content: "many tokens" });
 			scheduler.runAll();
@@ -316,7 +316,6 @@ describe("ChatApplicationService", () => {
 		const service = createService(database, runtime, scheduler);
 
 		try {
-			configureProvider(service);
 			const { session } = service.createSession();
 			const accepted = service.sendMessage({ sessionId: session.id, content: "large chunk" });
 			scheduler.runAll();
@@ -342,7 +341,6 @@ describe("ChatApplicationService", () => {
 		const service = createService(database, runtime, scheduler);
 
 		try {
-			configureProvider(service);
 			const { session } = service.createSession();
 			const accepted = service.sendMessage({ sessionId: session.id, content: "cancel reentry" });
 			let cancelled = false;
@@ -380,7 +378,6 @@ describe("ChatApplicationService", () => {
 		const published: ChatRunEvent[] = [];
 
 		try {
-			configureProvider(service);
 			const { session } = service.createSession();
 			const accepted = service.sendMessage({ sessionId: session.id, content: "stream quickly" });
 			const deltaPublished = new Promise<void>((resolve) => {
@@ -427,7 +424,6 @@ describe("ChatApplicationService", () => {
 		const service = createService(database, runtime, scheduler);
 
 		try {
-			configureProvider(service);
 			const { session } = service.createSession();
 			const accepted = service.sendMessage({ sessionId: session.id, content: "cancel now" });
 			scheduler.runAll();
@@ -458,7 +454,6 @@ describe("ChatApplicationService", () => {
 		const service = createService(database, runtime, scheduler);
 
 		try {
-			configureProvider(service);
 			const { session } = service.createSession();
 			const accepted = service.sendMessage({
 				sessionId: session.id,
@@ -538,7 +533,6 @@ describe("ChatApplicationService", () => {
 		const service = createService(database, runtime, scheduler, { runs, logger: { error() {} } });
 
 		try {
-			configureProvider(service);
 			const { session } = service.createSession();
 			const accepted = service.sendMessage({ sessionId: session.id, content: "append fails" });
 			scheduler.runAll();
@@ -584,7 +578,6 @@ describe("ChatApplicationService", () => {
 		);
 
 		try {
-			configureProvider(service);
 			const { session } = service.createSession();
 			service.sendMessage({ sessionId: session.id, content: "first" });
 			scheduler.runAll();
@@ -634,7 +627,6 @@ describe("ChatApplicationService", () => {
 		let restarted: ChatApplicationService | undefined;
 
 		try {
-			configureProvider(service);
 			const { session } = service.createSession();
 			const accepted = service.sendMessage({ sessionId: session.id, content: "fatal write" });
 			scheduler.runAll();
@@ -647,7 +639,6 @@ describe("ChatApplicationService", () => {
 			await service.shutdown();
 
 			restarted = createService(database, new FakeAskChatRuntime({}), new ManualScheduler());
-			configureProvider(restarted);
 			const recovered = await restarted.getSession({ sessionId: session.id });
 			expect(recovered.runs[0]?.status).toBe("cancelled");
 			expect(
@@ -694,7 +685,6 @@ describe("ChatApplicationService", () => {
 		let restarted: ChatApplicationService | undefined;
 
 		try {
-			configureProvider(service);
 			expect(() =>
 				service.sendMessage({
 					sessionId: orphaned.sessionId,
@@ -710,21 +700,19 @@ describe("ChatApplicationService", () => {
 				service.sendMessage({ sessionId: orphaned.sessionId, content: "still fenced" }),
 			).toThrow("persistence is unavailable");
 			expect(() =>
-				service.configureProvider({
+				service.createProvider({
 					schemaVersion: 1,
+					displayName: "Other",
+					type: "openai-compatible",
 					baseUrl: "https://api.openai.com/v1",
-					model: "other-model",
 					apiKey: "sk-other",
 				}),
 			).toThrow("persistence is unavailable");
-			expect(() => service.deleteProvider()).toThrow("persistence is unavailable");
+			expect(() =>
+				service.deleteProvider({ schemaVersion: 1, providerId: createUuidV7() }),
+			).toThrow("persistence is unavailable");
 			await expect(
-				service.testProvider({
-					schemaVersion: 1,
-					baseUrl: "https://api.openai.com/v1",
-					model: "other-model",
-					apiKey: "sk-other",
-				}),
+				service.testProvider({ schemaVersion: 1, providerId: createUuidV7() }),
 			).rejects.toThrow("persistence is unavailable");
 			expect(commitAttempts).toBe(1);
 			await Promise.resolve();
@@ -732,7 +720,6 @@ describe("ChatApplicationService", () => {
 
 			await service.shutdown();
 			restarted = createService(database, new FakeAskChatRuntime({}), new ManualScheduler());
-			configureProvider(restarted);
 			const recovered = await restarted.getSession({ sessionId: orphaned.sessionId });
 			expect(recovered.runs[0]?.status).toBe("cancelled");
 			await restarted.getSession({ sessionId: orphaned.sessionId });
@@ -759,7 +746,6 @@ describe("ChatApplicationService", () => {
 		const service = createService(database, runtime, scheduler);
 
 		try {
-			configureProvider(service);
 			const { session } = service.createSession();
 			const accepted = service.sendMessage({ sessionId: session.id, content: "cancel on running" });
 			service.subscribe((event) => {
@@ -793,7 +779,6 @@ describe("ChatApplicationService", () => {
 		const service = createService(database, runtime, scheduler);
 
 		try {
-			configureProvider(service);
 			const { session } = service.createSession();
 			const requestId = crypto.randomUUID();
 			const accepted = service.sendMessage({
@@ -850,7 +835,6 @@ describe("ChatApplicationService", () => {
 		const service = createService(database, runtime, scheduler);
 
 		try {
-			configureProvider(service);
 			const { session } = service.createSession();
 			service.sendMessage({ sessionId: session.id, content: "oversized final" });
 			scheduler.runAll();
@@ -871,7 +855,6 @@ describe("ChatApplicationService", () => {
 		const service = createService(database, new FakeAskChatRuntime({}), new ManualScheduler(), {
 			isRuntimeReady: () => false,
 		});
-		configureProvider(service);
 		const { session } = service.createSession();
 
 		expect(() => service.sendMessage({ sessionId: session.id, content: "blocked" })).toThrow(
@@ -891,7 +874,6 @@ describe("ChatApplicationService", () => {
 		});
 
 		try {
-			configureProvider(service);
 			const { session } = service.createSession();
 			const accepted = service.sendMessage({
 				sessionId: session.id,
@@ -925,7 +907,6 @@ describe("ChatApplicationService", () => {
 		);
 
 		try {
-			configureProvider(service);
 			const { session } = service.createSession();
 			const requestId = crypto.randomUUID();
 			const first = service.sendMessage({
@@ -976,7 +957,6 @@ describe("ChatApplicationService", () => {
 		);
 
 		try {
-			configureProvider(service);
 			const { session } = service.createSession();
 			const requestId = crypto.randomUUID();
 			const first = service.sendMessage({
@@ -1039,7 +1019,6 @@ describe("ChatApplicationService", () => {
 		const service = createService(database, runtime, scheduler);
 
 		try {
-			configureProvider(service);
 			const { session } = service.createSession();
 			const runIds: string[] = [];
 			for (const content of Array.from({ length: 9 }, (_, index) => `prompt-${index}`)) {
@@ -1201,7 +1180,6 @@ describe("ChatApplicationService", () => {
 		const service = createService(database, runtime, scheduler);
 
 		try {
-			configureProvider(service);
 			const { session } = service.createSession();
 
 			service.sendMessage({ sessionId: session.id, content: "First question" });
@@ -1236,7 +1214,6 @@ describe("ChatApplicationService", () => {
 		const service = createService(database, runtime, scheduler);
 
 		try {
-			configureProvider(service);
 			const { session } = service.createSession();
 			const accepted = service.sendMessage({
 				sessionId: session.id,
@@ -1307,7 +1284,6 @@ describe("ChatApplicationService", () => {
 		const service = createService(database, runtime, scheduler);
 
 		try {
-			configureProvider(service);
 			const { session } = service.createSession();
 			const accepted = service.sendMessage({ sessionId: session.id, content: "bounded cancel" });
 			scheduler.runAll();
@@ -1336,16 +1312,12 @@ describe("ChatApplicationService", () => {
 		const service = createService(database, runtime, scheduler);
 
 		try {
-			configureProvider(service);
-			const status = service.getProviderStatus();
-			expect(status).toEqual({
-				schemaVersion: 1,
-				configured: true,
-				baseUrl: "https://api.openai.com/v1",
-				model: "gpt-4.1-mini",
-				apiKeyMask: "••••••••cret",
-			});
-			expect("apiKey" in status).toBe(false);
+			const { providers } = service.listProviders();
+			const provider = providers[0];
+			expect(provider?.baseUrl).toBe("https://api.openai.com/v1");
+			expect(provider?.apiKeyMask).toBe("••••••••cret");
+			expect(provider?.models).toEqual([{ id: "gpt-5.4", enabled: true }]);
+			expect(JSON.stringify(providers)).not.toContain("sk-test-secret");
 
 			const { session } = service.createSession();
 			service.sendMessage({
@@ -1389,7 +1361,6 @@ describe("ChatApplicationService", () => {
 		);
 
 		try {
-			configureProvider(service);
 			const { session } = service.createSession();
 			const requestId = crypto.randomUUID();
 			const accepted = service.sendMessage({
@@ -1456,7 +1427,6 @@ describe("ChatApplicationService", () => {
 		);
 
 		try {
-			configureProvider(service);
 			const { session } = service.createSession();
 			service.sendMessage({ sessionId: session.id, content: "safe fallback" });
 			scheduler.runAll();
@@ -1500,7 +1470,6 @@ describe("ChatApplicationService", () => {
 		);
 
 		try {
-			configureProvider(service);
 			const { session } = service.createSession();
 			service.sendMessage({ sessionId: session.id, content: "fallback terminal" });
 			scheduler.runAll();
@@ -1517,38 +1486,42 @@ describe("ChatApplicationService", () => {
 		}
 	});
 
-	test("keeps the saved API key when updating Provider fields on the same origin", async () => {
+	test("keeps the saved API key when updating Provider fields without a new key", async () => {
 		const database = openAppDatabase(":memory:");
 		const scheduler = new ManualScheduler();
-		const store = new InMemoryAskProviderConfigStore();
+		const registry = createTestProviderRegistry({ seed: false });
 		const service = createService(database, new FakeAskChatRuntime({}), scheduler, {
-			providerConfigStore: store,
+			providers: registry,
 		});
 
 		try {
-			configureProvider(service);
-			service.configureProvider({
+			const created = service.createProvider({
 				schemaVersion: 1,
-				baseUrl: "https://api.openai.com/compatible/v1",
-				model: "updated-model",
-			});
-
-			expect(store.get()).toEqual({
-				provider: "openai-compatible",
-				baseUrl: "https://api.openai.com/compatible/v1",
-				model: "updated-model",
+				displayName: "OpenAI",
+				type: "openai-compatible",
+				baseUrl: "https://api.openai.com/v1",
 				apiKey: "sk-test-secret",
 			});
+			const updated = service.updateProvider({
+				schemaVersion: 1,
+				providerId: created.provider.id,
+				displayName: "OpenAI Compatible",
+				baseUrl: "https://api.openai.com/compatible/v1",
+			});
+
+			expect(updated.provider.baseUrl).toBe("https://api.openai.com/compatible/v1");
+			expect(updated.provider.displayName).toBe("OpenAI Compatible");
+			expect(registry.get(created.provider.id)?.apiKey).toBe("sk-test-secret");
 		} finally {
 			await service.shutdown();
 			database.close();
 		}
 	});
 
-	test("requires a new API key before sending credentials to another origin", async () => {
+	test("requires a new API key before testing a Provider on another origin", async () => {
 		const database = openAppDatabase(":memory:");
 		const scheduler = new ManualScheduler();
-		const testedConfigurations: AskProviderConfiguration[] = [];
+		const testedConfigurations: ResolvedProviderConfiguration[] = [];
 		const service = createService(database, new FakeAskChatRuntime({}), scheduler, {
 			testProviderConnection: async (configuration) => {
 				testedConfigurations.push(configuration);
@@ -1556,19 +1529,13 @@ describe("ChatApplicationService", () => {
 		});
 
 		try {
-			configureProvider(service);
-			expect(() =>
-				service.configureProvider({
-					schemaVersion: 1,
-					baseUrl: "https://untrusted.example/v1",
-					model: "updated-model",
-				}),
-			).toThrow("new API key");
-
 			const output = await service.testProvider({
 				schemaVersion: 1,
-				baseUrl: "https://untrusted.example/v1",
-				model: "updated-model",
+				draft: {
+					displayName: "Untrusted",
+					type: "openai-compatible",
+					baseUrl: "https://untrusted.example/v1",
+				},
 			});
 			expect(output.ok).toBe(false);
 			expect(output.error?.safeMessage).toContain("new API key");
@@ -1582,7 +1549,7 @@ describe("ChatApplicationService", () => {
 	test("tests Provider settings without exposing the API key", async () => {
 		const database = openAppDatabase(":memory:");
 		const scheduler = new ManualScheduler();
-		const testedConfigurations: AskProviderConfiguration[] = [];
+		const testedConfigurations: ResolvedProviderConfiguration[] = [];
 		const service = createService(database, new FakeAskChatRuntime({}), scheduler, {
 			testProviderConnection: async (configuration) => {
 				testedConfigurations.push(configuration);
@@ -1590,12 +1557,8 @@ describe("ChatApplicationService", () => {
 		});
 
 		try {
-			configureProvider(service);
-			const output = await service.testProvider({
-				schemaVersion: 1,
-				baseUrl: "https://api.openai.com/v1",
-				model: "gpt-4.1-mini",
-			});
+			const providerId = service.listProviders().providers[0]?.id ?? "";
+			const output = await service.testProvider({ schemaVersion: 1, providerId });
 
 			expect(output.ok).toBe(true);
 			expect(testedConfigurations[0]?.apiKey).toBe("sk-test-secret");
@@ -1621,12 +1584,8 @@ describe("ChatApplicationService", () => {
 		});
 
 		try {
-			const output = await service.testProvider({
-				schemaVersion: 1,
-				baseUrl: "https://api.openai.com/v1",
-				model: "gpt-4.1-mini",
-				apiKey: "sk-test-secret",
-			});
+			const providerId = service.listProviders().providers[0]?.id ?? "";
+			const output = await service.testProvider({ schemaVersion: 1, providerId });
 
 			expect(output.ok).toBe(false);
 			expect(output.error?.safeMessage).toBe("Provider authentication failed.");
@@ -1637,20 +1596,30 @@ describe("ChatApplicationService", () => {
 		}
 	});
 
-	test("deletes the saved Provider configuration", async () => {
+	test("deletes a saved Provider", async () => {
 		const database = openAppDatabase(":memory:");
 		const scheduler = new ManualScheduler();
-		const store = new InMemoryAskProviderConfigStore();
 		const service = createService(database, new FakeAskChatRuntime({}), scheduler, {
-			providerConfigStore: store,
+			providers: createTestProviderRegistry({ seed: false }),
 		});
 
 		try {
-			configureProvider(service);
-			const status = service.deleteProvider();
+			const created = service.createProvider({
+				schemaVersion: 1,
+				displayName: "OpenAI",
+				type: "openai-compatible",
+				baseUrl: "https://api.openai.com/v1",
+				apiKey: "sk-test-secret",
+			});
+			expect(service.listProviders().providers).toHaveLength(1);
 
-			expect(status.configured).toBe(false);
-			expect(store.get()).toBeNull();
+			const output = service.deleteProvider({
+				schemaVersion: 1,
+				providerId: created.provider.id,
+			});
+
+			expect(output.providerId).toBe(created.provider.id);
+			expect(service.listProviders().providers).toEqual([]);
 		} finally {
 			await service.shutdown();
 			database.close();
@@ -1664,7 +1633,6 @@ describe("ChatApplicationService", () => {
 		const service = createService(database, runtime, scheduler);
 
 		try {
-			configureProvider(service);
 			const { session } = service.createSession();
 			service.sendMessage({ sessionId: session.id, content: "Plan a launch" });
 			scheduler.runAll();
@@ -1703,7 +1671,6 @@ describe("ChatApplicationService", () => {
 		);
 
 		try {
-			configureProvider(service);
 			const { session } = service.createSession();
 			const accepted = service.sendMessage({ sessionId: session.id, content: "retire me" });
 			scheduler.runAll();
@@ -1838,7 +1805,6 @@ describe("ChatApplicationService", () => {
 		let restarted: ChatApplicationService | undefined;
 
 		try {
-			configureProvider(service);
 			const { session } = service.createSession();
 			await expect(service.deleteSession({ sessionId: session.id })).resolves.toEqual({
 				sessionId: session.id,
@@ -2353,7 +2319,6 @@ describe("ChatApplicationService", () => {
 		);
 
 		try {
-			configureProvider(service);
 			const { session } = service.createSession();
 			const accepted = service.sendMessage({ sessionId: session.id, content: "offline" });
 			scheduler.runAll();
@@ -2521,7 +2486,6 @@ describe("ChatApplicationService", () => {
 		const service = createService(database, new FakeAskChatRuntime({ pending: true }), scheduler);
 
 		try {
-			configureProvider(service);
 			const { session } = service.createSession();
 			const accepted = service.sendMessage({ sessionId: session.id, content: "Wait" });
 
@@ -2532,13 +2496,17 @@ describe("ChatApplicationService", () => {
 				"Stop the active response",
 			);
 			expect(() =>
-				service.configureProvider({
+				service.createProvider({
 					schemaVersion: 1,
+					displayName: "Another",
+					type: "openai-compatible",
 					baseUrl: "https://example.test/v1",
-					model: "another-model",
+					apiKey: "sk-another",
 				}),
 			).toThrow("Stop active responses");
-			expect(() => service.deleteProvider()).toThrow("Stop active responses");
+			expect(() =>
+				service.deleteProvider({ schemaVersion: 1, providerId: createUuidV7() }),
+			).toThrow("Stop active responses");
 			service.cancel({ runId: accepted.run.id });
 		} finally {
 			await service.shutdown();
@@ -2555,7 +2523,6 @@ describe("ChatApplicationService", () => {
 		let reentrantError: unknown;
 
 		try {
-			configureProvider(service);
 			service.subscribe((event) => {
 				if (event.runId === orphaned.runId && event.type === "message.completed") {
 					try {
@@ -2594,7 +2561,6 @@ describe("ChatApplicationService", () => {
 		let reentrant: Promise<unknown> | undefined;
 
 		try {
-			configureProvider(service);
 			service.subscribe((event) => {
 				if (event.runId === orphaned.runId && event.type === "message.completed") {
 					reentrant = Promise.resolve().then(() => {
@@ -2631,7 +2597,6 @@ describe("ChatApplicationService", () => {
 		const service = createService(database, runtime, scheduler);
 
 		try {
-			configureProvider(service);
 			const { session } = service.createSession();
 			service.setSessionArchived({ sessionId: session.id, archived: true });
 			expect(() =>
@@ -2673,7 +2638,6 @@ describe("ChatApplicationService", () => {
 		const sending = createOrphanedRun(database, "running");
 
 		try {
-			configureProvider(service);
 			expect(service.cancel({ runId: cancelling.runId }).run.status).toBe("cancelled");
 			expect(
 				(await service.getSession({ sessionId: cancelling.sessionId })).messages.at(-1)?.status,
@@ -2787,6 +2751,7 @@ function createOrphanedRun(
 			schemaVersion: 1,
 			providerId: createUuidV7(),
 			name: "OpenAI",
+			type: "openai-compatible",
 			baseUrl: "https://api.openai.com/v1",
 			model: "gpt-4.1-mini",
 			apiKey: "sk-test-secret",
@@ -2863,8 +2828,9 @@ function createService(
 		runs?: RunJournalRepository;
 		sessions?: SessionRepository;
 		logger?: { error(message: string, error: unknown): void };
-		providerConfigStore?: AskProviderConfigStore;
-		testProviderConnection?: (configuration: AskProviderConfiguration) => Promise<void>;
+		providers?: ProviderRegistry;
+		fetchProviderModels?: (request: ProviderCatalogRequest) => Promise<readonly ProviderModel[]>;
+		testProviderConnection?: (configuration: ResolvedProviderConfiguration) => Promise<void>;
 		isRuntimeReady?: () => boolean;
 		checkpointDeletionRetryBaseMs?: number;
 		checkpointDeletionRetryMaxMs?: number;
@@ -2878,9 +2844,12 @@ function createService(
 	return new ChatApplicationService({
 		sessions: options.sessions ?? database.sessions,
 		runs: options.runs ?? database.runs,
-		providerConfigStore: options.providerConfigStore ?? new InMemoryAskProviderConfigStore(),
+		providers: options.providers ?? createTestProviderRegistry(),
 		runtime,
 		schedule: scheduler.schedule,
+		...(options.fetchProviderModels === undefined
+			? {}
+			: { fetchProviderModels: options.fetchProviderModels }),
 		...(options.logger === undefined ? {} : { logger: options.logger }),
 		...(options.testProviderConnection === undefined
 			? {}
@@ -2912,13 +2881,140 @@ function createService(
 	});
 }
 
-function configureProvider(service: ChatApplicationService): void {
-	service.configureProvider({
-		schemaVersion: 1,
-		baseUrl: "https://api.openai.com/v1",
-		model: "gpt-4.1-mini",
-		apiKey: "sk-test-secret",
-	});
+function createTestProviderRegistry(options: { seed?: boolean } = {}): ProviderRegistry {
+	const providers: ProviderRecord[] = [];
+	let defaultModel: DefaultModelSelection | null = null;
+
+	const find = (providerId: string): ProviderRecord | undefined =>
+		providers.find((provider) => provider.id === providerId);
+	const requireRecord = (providerId: string): ProviderRecord => {
+		const record = find(providerId);
+		if (record === undefined) {
+			throw new ProviderNotFoundError(providerId);
+		}
+		return record;
+	};
+	const pruneDefaultModel = (): void => {
+		if (defaultModel === null) {
+			return;
+		}
+		const record = find(defaultModel.providerId);
+		const model = record?.models.find((candidate) => candidate.id === defaultModel?.modelId);
+		if (record === undefined || model === undefined || !model.enabled) {
+			defaultModel = null;
+		}
+	};
+
+	const registry: ProviderRegistry = {
+		list: () => providers.map((record) => structuredClone(record)),
+		get: (providerId) => {
+			const record = find(providerId);
+			return record === undefined ? null : structuredClone(record);
+		},
+		create: (input) => {
+			if (providers.length >= maxProviderCount) {
+				throw new ProviderCapacityError(maxProviderCount);
+			}
+			const record: ProviderRecord = {
+				id: createUuidV7(),
+				displayName: input.displayName,
+				type: input.type,
+				baseUrl: input.baseUrl,
+				apiKey: input.apiKey,
+				enabled: true,
+				models: [],
+				...(input.customHeaders === undefined ? {} : { customHeaders: input.customHeaders }),
+			};
+			providers.push(record);
+			return structuredClone(record);
+		},
+		update: (input) => {
+			const record = requireRecord(input.providerId);
+			if (input.displayName !== undefined) {
+				record.displayName = input.displayName;
+			}
+			if (input.type !== undefined) {
+				record.type = input.type;
+			}
+			if (input.baseUrl !== undefined) {
+				record.baseUrl = input.baseUrl;
+			}
+			if (input.apiKey !== undefined) {
+				record.apiKey = input.apiKey;
+			}
+			if (input.customHeaders !== undefined) {
+				if (Object.keys(input.customHeaders).length === 0) {
+					delete record.customHeaders;
+				} else {
+					record.customHeaders = input.customHeaders;
+				}
+			}
+			if (input.enabled !== undefined) {
+				record.enabled = input.enabled;
+			}
+			return structuredClone(record);
+		},
+		delete: (providerId) => {
+			const index = providers.findIndex((provider) => provider.id === providerId);
+			if (index < 0) {
+				throw new ProviderNotFoundError(providerId);
+			}
+			providers.splice(index, 1);
+			if (defaultModel?.providerId === providerId) {
+				defaultModel = null;
+			}
+		},
+		setModels: (providerId, models, fetchedAt) => {
+			const record = requireRecord(providerId);
+			const previouslyEnabled = new Set(
+				record.models.filter((model) => model.enabled).map((model) => model.id),
+			);
+			record.models = models.map((model) => ({
+				...model,
+				enabled: previouslyEnabled.has(model.id),
+			}));
+			record.modelsFetchedAt = fetchedAt;
+			pruneDefaultModel();
+			return structuredClone(record);
+		},
+		setModelsEnabled: (providerId, enabledModelIds) => {
+			const record = requireRecord(providerId);
+			const enabled = new Set(enabledModelIds);
+			record.models = record.models.map((model) => ({
+				...model,
+				enabled: enabled.has(model.id),
+			}));
+			pruneDefaultModel();
+			return structuredClone(record);
+		},
+		getDefaultModel: () => (defaultModel === null ? null : structuredClone(defaultModel)),
+		setDefaultModel: (selection) => {
+			if (selection === null) {
+				defaultModel = null;
+				return null;
+			}
+			const record = requireRecord(selection.providerId);
+			if (!record.models.some((model) => model.id === selection.modelId)) {
+				throw new ProviderModelNotFoundError(selection.providerId, selection.modelId);
+			}
+			defaultModel = structuredClone(selection);
+			return structuredClone(selection);
+		},
+	};
+
+	if (options.seed !== false) {
+		const record = registry.create({
+			displayName: "OpenAI",
+			type: "openai-compatible",
+			baseUrl: "https://api.openai.com/v1",
+			apiKey: "sk-test-secret",
+		});
+		registry.setModels(record.id, [{ id: "gpt-5.4", enabled: false }], "2026-01-01T00:00:00.000Z");
+		registry.setModelsEnabled(record.id, ["gpt-5.4"]);
+		registry.setDefaultModel({ providerId: record.id, modelId: "gpt-5.4" });
+	}
+
+	return registry;
 }
 
 class ManualScheduler {
@@ -3112,3 +3208,503 @@ class FakeAskChatRuntime implements AskChatRuntime {
 		}
 	}
 }
+
+describe("ChatApplicationService provider registry security", () => {
+	test("masks the API key and header values while exposing header names", async () => {
+		const database = openAppDatabase(":memory:");
+		const scheduler = new ManualScheduler();
+		const service = createService(database, new FakeAskChatRuntime({}), scheduler, {
+			providers: createTestProviderRegistry({ seed: false }),
+		});
+
+		try {
+			const created = service.createProvider({
+				schemaVersion: 1,
+				displayName: "OpenAI",
+				type: "openai-compatible",
+				baseUrl: "https://api.openai.com/v1",
+				apiKey: "sk-create-secret",
+				customHeaders: { "X-Org-Id": "org-secret-value" },
+			});
+			const createdJson = JSON.stringify(created);
+			expect(createdJson).not.toContain("sk-create-secret");
+			expect(createdJson).not.toContain("org-secret-value");
+			expect(created.provider.customHeaderNames).toEqual(["X-Org-Id"]);
+			expect(createdJson).toContain("X-Org-Id");
+
+			const updated = service.updateProvider({
+				schemaVersion: 1,
+				providerId: created.provider.id,
+				apiKey: "sk-update-secret",
+				customHeaders: { "X-Update-Header": "update-secret-value" },
+			});
+			const updatedJson = JSON.stringify(updated);
+			expect(updatedJson).not.toContain("sk-update-secret");
+			expect(updatedJson).not.toContain("update-secret-value");
+			expect(updated.provider.customHeaderNames).toEqual(["X-Update-Header"]);
+			expect(updatedJson).toContain("X-Update-Header");
+
+			const listJson = JSON.stringify(service.listProviders());
+			expect(listJson).not.toContain("sk-update-secret");
+			expect(listJson).not.toContain("update-secret-value");
+			expect(listJson).toContain("X-Update-Header");
+		} finally {
+			await service.shutdown();
+			database.close();
+		}
+	});
+
+	test("never leaks provider secrets through the Session page or published events", async () => {
+		const database = openAppDatabase(":memory:");
+		const scheduler = new ManualScheduler();
+		const registry = createTestProviderRegistry({ seed: false });
+		const runtime = new FakeAskChatRuntime({ deltas: ["Answer"] });
+		const service = createService(database, runtime, scheduler, { providers: registry });
+		const publishedEvents: ChatRunEvent[] = [];
+
+		try {
+			const provider = registry.create({
+				displayName: "OpenAI",
+				type: "openai-compatible",
+				baseUrl: "https://api.openai.com/v1",
+				apiKey: "sk-page-secret",
+				customHeaders: { "X-Secret-Header": "super-secret-header-value" },
+			});
+			registry.setModels(
+				provider.id,
+				[{ id: "gpt-5.4", enabled: false }],
+				"2026-01-01T00:00:00.000Z",
+			);
+			registry.setModelsEnabled(provider.id, ["gpt-5.4"]);
+			registry.setDefaultModel({ providerId: provider.id, modelId: "gpt-5.4" });
+
+			service.subscribe((event) => {
+				publishedEvents.push(event);
+			});
+
+			const { session } = service.createSession();
+			service.sendMessage({ sessionId: session.id, content: "Question" });
+			scheduler.runAll();
+			await service.waitForIdle();
+
+			const pageJson = JSON.stringify(
+				await service.getSessionPage({ sessionId: session.id, limit: 2 }),
+			);
+			expect(pageJson).not.toContain("sk-page-secret");
+			expect(pageJson).not.toContain("super-secret-header-value");
+
+			expect(publishedEvents.length).toBeGreaterThan(0);
+			for (const event of publishedEvents) {
+				const eventJson = JSON.stringify(event);
+				expect(eventJson).not.toContain("sk-page-secret");
+				expect(eventJson).not.toContain("super-secret-header-value");
+			}
+		} finally {
+			await service.shutdown();
+			database.close();
+		}
+	});
+});
+
+describe("ChatApplicationService provider and model resolution", () => {
+	const modelsFetchedAt = "2026-01-01T00:00:00.000Z";
+
+	function seedProvider(
+		registry: ProviderRegistry,
+		options: {
+			displayName: string;
+			type?: ProviderRecord["type"];
+			baseUrl: string;
+			apiKey: string;
+			models: ProviderModel[];
+			enabledModelIds: string[];
+			defaultModelId?: string;
+		},
+	): string {
+		const created = registry.create({
+			displayName: options.displayName,
+			type: options.type ?? "openai-compatible",
+			baseUrl: options.baseUrl,
+			apiKey: options.apiKey,
+		});
+		registry.setModels(created.id, options.models, modelsFetchedAt);
+		registry.setModelsEnabled(created.id, options.enabledModelIds);
+		if (options.defaultModelId !== undefined) {
+			registry.setDefaultModel({ providerId: created.id, modelId: options.defaultModelId });
+		}
+		return created.id;
+	}
+
+	test("sends against the Session's own model when set and the default otherwise", async () => {
+		const database = openAppDatabase(":memory:");
+		const scheduler = new ManualScheduler();
+		const registry = createTestProviderRegistry({ seed: false });
+		const runtime = new FakeAskChatRuntime({ deltas: ["ok"] });
+		const service = createService(database, runtime, scheduler, { providers: registry });
+
+		try {
+			const primaryId = seedProvider(registry, {
+				displayName: "Primary",
+				baseUrl: "https://primary.example/v1",
+				apiKey: "sk-primary",
+				models: [
+					{
+						id: "gpt-5.4",
+						enabled: false,
+						supportedEndpoints: ["/v1/messages", "/responses", "/chat/completions"],
+					},
+				],
+				enabledModelIds: ["gpt-5.4"],
+				defaultModelId: "gpt-5.4",
+			});
+			const secondaryId = seedProvider(registry, {
+				displayName: "Secondary",
+				type: "anthropic-compatible",
+				baseUrl: "https://secondary.example/v1",
+				apiKey: "sk-secondary",
+				models: [
+					{
+						id: "claude-4",
+						enabled: false,
+						supportedEndpoints: ["/chat/completions", "/v1/messages"],
+					},
+				],
+				enabledModelIds: ["claude-4"],
+			});
+
+			const defaultSession = service.createSession().session;
+			service.sendMessage({ sessionId: defaultSession.id, content: "use default" });
+			scheduler.runAll();
+			await service.waitForIdle();
+			expect(runtime.inputs[0]?.provider.providerId).toBe(primaryId);
+			expect(runtime.inputs[0]?.provider.model).toBe("gpt-5.4");
+			expect(runtime.inputs[0]?.provider.protocol).toBe("openai-responses");
+
+			const pinnedSession = service.createSession().session;
+			service.setSessionModel({
+				sessionId: pinnedSession.id,
+				model: { providerId: secondaryId, modelId: "claude-4" },
+			});
+			service.sendMessage({ sessionId: pinnedSession.id, content: "use pinned" });
+			scheduler.runAll();
+			await service.waitForIdle();
+			expect(runtime.inputs[1]?.provider.providerId).toBe(secondaryId);
+			expect(runtime.inputs[1]?.provider.model).toBe("claude-4");
+			expect(runtime.inputs[1]?.provider.type).toBe("anthropic-compatible");
+			expect(runtime.inputs[1]?.provider.protocol).toBe("anthropic-messages");
+		} finally {
+			await service.shutdown();
+			database.close();
+		}
+	});
+
+	test("falls back to the default when the Session provider is removed, disabled, or drops the model", async () => {
+		const database = openAppDatabase(":memory:");
+		const scheduler = new ManualScheduler();
+		const registry = createTestProviderRegistry({ seed: false });
+		const runtime = new FakeAskChatRuntime({ deltas: ["ok"] });
+		const service = createService(database, runtime, scheduler, { providers: registry });
+
+		try {
+			const fallbackId = seedProvider(registry, {
+				displayName: "Fallback",
+				baseUrl: "https://fallback.example/v1",
+				apiKey: "sk-fallback",
+				models: [{ id: "gpt-5.4", enabled: false }],
+				enabledModelIds: ["gpt-5.4"],
+				defaultModelId: "gpt-5.4",
+			});
+
+			const removableId = seedProvider(registry, {
+				displayName: "Removable",
+				baseUrl: "https://removable.example/v1",
+				apiKey: "sk-removable",
+				models: [{ id: "temp-model", enabled: false }],
+				enabledModelIds: ["temp-model"],
+			});
+			const removableSession = service.createSession().session;
+			service.setSessionModel({
+				sessionId: removableSession.id,
+				model: { providerId: removableId, modelId: "temp-model" },
+			});
+			registry.delete(removableId);
+			service.sendMessage({ sessionId: removableSession.id, content: "provider deleted" });
+			scheduler.runAll();
+			await service.waitForIdle();
+			expect(runtime.inputs[0]?.provider.providerId).toBe(fallbackId);
+
+			const disabledId = seedProvider(registry, {
+				displayName: "Disabled",
+				baseUrl: "https://disabled.example/v1",
+				apiKey: "sk-disabled",
+				models: [{ id: "off-model", enabled: false }],
+				enabledModelIds: ["off-model"],
+			});
+			const disabledSession = service.createSession().session;
+			service.setSessionModel({
+				sessionId: disabledSession.id,
+				model: { providerId: disabledId, modelId: "off-model" },
+			});
+			registry.update({ providerId: disabledId, enabled: false });
+			service.sendMessage({ sessionId: disabledSession.id, content: "provider disabled" });
+			scheduler.runAll();
+			await service.waitForIdle();
+			expect(runtime.inputs[1]?.provider.providerId).toBe(fallbackId);
+
+			const droppedId = seedProvider(registry, {
+				displayName: "Dropped",
+				baseUrl: "https://dropped.example/v1",
+				apiKey: "sk-dropped",
+				models: [{ id: "gone-model", enabled: false }],
+				enabledModelIds: ["gone-model"],
+			});
+			const droppedSession = service.createSession().session;
+			service.setSessionModel({
+				sessionId: droppedSession.id,
+				model: { providerId: droppedId, modelId: "gone-model" },
+			});
+			registry.setModels(droppedId, [{ id: "other-model", enabled: false }], modelsFetchedAt);
+			service.sendMessage({ sessionId: droppedSession.id, content: "model dropped" });
+			scheduler.runAll();
+			await service.waitForIdle();
+			expect(runtime.inputs[2]?.provider.providerId).toBe(fallbackId);
+
+			const disabledModelId = seedProvider(registry, {
+				displayName: "Disabled model",
+				baseUrl: "https://disabled-model.example/v1",
+				apiKey: "sk-disabled-model",
+				models: [{ id: "kept-model", enabled: false }],
+				enabledModelIds: ["kept-model"],
+			});
+			const disabledModelSession = service.createSession().session;
+			service.setSessionModel({
+				sessionId: disabledModelSession.id,
+				model: { providerId: disabledModelId, modelId: "kept-model" },
+			});
+			registry.setModelsEnabled(disabledModelId, []);
+			service.sendMessage({ sessionId: disabledModelSession.id, content: "model disabled" });
+			scheduler.runAll();
+			await service.waitForIdle();
+			expect(runtime.inputs[3]?.provider.providerId).toBe(fallbackId);
+		} finally {
+			await service.shutdown();
+			database.close();
+		}
+	});
+
+	test("throws not_configured when neither the Session nor the default resolves", async () => {
+		const database = openAppDatabase(":memory:");
+		const scheduler = new ManualScheduler();
+		const service = createService(database, new FakeAskChatRuntime({}), scheduler, {
+			providers: createTestProviderRegistry({ seed: false }),
+		});
+
+		try {
+			const { session } = service.createSession();
+			expect(() => service.sendMessage({ sessionId: session.id, content: "no provider" })).toThrow(
+				"No Provider and model are selected for this chat.",
+			);
+		} finally {
+			await service.shutdown();
+			database.close();
+		}
+	});
+
+	test("rejects unknown providers and models and clears the Session model with null", async () => {
+		const database = openAppDatabase(":memory:");
+		const scheduler = new ManualScheduler();
+		const registry = createTestProviderRegistry({ seed: false });
+		const service = createService(database, new FakeAskChatRuntime({}), scheduler, {
+			providers: registry,
+		});
+
+		try {
+			const providerId = seedProvider(registry, {
+				displayName: "OpenAI",
+				baseUrl: "https://api.openai.com/v1",
+				apiKey: "sk-secret",
+				models: [{ id: "gpt-5.4", enabled: false }],
+				enabledModelIds: ["gpt-5.4"],
+			});
+			const { session } = service.createSession();
+
+			expect(() =>
+				service.setSessionModel({
+					sessionId: session.id,
+					model: { providerId: createUuidV7(), modelId: "gpt-5.4" },
+				}),
+			).toThrow(ProviderNotFoundError);
+			expect(() =>
+				service.setSessionModel({
+					sessionId: session.id,
+					model: { providerId, modelId: "missing-model" },
+				}),
+			).toThrow(ProviderModelNotFoundError);
+
+			const selected = service.setSessionModel({
+				sessionId: session.id,
+				model: { providerId, modelId: "gpt-5.4" },
+			});
+			expect(selected.session.model).toEqual({ providerId, modelId: "gpt-5.4" });
+
+			const cleared = service.setSessionModel({ sessionId: session.id, model: null });
+			expect(cleared.session.model).toBeUndefined();
+		} finally {
+			await service.shutdown();
+			database.close();
+		}
+	});
+
+	test("drops an unadvertised reasoning effort and clamps the thinking budget", async () => {
+		const database = openAppDatabase(":memory:");
+		const scheduler = new ManualScheduler();
+		const registry = createTestProviderRegistry({ seed: false });
+		const service = createService(database, new FakeAskChatRuntime({}), scheduler, {
+			providers: registry,
+		});
+
+		try {
+			const providerId = seedProvider(registry, {
+				displayName: "Claude gateway",
+				type: "anthropic-compatible",
+				baseUrl: "https://api.anthropic.com/v1",
+				apiKey: "sk-secret",
+				models: [
+					{
+						id: "claude-opus-4.6",
+						enabled: false,
+						reasoningEfforts: ["low", "high"],
+						thinking: { minBudgetTokens: 1024, maxBudgetTokens: 8192 },
+					},
+				],
+				enabledModelIds: ["claude-opus-4.6"],
+			});
+			const { session } = service.createSession();
+
+			const kept = service.setSessionModel({
+				sessionId: session.id,
+				model: {
+					providerId,
+					modelId: "claude-opus-4.6",
+					reasoning: { effort: "high", budgetTokens: 100_000 },
+				},
+			});
+			expect(kept.session.model?.reasoning).toEqual({ effort: "high", budgetTokens: 8192 });
+
+			const dropped = service.setSessionModel({
+				sessionId: session.id,
+				model: {
+					providerId,
+					modelId: "claude-opus-4.6",
+					reasoning: { effort: "medium", budgetTokens: 100 },
+				},
+			});
+			expect(dropped.session.model?.reasoning).toEqual({ budgetTokens: 1024 });
+
+			const cleared = service.setSessionModel({
+				sessionId: session.id,
+				model: {
+					providerId,
+					modelId: "claude-opus-4.6",
+					reasoning: { effort: "unsupported" },
+				},
+			});
+			expect(cleared.session.model).toEqual({ providerId, modelId: "claude-opus-4.6" });
+		} finally {
+			await service.shutdown();
+			database.close();
+		}
+	});
+
+	test("fetchProviderModels stores the normalized catalog and preserves enabled ids", async () => {
+		const database = openAppDatabase(":memory:");
+		const scheduler = new ManualScheduler();
+		const registry = createTestProviderRegistry({ seed: false });
+		const requests: ProviderCatalogRequest[] = [];
+		const service = createService(database, new FakeAskChatRuntime({}), scheduler, {
+			providers: registry,
+			fetchProviderModels: async (request) => {
+				requests.push(request);
+				return [
+					{ id: "m1", enabled: true },
+					{ id: "m2", enabled: true },
+					{ id: "m3", enabled: true },
+				];
+			},
+		});
+
+		try {
+			const providerId = seedProvider(registry, {
+				displayName: "OpenAI",
+				baseUrl: "https://api.openai.com/v1",
+				apiKey: "sk-catalog-secret",
+				models: [
+					{ id: "m1", enabled: false },
+					{ id: "m2", enabled: false },
+				],
+				enabledModelIds: ["m1"],
+			});
+
+			const output = await service.fetchProviderModels({ schemaVersion: 1, providerId });
+			const enabledById = new Map(output.provider.models.map((model) => [model.id, model.enabled]));
+			expect(enabledById.get("m1")).toBe(true);
+			expect(enabledById.get("m2")).toBe(false);
+			expect(enabledById.get("m3")).toBe(false);
+			expect(output.provider.modelsFetchedAt).toBeDefined();
+			expect(requests[0]?.apiKey).toBe("sk-catalog-secret");
+		} finally {
+			await service.shutdown();
+			database.close();
+		}
+	});
+
+	test("listAvailableModels returns only enabled models of enabled providers with reasoning", async () => {
+		const database = openAppDatabase(":memory:");
+		const scheduler = new ManualScheduler();
+		const registry = createTestProviderRegistry({ seed: false });
+		const service = createService(database, new FakeAskChatRuntime({}), scheduler, {
+			providers: registry,
+		});
+
+		try {
+			const openAiId = seedProvider(registry, {
+				displayName: "OpenAI",
+				baseUrl: "https://api.openai.com/v1",
+				apiKey: "sk-openai",
+				models: [
+					{ id: "gpt-5.4", enabled: false },
+					{ id: "gpt-legacy", enabled: false },
+				],
+				enabledModelIds: ["gpt-5.4"],
+			});
+			const anthropicId = seedProvider(registry, {
+				displayName: "Anthropic",
+				type: "anthropic-compatible",
+				baseUrl: "https://api.anthropic.com/v1",
+				apiKey: "sk-anthropic",
+				models: [{ id: "claude-4", enabled: false, thinking: { minBudgetTokens: 1024 } }],
+				enabledModelIds: ["claude-4"],
+			});
+			const disabledProviderId = seedProvider(registry, {
+				displayName: "Disabled",
+				baseUrl: "https://disabled.example/v1",
+				apiKey: "sk-disabled",
+				models: [{ id: "hidden", enabled: false }],
+				enabledModelIds: ["hidden"],
+			});
+			registry.update({ providerId: disabledProviderId, enabled: false });
+
+			const output = service.listAvailableModels();
+			const identities = output.models.map((entry) => `${entry.providerId}:${entry.model.id}`);
+			expect(identities).toEqual([`${openAiId}:gpt-5.4`, `${anthropicId}:claude-4`]);
+
+			const openAiModel = output.models.find((entry) => entry.providerId === openAiId);
+			const anthropicModel = output.models.find((entry) => entry.providerId === anthropicId);
+			expect(openAiModel?.reasoning).toEqual({ kind: "none" });
+			expect(anthropicModel?.reasoning.kind).toBe("budget");
+		} finally {
+			await service.shutdown();
+			database.close();
+		}
+	});
+});

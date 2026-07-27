@@ -1,16 +1,19 @@
 import { describe, expect, test } from "bun:test";
 import {
 	appErrorSchema,
-	chatProviderStatusSchema,
 	chatMessageSchema,
 	chatRunErrorEventSchema,
 	createChatSessionInputSchema,
+	createProviderInputSchema,
 	deleteChatSessionOutputSchema,
-	openAiCompatibleProviderStateSchema,
+	providerSummarySchema,
+	runProviderStateSchema,
 	runtimeInfoSchema,
 	sendChatMessageInputSchema,
 	setChatSessionArchivedInputSchema,
-	testChatProviderOutputSchema,
+	setChatSessionModelInputSchema,
+	testProviderInputSchema,
+	testProviderOutputSchema,
 	updateChatSessionInputSchema,
 } from "../src";
 
@@ -59,6 +62,7 @@ describe("shared contracts", () => {
 				schemaVersion: 1,
 				providerId,
 				name: "OpenAI",
+				type: "openai-compatible",
 				baseUrl: "https://api.openai.com/v1",
 				model: "gpt-5.4",
 				apiKey: "sk-test-secret",
@@ -70,10 +74,11 @@ describe("shared contracts", () => {
 
 	test("rejects provider state objects that expose api keys", () => {
 		expect(() =>
-			openAiCompatibleProviderStateSchema.parse({
+			runProviderStateSchema.parse({
 				schemaVersion: 1,
 				providerId,
 				name: "OpenAI",
+				type: "openai-compatible",
 				baseUrl: "https://api.openai.com/v1",
 				model: "gpt-5.4",
 				status: "ready",
@@ -82,19 +87,112 @@ describe("shared contracts", () => {
 		).toThrow();
 	});
 
-	test("requires configured provider status to include a model", () => {
+	test("keeps provider summaries free of api keys and header values", () => {
 		expect(() =>
-			chatProviderStatusSchema.parse({
+			providerSummarySchema.parse({
 				schemaVersion: 1,
-				configured: true,
+				id: providerId,
+				displayName: "OpenAI",
+				type: "openai-compatible",
 				baseUrl: "https://api.openai.com/v1",
-				model: "",
+				enabled: true,
+				apiKey: "sk-test-secret",
+				customHeaderNames: [],
+				models: [],
 			}),
 		).toThrow();
+
+		const summary = providerSummarySchema.parse({
+			schemaVersion: 1,
+			id: providerId,
+			displayName: "OpenAI",
+			type: "openai-compatible",
+			baseUrl: "https://api.openai.com/v1",
+			enabled: true,
+			apiKeyMask: "••••••••cret",
+			customHeaderNames: ["X-Org"],
+			models: [
+				{
+					id: "gpt-5.4",
+					enabled: true,
+					contextWindowTokens: 272_000,
+					reasoningEfforts: ["low", "medium", "high"],
+				},
+			],
+		});
+
+		expect(summary.models[0]?.reasoningEfforts).toEqual(["low", "medium", "high"]);
+		expect(JSON.stringify(summary)).not.toContain("sk-test-secret");
+	});
+
+	test("rejects unsupported provider types and malformed custom headers", () => {
+		expect(() =>
+			createProviderInputSchema.parse({
+				schemaVersion: 1,
+				displayName: "Gateway",
+				type: "gemini",
+				baseUrl: "https://example.com/v1",
+				apiKey: "sk-test",
+			}),
+		).toThrow();
+
+		expect(() =>
+			createProviderInputSchema.parse({
+				schemaVersion: 1,
+				displayName: "Gateway",
+				type: "openai-compatible",
+				baseUrl: "https://example.com/v1",
+				apiKey: "sk-test",
+				customHeaders: { "Bad Header": "value" },
+			}),
+		).toThrow();
+
+		expect(
+			createProviderInputSchema.parse({
+				schemaVersion: 1,
+				displayName: "Gateway",
+				type: "anthropic-compatible",
+				baseUrl: "https://example.com/v1",
+				apiKey: "sk-test",
+				customHeaders: { "X-Org": "acme" },
+			}).customHeaders,
+		).toEqual({ "X-Org": "acme" });
+	});
+
+	test("requires exactly one provider test target", () => {
+		expect(() => testProviderInputSchema.parse({ schemaVersion: 1 })).toThrow();
+		expect(() =>
+			testProviderInputSchema.parse({
+				schemaVersion: 1,
+				providerId,
+				draft: {
+					displayName: "Gateway",
+					type: "openai-compatible",
+					baseUrl: "https://example.com/v1",
+				},
+			}),
+		).toThrow();
+		expect(testProviderInputSchema.parse({ schemaVersion: 1, providerId }).providerId).toBe(
+			providerId,
+		);
+	});
+
+	test("accepts a nullable session model selection", () => {
+		expect(setChatSessionModelInputSchema.parse({ sessionId, model: null }).model).toBeNull();
+		expect(
+			setChatSessionModelInputSchema.parse({
+				sessionId,
+				model: {
+					providerId,
+					modelId: "claude-opus-4.6",
+					reasoning: { budgetTokens: 8_192 },
+				},
+			}).model?.reasoning?.budgetTokens,
+		).toBe(8_192);
 	});
 
 	test("accepts structured Provider connection test results", () => {
-		const result = testChatProviderOutputSchema.parse({
+		const result = testProviderOutputSchema.parse({
 			schemaVersion: 1,
 			ok: false,
 			latencyMs: 42,

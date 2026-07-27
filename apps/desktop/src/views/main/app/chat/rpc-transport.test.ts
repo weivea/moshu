@@ -2,15 +2,29 @@ import type {
 	CancelChatRunOutput,
 	ChatRunEvent,
 	ChatSendAcceptedOutput,
-	ConfigureChatProviderInput,
-	ChatProviderStatus as ContractChatProviderStatus,
 	CreateChatSessionOutput,
+	CreateProviderInput,
 	DeleteChatSessionOutput,
+	DeleteProviderOutput,
+	FetchProviderModelsOutput,
 	GetChatSessionSnapshotOutput,
+	GetDefaultModelOutput,
+	ListAvailableModelsOutput,
 	ListChatSessionsOutput,
+	ListProvidersOutput,
+	ProviderMutationOutput,
+	ProviderSummary,
 	SetChatSessionArchivedOutput,
-	TestChatProviderOutput,
+	SetChatSessionModelInput,
+	SetChatSessionModelOutput,
+	SetDefaultModelInput,
+	SetDefaultModelOutput,
+	SetProviderModelsEnabledInput,
+	SetProviderModelsEnabledOutput,
+	TestProviderInput,
+	TestProviderOutput,
 	UpdateChatSessionOutput,
+	UpdateProviderInput,
 } from "@moshu/contracts";
 import { maxRetainedSessionRetirements, retiredSessionTombstoneTtlMs } from "@moshu/contracts";
 import { describe, expect, test } from "vitest";
@@ -39,19 +53,25 @@ describe("RPC Chat transport", () => {
 		const events: ChatTransportEvent[] = [];
 		transport.subscribe((event) => events.push(event));
 
-		const configured = await transport.configureProvider({
-			endpoint: "https://api.openai.com/v1",
-			model: "gpt-4.1-mini",
+		const created = await transport.createProvider({
+			schemaVersion: 1,
+			displayName: "OpenAI",
+			type: "openai-compatible",
+			baseUrl: "https://api.openai.com/v1",
 			apiKey: "sk-test-secret",
 		});
-		expect(configured).toEqual({
-			configured: true,
-			endpoint: "https://api.openai.com/v1",
-			model: "gpt-4.1-mini",
-			askMode: "Ask",
+		expect(created).toEqual({
+			schemaVersion: 1,
+			id: providerId,
+			displayName: "OpenAI",
+			type: "openai-compatible",
+			baseUrl: "https://api.openai.com/v1",
+			enabled: true,
 			apiKeyMask: "********cret",
+			customHeaderNames: [],
+			models: [],
 		});
-		expect(client.lastConfiguration?.apiKey).toBe("sk-test-secret");
+		expect(client.lastCreateInput?.apiKey).toBe("sk-test-secret");
 
 		const session = await transport.createSession();
 		expect(session.id).toBe(sessionId);
@@ -163,12 +183,10 @@ describe("RPC Chat transport", () => {
 		const client = new FakeRpcChatClient();
 		const transport = createRpcChatTransport(client);
 
-		expect(
-			await transport.testProvider({
-				endpoint: "https://api.openai.com/v1",
-				model: "gpt-4.1-mini",
-			}),
-		).toEqual({ ok: true, latencyMs: 12 });
+		expect(await transport.testProvider({ schemaVersion: 1, providerId })).toEqual({
+			ok: true,
+			latencyMs: 12,
+		});
 		expect(await transport.listSessions()).toEqual([
 			{
 				id: sessionId,
@@ -204,7 +222,11 @@ describe("RPC Chat transport", () => {
 });
 
 class FakeRpcChatClient implements RpcChatClient {
-	lastConfiguration?: ConfigureChatProviderInput;
+	lastCreateInput?: CreateProviderInput;
+	lastUpdateInput?: UpdateProviderInput;
+	lastSetModelsInput?: SetProviderModelsEnabledInput;
+	lastSetDefaultInput?: SetDefaultModelInput;
+	lastSetSessionModelInput?: SetChatSessionModelInput;
 	readonly sendInputs: Array<{ requestId: string; sessionId: string; content: string }> = [];
 	readonly cancelInputs: Array<{ sessionId: string; runId: string }> = [];
 	lastInvalidationSubscriptionOptions?: ChatSessionInvalidationSubscriptionOptions;
@@ -213,45 +235,72 @@ class FakeRpcChatClient implements RpcChatClient {
 	#invalidationListeners = new Set<
 		(invalidation: ChatSessionInvalidation) => void | PromiseLike<void>
 	>();
-	#status: ContractChatProviderStatus = {
-		schemaVersion: 1,
-		configured: true,
-		baseUrl: "https://api.openai.com/v1",
-		model: "gpt-4.1-mini",
-	};
 
-	async getChatProviderStatus() {
-		return this.#status;
+	async listProviders(): Promise<ListProvidersOutput> {
+		return { schemaVersion: 1, providers: [] };
 	}
 
-	async configureChatProvider(input: ConfigureChatProviderInput) {
-		this.lastConfiguration = input;
-		this.#status = {
-			schemaVersion: 1,
-			configured: true,
-			baseUrl: input.baseUrl,
-			model: input.model,
-			apiKeyMask: "********cret",
-		};
-		return this.#status;
-	}
-
-	async testChatProvider(): Promise<TestChatProviderOutput> {
+	async createProvider(input: CreateProviderInput): Promise<ProviderMutationOutput> {
+		this.lastCreateInput = input;
 		return {
 			schemaVersion: 1,
-			ok: true,
-			latencyMs: 12,
+			provider: createProviderSummary({
+				displayName: input.displayName,
+				type: input.type,
+				baseUrl: input.baseUrl,
+				customHeaderNames: Object.keys(input.customHeaders ?? {}),
+			}),
 		};
 	}
 
-	async deleteChatProvider() {
-		this.#status = {
+	async updateProvider(input: UpdateProviderInput): Promise<ProviderMutationOutput> {
+		this.lastUpdateInput = input;
+		return { schemaVersion: 1, provider: createProviderSummary() };
+	}
+
+	async deleteProvider(deleteProviderId: string): Promise<DeleteProviderOutput> {
+		return { schemaVersion: 1, providerId: deleteProviderId };
+	}
+
+	async testProvider(_input: TestProviderInput): Promise<TestProviderOutput> {
+		return { schemaVersion: 1, ok: true, latencyMs: 12 };
+	}
+
+	async fetchProviderModels(_providerId: string): Promise<FetchProviderModelsOutput> {
+		return { schemaVersion: 1, provider: createProviderSummary() };
+	}
+
+	async setProviderModelsEnabled(
+		input: SetProviderModelsEnabledInput,
+	): Promise<SetProviderModelsEnabledOutput> {
+		this.lastSetModelsInput = input;
+		return { schemaVersion: 1, provider: createProviderSummary() };
+	}
+
+	async listAvailableModels(): Promise<ListAvailableModelsOutput> {
+		return { schemaVersion: 1, models: [] };
+	}
+
+	async getDefaultModel(): Promise<GetDefaultModelOutput> {
+		return { schemaVersion: 1 };
+	}
+
+	async setDefaultModel(input: SetDefaultModelInput): Promise<SetDefaultModelOutput> {
+		this.lastSetDefaultInput = input;
+		return {
 			schemaVersion: 1,
-			configured: false,
-			baseUrl: "https://api.openai.com/v1",
-			model: "",
+			...(input.defaultModel === null ? {} : { defaultModel: input.defaultModel }),
 		};
-		return this.#status;
+	}
+
+	async setChatSessionModel(input: SetChatSessionModelInput): Promise<SetChatSessionModelOutput> {
+		this.lastSetSessionModelInput = input;
+		return {
+			session: {
+				...createContractSession(),
+				...(input.model === null ? {} : { model: input.model }),
+			},
+		};
 	}
 
 	async createChatSession(): Promise<CreateChatSessionOutput> {
@@ -387,6 +436,21 @@ function createContractSession() {
 	};
 }
 
+function createProviderSummary(overrides: Partial<ProviderSummary> = {}): ProviderSummary {
+	return {
+		schemaVersion: 1,
+		id: providerId,
+		displayName: "OpenAI",
+		type: "openai-compatible",
+		baseUrl: "https://api.openai.com/v1",
+		enabled: true,
+		apiKeyMask: "********cret",
+		customHeaderNames: [],
+		models: [],
+		...overrides,
+	};
+}
+
 function createAssistantMessage() {
 	return {
 		schemaVersion: 1 as const,
@@ -413,6 +477,7 @@ function createRun() {
 			schemaVersion: 1 as const,
 			providerId,
 			name: "OpenAI",
+			type: "openai-compatible" as const,
 			baseUrl: "https://api.openai.com/v1",
 			model: "gpt-4.1-mini",
 			status: "ready" as const,

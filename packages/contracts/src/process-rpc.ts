@@ -4,13 +4,11 @@ import {
 	cancelChatRunInputSchema,
 	cancelChatRunOutputSchema,
 	chatMessageSchema,
-	chatProviderStatusSchema,
 	chatRunEventCursorSchema,
 	chatRunEventSchema,
 	chatRunSchema,
 	chatSendAcceptedOutputSchema,
 	chatSessionSchema,
-	configureChatProviderInputSchema,
 	createChatSessionInputSchema,
 	createChatSessionOutputSchema,
 	deleteChatSessionInputSchema,
@@ -19,25 +17,50 @@ import {
 	listChatSessionsOutputSchema,
 	setChatSessionArchivedInputSchema,
 	setChatSessionArchivedOutputSchema,
-	testChatProviderInputSchema,
-	testChatProviderOutputSchema,
+	setChatSessionModelInputSchema,
+	setChatSessionModelOutputSchema,
 	updateChatSessionInputSchema,
 	updateChatSessionOutputSchema,
 	uuidV7Schema,
 } from "./chat";
+import {
+	createProviderInputSchema,
+	deleteProviderInputSchema,
+	deleteProviderOutputSchema,
+	fetchProviderModelsInputSchema,
+	fetchProviderModelsOutputSchema,
+	getDefaultModelOutputSchema,
+	listAvailableModelsOutputSchema,
+	listProvidersOutputSchema,
+	providerMutationOutputSchema,
+	setDefaultModelInputSchema,
+	setDefaultModelOutputSchema,
+	setProviderModelsEnabledInputSchema,
+	setProviderModelsEnabledOutputSchema,
+	testProviderInputSchema,
+	testProviderOutputSchema,
+	updateProviderInputSchema,
+} from "./provider";
 import { agentsRuntimeInfoSchema, emptyParamsSchema } from "./runtime";
 
 export const productRpcMethods = {
 	runtimeGet: "moshu.v1.runtime.get",
-	providerStatus: "moshu.v1.provider.status",
-	providerConfigure: "moshu.v1.provider.configure",
-	providerTest: "moshu.v1.provider.test",
-	providerDelete: "moshu.v1.provider.delete",
+	providersList: "moshu.v1.providers.list",
+	providersCreate: "moshu.v1.providers.create",
+	providersUpdate: "moshu.v1.providers.update",
+	providersDelete: "moshu.v1.providers.delete",
+	providersTest: "moshu.v1.providers.test",
+	providersFetchModels: "moshu.v1.providers.fetchModels",
+	providersSetModelsEnabled: "moshu.v1.providers.setModelsEnabled",
+	modelsListAvailable: "moshu.v1.models.listAvailable",
+	defaultModelGet: "moshu.v1.settings.defaultModel.get",
+	defaultModelSet: "moshu.v1.settings.defaultModel.set",
 	sessionCreate: "moshu.v1.session.create",
 	sessionGet: "moshu.v1.session.get",
 	sessionList: "moshu.v1.session.list",
 	sessionUpdate: "moshu.v1.session.update",
 	sessionArchive: "moshu.v1.session.archive",
+	sessionSetModel: "moshu.v1.session.setModel",
 	sessionDelete: "moshu.v1.session.delete",
 	chatSend: "moshu.v1.chat.send",
 	chatCancel: "moshu.v1.chat.cancel",
@@ -68,7 +91,7 @@ export const sendAskChatMessageInputSchema = z
 	.strict();
 
 export const createProcessChatSessionInputSchema = createChatSessionInputSchema
-	.required()
+	.required({ title: true, defaultMode: true })
 	.extend({
 		schemaVersion: z.literal(1),
 		createKey: z.string().uuid(),
@@ -146,21 +169,45 @@ export const getChatSessionPageOutputSchema = z
 
 export const productRpcRequestSchemas = {
 	[productRpcMethods.runtimeGet]: { input: emptyParamsSchema, output: agentsRuntimeInfoSchema },
-	[productRpcMethods.providerStatus]: {
+	[productRpcMethods.providersList]: {
 		input: emptyParamsSchema,
-		output: chatProviderStatusSchema,
+		output: listProvidersOutputSchema,
 	},
-	[productRpcMethods.providerConfigure]: {
-		input: configureChatProviderInputSchema,
-		output: chatProviderStatusSchema,
+	[productRpcMethods.providersCreate]: {
+		input: createProviderInputSchema,
+		output: providerMutationOutputSchema,
 	},
-	[productRpcMethods.providerTest]: {
-		input: testChatProviderInputSchema,
-		output: testChatProviderOutputSchema,
+	[productRpcMethods.providersUpdate]: {
+		input: updateProviderInputSchema,
+		output: providerMutationOutputSchema,
 	},
-	[productRpcMethods.providerDelete]: {
+	[productRpcMethods.providersDelete]: {
+		input: deleteProviderInputSchema,
+		output: deleteProviderOutputSchema,
+	},
+	[productRpcMethods.providersTest]: {
+		input: testProviderInputSchema,
+		output: testProviderOutputSchema,
+	},
+	[productRpcMethods.providersFetchModels]: {
+		input: fetchProviderModelsInputSchema,
+		output: fetchProviderModelsOutputSchema,
+	},
+	[productRpcMethods.providersSetModelsEnabled]: {
+		input: setProviderModelsEnabledInputSchema,
+		output: setProviderModelsEnabledOutputSchema,
+	},
+	[productRpcMethods.modelsListAvailable]: {
 		input: emptyParamsSchema,
-		output: chatProviderStatusSchema,
+		output: listAvailableModelsOutputSchema,
+	},
+	[productRpcMethods.defaultModelGet]: {
+		input: emptyParamsSchema,
+		output: getDefaultModelOutputSchema,
+	},
+	[productRpcMethods.defaultModelSet]: {
+		input: setDefaultModelInputSchema,
+		output: setDefaultModelOutputSchema,
 	},
 	[productRpcMethods.sessionCreate]: {
 		input: createProcessChatSessionInputSchema,
@@ -181,6 +228,10 @@ export const productRpcRequestSchemas = {
 	[productRpcMethods.sessionArchive]: {
 		input: setChatSessionArchivedInputSchema,
 		output: setChatSessionArchivedOutputSchema,
+	},
+	[productRpcMethods.sessionSetModel]: {
+		input: setChatSessionModelInputSchema,
+		output: setChatSessionModelOutputSchema,
 	},
 	[productRpcMethods.sessionDelete]: {
 		input: deleteChatSessionInputSchema,
@@ -210,15 +261,22 @@ export const productRpcEventSchemas = {
 
 export const clientProductRequestMethods = [
 	productRpcMethods.runtimeGet,
-	productRpcMethods.providerStatus,
-	productRpcMethods.providerConfigure,
-	productRpcMethods.providerTest,
-	productRpcMethods.providerDelete,
+	productRpcMethods.providersList,
+	productRpcMethods.providersCreate,
+	productRpcMethods.providersUpdate,
+	productRpcMethods.providersDelete,
+	productRpcMethods.providersTest,
+	productRpcMethods.providersFetchModels,
+	productRpcMethods.providersSetModelsEnabled,
+	productRpcMethods.modelsListAvailable,
+	productRpcMethods.defaultModelGet,
+	productRpcMethods.defaultModelSet,
 	productRpcMethods.sessionCreate,
 	productRpcMethods.sessionGet,
 	productRpcMethods.sessionList,
 	productRpcMethods.sessionUpdate,
 	productRpcMethods.sessionArchive,
+	productRpcMethods.sessionSetModel,
 	productRpcMethods.sessionDelete,
 	productRpcMethods.chatSend,
 	productRpcMethods.chatCancel,

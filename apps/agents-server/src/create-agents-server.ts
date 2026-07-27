@@ -2,9 +2,9 @@ import { mkdirSync } from "node:fs";
 import { dirname, isAbsolute } from "node:path";
 import {
 	type AskChatRuntime,
-	type AskProviderConfigStore,
 	BunSqliteSaver,
 	createAskChatRuntime,
+	type ProviderRegistry,
 } from "@moshu/agent-runtime";
 import type { AgentsServerBootstrapRecord } from "@moshu/contracts";
 import { productRpcMaxBufferedOutboundBytes, productRpcMaxFrameBytes } from "@moshu/contracts";
@@ -13,7 +13,7 @@ import { createRpcBearerAuthenticator, createRpcServer, type RpcServer } from "@
 
 import { ChatApplicationService } from "./chat-application-service";
 import { ExecutorReadiness } from "./executor-readiness";
-import { FileAskProviderConfigStore } from "./file-provider-config-store";
+import { FileProviderRegistryStore } from "./file-provider-registry-store";
 import {
 	agentsServerMethodAllowlist,
 	createProductRpcHandlers,
@@ -30,13 +30,13 @@ export interface AgentsServerInstance {
 export interface CreateAgentsServerOptions {
 	bootstrap: AgentsServerBootstrapRecord;
 	serverVersion: string;
-	createRuntime?: (
-		providerConfigStore: AskProviderConfigStore,
-		checkpointer: BunSqliteSaver,
-	) => AskChatRuntime;
+	createRuntime?: (providers: ProviderRegistry, checkpointer: BunSqliteSaver) => AskChatRuntime;
 	testProviderConnection?: ConstructorParameters<
 		typeof ChatApplicationService
 	>[0]["testProviderConnection"];
+	fetchProviderModels?: ConstructorParameters<
+		typeof ChatApplicationService
+	>[0]["fetchProviderModels"];
 	checkpointDeletionAttemptTimeoutMs?: number;
 	checkpointDeletionMaxInFlightAttempts?: number;
 	checkpointDeletionStartupTimeoutMs?: number;
@@ -78,21 +78,16 @@ export async function createAgentsServer(
 	let unsubscribe: (() => void) | undefined;
 	try {
 		checkpointSaver = new BunSqliteSaver(options.bootstrap.paths.checkpointDatabase);
-		const providerConfigStore = new FileAskProviderConfigStore(
-			options.bootstrap.paths.providerConfig,
-		);
+		const providers = new FileProviderRegistryStore(options.bootstrap.paths.providerConfig);
 		const runtime =
-			options.createRuntime?.(providerConfigStore, checkpointSaver) ??
-			createAskChatRuntime({
-				providerConfigStore,
-				checkpointer: checkpointSaver,
-			});
+			options.createRuntime?.(providers, checkpointSaver) ??
+			createAskChatRuntime({ checkpointer: checkpointSaver });
 		const executorReadiness = new ExecutorReadiness();
 		const eventRouter = new ProductEventRouter();
 		chatService = new ChatApplicationService({
 			sessions: database.sessions,
 			runs: database.runs,
-			providerConfigStore,
+			providers,
 			runtime,
 			isRuntimeReady: () => executorReadiness.isReady(),
 			logger: {
@@ -126,6 +121,9 @@ export async function createAgentsServer(
 			...(options.testProviderConnection === undefined
 				? {}
 				: { testProviderConnection: options.testProviderConnection }),
+			...(options.fetchProviderModels === undefined
+				? {}
+				: { fetchProviderModels: options.fetchProviderModels }),
 			...(options.shutdownTimeoutMs === undefined
 				? {}
 				: { shutdownTimeoutMs: options.shutdownTimeoutMs }),

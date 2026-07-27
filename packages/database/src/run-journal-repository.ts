@@ -14,10 +14,10 @@ import {
 	chatRunSchema,
 	chatRunStatusSchema,
 	deleteChatSessionOutputSchema,
-	type OpenAiCompatibleProviderConfigInput,
-	type OpenAiCompatibleProviderState,
-	openAiCompatibleProviderStateSchema,
+	type RunProviderConfigInput,
+	type RunProviderState,
 	retiredSessionTombstoneTtlMs,
+	runProviderStateSchema,
 	sendAskChatMessageInputSchema,
 	uuidV7Schema,
 } from "@moshu/contracts";
@@ -51,7 +51,7 @@ export interface CreateRunInput {
 	clientRequestId: string;
 	sessionId: string;
 	mode: ChatRun["mode"];
-	provider: OpenAiCompatibleProviderConfigInput;
+	provider: RunProviderConfigInput;
 	userMessageId: string;
 	userContent: string;
 	assistantMessageId: string;
@@ -226,16 +226,18 @@ function parseJsonValue(raw: string, description: string): unknown {
 	}
 }
 
-function toSafeProviderState(
-	provider: OpenAiCompatibleProviderConfigInput,
-): OpenAiCompatibleProviderState {
-	return openAiCompatibleProviderStateSchema.parse({
+/** Strips the API key and every custom header value before a run is journalled. */
+function toSafeProviderState(provider: RunProviderConfigInput): RunProviderState {
+	return runProviderStateSchema.parse({
 		schemaVersion: 1,
 		providerId: provider.providerId,
 		name: provider.name,
+		type: provider.type,
 		baseUrl: provider.baseUrl,
 		model: provider.model,
 		organization: provider.organization,
+		reasoningEffort: provider.reasoningEffort,
+		reasoningBudgetTokens: provider.reasoningBudgetTokens,
 		status: "ready",
 	});
 }
@@ -249,6 +251,21 @@ function parseError(raw: string | null): AppError | undefined {
 		throw new Error("Invalid error record.");
 	}
 	return appErrorSchema.parse(value.error);
+}
+
+function parseRunProviderState(raw: string): RunProviderState {
+	const value = parseJsonValue(raw, "provider state");
+	if (typeof value !== "object" || value === null || Array.isArray(value)) {
+		return runProviderStateSchema.parse(value);
+	}
+	const storedType = "type" in value ? value.type : undefined;
+	const type =
+		storedType === "openai-chat-completions" || storedType === "openai-responses"
+			? "openai-compatible"
+			: storedType === "anthropic-messages"
+				? "anthropic-compatible"
+				: storedType;
+	return runProviderStateSchema.parse({ ...value, type });
 }
 
 function serializeError(error: AppError): string {
@@ -265,9 +282,7 @@ function buildRun(row: RunRow): ChatRun {
 		sessionId: row.sessionId,
 		mode: row.mode,
 		status: row.status,
-		provider: openAiCompatibleProviderStateSchema.parse(
-			parseJsonValue(row.providerJson, "provider state"),
-		),
+		provider: parseRunProviderState(row.providerJson),
 		userMessageId: row.userMessageId,
 		assistantMessageId: row.assistantMessageId,
 		createdAt: toIsoDateTime(row.createdAtMs),

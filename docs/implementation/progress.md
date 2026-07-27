@@ -48,8 +48,21 @@ React Chat UI
 
 已验证能力：
 
-- `/settings/providers` 支持一个 OpenAI-compatible 配置的保存、保留/替换 Key、连接测试和删除。
-- Provider 开发配置写入 app-data JSON，使用原子替换和 `0600` 权限；WebView 只读掩码。
+- 设置页改为左侧栏导航：Providers、Default Model、General 已实现，MCP/Skills/Usage/Security 为占位页。
+- `/settings/providers` 支持配置多个 Provider（Display name、Type、Base URL、API key、Custom headers JSON），
+  以及连接测试、删除和「获取模型列表」后按勾选启用模型。
+- Provider Type 只有 `openai-compatible` 和 `anthropic-compatible`；实际请求协议由模型
+  `supported_endpoints` 解析，多 endpoint 优先匹配 Provider 协议族并保持目录顺序，缺失时按 Type 回退。
+- Chat Completions、Responses 和 Anthropic Messages 分别使用显式的 `ChatOpenAICompletions`、
+  `ChatOpenAIResponses` 和 `ChatAnthropic` adapter，不允许通用 `ChatOpenAI` 自动切换协议。
+- Responses 多轮请求统一使用官方 v1 content blocks，区分 user/system `input_text` 与 assistant
+  `output_text`，兼容既有字符串 checkpoint 且不丢失 metadata。
+- 模型目录只解析 `/models` 响应（OpenAI、GitHub Copilot、Anthropic、OpenRouter 四种形态）；
+  接口未返回的 context window、输出上限和推理能力一律不展示。
+- 推理控制区分 effort 档位与 Anthropic thinking budget，按目录声明推导；未声明或未开启的参数不下发。
+- Session 输入框底部可切换模型与推理设置，选择持久化在 `chat_sessions`；新会话继承全局默认模型。
+- Provider 开发配置写入 app-data JSON（`provider.json`，`schemaVersion: 3`），使用原子替换和 `0600` 权限；
+  WebView 只读到掩码和 header 名称，读不到 API Key 或 header 值。
 - 普通 Chat 支持流式回复、停止、继续已有 Session 和失败状态。
 - Session 支持新建、选择、搜索、标题、重命名、归档/恢复和永久删除。
 - `/chat/new` 与 `/chat/:sessionId` 是当前 Session 选择事实来源。
@@ -77,7 +90,8 @@ React Chat UI
 - 没有 Project 文件/命令/Git Tool、Diff/撤销、任务中心或桌面通知。
 - 没有 MCP lifecycle 或 Skill storage/prompt/execution split。
 - checkpoint 尚未接入 application 强退后的 graph resume；orphan Run 当前只安全收敛为取消。
-- Secret Vault/Keychain 尚未接入；开发期 Provider Key 仍在 Host 管理的本地配置。
+- Secret Vault/Keychain 尚未接入；开发期 Provider Key 与 Custom header 值仍存在 owner-only 的 app-data 文件中。
+- 业务库 schema 升到 `user_version 9`（`chat_sessions` 新增模型选择列）；旧的本地开发数据会在启动时协同重置。
 - 没有 signed/packaged three-role desktop E2E。
 
 ## 5. 架构迁移状态

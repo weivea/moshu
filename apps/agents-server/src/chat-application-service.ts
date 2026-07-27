@@ -3,62 +3,98 @@ import {
 	type AskChatMessage,
 	type AskChatRuntime,
 	AskChatRuntimeError,
-	type AskProviderConfigStore,
-	type AskProviderConfiguration,
-	normalizeAskProviderConfiguration,
+	normalizeReasoningSelection,
+	ProviderModelNotFoundError,
+	ProviderNotFoundError,
+	type ProviderRecord,
+	type ProviderRegistry,
+	type ResolvedProviderConfiguration,
+	resolveModelProtocol,
+	resolveReasoningCapability,
+	toProviderSummary,
 } from "@moshu/agent-runtime";
 import {
 	type AppError,
+	type AvailableModel,
 	appErrorSchema,
 	type CancelChatRunInput,
 	type CancelChatRunOutput,
 	type ChatMessage,
-	type ChatProviderStatus,
 	type ChatRun,
 	type ChatRunEvent,
 	type ChatSendAcceptedOutput,
-	type ConfigureChatProviderInput,
 	type CreateChatSessionOutput,
 	type CreateProcessChatSessionInput,
+	type CreateProviderInput,
 	chatMessageSchema,
-	chatProviderStatusSchema,
 	chatSendAcceptedOutputSchema,
-	configureChatProviderInputSchema,
+	createProviderInputSchema,
+	type DefaultModelSelection,
 	type DeleteChatSessionInput,
 	type DeleteChatSessionOutput,
+	type DeleteProviderInput,
+	type DeleteProviderOutput,
 	deleteChatSessionInputSchema,
+	deleteProviderInputSchema,
+	deleteProviderOutputSchema,
+	type FetchProviderModelsInput,
+	type FetchProviderModelsOutput,
+	fetchProviderModelsInputSchema,
+	fetchProviderModelsOutputSchema,
 	type GetChatSessionInput,
 	type GetChatSessionOutput,
 	type GetChatSessionPageInput,
 	type GetChatSessionPageOutput,
 	type GetChatSessionSnapshotOutput,
+	type GetDefaultModelOutput,
 	getChatSessionInputSchema,
 	getChatSessionPageInputSchema,
 	getChatSessionPageOutputSchema,
 	getChatSessionSnapshotOutputSchema,
+	getDefaultModelOutputSchema,
+	type ListAvailableModelsOutput,
 	type ListChatSessionsInput,
 	type ListChatSessionsOutput,
+	type ListProvidersOutput,
+	listAvailableModelsOutputSchema,
 	listChatSessionsInputSchema,
+	listProvidersOutputSchema,
 	maxAssistantMessageContentCharacters,
 	maxChatDeltaCharacters,
 	maxReplayEventBytesPerPage,
 	maxReplayEventsPerPage,
 	normalizeAppErrorSafeMessage,
 	type ProcessPeerIdentity,
+	type ProviderModel,
+	type ProviderMutationOutput,
+	providerMutationOutputSchema,
 	type ReplayChatEventsInput,
 	type ReplayChatEventsOutput,
 	replayChatEventsInputSchema,
 	replayChatEventsOutputSchema,
 	type SetChatSessionArchivedInput,
 	type SetChatSessionArchivedOutput,
+	type SetChatSessionModelInput,
+	type SetChatSessionModelOutput,
+	type SetDefaultModelInput,
+	type SetDefaultModelOutput,
+	type SetProviderModelsEnabledInput,
+	type SetProviderModelsEnabledOutput,
 	setChatSessionArchivedInputSchema,
-	type TestChatProviderInput,
-	type TestChatProviderOutput,
-	testChatProviderInputSchema,
-	testChatProviderOutputSchema,
+	setChatSessionModelInputSchema,
+	setDefaultModelInputSchema,
+	setDefaultModelOutputSchema,
+	setProviderModelsEnabledInputSchema,
+	setProviderModelsEnabledOutputSchema,
+	type TestProviderInput,
+	type TestProviderOutput,
+	testProviderInputSchema,
+	testProviderOutputSchema,
 	type UpdateChatSessionInput,
 	type UpdateChatSessionOutput,
+	type UpdateProviderInput,
 	updateChatSessionInputSchema,
+	updateProviderInputSchema,
 } from "@moshu/contracts";
 import {
 	ChatRunNotFoundError,
@@ -72,14 +108,21 @@ import {
 	type RunPageCursor,
 	type SessionRepository,
 } from "@moshu/database";
+import {
+	anthropicApiVersion,
+	fetchProviderModelCatalog,
+	type ProviderCatalogRequest,
+} from "./provider-catalog";
 
-const DEFAULT_PROVIDER_BASE_URL = "https://api.openai.com/v1";
 const STREAMED_DELTA_FLUSH_LATENCY_MS = 20;
 const replayTextEncoder = new TextEncoder();
 
 type ChatEventListener = (event: ChatRunEvent) => void | PromiseLike<void>;
 type ChatTaskScheduler = (task: () => void) => void;
-type ProviderConnectionTester = (configuration: AskProviderConfiguration) => Promise<void>;
+type ProviderConnectionTester = (configuration: ResolvedProviderConfiguration) => Promise<void>;
+type ProviderModelCatalogFetcher = (
+	request: ProviderCatalogRequest,
+) => Promise<readonly ProviderModel[]>;
 
 interface ChatServiceLogger {
 	error(message: string, error: unknown): void;
@@ -112,8 +155,9 @@ const defaultShutdownTimeoutMs = 5_000;
 export interface ChatApplicationServiceOptions {
 	sessions: SessionRepository;
 	runs: RunJournalRepository;
-	providerConfigStore: AskProviderConfigStore;
+	providers: ProviderRegistry;
 	runtime: AskChatRuntime;
+	fetchProviderModels?: ProviderModelCatalogFetcher;
 	schedule?: ChatTaskScheduler;
 	logger?: ChatServiceLogger;
 	testProviderConnection?: ProviderConnectionTester;
@@ -137,6 +181,7 @@ interface ActiveChatRun {
 	runId: string;
 	sessionId: string;
 	assistantMessageId: string;
+	provider: ResolvedProviderConfiguration;
 	messages: AskChatMessage[];
 	durableAssistantContent: string;
 	pendingAssistantDelta: string;
@@ -152,7 +197,8 @@ interface ActiveChatRun {
 export class ChatApplicationService {
 	readonly #sessions: SessionRepository;
 	readonly #runs: RunJournalRepository;
-	readonly #providerConfigStore: AskProviderConfigStore;
+	readonly #providers: ProviderRegistry;
+	readonly #fetchProviderModels: ProviderModelCatalogFetcher;
 	readonly #runtime: AskChatRuntime;
 	readonly #schedule: ChatTaskScheduler;
 	readonly #logger: ChatServiceLogger;
@@ -196,11 +242,12 @@ export class ChatApplicationService {
 	constructor(options: ChatApplicationServiceOptions) {
 		this.#sessions = options.sessions;
 		this.#runs = options.runs;
-		this.#providerConfigStore = options.providerConfigStore;
+		this.#providers = options.providers;
+		this.#fetchProviderModels = options.fetchProviderModels ?? fetchProviderModelCatalog;
 		this.#runtime = options.runtime;
 		this.#schedule = options.schedule ?? ((task) => setTimeout(task, 0));
 		this.#logger = options.logger ?? console;
-		this.#testProviderConnection = options.testProviderConnection ?? testOpenAiCompatibleProvider;
+		this.#testProviderConnection = options.testProviderConnection ?? testProviderConnection;
 		this.#isRuntimeReady = options.isRuntimeReady ?? (() => true);
 		this.#checkpointDeletionRetryBaseMs = requirePositiveSafeInteger(
 			options.checkpointDeletionRetryBaseMs ?? defaultCheckpointDeletionRetryBaseMs,
@@ -244,52 +291,67 @@ export class ChatApplicationService {
 		};
 	}
 
-	getProviderStatus(): ChatProviderStatus {
-		const status = this.#providerConfigStore.getStatus();
-
-		return chatProviderStatusSchema.parse({
+	listProviders(): ListProvidersOutput {
+		return listProvidersOutputSchema.parse({
 			schemaVersion: 1,
-			configured: status.configured,
-			baseUrl: status.baseUrl ?? DEFAULT_PROVIDER_BASE_URL,
-			model: status.model ?? "",
-			...(status.apiKeyMask === undefined ? {} : { apiKeyMask: status.apiKeyMask }),
+			providers: this.#providers.list().map(toProviderSummary),
 		});
 	}
 
-	configureProvider(input: ConfigureChatProviderInput): ChatProviderStatus {
-		const parsedInput = configureChatProviderInputSchema.parse(input);
+	createProvider(input: CreateProviderInput): ProviderMutationOutput {
+		const parsedInput = createProviderInputSchema.parse(input);
 		this.#assertProviderCanChange();
-		const apiKey = this.#resolveApiKey(
-			parsedInput.baseUrl,
-			parsedInput.apiKey,
-			"configure the Provider",
-		);
-		this.#providerConfigStore.set({
-			provider: "openai-compatible",
-			apiKey,
+		const record = this.#providers.create({
+			displayName: parsedInput.displayName,
+			type: parsedInput.type,
 			baseUrl: parsedInput.baseUrl,
-			model: parsedInput.model,
+			apiKey: parsedInput.apiKey,
+			...(parsedInput.customHeaders === undefined
+				? {}
+				: { customHeaders: parsedInput.customHeaders }),
 		});
 
-		return this.getProviderStatus();
+		return providerMutationOutputSchema.parse({
+			schemaVersion: 1,
+			provider: toProviderSummary(record),
+		});
 	}
 
-	async testProvider(input: TestChatProviderInput): Promise<TestChatProviderOutput> {
+	updateProvider(input: UpdateProviderInput): ProviderMutationOutput {
+		const parsedInput = updateProviderInputSchema.parse(input);
+		this.#assertProviderCanChange();
+		const record = this.#providers.update(parsedInput);
+
+		return providerMutationOutputSchema.parse({
+			schemaVersion: 1,
+			provider: toProviderSummary(record),
+		});
+	}
+
+	deleteProvider(input: DeleteProviderInput): DeleteProviderOutput {
+		const parsedInput = deleteProviderInputSchema.parse(input);
+		this.#assertProviderCanChange();
+		this.#providers.delete(parsedInput.providerId);
+
+		return deleteProviderOutputSchema.parse({
+			schemaVersion: 1,
+			providerId: parsedInput.providerId,
+		});
+	}
+
+	async testProvider(input: TestProviderInput): Promise<TestProviderOutput> {
 		this.#assertDataPlaneAvailable();
 		const startedAt = Date.now();
 
 		try {
-			const configuration = this.#resolveProviderConfiguration(
-				testChatProviderInputSchema.parse(input),
-			);
-			await this.#testProviderConnection(configuration);
-			return testChatProviderOutputSchema.parse({
+			await this.#testProviderConnection(this.#resolveTestConfiguration(input));
+			return testProviderOutputSchema.parse({
 				schemaVersion: 1,
 				ok: true,
 				latencyMs: Date.now() - startedAt,
 			});
 		} catch (error) {
-			return testChatProviderOutputSchema.parse({
+			return testProviderOutputSchema.parse({
 				schemaVersion: 1,
 				ok: false,
 				latencyMs: Date.now() - startedAt,
@@ -298,10 +360,102 @@ export class ChatApplicationService {
 		}
 	}
 
-	deleteProvider(): ChatProviderStatus {
-		this.#assertProviderCanChange();
-		this.#providerConfigStore.clear();
-		return this.getProviderStatus();
+	async fetchProviderModels(input: FetchProviderModelsInput): Promise<FetchProviderModelsOutput> {
+		const parsedInput = fetchProviderModelsInputSchema.parse(input);
+		this.#assertDataPlaneAvailable();
+		const record = this.#requireProvider(parsedInput.providerId);
+		const models = await this.#fetchProviderModels({
+			type: record.type,
+			baseUrl: record.baseUrl,
+			apiKey: record.apiKey,
+			...(record.customHeaders === undefined ? {} : { customHeaders: record.customHeaders }),
+		});
+		const updated = this.#providers.setModels(
+			record.id,
+			models.map((model) => ({ ...model })),
+			new Date().toISOString(),
+		);
+
+		return fetchProviderModelsOutputSchema.parse({
+			schemaVersion: 1,
+			provider: toProviderSummary(updated),
+		});
+	}
+
+	setProviderModelsEnabled(input: SetProviderModelsEnabledInput): SetProviderModelsEnabledOutput {
+		const parsedInput = setProviderModelsEnabledInputSchema.parse(input);
+		this.#assertDataPlaneAvailable();
+		const updated = this.#providers.setModelsEnabled(
+			parsedInput.providerId,
+			parsedInput.enabledModelIds,
+		);
+
+		return setProviderModelsEnabledOutputSchema.parse({
+			schemaVersion: 1,
+			provider: toProviderSummary(updated),
+		});
+	}
+
+	listAvailableModels(): ListAvailableModelsOutput {
+		const models: AvailableModel[] = [];
+		for (const record of this.#providers.list()) {
+			if (!record.enabled) {
+				continue;
+			}
+			for (const model of record.models) {
+				if (!model.enabled) {
+					continue;
+				}
+				models.push({
+					providerId: record.id,
+					providerDisplayName: record.displayName,
+					providerType: record.type,
+					model: { ...model },
+					reasoning: resolveReasoningCapability(record.type, model),
+				});
+			}
+		}
+		const defaultModel = this.#providers.getDefaultModel();
+
+		return listAvailableModelsOutputSchema.parse({
+			schemaVersion: 1,
+			models,
+			...(defaultModel === null ? {} : { defaultModel }),
+		});
+	}
+
+	getDefaultModel(): GetDefaultModelOutput {
+		const defaultModel = this.#providers.getDefaultModel();
+		return getDefaultModelOutputSchema.parse({
+			schemaVersion: 1,
+			...(defaultModel === null ? {} : { defaultModel }),
+		});
+	}
+
+	setDefaultModel(input: SetDefaultModelInput): SetDefaultModelOutput {
+		const parsedInput = setDefaultModelInputSchema.parse(input);
+		this.#assertDataPlaneAvailable();
+		const selection =
+			parsedInput.defaultModel === null ? null : this.#normalizeSelection(parsedInput.defaultModel);
+		const stored = this.#providers.setDefaultModel(selection);
+
+		return setDefaultModelOutputSchema.parse({
+			schemaVersion: 1,
+			...(stored === null ? {} : { defaultModel: stored }),
+		});
+	}
+
+	setSessionModel(input: SetChatSessionModelInput): SetChatSessionModelOutput {
+		const parsedInput = setChatSessionModelInputSchema.parse(input);
+		this.#assertDataPlaneAvailable();
+		if (parsedInput.model !== null) {
+			this.#requireProviderModel(parsedInput.model.providerId, parsedInput.model.modelId);
+		}
+
+		return this.#sessions.setModel({
+			sessionId: parsedInput.sessionId,
+			model: parsedInput.model === null ? null : this.#normalizeSelection(parsedInput.model),
+		});
 	}
 
 	createSession(): CreateChatSessionOutput {
@@ -472,14 +626,7 @@ export class ChatApplicationService {
 			}
 		}
 		this.#assertRuntimeReady();
-		const provider = this.#providerConfigStore.get();
-		if (provider === null) {
-			throw new AskChatRuntimeError({
-				kind: "not_configured",
-				message: "Ask provider is not configured.",
-				retryable: false,
-			});
-		}
+		const provider = this.#resolveSessionProvider(input.sessionId);
 
 		const reservation = this.#reserveSessionStart(input.sessionId);
 		let convertedReservation = false;
@@ -514,11 +661,21 @@ export class ChatApplicationService {
 				mode: "ask",
 				provider: {
 					schemaVersion: 1,
-					providerId: this.#providerId,
-					name: provider.baseUrl === DEFAULT_PROVIDER_BASE_URL ? "OpenAI" : "OpenAI-compatible",
-					baseUrl: provider.baseUrl ?? DEFAULT_PROVIDER_BASE_URL,
+					providerId: provider.providerId,
+					name: provider.providerName,
+					type: provider.type,
+					baseUrl: provider.baseUrl,
 					model: provider.model,
 					apiKey: provider.apiKey,
+					...(provider.customHeaders === undefined
+						? {}
+						: { customHeaders: provider.customHeaders }),
+					...(provider.reasoning?.effort === undefined
+						? {}
+						: { reasoningEffort: provider.reasoning.effort }),
+					...(provider.reasoning?.budgetTokens === undefined
+						? {}
+						: { reasoningBudgetTokens: provider.reasoning.budgetTokens }),
 				},
 				userMessageId,
 				userContent: input.content,
@@ -532,6 +689,7 @@ export class ChatApplicationService {
 				durableAssistantContent: "",
 				pendingAssistantDelta: "",
 				pendingDeltaFlushTimer: undefined,
+				provider,
 				abortController: new AbortController(),
 				cancelRequested: false,
 				executionStarted: false,
@@ -1199,6 +1357,7 @@ export class ChatApplicationService {
 			const result = await this.#runtime.run({
 				runId: activeRun.runId,
 				threadId: activeRun.sessionId,
+				provider: activeRun.provider,
 				messages: activeRun.messages,
 				signal: activeRun.abortController.signal,
 				onEvent: async (event) => {
@@ -1382,6 +1541,9 @@ export class ChatApplicationService {
 			0,
 			maxAssistantMessageContentCharacters,
 		);
+		// The client only ever sees a redacted AppError, so the underlying provider failure has to
+		// reach the server log or the failure is undiagnosable.
+		this.#logger.error(`Chat run ${activeRun.runId} failed against the Provider.`, error);
 		try {
 			return this.#runs.commitTerminal({
 				runId: activeRun.runId,
@@ -1734,14 +1896,131 @@ export class ChatApplicationService {
 		}
 	}
 
-	#resolveProviderConfiguration(input: TestChatProviderInput): AskProviderConfiguration {
-		const apiKey = this.#resolveApiKey(input.baseUrl, input.apiKey, "test the Provider");
+	#requireProvider(providerId: string): ProviderRecord {
+		const record = this.#providers.get(providerId);
+		if (record === null) {
+			throw new ProviderNotFoundError(providerId);
+		}
+		return record;
+	}
 
-		return normalizeAskProviderConfiguration({
-			provider: "openai-compatible",
+	#requireProviderModel(providerId: string, modelId: string): ProviderModel {
+		const record = this.#requireProvider(providerId);
+		const model = record.models.find((candidate) => candidate.id === modelId);
+		if (model === undefined) {
+			throw new ProviderModelNotFoundError(providerId, modelId);
+		}
+		return model;
+	}
+
+	/** Rebuilds the selection, dropping any reasoning setting the model no longer advertises. */
+	#normalizeSelection(selection: {
+		providerId: string;
+		modelId: string;
+		reasoning?: { effort?: string | undefined; budgetTokens?: number | undefined } | undefined;
+	}): DefaultModelSelection {
+		const record = this.#requireProvider(selection.providerId);
+		const model = this.#requireProviderModel(selection.providerId, selection.modelId);
+		const reasoning = normalizeReasoningSelection(
+			resolveReasoningCapability(record.type, model),
+			selection.reasoning,
+		);
+
+		return {
+			providerId: selection.providerId,
+			modelId: selection.modelId,
+			...(reasoning === undefined ? {} : { reasoning }),
+		};
+	}
+
+	/**
+	 * Resolves the Provider a Session should run against: its own selection first, then the
+	 * global default. Selections pointing at a removed Provider or model fall back too.
+	 */
+	#resolveSessionProvider(sessionId: string): ResolvedProviderConfiguration {
+		const session = this.#sessions.get({ sessionId });
+		const candidates = [session.model, this.#providers.getDefaultModel() ?? undefined];
+		for (const candidate of candidates) {
+			if (candidate === undefined) {
+				continue;
+			}
+			const record = this.#providers.get(candidate.providerId);
+			const model = record?.models.find((entry) => entry.id === candidate.modelId);
+			if (record === null || record === undefined || !record.enabled) {
+				continue;
+			}
+			if (model === undefined || !model.enabled) {
+				continue;
+			}
+			const reasoning = normalizeReasoningSelection(
+				resolveReasoningCapability(record.type, model),
+				candidate.reasoning,
+			);
+
+			return {
+				providerId: record.id,
+				providerName: record.displayName,
+				type: record.type,
+				protocol: resolveModelProtocol(record.type, model),
+				baseUrl: record.baseUrl,
+				apiKey: record.apiKey,
+				...(record.customHeaders === undefined ? {} : { customHeaders: record.customHeaders }),
+				model: model.id,
+				...(model.maxOutputTokens === undefined ? {} : { maxOutputTokens: model.maxOutputTokens }),
+				...(reasoning === undefined ? {} : { reasoning }),
+			};
+		}
+
+		throw new AskChatRuntimeError({
+			kind: "not_configured",
+			message: "No Provider and model are selected for this chat.",
+			retryable: false,
+		});
+	}
+
+	#resolveTestConfiguration(input: TestProviderInput): ResolvedProviderConfiguration {
+		const parsedInput = testProviderInputSchema.parse(input);
+		if (parsedInput.providerId !== undefined) {
+			const record = this.#requireProvider(parsedInput.providerId);
+			return {
+				providerId: record.id,
+				providerName: record.displayName,
+				type: record.type,
+				protocol: resolveModelProtocol(record.type),
+				baseUrl: record.baseUrl,
+				apiKey: record.apiKey,
+				...(record.customHeaders === undefined ? {} : { customHeaders: record.customHeaders }),
+				model: record.models.find((model) => model.enabled)?.id ?? "",
+			};
+		}
+
+		const draft = parsedInput.draft ?? fail("Provider test input lost its draft.");
+		const apiKey = draft.apiKey ?? this.#resolveDraftApiKey(draft.baseUrl);
+
+		return {
+			providerId: this.#providerId,
+			providerName: draft.displayName,
+			type: draft.type,
+			protocol: resolveModelProtocol(draft.type),
+			baseUrl: draft.baseUrl,
 			apiKey,
-			baseUrl: input.baseUrl,
-			model: input.model,
+			...(draft.customHeaders === undefined ? {} : { customHeaders: draft.customHeaders }),
+			model: "",
+		};
+	}
+
+	/** Reuses a stored key only for the same origin so keys never cross Provider hosts. */
+	#resolveDraftApiKey(baseUrl: string): string {
+		for (const record of this.#providers.list()) {
+			if (haveSameOrigin(record.baseUrl, baseUrl)) {
+				return record.apiKey;
+			}
+		}
+
+		throw new AskChatRuntimeError({
+			kind: "not_configured",
+			message: "A new API key is required to test a Provider on a different Endpoint origin.",
+			retryable: false,
 		});
 	}
 
@@ -1867,26 +2146,13 @@ export class ChatApplicationService {
 			retryable: true,
 		});
 	}
+}
 
-	#resolveApiKey(baseUrl: string, apiKey: string | undefined, action: string): string {
-		if (apiKey !== undefined) {
-			return apiKey;
-		}
-
-		const storedConfiguration = this.#providerConfigStore.get();
-		if (
-			storedConfiguration !== null &&
-			new URL(storedConfiguration.baseUrl ?? DEFAULT_PROVIDER_BASE_URL).origin ===
-				new URL(baseUrl).origin
-		) {
-			return storedConfiguration.apiKey;
-		}
-
-		throw new AskChatRuntimeError({
-			kind: "not_configured",
-			message: `A new API key is required to ${action} for a different Endpoint origin.`,
-			retryable: false,
-		});
+function haveSameOrigin(left: string, right: string): boolean {
+	try {
+		return new URL(left).origin === new URL(right).origin;
+	} catch {
+		return false;
 	}
 }
 
@@ -1939,19 +2205,21 @@ function createAssistantMessage(
 	});
 }
 
-async function testOpenAiCompatibleProvider(
-	configuration: AskProviderConfiguration,
-): Promise<void> {
-	const baseUrl = configuration.baseUrl ?? DEFAULT_PROVIDER_BASE_URL;
+async function testProviderConnection(configuration: ResolvedProviderConfiguration): Promise<void> {
 	const controller = new AbortController();
 	const timeout = setTimeout(() => controller.abort(), 10_000);
+	const authenticationHeaders =
+		configuration.type === "anthropic-compatible"
+			? { "x-api-key": configuration.apiKey, "anthropic-version": anthropicApiVersion }
+			: { Authorization: `${"Bearer"} ${configuration.apiKey}` };
 
 	try {
-		const response = await fetch(`${baseUrl}/models`, {
+		const response = await fetch(`${configuration.baseUrl.replace(/\/+$/, "")}/models`, {
 			method: "GET",
 			redirect: "error",
 			headers: {
-				Authorization: `Bearer ${configuration.apiKey}`,
+				...authenticationHeaders,
+				...(configuration.customHeaders ?? {}),
 				Accept: "application/json",
 			},
 			signal: controller.signal,

@@ -2,28 +2,42 @@ import {
 	agentsRuntimeInfoSchema,
 	cancelChatRunInputSchema,
 	cancelChatRunOutputSchema,
-	chatProviderStatusSchema,
 	chatSendAcceptedOutputSchema,
-	configureChatProviderInputSchema,
+	createProviderInputSchema,
 	deleteChatSessionInputSchema,
 	deleteChatSessionOutputSchema,
+	deleteProviderInputSchema,
+	deleteProviderOutputSchema,
 	emptyParamsSchema,
+	fetchProviderModelsInputSchema,
+	fetchProviderModelsOutputSchema,
 	type GetChatSessionPageOutput,
 	getChatSessionInputSchema,
 	getChatSessionPageInputSchema,
 	getChatSessionPageOutputSchema,
 	getChatSessionSnapshotOutputSchema,
+	getDefaultModelOutputSchema,
+	listAvailableModelsOutputSchema,
 	listChatSessionsInputSchema,
 	listChatSessionsOutputSchema,
+	listProvidersOutputSchema,
 	productRpcMethods,
+	providerMutationOutputSchema,
 	runtimeInfoSchema,
 	sendAskChatMessageInputSchema,
 	setChatSessionArchivedInputSchema,
 	setChatSessionArchivedOutputSchema,
-	testChatProviderInputSchema,
-	testChatProviderOutputSchema,
+	setChatSessionModelInputSchema,
+	setChatSessionModelOutputSchema,
+	setDefaultModelInputSchema,
+	setDefaultModelOutputSchema,
+	setProviderModelsEnabledInputSchema,
+	setProviderModelsEnabledOutputSchema,
+	testProviderInputSchema,
+	testProviderOutputSchema,
 	updateChatSessionInputSchema,
 	updateChatSessionOutputSchema,
+	updateProviderInputSchema,
 } from "@moshu/contracts";
 import { BrowserView, Updater } from "electrobun/bun";
 import { traceChatRpcRequest } from "../shared/chat-rpc-diagnostics";
@@ -62,40 +76,82 @@ export function createDesktopRpc({ agentsClient }: DesktopRpcDependencies) {
 						deepAgents: server.deepAgents,
 					});
 				},
-				getChatProviderStatus: (params) =>
+				listProviders: (params) =>
 					agentsClient.request(
-						productRpcMethods.providerStatus,
+						productRpcMethods.providersList,
 						params,
 						emptyParamsSchema,
-						chatProviderStatusSchema,
+						listProvidersOutputSchema,
 					),
-				configureChatProvider: (params) =>
+				createProvider: (params) =>
 					agentsClient.request(
-						productRpcMethods.providerConfigure,
+						productRpcMethods.providersCreate,
 						params,
-						configureChatProviderInputSchema,
-						chatProviderStatusSchema,
+						createProviderInputSchema,
+						providerMutationOutputSchema,
 					),
-				testChatProvider: (params) =>
+				updateProvider: (params) =>
 					agentsClient.request(
-						productRpcMethods.providerTest,
+						productRpcMethods.providersUpdate,
 						params,
-						testChatProviderInputSchema,
-						testChatProviderOutputSchema,
+						updateProviderInputSchema,
+						providerMutationOutputSchema,
 					),
-				deleteChatProvider: (params) =>
+				deleteProvider: (params) =>
 					agentsClient.request(
-						productRpcMethods.providerDelete,
+						productRpcMethods.providersDelete,
+						params,
+						deleteProviderInputSchema,
+						deleteProviderOutputSchema,
+					),
+				testProvider: (params) =>
+					agentsClient.request(
+						productRpcMethods.providersTest,
+						params,
+						testProviderInputSchema,
+						testProviderOutputSchema,
+					),
+				fetchProviderModels: (params) =>
+					agentsClient.request(
+						productRpcMethods.providersFetchModels,
+						params,
+						fetchProviderModelsInputSchema,
+						fetchProviderModelsOutputSchema,
+					),
+				setProviderModelsEnabled: (params) =>
+					agentsClient.request(
+						productRpcMethods.providersSetModelsEnabled,
+						params,
+						setProviderModelsEnabledInputSchema,
+						setProviderModelsEnabledOutputSchema,
+					),
+				listAvailableModels: (params) =>
+					agentsClient.request(
+						productRpcMethods.modelsListAvailable,
 						params,
 						emptyParamsSchema,
-						chatProviderStatusSchema,
+						listAvailableModelsOutputSchema,
+					),
+				getDefaultModel: (params) =>
+					agentsClient.request(
+						productRpcMethods.defaultModelGet,
+						params,
+						emptyParamsSchema,
+						getDefaultModelOutputSchema,
+					),
+				setDefaultModel: (params) =>
+					agentsClient.request(
+						productRpcMethods.defaultModelSet,
+						params,
+						setDefaultModelInputSchema,
+						setDefaultModelOutputSchema,
 					),
 				createChatSession: (params) =>
 					traceChatRpcRequest({
 						side: "bun",
 						operation: "createChatSession",
 						input: params,
-						execute: () => agentsClient.createSession(),
+						execute: () => agentsClient.createSession(undefined, params.model),
 					}),
 				getChatSession: (params) =>
 					traceChatRpcRequest({
@@ -124,6 +180,14 @@ export function createDesktopRpc({ agentsClient }: DesktopRpcDependencies) {
 						params,
 						setChatSessionArchivedInputSchema,
 						setChatSessionArchivedOutputSchema,
+					),
+				setChatSessionModel: (params) =>
+					agentsClient.request(
+						productRpcMethods.sessionSetModel,
+						params,
+						setChatSessionModelInputSchema,
+						setChatSessionModelOutputSchema,
+						params.sessionId,
 					),
 				deleteChatSession: (params) =>
 					agentsClient.request(

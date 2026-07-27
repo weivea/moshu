@@ -54,9 +54,12 @@ function makeProviderInput(secret = "sk-test-secret") {
 		schemaVersion: 1 as const,
 		providerId: createUuidV7(),
 		name: "OpenAI",
+		type: "openai-compatible" as const,
 		baseUrl: "https://api.openai.com/v1",
 		model: "gpt-5.4",
 		apiKey: secret,
+		customHeaders: { "X-Org": "acme-secret-header-value" },
+		reasoningEffort: "medium",
 	};
 }
 
@@ -65,6 +68,7 @@ function makeProviderState() {
 		schemaVersion: 1 as const,
 		providerId: createUuidV7(),
 		name: "OpenAI",
+		type: "openai-compatible" as const,
 		baseUrl: "https://api.openai.com/v1",
 		model: "gpt-5.4",
 		status: "ready" as const,
@@ -2036,6 +2040,122 @@ describe("application database", () => {
 				}
 			}
 		});
+	});
+
+	test("never persists provider custom header values", () => {
+		withTempDatabase((databasePath) => {
+			const headerSecret = "acme-secret-header-value";
+			const database = openAppDatabase(databasePath);
+			try {
+				const session = database.sessions.create({ title: "Header secrecy" }).session;
+				const created = database.runs.create({
+					clientRequestId: crypto.randomUUID(),
+					sessionId: session.id,
+					mode: "ask",
+					provider: makeProviderInput(),
+					userMessageId: createUuidV7(),
+					userContent: "Header safety prompt",
+					assistantMessageId: createUuidV7(),
+				});
+				expect("customHeaders" in created.run.provider).toBe(false);
+				expect(created.run.provider.type).toBe("openai-compatible");
+				expect(created.run.provider.reasoningEffort).toBe("medium");
+				expect(JSON.stringify(created.run)).not.toContain(headerSecret);
+			} finally {
+				database.close();
+			}
+
+			for (const path of [databasePath, `${databasePath}-wal`, `${databasePath}-shm`]) {
+				if (existsSync(path)) {
+					expect(readFileSync(path).includes(Buffer.from(headerSecret))).toBe(false);
+				}
+			}
+		});
+	});
+
+	test("reads run journals written with legacy protocol-shaped Provider types", () => {
+		const database = openAppDatabase(":memory:");
+		try {
+			const session = database.sessions.create({ title: "Legacy Provider types" }).session;
+			const created = database.runs.create({
+				clientRequestId: crypto.randomUUID(),
+				sessionId: session.id,
+				mode: "ask",
+				provider: makeProviderInput(),
+				userMessageId: createUuidV7(),
+				userContent: "Legacy Provider prompt",
+				assistantMessageId: createUuidV7(),
+			});
+
+			for (const [legacyType, expectedType] of [
+				["openai-chat-completions", "openai-compatible"],
+				["openai-responses", "openai-compatible"],
+				["anthropic-messages", "anthropic-compatible"],
+			] as const) {
+				database.client
+					.query("UPDATE chat_runs SET provider_json = $providerJson WHERE id = $runId")
+					.run({
+						runId: created.run.id,
+						providerJson: JSON.stringify({ ...created.run.provider, type: legacyType }),
+					});
+				expect(database.runs.get(created.run.id).provider.type).toBe(expectedType);
+			}
+		} finally {
+			database.close();
+		}
+	});
+
+	test("stores and clears the Session model selection", () => {
+		const database = openAppDatabase(":memory:");
+		try {
+			const providerId = createUuidV7();
+			const created = database.sessions.create({ title: "Model selection" }).session;
+			expect(created.model).toBeUndefined();
+
+			const withEffort = database.sessions.setModel({
+				sessionId: created.id,
+				model: { providerId, modelId: "gpt-5.5", reasoning: { effort: "high" } },
+			}).session;
+			expect(withEffort.model).toEqual({
+				providerId,
+				modelId: "gpt-5.5",
+				reasoning: { effort: "high" },
+			});
+
+			const withBudget = database.sessions.setModel({
+				sessionId: created.id,
+				model: {
+					providerId,
+					modelId: "claude-opus-4.6",
+					reasoning: { budgetTokens: 8_192 },
+				},
+			}).session;
+			expect(withBudget.model?.reasoning).toEqual({ budgetTokens: 8_192 });
+
+			const cleared = database.sessions.setModel({ sessionId: created.id, model: null }).session;
+			expect(cleared.model).toBeUndefined();
+			expect(database.sessions.get({ sessionId: created.id }).model).toBeUndefined();
+		} finally {
+			database.close();
+		}
+	});
+
+	test("keeps the model selection supplied at Session creation", () => {
+		const database = openAppDatabase(":memory:");
+		try {
+			const providerId = createUuidV7();
+			const created = database.sessions.create({
+				title: "Inherited default",
+				model: { providerId, modelId: "gpt-5.4" },
+			}).session;
+
+			expect(database.sessions.get({ sessionId: created.id }).model).toEqual({
+				providerId,
+				modelId: "gpt-5.4",
+			});
+		} finally {
+			database.close();
+		}
 	});
 
 	test("deletes one Session with 10,001 Runs using one retirement tombstone", () => {

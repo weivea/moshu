@@ -3,11 +3,14 @@ import {
 	ChatHomePage,
 	ChatSessionPage,
 	ChatsPage,
+	DefaultModelSettingsRoutePage,
+	GeneralSettingsRoutePage,
 	NewChatPage,
 	PlaceholderPage,
-	ProfileSettingsRoutePage,
 	ProviderSettingsRoutePage,
+	SettingsPlaceholderPage,
 } from "./pages";
+import { SettingsLayout } from "./settings/settings-layout";
 import { AppShell } from "./shell";
 
 export const router = createHashRouter([
@@ -65,18 +68,16 @@ export const router = createHashRouter([
 				path: "canvas/:canvasId",
 				element: <PlaceholderPage titleKey="page.canvasDetail.title" icon="canvas" />,
 			},
-			{ path: "settings", element: <Navigate to="/settings/profile" replace /> },
 			{
-				path: "settings/profile",
-				element: <ProfileSettingsRoutePage />,
-			},
-			{
-				path: "settings/providers",
-				element: <ProviderSettingsRoutePage />,
-			},
-			{
-				path: "settings/:section",
-				element: <PlaceholderPage titleKey="page.settings.title" icon="settings" />,
+				path: "settings",
+				element: <SettingsLayout />,
+				children: [
+					{ index: true, element: <Navigate to="/settings/providers" replace /> },
+					{ path: "providers", element: <ProviderSettingsRoutePage /> },
+					{ path: "default-model", element: <DefaultModelSettingsRoutePage /> },
+					{ path: "general", element: <GeneralSettingsRoutePage /> },
+					{ path: ":section", element: <SettingsPlaceholderPage /> },
+				],
 			},
 		],
 	},

@@ -1,23 +1,28 @@
+import type {
+	AvailableModel,
+	CreateProviderInput,
+	DefaultModelSelection,
+	ProviderSummary,
+	SessionModelSelection,
+	TestProviderInput,
+	UpdateProviderInput,
+} from "@moshu/contracts";
+
 export const DEFAULT_PROVIDER_ENDPOINT = "https://api.openai.com/v1";
 
 export type ChatRole = "user" | "assistant";
 export type ChatMessageStatus = "streaming" | "completed" | "cancelled" | "error";
 
-export interface ChatProviderStatus {
-	configured: boolean;
-	endpoint: string;
-	model: string;
-	askMode: string;
-	apiKeyMask?: string;
-}
+export type {
+	AvailableModel,
+	CreateProviderInput,
+	DefaultModelSelection,
+	ProviderSummary,
+	SessionModelSelection,
+	UpdateProviderInput,
+};
 
-export interface ChatProviderConfiguration {
-	endpoint: string;
-	model: string;
-	apiKey?: string;
-}
-
-export interface ChatProviderConnectionTestResult {
+export interface ProviderConnectionTestResult {
 	ok: boolean;
 	latencyMs: number;
 	errorMessage?: string;
@@ -37,7 +42,7 @@ export interface ChatSession {
 	title: string;
 	updatedAt: string;
 	archivedAt?: string;
-	model: string;
+	model?: SessionModelSelection;
 	askMode: string;
 	messages: ChatMessage[];
 	eventCursors?: Record<string, number>;
@@ -117,11 +122,26 @@ export interface ChatSessionInvalidationSubscriptionOptions {
 }
 
 export interface ChatTransport {
-	getProviderStatus(): Promise<ChatProviderStatus>;
-	configureProvider(input: ChatProviderConfiguration): Promise<ChatProviderStatus>;
-	testProvider(input: ChatProviderConfiguration): Promise<ChatProviderConnectionTestResult>;
-	deleteProvider(): Promise<ChatProviderStatus>;
-	createSession(): Promise<ChatSession>;
+	listProviders(): Promise<ProviderSummary[]>;
+	createProvider(input: CreateProviderInput): Promise<ProviderSummary>;
+	updateProvider(input: UpdateProviderInput): Promise<ProviderSummary>;
+	deleteProvider(providerId: string): Promise<void>;
+	testProvider(input: TestProviderInput): Promise<ProviderConnectionTestResult>;
+	fetchProviderModels(providerId: string): Promise<ProviderSummary>;
+	setProviderModelsEnabled(providerId: string, enabledModelIds: string[]): Promise<ProviderSummary>;
+	listAvailableModels(): Promise<{
+		models: AvailableModel[];
+		defaultModel?: DefaultModelSelection;
+	}>;
+	getDefaultModel(): Promise<DefaultModelSelection | undefined>;
+	setDefaultModel(
+		selection: DefaultModelSelection | null,
+	): Promise<DefaultModelSelection | undefined>;
+	setSessionModel(
+		sessionId: string,
+		selection: SessionModelSelection | null,
+	): Promise<SessionModelSelection | undefined>;
+	createSession(model?: SessionModelSelection): Promise<ChatSession>;
 	getSession(sessionId: string): Promise<ChatSession>;
 	listSessions(input?: ListChatSessionsOptions): Promise<ChatSessionSummary[]>;
 	renameSession(sessionId: string, title: string): Promise<ChatSessionSummary>;

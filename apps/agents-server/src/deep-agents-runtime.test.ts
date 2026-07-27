@@ -1,10 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import {
-	BunSqliteSaver,
-	InMemoryAskProviderConfigStore,
-	createAskChatRuntime,
-} from "@moshu/agent-runtime";
+import { BunSqliteSaver, createAskChatRuntime } from "@moshu/agent-runtime";
 
 describe("Application Host Deep Agents runtime", () => {
 	test("executes the default OpenAI-compatible graph in the desktop Bun runtime", async () => {
@@ -27,24 +23,23 @@ describe("Application Host Deep Agents runtime", () => {
 				);
 			},
 		});
-		const providerConfigStore = new InMemoryAskProviderConfigStore();
-		providerConfigStore.set({
-			provider: "openai-compatible",
-			apiKey: "host-smoke-key",
-			baseUrl: `http://127.0.0.1:${server.port}/v1`,
-			model: "host-smoke-model",
-		});
 		const saver = new BunSqliteSaver(":memory:");
-		const runtime = createAskChatRuntime({
-			providerConfigStore,
-			checkpointer: saver,
-		});
+		const runtime = createAskChatRuntime({ checkpointer: saver });
 
 		try {
 			await expect(
 				runtime.run({
 					runId: "host-smoke-run",
 					threadId: "host-smoke-session",
+					provider: {
+						providerId: "host-smoke-provider",
+						providerName: "Host smoke",
+						type: "openai-compatible",
+						protocol: "openai-chat-completions",
+						baseUrl: `http://127.0.0.1:${server.port}/v1`,
+						apiKey: "host-smoke-key",
+						model: "host-smoke-model",
+					},
 					messages: [{ role: "user", content: "Run in the Application Host" }],
 				}),
 			).resolves.toMatchObject({

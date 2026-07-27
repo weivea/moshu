@@ -1,11 +1,10 @@
 import { Button } from "@heroui/react";
 import { type FormEvent, useState } from "react";
-import { useI18n } from "./i18n";
-import { useLocalProfile } from "./local-profile";
-import { useAppearance } from "./providers";
-import { SettingsNavigation } from "./settings-navigation";
+import { useI18n } from "../i18n";
+import { useLocalProfile } from "../local-profile";
+import { useAppearance } from "../providers";
 
-export function ProfileSettingsPage() {
+export function GeneralSettingsPage() {
 	const { t, toggleLocale } = useI18n();
 	const { toggleTheme } = useAppearance();
 	const profile = useLocalProfile();
@@ -24,16 +23,14 @@ export function ProfileSettingsPage() {
 	};
 
 	return (
-		<section className="profile-settings-page">
-			<SettingsNavigation />
-
-			<header className="settings-page__header">
+		<section className="settings-section">
+			<header className="settings-section__header">
 				<span className="chat-page__eyebrow">{t("profile.eyebrow")}</span>
 				<h1>{t("profile.title")}</h1>
 				<p>{t("profile.description")}</p>
 			</header>
 
-			<div className="settings-page__grid">
+			<div className="settings-section__grid">
 				<form className="chat-card profile-form" onSubmit={saveProfile}>
 					<div className="profile-preview" aria-hidden="true">
 						<span>{(profile.username ?? t("profile.defaultName")).slice(0, 1).toUpperCase()}</span>

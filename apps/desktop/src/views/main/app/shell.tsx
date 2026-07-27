@@ -266,7 +266,7 @@ export function AppShell() {
 								</div>
 
 								<footer className="app-sidebar__footer">
-									<Link className="local-profile-link" to="/settings/profile">
+									<Link className="local-profile-link" to="/settings/general">
 										<span className="local-profile-avatar" aria-hidden="true">
 											{displayName.slice(0, 1).toUpperCase()}
 										</span>
@@ -274,7 +274,7 @@ export function AppShell() {
 									</Link>
 									<Link
 										className="sidebar-footer-button"
-										to="/settings/profile"
+										to="/settings/general"
 										aria-label={t("nav.settings")}
 										title={t("nav.settings")}
 									>

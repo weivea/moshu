@@ -1,8 +1,15 @@
 import { describe, expect, test } from "bun:test";
 
 import {
+	ProviderCapacityError,
+	ProviderModelNotFoundError,
+	ProviderNotFoundError,
+} from "@moshu/agent-runtime";
+import {
 	type ChatRunEvent,
+	clientProductRequestMethods,
 	createChatSessionOutputSchema,
+	executorProductRequestMethods,
 	productRpcInternalHandlerErrorCode,
 	productRpcMethods,
 } from "@moshu/contracts";
@@ -13,6 +20,7 @@ import { z } from "zod";
 import type { ChatApplicationService } from "./chat-application-service";
 import type { ExecutorReadiness } from "./executor-readiness";
 import { createProductRpcHandlers, ProductEventRouter, publishChatEvent } from "./product-rpc";
+import { ProviderCatalogError } from "./provider-catalog";
 
 describe("product RPC event broadcast", () => {
 	test("isolates a failed client peer and continues broadcasting", () => {
@@ -651,3 +659,232 @@ function createTerminalEvent(): ChatRunEvent {
 		payload: { previousStatus: "running", status: "completed" },
 	};
 }
+
+describe("product RPC provider and model handlers", () => {
+	const providerId = "01984df0-cf17-7e6e-9a7d-4d98c1f0d5ce";
+	const sessionId = "01984df0-cf17-7e6e-9a7d-4d98c1f0d5cf";
+	const providerSummary = {
+		schemaVersion: 1,
+		id: providerId,
+		displayName: "OpenAI",
+		type: "openai-compatible",
+		baseUrl: "https://api.openai.com/v1",
+		enabled: true,
+		apiKeyMask: "••••••••cret",
+		customHeaderNames: [],
+		models: [{ id: "gpt-5.4", enabled: true }],
+	};
+	const chatSession = {
+		schemaVersion: 1,
+		id: sessionId,
+		title: "New chat",
+		defaultMode: "ask",
+		model: { providerId, modelId: "gpt-5.4" },
+		createdAt: "2026-07-25T04:15:28.349Z",
+		updatedAt: "2026-07-25T04:15:28.349Z",
+	};
+
+	test("dispatches every provider, model, and session-model request to the chat service", async () => {
+		const peer = createPeer({ emitEvent: () => "event", close() {} });
+		const recorded: Array<{ method: string; input: unknown }> = [];
+		const record = (method: string, output: unknown) => (input?: unknown) => {
+			recorded.push({ method, input });
+			return output;
+		};
+
+		const listOutput = { schemaVersion: 1, providers: [providerSummary] };
+		const mutationOutput = { schemaVersion: 1, provider: providerSummary };
+		const deleteOutput = { schemaVersion: 1, providerId };
+		const testOutput = { schemaVersion: 1, ok: true, latencyMs: 12 };
+		const availableOutput = { schemaVersion: 1, models: [] };
+		const defaultGetOutput = { schemaVersion: 1 };
+		const defaultSetOutput = { schemaVersion: 1, defaultModel: { providerId, modelId: "gpt-5.4" } };
+		const sessionOutput = { session: chatSession };
+
+		const chatService = {
+			listProviders: record("listProviders", listOutput),
+			createProvider: record("createProvider", mutationOutput),
+			updateProvider: record("updateProvider", mutationOutput),
+			deleteProvider: record("deleteProvider", deleteOutput),
+			testProvider: record("testProvider", testOutput),
+			fetchProviderModels: record("fetchProviderModels", mutationOutput),
+			setProviderModelsEnabled: record("setProviderModelsEnabled", mutationOutput),
+			listAvailableModels: record("listAvailableModels", availableOutput),
+			getDefaultModel: record("getDefaultModel", defaultGetOutput),
+			setDefaultModel: record("setDefaultModel", defaultSetOutput),
+			setSessionModel: record("setSessionModel", sessionOutput),
+		} as unknown as ChatApplicationService;
+		const handlers = createProductRpcHandlers({
+			chatService,
+			executorReadiness: {} as ExecutorReadiness,
+			eventRouter: new ProductEventRouter(),
+			serverVersion: "test",
+		}).requests;
+
+		const cases = [
+			{
+				method: productRpcMethods.providersList,
+				serviceMethod: "listProviders",
+				input: {},
+				output: listOutput,
+			},
+			{
+				method: productRpcMethods.providersCreate,
+				serviceMethod: "createProvider",
+				input: {
+					schemaVersion: 1,
+					displayName: "OpenAI",
+					type: "openai-compatible",
+					baseUrl: "https://api.openai.com/v1",
+					apiKey: "sk-secret",
+				},
+				output: mutationOutput,
+			},
+			{
+				method: productRpcMethods.providersUpdate,
+				serviceMethod: "updateProvider",
+				input: { schemaVersion: 1, providerId, displayName: "Renamed" },
+				output: mutationOutput,
+			},
+			{
+				method: productRpcMethods.providersDelete,
+				serviceMethod: "deleteProvider",
+				input: { schemaVersion: 1, providerId },
+				output: deleteOutput,
+			},
+			{
+				method: productRpcMethods.providersTest,
+				serviceMethod: "testProvider",
+				input: { schemaVersion: 1, providerId },
+				output: testOutput,
+			},
+			{
+				method: productRpcMethods.providersFetchModels,
+				serviceMethod: "fetchProviderModels",
+				input: { schemaVersion: 1, providerId },
+				output: mutationOutput,
+			},
+			{
+				method: productRpcMethods.providersSetModelsEnabled,
+				serviceMethod: "setProviderModelsEnabled",
+				input: { schemaVersion: 1, providerId, enabledModelIds: ["gpt-5.4"] },
+				output: mutationOutput,
+			},
+			{
+				method: productRpcMethods.modelsListAvailable,
+				serviceMethod: "listAvailableModels",
+				input: {},
+				output: availableOutput,
+			},
+			{
+				method: productRpcMethods.defaultModelGet,
+				serviceMethod: "getDefaultModel",
+				input: {},
+				output: defaultGetOutput,
+			},
+			{
+				method: productRpcMethods.defaultModelSet,
+				serviceMethod: "setDefaultModel",
+				input: { schemaVersion: 1, defaultModel: { providerId, modelId: "gpt-5.4" } },
+				output: defaultSetOutput,
+			},
+			{
+				method: productRpcMethods.sessionSetModel,
+				serviceMethod: "setSessionModel",
+				input: { sessionId, model: { providerId, modelId: "gpt-5.4" } },
+				output: sessionOutput,
+			},
+		];
+
+		for (const testCase of cases) {
+			const handler = handlers?.[testCase.method];
+			if (handler === undefined) {
+				throw new Error(`Missing ${testCase.method} product RPC handler.`);
+			}
+			const result = await handler(testCase.input, createRequestContext(peer, testCase.method));
+			expect(result).toEqual(testCase.output);
+		}
+
+		expect(recorded.map((entry) => entry.method)).toEqual(
+			cases.map((entry) => entry.serviceMethod),
+		);
+	});
+
+	test("maps provider registry failures to stable product RPC error codes", async () => {
+		const peer = createPeer({ emitEvent: () => "event", close() {} });
+		const cases = [
+			{
+				method: productRpcMethods.providersDelete,
+				serviceMethod: "deleteProvider",
+				input: { schemaVersion: 1, providerId },
+				error: new ProviderNotFoundError(providerId),
+				code: "PROVIDER_NOT_FOUND",
+			},
+			{
+				method: productRpcMethods.sessionSetModel,
+				serviceMethod: "setSessionModel",
+				input: { sessionId, model: { providerId, modelId: "gpt-5.4" } },
+				error: new ProviderModelNotFoundError(providerId, "gpt-5.4"),
+				code: "PROVIDER_MODEL_NOT_FOUND",
+			},
+			{
+				method: productRpcMethods.providersCreate,
+				serviceMethod: "createProvider",
+				input: {
+					schemaVersion: 1,
+					displayName: "OpenAI",
+					type: "openai-compatible",
+					baseUrl: "https://api.openai.com/v1",
+					apiKey: "sk-secret",
+				},
+				error: new ProviderCapacityError(64),
+				code: "PROVIDER_CAPACITY",
+			},
+			{
+				method: productRpcMethods.providersFetchModels,
+				serviceMethod: "fetchProviderModels",
+				input: { schemaVersion: 1, providerId },
+				error: new ProviderCatalogError("The Provider rejected the model list request.", 502),
+				code: "PROVIDER_MODEL_LIST_FAILED",
+			},
+		];
+
+		for (const testCase of cases) {
+			const chatService = {
+				[testCase.serviceMethod]: () => {
+					throw testCase.error;
+				},
+			} as unknown as ChatApplicationService;
+			const handler = createProductRpcHandlers({
+				chatService,
+				executorReadiness: {} as ExecutorReadiness,
+				eventRouter: new ProductEventRouter(),
+				serverVersion: "test",
+			}).requests?.[testCase.method];
+			if (handler === undefined) {
+				throw new Error(`Missing ${testCase.method} product RPC handler.`);
+			}
+			const error = await Promise.resolve()
+				.then(() => handler(testCase.input, createRequestContext(peer, testCase.method)))
+				.catch((reason: unknown) => reason);
+			expect(error).toBeInstanceOf(RpcHandlerError);
+			expect((error as RpcHandlerError).code).toBe(testCase.code);
+		}
+	});
+
+	test("registers a handler for every client and executor product request method", () => {
+		const handlers = createProductRpcHandlers({
+			chatService: {} as unknown as ChatApplicationService,
+			executorReadiness: {} as ExecutorReadiness,
+			eventRouter: new ProductEventRouter(),
+			serverVersion: "test",
+		}).requests;
+
+		for (const method of clientProductRequestMethods) {
+			expect(typeof handlers?.[method]).toBe("function");
+		}
+		for (const method of executorProductRequestMethods) {
+			expect(typeof handlers?.[method]).toBe("function");
+		}
+	});
+});

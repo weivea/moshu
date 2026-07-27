@@ -20,6 +20,7 @@ import {
 	type ReplayCursorSupport,
 	replayChatEventsInputSchema,
 	replayChatEventsOutputSchema,
+	type SessionModelSelection,
 	sendAskChatMessageInputSchema,
 	setChatSessionArchivedInputSchema,
 	updateChatSessionInputSchema,
@@ -354,8 +355,11 @@ export class DesktopAgentsClient {
 		}
 	}
 
-	async createSession(createKey?: string): Promise<CreateChatSessionOutput> {
-		const reservation = this.#getOrCreateSessionCreateReservation(createKey);
+	async createSession(
+		createKey?: string,
+		model?: SessionModelSelection,
+	): Promise<CreateChatSessionOutput> {
+		const reservation = this.#getOrCreateSessionCreateReservation(createKey, model);
 		const recovered = this.#recoveredSessionCreates.get(reservation.createKey);
 		if (recovered !== undefined) {
 			this.#recoveredSessionCreates.delete(reservation.createKey);
@@ -606,13 +610,17 @@ export class DesktopAgentsClient {
 		}
 	}
 
-	#getOrCreateSessionCreateReservation(createKey?: string): SessionCreateReservation {
+	#getOrCreateSessionCreateReservation(
+		createKey?: string,
+		model?: SessionModelSelection,
+	): SessionCreateReservation {
 		const selectedKey = createKey ?? this.#implicitSessionCreateKey ?? crypto.randomUUID();
 		const parsedInput = createProcessChatSessionInputSchema.parse({
 			schemaVersion: 1,
 			createKey: selectedKey,
 			title: "New chat",
 			defaultMode: "ask",
+			...(model === undefined ? {} : { model }),
 		});
 		const existing = this.#pendingSessionCreates.get(parsedInput.createKey);
 		if (existing !== undefined) {
