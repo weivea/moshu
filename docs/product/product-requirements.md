@@ -103,7 +103,8 @@ Agent、MCP 和 Skills 可组合、可移植、可按范围启停，且扩展权
 
 ### 7.4 协议优先，避免生态锁定
 
-优先采用 OpenAI/Claude compatible API、MCP、Agent Skills 和可版本化 JSON 等开放边界。
+当前模型层采用 public Pi API；custom endpoint 限四种公开 API family。未来 Tool/MCP/Agent Skills 使用
+Moshu-owned、可版本化合同，SDK 类型不进入产品 RPC。
 
 ### 7.5 渐进披露复杂度
 
@@ -146,7 +147,7 @@ agents server 拥有 Agent、Run、Policy、审批和持久状态；executor 只
 | Knowledge Base | 经本地切分和索引、按需检索进入上下文的资料集合 |
 | Canvas | 独立于消息流、可由用户和 Agent 共同编辑的版本化成果 |
 | Approval | 用户对尚未发生的副作用操作做出的允许、修改或拒绝决定 |
-| Checkpoint | Run 的持久化状态，可用于中断后恢复 |
+| Pi Session | public `SessionManager` JSONL 保存 conversation context；产品 Run 状态和 event 另存于产品 DB |
 
 ## 10. 成功指标
 
@@ -157,7 +158,7 @@ agents server 拥有 Agent、Run、Policy、审批和持久状态；executor 只
 | Provider 配置成功率 | 使用有效凭证的连接测试成功比例 | ≥ 95% |
 | 首次价值达成率 | 新用户首次启动后完成一次有效模型回复 | ≥ 70% |
 | Project 闭环成功率 | 创建项目后完成一次包含文件读取或修改的 Run | ≥ 60% |
-| 可恢复率 | 模拟退出后可恢复到最后安全检查点的测试比例 | 100% |
+| 可恢复率 | 模拟退出后可读取已持久化 Session/context，并安全终结 orphan Run 的测试比例 | 100% |
 | 变更可追溯率 | Agent 文件修改可关联到 Run、工具调用与 Diff | 100% |
 | 审批可解释率 | 审批卡包含动作、目标、风险和参数 | 100% |
 | 密钥泄露 | 日志、导出、WebView 状态中出现明文密钥 | 0 |
@@ -177,7 +178,7 @@ agents server 拥有 Agent、Run、Policy、审批和持久状态；executor 只
 | --- | --- | --- |
 | Provider API 差异 | 工具调用、流式和用量字段不一致 | 建立能力注册表、适配层和兼容性测试 |
 | 模型不遵守工具约束 | 越权或重复动作 | 权限在工具层执行，不依赖提示词自律 |
-| Deep Agents 预览 API 变化 | 异步子 Agent 等能力可能变更 | 封装运行时边界，锁版本并维护升级测试 |
+| Pi API 变化 | Provider、Agent Session 或事件能力变化 | 精确锁定 `0.82.1`、只用公开导出并维护 binary compatibility gate |
 | 三角色连接或 companion 崩溃 | Executor 离线、Run 中断或旧实例结果污染 | stable identity、instance/generation、capped restart、reconcile 和恢复 UX |
 | 本机命令无天然沙箱 | 可能访问项目外资源 | 命令策略、环境隔离、审批和高风险硬限制 |
 | MCP/Skill 供应链 | 第三方扩展可带来副作用 | 安装审查、能力清单、作用域和运行审批 |

@@ -1,6 +1,5 @@
-import { existsSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { mkdtemp } from "node:fs/promises";
-import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import {
 	CompanionProcessSupervisor,
@@ -40,10 +39,11 @@ import {
 } from "../packages/process-rpc/src";
 
 const repositoryRoot = resolve(import.meta.dir, "..");
-const directory = await mkdtemp(resolve(tmpdir(), "moshu-three-process-"));
+const smokeRoot = resolve(repositoryRoot, ".test-artifacts");
+mkdirSync(smokeRoot, { recursive: true });
+const directory = await mkdtemp(resolve(smokeRoot, "moshu-three-process-"));
 const productDatabase = resolve(directory, "moshu.db");
-const checkpointDatabase = resolve(directory, "moshu-checkpoints.db");
-const providerConfig = resolve(directory, "provider.json");
+const agentDataDirectory = resolve(directory, "agent-data");
 const staleCredential = Buffer.alloc(32, 91).toString("base64url");
 const agentsClient = new DesktopAgentsClient();
 let connectionOptions: DesktopAgentsConnectOptions | undefined;
@@ -65,7 +65,7 @@ const supervisor = new CompanionProcessSupervisor({
 			getCompanionExecutableFilename("executor"),
 		),
 	},
-	dataPaths: { productDatabase, checkpointDatabase, providerConfig },
+	dataPaths: { productDatabase, agentDataDirectory },
 	additionalPeerBindings: [
 		{
 			credential: staleCredential,
@@ -150,9 +150,9 @@ try {
 	const created_provider = await agentsClient.request(
 		productRpcMethods.providersCreate,
 		{
-			schemaVersion: 1,
+			schemaVersion: 2,
 			displayName: "Smoke provider",
-			type: "openai-compatible",
+			api: "openai-completions",
 			baseUrl: "https://smoke.invalid/v1",
 			apiKey: "smoke-secret",
 		},
@@ -165,7 +165,7 @@ try {
 	const providerId = created_provider.provider.id;
 	const withModels = await agentsClient.request(
 		productRpcMethods.providersFetchModels,
-		{ schemaVersion: 1, providerId },
+		{ schemaVersion: 2, providerId },
 		fetchProviderModelsInputSchema,
 		fetchProviderModelsOutputSchema,
 	);
@@ -175,13 +175,13 @@ try {
 	}
 	await agentsClient.request(
 		productRpcMethods.providersSetModelsEnabled,
-		{ schemaVersion: 1, providerId, enabledModelIds: [smokeModelId] },
+		{ schemaVersion: 2, providerId, enabledModelIds: [smokeModelId] },
 		setProviderModelsEnabledInputSchema,
 		setProviderModelsEnabledOutputSchema,
 	);
 	const defaultModel = await agentsClient.request(
 		productRpcMethods.defaultModelSet,
-		{ schemaVersion: 1, defaultModel: { providerId, modelId: smokeModelId } },
+		{ schemaVersion: 2, defaultModel: { providerId, modelId: smokeModelId } },
 		setDefaultModelInputSchema,
 		setDefaultModelOutputSchema,
 	);
@@ -314,7 +314,7 @@ try {
 	}
 	unsubscribe();
 
-	for (const filename of [productDatabase, checkpointDatabase, providerConfig]) {
+	for (const filename of [productDatabase, agentDataDirectory]) {
 		if (!existsSync(filename)) {
 			throw new Error(`agents-server did not create its owned data file: ${filename}`);
 		}

@@ -20,7 +20,10 @@ import {
 	type ListChatSessionsOutput,
 	type ListProvidersOutput,
 	type ProviderMutationOutput,
+	type ProviderAuthAttemptOutput,
+	type RespondProviderAuthInput,
 	type RuntimeInfo,
+	type StartProviderAuthInput,
 	type SessionModelSelection,
 	type SetChatSessionArchivedInput,
 	type SetChatSessionArchivedOutput,
@@ -78,6 +81,8 @@ export type ChatSessionInvalidation = z.infer<typeof chatSessionInvalidationSche
 export type AcknowledgeChatSessionInvalidationInput = z.infer<
 	typeof acknowledgeChatSessionInvalidationInputSchema
 >;
+export const openExternalUrlInputSchema = z.object({ url: z.string().url() }).strict();
+export const openExternalUrlOutputSchema = z.object({ opened: z.boolean() }).strict();
 
 export type DesktopRpc = {
 	bun: RPCSchema<{
@@ -113,6 +118,30 @@ export type DesktopRpc = {
 			setProviderModelsEnabled: {
 				params: SetProviderModelsEnabledInput;
 				response: SetProviderModelsEnabledOutput;
+			};
+			providerAuthStart: {
+				params: StartProviderAuthInput;
+				response: ProviderAuthAttemptOutput;
+			};
+			providerAuthGet: {
+				params: { attemptId: string };
+				response: ProviderAuthAttemptOutput;
+			};
+			providerAuthRespond: {
+				params: RespondProviderAuthInput;
+				response: ProviderAuthAttemptOutput;
+			};
+			providerAuthCancel: {
+				params: { attemptId: string };
+				response: ProviderAuthAttemptOutput;
+			};
+			providerLogout: {
+				params: { schemaVersion: 2; providerId: string };
+				response: { schemaVersion: 2; providerId: string; configured: false };
+			};
+			openExternalUrl: {
+				params: { url: string };
+				response: { opened: boolean };
 			};
 			listAvailableModels: {
 				params: EmptyParams;

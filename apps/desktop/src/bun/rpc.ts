@@ -22,9 +22,15 @@ import {
 	listChatSessionsOutputSchema,
 	listProvidersOutputSchema,
 	productRpcMethods,
+	providerAuthAttemptInputSchema,
+	providerAuthAttemptOutputSchema,
 	providerMutationOutputSchema,
 	runtimeInfoSchema,
 	sendAskChatMessageInputSchema,
+	logoutProviderInputSchema,
+	logoutProviderOutputSchema,
+	respondProviderAuthInputSchema,
+	startProviderAuthInputSchema,
 	setChatSessionArchivedInputSchema,
 	setChatSessionArchivedOutputSchema,
 	setChatSessionModelInputSchema,
@@ -39,11 +45,13 @@ import {
 	updateChatSessionOutputSchema,
 	updateProviderInputSchema,
 } from "@moshu/contracts";
-import { BrowserView, Updater } from "electrobun/bun";
+import { BrowserView, Updater, Utils } from "electrobun/bun";
 import { traceChatRpcRequest } from "../shared/chat-rpc-diagnostics";
 import {
 	acknowledgeChatSessionInvalidationInputSchema,
 	type DesktopRpc,
+	openExternalUrlInputSchema,
+	openExternalUrlOutputSchema,
 	type SendDesktopChatMessageInput,
 } from "../shared/rpc";
 import type { DesktopAgentsClient } from "./desktop-agents-client";
@@ -73,7 +81,7 @@ export function createDesktopRpc({ agentsClient }: DesktopRpcDependencies) {
 						bunVersion: server.bunVersion,
 						platform: server.platform,
 						arch: server.arch,
-						deepAgents: server.deepAgents,
+						agentRuntime: server.agentRuntime,
 					});
 				},
 				listProviders: (params) =>
@@ -125,6 +133,45 @@ export function createDesktopRpc({ agentsClient }: DesktopRpcDependencies) {
 						setProviderModelsEnabledInputSchema,
 						setProviderModelsEnabledOutputSchema,
 					),
+				providerAuthStart: (params) =>
+					agentsClient.request(
+						productRpcMethods.providerAuthStart,
+						params,
+						startProviderAuthInputSchema,
+						providerAuthAttemptOutputSchema,
+					),
+				providerAuthGet: (params) =>
+					agentsClient.request(
+						productRpcMethods.providerAuthGet,
+						params,
+						providerAuthAttemptInputSchema,
+						providerAuthAttemptOutputSchema,
+					),
+				providerAuthRespond: (params) =>
+					agentsClient.request(
+						productRpcMethods.providerAuthRespond,
+						params,
+						respondProviderAuthInputSchema,
+						providerAuthAttemptOutputSchema,
+					),
+				providerAuthCancel: (params) =>
+					agentsClient.request(
+						productRpcMethods.providerAuthCancel,
+						params,
+						providerAuthAttemptInputSchema,
+						providerAuthAttemptOutputSchema,
+					),
+				providerLogout: (params) =>
+					agentsClient.request(
+						productRpcMethods.providerLogout,
+						params,
+						logoutProviderInputSchema,
+						logoutProviderOutputSchema,
+					),
+				openExternalUrl: (params) => {
+					const input = openExternalUrlInputSchema.parse(params);
+					return openExternalUrlOutputSchema.parse({ opened: Utils.openExternal(input.url) });
+				},
 				listAvailableModels: (params) =>
 					agentsClient.request(
 						productRpcMethods.modelsListAvailable,

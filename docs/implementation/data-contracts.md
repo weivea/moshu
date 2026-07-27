@@ -1,7 +1,7 @@
 # 数据与接口契约
 
-> 状态：批准的目标契约；尚未完全实现
-> 当前单进程 Ask 合同见[实施进度](./progress.md)
+> 状态：Provider、Ask、Session/Run 已实现；Tool/MCP/Skill 合同仍是目标
+> 当前实现边界见[实施进度](./progress.md)
 
 ## 1. 目标
 
@@ -9,7 +9,7 @@
 - 每个持久实体、连接实例、Run、Tool、Action 和 invocation 可明确关联。
 - server 决策与持久化授权，executor 在实际执行前验证一次性 grant。
 - 断线、重连、进程重启和迟到消息不会覆盖新实例状态。
-- Deep Agents、Provider、MCP 和 Skill SDK 类型不进入公共 RPC 或 UI 契约。
+- Pi、Provider、MCP 和 Skill SDK 类型不进入公共 RPC 或 UI 契约。
 - 本次开发期重构可重置旧数据，不把迁移工作误写为已实现。
 
 ## 2. 通用约定
@@ -80,16 +80,16 @@ interface AppError {
 
 | 数据/资源 | 唯一所有者 | 禁止 |
 | --- | --- | --- |
-| 业务 DB、checkpoint、migration、backup | agents server | client/executor 直接打开或写入 |
+| 产品 DB、Pi Session JSONL、migration、backup | agents server | client/executor 直接打开或写入 |
 | Provider/model config/credential、Agent definitions/versions | agents server | executor 读取 Provider secret 或自行修改 Agent |
-| Session/Run/event、Provider access、Agent runtime | agents server | client/executor 直接调用 Provider/graph |
+| Session/Run/event、Provider access、Agent runtime | agents server | client/executor 直接调用 Provider/Pi runtime |
 | Policy、approval、Action intent/result、grant audit | agents server | executor 自行批准 Action |
 | MCP config/credential/OAuth/lifecycle、Skill install/version/content/resource | owning executor | server 保存 recoverable copy 或 client 绕过 server 路由 |
 | redacted executor inventory cache | agents server projection | 当作 MCP/Skill 恢复源、授权依据或权威状态 |
 | Tool/MCP invocation、Skill scripts、进程树 | executor | server/client 直接执行 |
 | UI state、窗口、Updater、companion supervisor | client | server/executor 操作桌面框架 |
 | Provider/model Secret | agents server `SecretVault` | client/WebView/executor 读取 |
-| MCP Secret | executor `ExecutorSecretStore` | server DB/checkpoint/snapshot/backup 保存副本 |
+| MCP Secret | executor `ExecutorSecretStore` | server DB/Pi Session JSONL/snapshot/backup 保存副本 |
 
 ### 4.2 业务表
 
@@ -101,7 +101,7 @@ interface AppError {
 | `agent_definitions` | id, name, executor_id, current_version_id, disabled_at | 多个 Agent 可绑定同一 executor |
 | `agent_versions` | id, agent_id, version, config_json, config_hash | 不可变配置快照 |
 | `agent_resource_refs` | agent_version_id, executor_id, kind, resource_id, resource_version, content_hash | 只保存 assigned executor 的稳定 MCP/Skill 引用 |
-| `provider_connections` | id, type, endpoint, secret_ref, status | Provider connection config（规划中；当前 Provider 配置存于 `provider.json`） |
+| `provider_connections` | id, type, endpoint, secret_ref, status | 规划中的正式产品表；当前 Provider metadata/preference 存于 app-owned schema v5 registry，secret 独立存入 vault |
 | `executor_inventory_snapshots` | executor_id, generation, inventory_epoch, inventory_revision, stale, redacted_json, observed_at | 原子替换、可丢弃、非权威的 capability/inventory cache |
 | `sessions` | id, project_id, agent_version_id, mode, title, status, revision | 产品会话目录 |
 | `runs` | id, session_id, executor_id, mode, status, config_snapshot_json | 一次 Agent 执行；snapshot 只含 resource refs/hashes，不含 Skill 正文 |
@@ -333,37 +333,25 @@ diagnostics.export
 
 #### 8.3.1 Provider 与模型选择（当前实现）
 
-当前已实现的 Provider 方法集为 `moshu.v1.providers.{list,create,update,delete,test,fetchModels,setModelsEnabled}`、
-`moshu.v1.models.listAvailable`、`moshu.v1.settings.defaultModel.{get,set}` 和 `moshu.v1.session.setModel`。
+当前已实现 `moshu.v1.providers.{list,create,update,delete,test,fetchModels,setModelsEnabled}`、
+`moshu.v1.models.listAvailable`、`moshu.v1.settings.defaultModel.{get,set}`、`moshu.v1.session.setModel`，
+以及 `moshu.v2.providerAuth.{start,get,respond,cancel}` 和 `moshu.v2.provider.logout`。
 
-- Provider `type` 只表示兼容协议族：`openai-compatible` 或 `anthropic-compatible`。
-- 每个 Provider 记录 `displayName`、`type`、`baseUrl`、`apiKey`、`customHeaders` 和拉取到的 model 目录；
-  `providers.list` 返回的 `ProviderSummary` 只含 `apiKeyMask` 与 `customHeaderNames`，**不含** `apiKey`
-  或任何 header 值。
-- `providers.fetchModels` 请求 `{baseUrl}/models`（Anthropic 类型带 `x-api-key` 与 `anthropic-version`），
-  宽松解析 OpenAI、GitHub Copilot、Anthropic 和 OpenRouter 四种响应形态；响应未声明的字段一律省略，
-  UI 不渲染。保留上一次的勾选状态。
-- 模型声明 `supported_endpoints` 时，运行时识别 `/chat/completions`、`/responses` 和 `/v1/messages`
-  （同时接受带 `/v1` 或完整 URL 的等价路径）。多种协议并存时先选与 Provider `type` 同族的 endpoint，
-  同族内保持数组顺序；没有同族 endpoint 时取首个可识别 endpoint。字段缺失或没有可识别值时，
-  `openai-compatible` 回退 Chat Completions，`anthropic-compatible` 回退 Messages。
-- 三种实际 wire protocol 分别使用 `ChatOpenAICompletions`、`ChatOpenAIResponses` 和 `ChatAnthropic`
-  显式 adapter，不使用 `ChatOpenAI` 的自动协议切换。
-- Responses 请求统一使用 LangChain v1 content blocks；user/system 文本发送为 `input_text`，
-  assistant 历史发送为 `output_text`，同时保留 message metadata、tool call 和 usage 信息。
-- 推理控制按目录声明推导：`capabilities.supports.reasoning_effort[]` → effort 档位；
-  `adaptive_thinking` / `min_thinking_budget` / `max_thinking_budget` → thinking budget；两者都声明时都提供；
-  都未声明但模型实际解析为 Anthropic Messages 时提供一个默认关闭的 budget 控件（协议固有能力）；
-  其余情况不提供。
-  未声明或未开启的推理参数不会下发。
-- Session 通过 `session.setModel` 记录 `{providerId, modelId, reasoning}`；`chat.send` 的解析顺序为
-  Session 选择 → 全局默认 → `not_configured`，引用已删除或已停用的 Provider/模型时自动降级。
-
-Provider 配置持久化在 `{userData}/provider.json`（`schemaVersion: 3`，0600，`.tmp` + rename 原子写）。
-`schemaVersion: 1` 的单 Provider 文档会迁移成一条 Provider 记录；`schemaVersion: 2` 的三种旧 Type
-会迁移成两个兼容协议族，旧 Responses Provider 在模型没有 endpoint 元数据时保留 `/responses` 路由。
-业务数据库不保存任何 Provider 凭据：`chat_runs.provider_json` 在落盘前经 `toSafeProviderState()`
-剥除 `apiKey` 与 `customHeaders`。
+- builtin Provider 来自 public Pi `ModelRuntime` 的运行时枚举；公共合同不固化 Provider 数量或 SDK 类型。
+- custom Provider 只允许 `openai-completions`、`openai-responses`、`anthropic-messages` 和
+  `google-generative-ai`，并使用稳定实例 ID。builtin identity/API metadata 只读。
+- `ProviderSummary` 只返回 source、启用状态、authentication readiness、auth methods、模型能力和
+  `customHeaderNames`；API key、header value、OAuth token 与 secret prompt response 从不返回。
+- Provider auth 是异步 attempt：`start` 立即返回；client 用 `get` 单请求轮询，并用 `respond` 回答
+  text/secret/select/manual-code prompt。auth URL、device code 和 progress 作为 secret-free notification。
+- Provider preference/custom endpoint 存于 app-owned schema v5 registry；credential 只存于
+  `SecretVaultCredentialStore`。custom header 的名称可进 registry，值只能进 vault。
+- `fetchModels` 只刷新选中的 Provider。builtin/custom enabled 状态和 enabled model IDs 都会持久化；
+  disabled Provider/模型不能成为默认或 Session 选择。
+- Session 通过 `session.setModel` 记录 `{providerId, modelId, thinkingLevel?}`。`ThinkingLevel` 必须被当前
+  model 支持；若刷新后已保存档位失效，运行时安全省略该档位。删除、禁用 Provider/模型会安全清除默认值。
+- Run snapshot 通过 Pi-neutral safe projection 落盘，只包含 Provider/model identity 与有效
+  `ThinkingLevel`，不含 credential 或 custom header value。
 
 client 只暴露领域方法，不提供通用 method forwarding。MCP/Skill query/command 先由 server 校验 client/executor identity、Agent binding 和产品授权，再路由到 selected executor：
 
@@ -505,7 +493,9 @@ grant 单次使用。executor 先原子标记 nonce 已消费，再执行；旧�
 
 - Provider/model credential 只存在于 agents server `SecretVault`，供 Provider adapter 使用，永不发送 executor。
 - MCP credential、token 和 OAuth state 只由 owning executor 的 `ExecutorSecretStore` 持久化和解析；server 无 Secret Ref 或 recoverable copy。
-- client 的设置 command 经 server 授权后路由到 selected executor；secret 只可存在于不落盘、强制脱敏且 relay 后释放的 command payload，不能进入 server DB/checkpoint/event/audit payload、snapshot、backup 或 log。
+- client 的设置 command 经 server 授权后路由到 selected executor；secret 只可存在于不落盘、强制脱敏且
+  relay 后释放的 command payload，不能进入 server DB/Pi Session JSONL/event/audit payload、snapshot、
+  backup 或 log。
 - executor query/result/inventory 永不返回 secret、secret handle 或 recoverable auth config，只返回 redacted 状态。
 - executor 可在 connection/process lifetime 将 credential 加载到内存；stdio MCP 只向目标 child 注入最小环境，不修改 executor 全局环境，也不传给无关 child/Agent。
 - HTTP MCP 可在可行时按 request 注入 credential，但不是 universal requirement。
@@ -644,29 +634,34 @@ server 收到 mutation result 后立即增量同步到返回的 epoch/revision�
 - executor 保存 Skill installation、immutable version、metadata、`SKILL.md`、references、assets、scripts 和 content hash。
 - server 只保存 `ExecutorResourceRef`，构造或恢复 Agent 时按完整 ref 向 assigned executor 获取 metadata 和 `SKILL.md`。
 - executor 返回的 prompt payload 包含 stable resource ID、version、hash；server 验证后才构造 Agent prompt。
-- prompt payload 只在 server memory 中使用，不写入 Agent/Run config snapshot、checkpoint、event、backup、inventory、diagnostic 或 export；恢复时重新获取。
+- prompt payload 只在 server memory 中使用，不写入 Agent/Run config snapshot、Pi Session JSONL、event、
+  backup、inventory、diagnostic 或 export；恢复时重新获取。
 - hash/version 不匹配、Skill missing、wrong executor 或 executor offline 时 fail closed；不能使用 snapshot 或过期内容启动。
 - server 不把 executor local path 写入 Agent config 或 client payload。
 - `allowed-tools` 只是声明；references/assets/scripts 的读取和执行仍创建 Action 并由 executor 校验 grant。
 
-## 13. Checkpoint 与 Transcript
+## 13. Pi Session 与 Transcript
 
-- 一个 Session 使用稳定 LangGraph `threadId`。
-- checkpoint DB 只有 agents server 的 `BunSqliteSaver` 写入。
-- `runs` 保存 effective Agent/executor/config snapshot 和可恢复 checkpoint 引用。
-- conversation transcript 的事实来源是 checkpoint messages；Session 标题、搜索、归档和 RunJournal 属于业务 DB。
-- client/executor 不直接查询 checkpoint。
-- executor restart 不改变 thread ownership；Tool outcome 先由 Action recovery 对账，再恢复 graph。
-- 删除 Session 由 server 调用 `deleteThread`。
+- 一个产品 Session 保存符合 Pi ID 约束的稳定 `piSessionId`。
+- agents server 用 `SessionManager.create(cwd, sessionsDir, { id })` 打开 app-owned JSONL；client/executor
+  不直接读写。
+- Pi JSONL 保存 conversation context；Session 标题、搜索、归档、RunJournal、event cursor 和 tombstone
+  属于产品 DB。
+- 同一 Pi Session 只允许一个 owner；不同 Session 可并发。运行完成、取消或失败后都 dispose。
+- Pi 没有 public delete API。产品删除先持久化 `agent_session_cleanup_outbox`，再经 canonical containment、
+  lease/dispose 和 targeted unlink；失败保留并按有界 backoff 重试。
+- 非终态 orphan Run 在启动 reconciliation 中安全终结；存在 JSONL 不表示可继续崩溃前的同一个 Run。
 
 ## 14. Secret Ports
 
-### 14.1 agents server `SecretVault`
+### 14.1 agents server `SecretVaultCredentialStore`
 
-- 只长期保存 Provider/model credential；业务 DB 只保存 `SecretRef`。
+- 只长期保存 Provider/model credential；Provider registry 和产品 DB 均不保存 secret value。
 - client/WebView 只读取掩码和配置状态，Provider Key 不发送 executor。
-- Provider secret 不进入 checkpoint、Run event、grant、日志、诊断或导出。
-- 首发 macOS adapter 通过经审查的 Bun FFI/native bridge 调用 Keychain；不可用时显式 blocked，不回退到明文。
+- Provider secret 不进入 Pi Session JSONL、Run event、grant、日志、诊断或导出。
+- 当前 adapter 是 app-owned 文件：parent `0700`、vault `0600`、provider-scoped lock、短 whole-file commit
+  lock、fresh read/apply、atomic rename、file/directory fsync。它不防同账户恶意软件、root 或磁盘备份；
+  Keychain adapter 是外部分发前工作。
 
 ### 14.2 executor `ExecutorSecretStore`
 
@@ -687,7 +682,7 @@ interface ExecutorSecretStore {
 
 本次三角色重构发生在开发阶段：
 
-- 不要求把现有单进程 `app.db`、checkpoint 或 Provider 开发配置迁移到目标 schema。
+- 不要求把旧 runtime 数据或 Provider 开发配置迁移到当前 schema。
 - server 检测不兼容开发 schema 时可提供明确的 reset 流程；不得静默解释旧字段。
 - 自动化 fixture 只要求当前目标 schema 的创建、关闭重开、backup 和恢复。
 - 首次对外发布冻结 schema 后，才启用正式 expand/backfill/contract migration 和跨版本 gate。
@@ -701,13 +696,13 @@ interface ExecutorSecretStore {
 | CON-003 | client 无 executor 直连 API；executor 无 DB、Provider、Policy 或 approval API |
 | CON-004 | executor syncing/offline 时绑定 Agent 的新 Run 分别返回 `INVENTORY_SYNC_REQUIRED`/`EXECUTOR_OFFLINE` |
 | CON-005 | Policy/approval/intent 在 grant 前持久化，executor 拒绝过期、重复、篡改或错误目标 grant |
-| CON-006 | Provider/model credential 从不进入 executor；server DB/checkpoint/backup/snapshot 不含 recoverable MCP/Skill config/content/credential/OAuth 或 executor secret locator |
+| CON-006 | Provider/model credential 从不进入 executor；server DB/Pi Session JSONL/backup/snapshot 不含 recoverable MCP/Skill config/content/credential/OAuth 或 executor secret locator |
 | CON-007 | Action result 只由 server 持久化；断线后 non-idempotent Action 不自动重放 |
 | CON-008 | Agent 只能引用 assigned executor 的稳定 MCP/Skill version/hash；Skill metadata/`SKILL.md` missing/mismatch 时 fail closed |
 | CON-009 | MCP/Skill mutation 只有 owning executor 原子持久化后才成功；offline/冲突/失败保持 typed failure |
-| CON-010 | DB/checkpoint 只有 server writer；executor kill/restart 不造成 SQLite 多写 |
+| CON-010 | 产品 DB/Pi Session JSONL 只有 server writer；executor kill/restart 不造成 SQLite 多写 |
 | CON-011 | client 重连可按 event seq 补齐；executor 重连可按 invocation ID 对账 |
-| CON-012 | 当前开发 schema 可明确重置；文档和测试不声称迁移旧单进程数据 |
+| CON-012 | 当前开发 schema 可明确重置；文档和测试不声称迁移旧 runtime 数据 |
 | CON-013 | local executor root/secret file 权限、owner、atomic replace 和 symlink/no-follow 规则通过测试，产品说明真实披露其威胁边界 |
 | CON-014 | 每次 executor 注册/重连立即 full sync；成功前不 runnable，snapshot 原子替换且 cache 明确 non-authoritative/disposable |
 | CON-015 | persisted epoch/revision、bounded delta/tombstone、hint debounce、60 秒 ±20% poll 和 gap/compaction/epoch/cursor snapshot fallback 可确定收敛 |

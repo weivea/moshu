@@ -14,8 +14,8 @@ export const chatSessionsTable = sqliteTable(
 		defaultMode: text("default_mode", { enum: agentModeValues }).notNull(),
 		providerId: text("provider_id"),
 		modelId: text("model_id"),
-		reasoningEffort: text("reasoning_effort"),
-		reasoningBudgetTokens: integer("reasoning_budget_tokens"),
+		thinkingLevel: text("thinking_level"),
+		piSessionId: text("pi_session_id").notNull(),
 		createdAtMs: integer("created_at_ms").notNull(),
 		updatedAtMs: integer("updated_at_ms").notNull(),
 		lastMessageAtMs: integer("last_message_at_ms"),
@@ -116,8 +116,8 @@ export const retiredChatSessionsTable = sqliteTable(
 	(table) => [index("retired_chat_sessions_retired_at_idx").on(table.retiredAtMs)],
 );
 
-export const checkpointDeletionOutboxTable = sqliteTable(
-	"checkpoint_deletion_outbox",
+export const agentSessionCleanupOutboxTable = sqliteTable(
+	"agent_session_cleanup_outbox",
 	{
 		sessionId: text("session_id").primaryKey(),
 		createdAtMs: integer("created_at_ms").notNull(),
@@ -126,11 +126,11 @@ export const checkpointDeletionOutboxTable = sqliteTable(
 		lastAttemptAtMs: integer("last_attempt_at_ms"),
 		lastError: text("last_error"),
 	},
-	(table) => [index("checkpoint_deletion_outbox_next_attempt_idx").on(table.nextAttemptAtMs)],
+	(table) => [index("agent_session_cleanup_outbox_next_attempt_idx").on(table.nextAttemptAtMs)],
 );
 
 export const appSchema = {
-	checkpointDeletionOutboxTable,
+	agentSessionCleanupOutboxTable,
 	chatRunEventsTable,
 	chatRunsTable,
 	chatSessionCreateRequestsTable,

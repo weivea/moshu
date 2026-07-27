@@ -20,6 +20,7 @@ import {
 	type ProcessPeerIdentity,
 	processPeerIdentitySchema,
 	type SessionModelSelection,
+	sessionModelSelectionSchema,
 	type SetChatSessionArchivedInput,
 	type SetChatSessionArchivedOutput,
 	type SetChatSessionModelInput,
@@ -96,29 +97,22 @@ function buildSessionModel(row: SessionRow): SessionModelSelection | undefined {
 	if (row.providerId === null || row.modelId === null) {
 		return undefined;
 	}
-	const reasoning = {
-		...(row.reasoningEffort === null ? {} : { effort: row.reasoningEffort }),
-		...(row.reasoningBudgetTokens === null ? {} : { budgetTokens: row.reasoningBudgetTokens }),
-	};
-
-	return {
+	return sessionModelSelectionSchema.parse({
 		providerId: row.providerId,
 		modelId: row.modelId,
-		...(Object.keys(reasoning).length === 0 ? {} : { reasoning }),
-	};
+		...(row.thinkingLevel === null ? {} : { thinkingLevel: row.thinkingLevel }),
+	});
 }
 
 function toModelColumns(model: SessionModelSelection | null): {
 	providerId: string | null;
 	modelId: string | null;
-	reasoningEffort: string | null;
-	reasoningBudgetTokens: number | null;
+	thinkingLevel: string | null;
 } {
 	return {
 		providerId: model === null ? null : model.providerId,
 		modelId: model === null ? null : model.modelId,
-		reasoningEffort: model?.reasoning?.effort ?? null,
-		reasoningBudgetTokens: model?.reasoning?.budgetTokens ?? null,
+		thinkingLevel: model?.thinkingLevel ?? null,
 	};
 }
 
@@ -126,6 +120,7 @@ function buildSession(row: SessionRow): ChatSession {
 	return chatSessionSchema.parse({
 		schemaVersion: 1,
 		id: row.id,
+		agentSessionId: row.piSessionId,
 		title: row.title,
 		defaultMode: row.defaultMode,
 		model: buildSessionModel(row),
@@ -146,8 +141,10 @@ export class SqliteSessionRepository implements SessionRepository {
 	create(input: CreateChatSessionInput): CreateChatSessionOutput {
 		const parsedInput = createChatSessionInputSchema.parse(input);
 		const nowMs = this.clock.now();
+		const id = this.idGenerator.create(nowMs);
 		const row: typeof chatSessionsTable.$inferInsert = {
-			id: this.idGenerator.create(nowMs),
+			id,
+			piSessionId: id,
 			title: parsedInput.title,
 			defaultMode: parsedInput.defaultMode ?? "ask",
 			...toModelColumns(parsedInput.model ?? null),
@@ -206,8 +203,10 @@ export class SqliteSessionRepository implements SessionRepository {
 			}
 
 			const nowMs = this.clock.now();
+			const id = this.idGenerator.create(nowMs);
 			const row: typeof chatSessionsTable.$inferInsert = {
-				id: this.idGenerator.create(nowMs),
+				id,
+				piSessionId: id,
 				title: request.title,
 				defaultMode: request.defaultMode,
 				...toModelColumns(request.model ?? null),

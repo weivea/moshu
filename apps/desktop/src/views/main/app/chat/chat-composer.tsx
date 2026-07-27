@@ -1,5 +1,5 @@
 import { Button } from "@heroui/react";
-import type { AvailableModel, ReasoningSelection } from "@moshu/contracts";
+import type { AvailableModel, ThinkingLevel } from "@moshu/contracts";
 import { AppIcon } from "@moshu/ui";
 import { type KeyboardEvent, useId } from "react";
 import { useI18n } from "../i18n";
@@ -13,7 +13,7 @@ export interface ChatComposerProps {
 	isStopping: boolean;
 	availableModels: readonly AvailableModel[];
 	selectedModel?: AvailableModel;
-	reasoning?: ReasoningSelection;
+	thinkingLevel?: ThinkingLevel;
 	onDraftChange(value: string): void;
 	onModelChange(selection: SessionModelSelection | null): void;
 	onSend(): void;
@@ -27,7 +27,7 @@ export function ChatComposer({
 	isStopping,
 	availableModels,
 	selectedModel,
-	reasoning,
+	thinkingLevel,
 	onDraftChange,
 	onModelChange,
 	onSend,
@@ -69,22 +69,22 @@ export function ChatComposer({
 					{...(selectedModel === undefined
 						? {}
 						: { providerId: selectedModel.providerId, modelId: selectedModel.model.id })}
-					{...(reasoning === undefined ? {} : { reasoning })}
+					{...(thinkingLevel === undefined ? {} : { thinkingLevel })}
 					onSelect={(providerId, modelId) =>
 						onModelChange({
 							providerId,
 							modelId,
-							...(reasoning === undefined ? {} : { reasoning }),
+							...(thinkingLevel === undefined ? {} : { thinkingLevel }),
 						})
 					}
-					onReasoningChange={(nextReasoning) => {
+					onThinkingLevelChange={(nextThinkingLevel) => {
 						if (selectedModel === undefined) {
 							return;
 						}
 						onModelChange({
 							providerId: selectedModel.providerId,
 							modelId: selectedModel.model.id,
-							...(nextReasoning === undefined ? {} : { reasoning: nextReasoning }),
+							...(nextThinkingLevel === undefined ? {} : { thinkingLevel: nextThinkingLevel }),
 						});
 					}}
 				/>

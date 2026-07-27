@@ -37,14 +37,14 @@
 | 数据策略 | Local-first，首版无需账号，数据和配置默认保存在本机 |
 | Project | 一个本地文件夹或 Git 仓库，可用于代码、文档或通用任务 |
 | Chat 类型 | 普通 Chat 不绑定目录；Project Chat 绑定项目并可操作项目环境 |
-| Agent 模式 | Ask、Plan、Agent |
-| 本机能力 | 可读写项目文件、执行终端命令；敏感操作需要审批 |
+| Agent 模式 | 当前已实现 no-tools Ask；Plan、Agent 和 Tool execution 是后续目标 |
+| 本机能力 | 当前 Ask 不执行文件或命令；未来由 Moshu-owned Policy/grant/executor 边界提供 |
 | Allow all | 输入框可开启，仅当前会话生效；重启后关闭；系统级高风险操作仍需确认 |
 | 并发 | 默认最多 3 个活跃会话，可配置为 1–5 个，超出后排队 |
-| Deep Agents | 展示任务计划、待办、子 Agent、上下文压缩、中断与恢复的执行轨迹 |
+| Pi runtime | public Pi `0.82.1` 提供 `ModelRuntime`、headless `AgentSession`、stream/usage、取消和 Session JSONL |
 | Git | 首版提供状态、Diff、变更审阅和单项撤销；分支、提交、Worktree 后置 |
 | 自定义 Agent | 可视化配置提示词、模型、工具/MCP、Skills、权限、知识文件，并可导入导出 |
-| Provider | OpenAI、Anthropic、Gemini、DeepSeek、Kimi、智谱；自定义 OpenAI-compatible 与 Claude-compatible Endpoint |
+| Provider | 运行时动态枚举 public Pi builtin；custom endpoint 限四种已批准 API family |
 | 模型体验 | 连接测试、模型切换、参数、能力标签、Token/费用统计和预算提醒 |
 | 本地模型 | 第二阶段支持 Ollama；LM Studio 通过兼容 Endpoint 接入 |
 | MCP | stdio、Streamable HTTP、兼容 SSE；Bearer/API Key 与 OAuth 2.1；支持配置导入 |
@@ -60,18 +60,18 @@
 
 ## 4. 产品边界
 
-### 首个可用闭环
+### 当前可用闭环
 
 用户安装应用后，不登录即可完成以下流程：
 
 1. 配置并测试一个模型 Provider。
-2. 创建普通 Chat，或添加本地目录后创建 Project Chat。
-3. 选择 Ask、Plan 或 Agent 模式并提交任务。
-4. 查看 Agent 的计划、待办、工具调用、子 Agent 和流式输出。
-5. 审批文件修改或命令；也可对当前会话开启 Allow all。
-6. 查看文件变更和 Git Diff，撤销某项 Agent 变更。
-7. 切换到其他会话，让原任务继续在后台运行。
-8. 应用退出或异常后，重新打开并继续可恢复的任务。
+2. 创建普通 Chat 并选择已启用模型和可用 `ThinkingLevel`。
+3. 以 no-tools Ask 提交任务并查看流式文本、状态和错误。
+4. 停止活动回复，或切换到其他 Session。
+5. 重启应用后读取产品 Session、历史 Run/event 和 Pi conversation context。
+6. 搜索、重命名、归档、恢复或永久删除 Session。
+
+Project Chat、Plan/Agent、Tool、审批、Diff、MCP、Skills 和 subagent 仍是后续阶段目标。
 
 ### 首版不追求
 
@@ -91,10 +91,10 @@
 | UI | React + React Router |
 | 组件库 | HeroUI；统一主题 Token、浅色/深色模式和无障碍行为 |
 | 图标 | `@gravity-ui/icons`；应用提供统一 Icon 包装层处理尺寸、颜色、标签和 tree-shaking |
-| Agents server | 独占产品 DB/checkpoint、Provider/model credential、Agent definitions/versions、Session/Run/event、Provider access、Agent runtime、Policy/approval 和 Action intent/result；只保存 Agent resource ref 与同步得到的非权威、可丢弃 executor inventory cache |
+| Agents server | 当前独占产品 DB、Pi Session JSONL、Provider/model credential、Session/Run/event、Provider access 和 Pi Agent runtime；未来再承载 Policy/approval 和 Action intent/result |
 | Executor | 独占自身 MCP config/credential/OAuth/lifecycle、Skill install/immutable version/content/hash/resources、实际 Tool、取消、进程树和 private local data |
-| Agent | LangChain JavaScript `deepagents` 只在 agents server 运行；多个 Agent 可绑定同一个 executor |
-| 持久化 | agents server 单写 `bun:sqlite` 业务库和项目维护的 LangGraph `BunSqliteSaver` |
+| Agent | public Pi `0.82.1` 只在 agents server 运行；当前是禁用全部动态资源和 Tool 的 headless Ask |
+| 持久化 | agents server 单写产品 DB；public Pi `SessionManager` 在显式 `agentDataDirectory/sessions` 保存 JSONL |
 | RPC | 应用协议为 `client <-> agents server <-> executor` 的 WebSocket + versioned JSON RPC；WebView 仍只使用最小 Electrobun RPC |
 | Authorization | agents server 决定并持久化 Policy/approval，再签发一次性 execution grant；executor 验证后执行 |
 | Secret | Provider/model credential 永远留在 agents server；MCP credential 只在 owning executor 的 `ExecutorSecretStore` 与目标 connection/process 使用，不复制到 server 或暴露给 query/UI/prompt/log/export |
@@ -110,17 +110,16 @@
 - Agent 只保存 assigned executor stable resource ref；server 按 version/hash 获取 Skill metadata 与 `SKILL.md`，resources/scripts 仍通过 executor。
 - executor-owned MCP credential 与 execution grant 分离：连接可保持认证，但每次 Tool 仍需 server 的一次性授权；runtime teardown 不宣称 JavaScript 可可靠清零 string memory。
 - 两个 companion 必须随 desktop 整体打包、签名和更新，不能要求用户安装 runtime，也不能运行时下载未知 binary。
-- 当前代码仍是单 Application Host 内的无 Tool Ask slice。目标 WebSocket、registry、grant 和 companion supervision 尚未实现，详见[实施进度](../implementation/progress.md)。
-- 本次开发阶段重构无需迁移现有业务 DB/checkpoint/Provider 开发数据；不兼容时明确 reset。首次外部发布后再冻结正式 migration gate。
+- 当前已实现 compiled companion supervision、动态 loopback/authenticated RPC、Provider/auth、no-tools Pi Ask、
+  产品 DB 与 Pi Session JSONL。Executor Tool/MCP/Skill、Policy/grant 和 Agent binding 尚未实现，详见
+  [实施进度](../implementation/progress.md)。
+- 本次开发阶段重构无需迁移旧 runtime/Provider 开发数据；不兼容时明确 reset。首次外部发布后再冻结正式
+  migration gate。
 
 ## 7. 参考资料
 
-- [Deep Agents JavaScript Overview](https://docs.langchain.com/oss/javascript/deepagents/overview)
-- [Deep Agents Human-in-the-loop](https://docs.langchain.com/oss/javascript/deepagents/human-in-the-loop)
-- [Deep Agents Skills](https://docs.langchain.com/oss/javascript/deepagents/skills)
-- [LangChain MCP](https://docs.langchain.com/oss/javascript/langchain/mcp)
+- [Pi mono repository](https://github.com/badlogic/pi-mono)
 - [Agent Skills Specification](https://agentskills.io/specification)
-- [LangChain.js Providers](https://github.com/langchain-ai/langchainjs/tree/main/libs/providers)
 - [Electrobun](https://github.com/blackboardsh/electrobun)
 - [Electrobun 1.18.1 README](https://github.com/blackboardsh/electrobun/blob/v1.18.1/README.md)
 - [Electrobun 1.18.1 Architecture](https://github.com/blackboardsh/electrobun/blob/v1.18.1/docs/src/content/docs/electrobun/guides/architecture/overview.mdx)

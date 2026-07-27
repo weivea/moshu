@@ -2,6 +2,9 @@
 
 ## 1. 能力模型
 
+当前 shipped slice 只有动态 Provider + no-tools Ask。以下 Tool、MCP、Skill、Knowledge、Policy 和 subagent
+组合描述未来 Moshu-owned 产品边界，不表示 public Pi resource loading 已开启。
+
 一个可运行 Agent 由以下配置组合而成：
 
 ```text
@@ -103,47 +106,33 @@ Agent
 
 ### 3.1 数据模型
 
-Provider 配置分为三层：
+Provider domain 分为：
 
-1. **Provider preset**：协议、默认 Endpoint、认证方式和能力规则。
-2. **Connection profile**：用户的一组凭证、Endpoint、代理和自定义 Header。
-3. **Model profile**：模型 ID、能力、上下文、参数、费率和连接选择。
+1. **Builtin Provider**：由 public Pi `ModelRuntime` 在运行时枚举；ID、display name 和 API metadata 只读，
+   每个 Provider 保存一份 credential。
+2. **Custom Provider instance**：拥有稳定 instance ID、display name、base URL、API family 和 secret header
+   metadata；同一 family 可创建多个实例。
+3. **Model profile**：由运行时刷新得到 model ID、capability、`ThinkingLevel`、上下文和用量 metadata。
 
-同一 Provider 允许创建多个 Connection profile，例如个人与公司账号。
+Provider registry、auth、连接测试、模型调用、用量和长期 Provider Secret 都位于 agents server。executor
+不代替 server 调用模型，也不会收到 Provider Key。
 
-Provider adapter、连接测试、模型调用、用量和长期 Provider Secret 都位于 agents server。executor 不代替 server 调用模型，也不会收到 Provider Key。
+### 3.2 Provider 范围
 
-### 3.2 首版 Provider 矩阵
-
-| 用户可见 Provider | 接入策略 | 首版 |
-| --- | --- | --- |
-| OpenAI | LangChain OpenAI Provider | 是 |
-| Anthropic | LangChain Anthropic Provider | 是 |
-| Google Gemini | LangChain Google GenAI Provider | 是 |
-| DeepSeek | LangChain DeepSeek Provider | 是 |
-| Kimi / Moonshot | OpenAI-compatible 品牌预设 | 是 |
-| 智谱 / Z.ai | OpenAI-compatible 品牌预设 | 是 |
-| Custom OpenAI-compatible | 自定义 Base URL、Key、Header | 是 |
-| Custom Claude-compatible | 自定义 Anthropic API URL、Key、Header | 是 |
-| Ollama | LangChain Ollama Provider | 阶段 2 |
-| LM Studio | OpenAI-compatible 本地 Endpoint | 阶段 2 |
-| OpenRouter、xAI、Groq、Mistral、AWS、Azure 等 | 按 LangChain Provider 扩展 | 阶段 3 候选 |
-
-Kimi 和智谱必须作为独立品牌入口提供默认值和帮助文案，而不是要求用户理解“兼容协议”后手工填写全部字段。
+- builtin 清单完全来自运行时枚举，不在产品代码或文档固化数量；动态 Provider 可在认证并刷新后出现模型。
+- custom endpoint 只允许 `openai-completions`、`openai-responses`、`anthropic-messages` 和
+  `google-generative-ai`。
+- auth action 来自每个 `ProviderSummary.authMethods`，UI 不按 Provider ID 维护 API Key/OAuth 分组。
 
 ### 3.3 Provider 设置页
 
-每个连接支持：
+Provider 列表显示 builtin/custom source、enabled 和 authentication readiness。builtin detail 允许启停、认证、
+退出、刷新与模型勾选，但不能改 ID/display name/base URL/API/header 或删除。custom detail 可编辑 endpoint/API/
+header name 并删除；secret value 只通过创建或公共 auth panel 输入。
 
-- 名称、Provider 类型、API Key/Token。
-- Base URL 和必要版本字段。
-- 自定义 Header；敏感值使用密钥存储。
-- 代理、超时、重试上限等高级项。
-- “测试连接”：验证认证、流式回复和最小工具调用能力。
-- 获取模型列表；无法自动获取时可手工添加模型 ID。
-- 连接状态、最近成功时间和可操作错误信息。
-
-测试不得产生不可预期高额费用；界面需说明将发起最小模型请求。
+auth panel 支持 API Key/OAuth、text/secret/select/manual code prompt，以及 info/auth URL/device code/progress
+notification。`start` 立即返回，UI 单请求有界轮询；离开面板或退出时取消 attempt。Provider URL 作为 opaque
+外链打开，不解析 callback。认证/配置不足时测试、刷新和模型控件禁用或返回明确安全错误。
 
 ### 3.4 模型能力注册表
 
@@ -153,7 +142,7 @@ Kimi 和智谱必须作为独立品牌入口提供默认值和帮助文案，而
 - Tool calling。
 - Structured output。
 - Streaming。
-- Reasoning/思考参数。
+- Pi `ThinkingLevel`。
 - 上下文窗口和最大输出。
 - Prompt caching。
 - Embedding 能力。
@@ -163,11 +152,10 @@ Kimi 和智谱必须作为独立品牌入口提供默认值和帮助文案，而
 
 ### 3.5 模型参数
 
-- 通用参数：temperature、top-p、max output tokens、stop。
-- Provider 专属参数：reasoning effort、thinking budget、缓存等。
-- UI 仅展示当前模型支持的参数。
-- Agent 可定义推荐值；Session 可临时覆盖。
-- 原始高级参数以结构化 JSON 编辑时必须进行 Schema 校验。
+- 当前 Session 只保存 public Pi model 声明支持的 `ThinkingLevel`。
+- 新选择在写入时严格验证；Provider/model 被禁用或删除时安全清除默认选择。
+- model refresh 后若已保存档位不再被支持，运行时省略该档位，不让 Chat 持久失败。
+- temperature、top-p、token limit 和高级参数仍是后续产品范围。
 
 ### 3.6 用量、费用和预算
 
@@ -223,7 +211,8 @@ client 提供完整 MCP 配置 UI，但不直连 executor。query/command 先由
 - 远程连接支持静态 Header、Bearer/API Key。
 - 支持符合 MCP 规范的 OAuth 2.1、PKCE、资源服务器发现和浏览器授权。
 - 动态客户端注册不可用时，允许用户填写 Client ID；Client Secret 安全存储。
-- Access/Refresh Token 和其他 MCP Secret 只写入 owning executor 的 `ExecutorSecretStore`，不进入 server DB/checkpoint/backup/snapshot、MCP query result、日志或 WebView。
+- Access/Refresh Token 和其他 MCP Secret 只写入 owning executor 的 `ExecutorSecretStore`，不进入 server
+  DB/Pi Session JSONL/backup/snapshot、MCP query result、日志或 WebView。
 - local desktop 首个 `ExecutorSecretStore` 可使用 private files；future executor 可改用 Keychain、Docker Secret 或 cloud secret manager。
 - executor 可在 connection/process 生命周期内把 credential 加载到内存；不得进入模型/UI/prompt、query RPC、diagnostic/export、executor 全局环境或无关 child/Agent。
 - revocation、expiry 或 MCP shutdown 会关闭对应连接/进程并释放 runtime reference；JavaScript 不承诺可靠清零 string memory。
@@ -289,7 +278,8 @@ Skill installation、immutable versions/content/hash、metadata、实际目录�
 
 - Agent 构建或恢复前，agents server 按 `executorId + stableSkillId + version + contentHash` 通过 executor RPC 获取 Skill metadata 和 `SKILL.md`。
 - server 验证 owner、version 与 hash 后构造有效 Agent prompt；offline、missing 或 mismatch 时 fail closed，不使用 snapshot/旧内容。
-- fetched content 只用于当次内存 prompt assembly，不写入 Agent/Run snapshot、checkpoint、event、backup、diagnostic 或 export；恢复时重新按 ref 获取。
+- fetched content 只用于当次内存 prompt assembly，不写入 Agent/Run snapshot、Pi Session JSONL、event、
+  backup、diagnostic 或 export；恢复时重新按 ref 获取。
 - 脚本、引用和资源仅在需要时通过 executor 读取或执行。
 - UI 在执行轨迹中显示“激活了哪个 Skill”，但不把全部 Skill 内容塞入消息流。
 

@@ -13,6 +13,9 @@ import type {
 	ListChatSessionsOutput,
 	ListProvidersOutput,
 	ProviderMutationOutput,
+	ProviderAuthAttemptOutput,
+	RespondProviderAuthInput,
+	StartProviderAuthInput,
 	ProviderSummary,
 	SetChatSessionArchivedOutput,
 	SetChatSessionModelInput,
@@ -46,6 +49,25 @@ const assistantMessageId = "01984df0-cf1a-7178-b174-42fc83c3e87d";
 const eventId = "01984df0-cf1b-7521-a4a5-40eef114ce9f";
 const createdAt = "2026-07-25T04:15:28.349Z";
 
+function createAuthAttempt(
+	authProviderId: string,
+	authType: "api_key" | "oauth",
+	status: "completed" | "cancelled" = "completed",
+): ProviderAuthAttemptOutput {
+	return {
+		attempt: {
+			schemaVersion: 2,
+			id: "01984df0-cf1b-7521-a4a5-40eef114ce9f",
+			providerId: authProviderId,
+			authType,
+			status,
+			createdAt,
+			updatedAt: createdAt,
+			notifications: [],
+		},
+	};
+}
+
 describe("RPC Chat transport", () => {
 	test("maps provider configuration, accepted messages, and persisted run events", async () => {
 		const client = new FakeRpcChatClient();
@@ -54,20 +76,22 @@ describe("RPC Chat transport", () => {
 		transport.subscribe((event) => events.push(event));
 
 		const created = await transport.createProvider({
-			schemaVersion: 1,
+			schemaVersion: 2,
 			displayName: "OpenAI",
-			type: "openai-compatible",
+			api: "openai-responses",
 			baseUrl: "https://api.openai.com/v1",
 			apiKey: "sk-test-secret",
 		});
 		expect(created).toEqual({
-			schemaVersion: 1,
+			schemaVersion: 2,
 			id: providerId,
 			displayName: "OpenAI",
-			type: "openai-compatible",
+			source: "custom",
+			api: "openai-responses",
 			baseUrl: "https://api.openai.com/v1",
 			enabled: true,
-			apiKeyMask: "********cret",
+			authMethods: ["api_key"],
+			credential: { configured: true, type: "api_key" },
 			customHeaderNames: [],
 			models: [],
 		});
@@ -183,7 +207,7 @@ describe("RPC Chat transport", () => {
 		const client = new FakeRpcChatClient();
 		const transport = createRpcChatTransport(client);
 
-		expect(await transport.testProvider({ schemaVersion: 1, providerId })).toEqual({
+		expect(await transport.testProvider({ schemaVersion: 2, providerId })).toEqual({
 			ok: true,
 			latencyMs: 12,
 		});
@@ -198,6 +222,18 @@ describe("RPC Chat transport", () => {
 		expect((await transport.renameSession(sessionId, "Renamed")).title).toBe("Renamed");
 		expect((await transport.setSessionArchived(sessionId, true)).archivedAt).toBe(createdAt);
 		await expect(transport.deleteSession(sessionId)).resolves.toBeUndefined();
+	});
+
+	test("forwards Provider authentication and logout without retaining secret responses", async () => {
+		const client = new FakeRpcChatClient();
+		const transport = createRpcChatTransport(client);
+		const started = await transport.startProviderAuth(providerId, "api_key");
+		await transport.respondProviderAuth(started.id, eventId, "fake-input-only-secret");
+		await transport.getProviderAuth(started.id);
+		expect((await transport.cancelProviderAuth(started.id)).status).toBe("cancelled");
+		await transport.logoutProvider(providerId);
+		expect(client.authCalls).toEqual(["start:api_key", "respond", "get", "cancel", "logout"]);
+		expect(JSON.stringify(client.authCalls)).not.toContain("fake-input-only-secret");
 	});
 
 	test("forwards Session invalidation acknowledgement only after renderer refetch work", async () => {
@@ -229,6 +265,7 @@ class FakeRpcChatClient implements RpcChatClient {
 	lastSetSessionModelInput?: SetChatSessionModelInput;
 	readonly sendInputs: Array<{ requestId: string; sessionId: string; content: string }> = [];
 	readonly cancelInputs: Array<{ sessionId: string; runId: string }> = [];
+	readonly authCalls: string[] = [];
 	lastInvalidationSubscriptionOptions?: ChatSessionInvalidationSubscriptionOptions;
 	failNextSend = false;
 	#listeners = new Set<(event: ChatRunEvent) => void>();
@@ -237,16 +274,16 @@ class FakeRpcChatClient implements RpcChatClient {
 	>();
 
 	async listProviders(): Promise<ListProvidersOutput> {
-		return { schemaVersion: 1, providers: [] };
+		return { schemaVersion: 2, providers: [] };
 	}
 
 	async createProvider(input: CreateProviderInput): Promise<ProviderMutationOutput> {
 		this.lastCreateInput = input;
 		return {
-			schemaVersion: 1,
+			schemaVersion: 2,
 			provider: createProviderSummary({
 				displayName: input.displayName,
-				type: input.type,
+				api: input.api,
 				baseUrl: input.baseUrl,
 				customHeaderNames: Object.keys(input.customHeaders ?? {}),
 			}),
@@ -255,40 +292,69 @@ class FakeRpcChatClient implements RpcChatClient {
 
 	async updateProvider(input: UpdateProviderInput): Promise<ProviderMutationOutput> {
 		this.lastUpdateInput = input;
-		return { schemaVersion: 1, provider: createProviderSummary() };
+		return { schemaVersion: 2, provider: createProviderSummary() };
 	}
 
 	async deleteProvider(deleteProviderId: string): Promise<DeleteProviderOutput> {
-		return { schemaVersion: 1, providerId: deleteProviderId };
+		return { schemaVersion: 2, providerId: deleteProviderId };
 	}
 
 	async testProvider(_input: TestProviderInput): Promise<TestProviderOutput> {
-		return { schemaVersion: 1, ok: true, latencyMs: 12 };
+		return { schemaVersion: 2, ok: true, latencyMs: 12 };
 	}
 
 	async fetchProviderModels(_providerId: string): Promise<FetchProviderModelsOutput> {
-		return { schemaVersion: 1, provider: createProviderSummary() };
+		return { schemaVersion: 2, provider: createProviderSummary() };
 	}
 
 	async setProviderModelsEnabled(
 		input: SetProviderModelsEnabledInput,
 	): Promise<SetProviderModelsEnabledOutput> {
 		this.lastSetModelsInput = input;
-		return { schemaVersion: 1, provider: createProviderSummary() };
+		return { schemaVersion: 2, provider: createProviderSummary() };
+	}
+
+	async providerAuthStart(input: StartProviderAuthInput): Promise<ProviderAuthAttemptOutput> {
+		this.authCalls.push(`start:${input.authType}`);
+		return createAuthAttempt(input.providerId, input.authType);
+	}
+
+	async providerAuthGet(_attemptId: string): Promise<ProviderAuthAttemptOutput> {
+		this.authCalls.push("get");
+		return createAuthAttempt(providerId, "api_key");
+	}
+
+	async providerAuthRespond(_input: RespondProviderAuthInput): Promise<ProviderAuthAttemptOutput> {
+		this.authCalls.push("respond");
+		return createAuthAttempt(providerId, "api_key");
+	}
+
+	async providerAuthCancel(_attemptId: string): Promise<ProviderAuthAttemptOutput> {
+		this.authCalls.push("cancel");
+		return createAuthAttempt(providerId, "api_key", "cancelled");
+	}
+
+	async providerLogout(_providerId: string): Promise<unknown> {
+		this.authCalls.push("logout");
+		return { schemaVersion: 2, providerId, configured: false };
+	}
+
+	async openExternalUrl(_url: string): Promise<{ opened: boolean }> {
+		return { opened: true };
 	}
 
 	async listAvailableModels(): Promise<ListAvailableModelsOutput> {
-		return { schemaVersion: 1, models: [] };
+		return { schemaVersion: 2, models: [] };
 	}
 
 	async getDefaultModel(): Promise<GetDefaultModelOutput> {
-		return { schemaVersion: 1 };
+		return { schemaVersion: 2 };
 	}
 
 	async setDefaultModel(input: SetDefaultModelInput): Promise<SetDefaultModelOutput> {
 		this.lastSetDefaultInput = input;
 		return {
-			schemaVersion: 1,
+			schemaVersion: 2,
 			...(input.defaultModel === null ? {} : { defaultModel: input.defaultModel }),
 		};
 	}
@@ -429,6 +495,7 @@ function createContractSession() {
 	return {
 		schemaVersion: 1 as const,
 		id: sessionId,
+		agentSessionId: sessionId,
 		title: "New chat",
 		defaultMode: "ask" as const,
 		createdAt,
@@ -438,13 +505,15 @@ function createContractSession() {
 
 function createProviderSummary(overrides: Partial<ProviderSummary> = {}): ProviderSummary {
 	return {
-		schemaVersion: 1,
+		schemaVersion: 2,
 		id: providerId,
 		displayName: "OpenAI",
-		type: "openai-compatible",
+		source: "custom",
+		api: "openai-responses",
 		baseUrl: "https://api.openai.com/v1",
 		enabled: true,
-		apiKeyMask: "********cret",
+		authMethods: ["api_key"],
+		credential: { configured: true, type: "api_key" },
 		customHeaderNames: [],
 		models: [],
 		...overrides,
@@ -477,8 +546,8 @@ function createRun() {
 			schemaVersion: 1 as const,
 			providerId,
 			name: "OpenAI",
-			type: "openai-compatible" as const,
-			baseUrl: "https://api.openai.com/v1",
+			source: "custom" as const,
+			api: "openai-responses",
 			model: "gpt-4.1-mini",
 			status: "ready" as const,
 		},

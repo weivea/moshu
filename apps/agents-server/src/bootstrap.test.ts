@@ -43,9 +43,8 @@ const validRecord: AgentsServerBootstrapRecord = {
 		},
 	],
 	paths: {
-		productDatabase: "/tmp/moshu.db",
-		checkpointDatabase: "/tmp/moshu-checkpoints.db",
-		providerConfig: "/tmp/provider.json",
+		productDatabase: "/app/moshu/product.db",
+		agentDataDirectory: "/app/moshu/agent-data",
 	},
 };
 

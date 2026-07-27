@@ -94,8 +94,7 @@ mainWindow.on("close", () => {
 companionStartupPromise = startCompanionRuntime({
 	dataPaths: {
 		productDatabase: join(Utils.paths.userData, "moshu.db"),
-		checkpointDatabase: join(Utils.paths.userData, "moshu-checkpoints.db"),
-		providerConfig: join(Utils.paths.userData, "provider.json"),
+		agentDataDirectory: join(Utils.paths.userData, "agent-data"),
 	},
 	connectClient: (options) => agentsClient.connect(options),
 	onSupervisorCreated(supervisor) {

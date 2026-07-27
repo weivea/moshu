@@ -1,4 +1,9 @@
-import type { CreateProviderInput, UpdateProviderInput } from "@moshu/contracts";
+import type {
+	CreateProviderInput,
+	ProviderAuthAttempt,
+	ProviderAuthType,
+	UpdateProviderInput,
+} from "@moshu/contracts";
 import type {
 	AvailableModel,
 	ChatMessage,
@@ -30,6 +35,7 @@ export function createPreviewChatTransport(): ChatTransport {
 	const listeners = new Set<ChatTransportListener>();
 	const sessions = new Map<string, ChatSession>();
 	const pendingResponses = new Map<string, PendingPreviewResponse>();
+	const authAttempts = new Map<string, ProviderAuthAttempt>();
 
 	function cloneMessage(message: ChatMessage): ChatMessage {
 		return { ...message };
@@ -162,13 +168,15 @@ export function createPreviewChatTransport(): ChatTransport {
 		},
 		async createProvider(input: CreateProviderInput) {
 			const provider: ProviderSummary = {
-				schemaVersion: 1,
+				schemaVersion: 2,
 				id: `preview-provider-${nextProviderNumber}`,
 				displayName: input.displayName,
-				type: input.type,
+				source: "custom",
+				api: input.api,
 				baseUrl: input.baseUrl,
 				enabled: true,
-				apiKeyMask: `••••••••${input.apiKey.slice(-4)}`,
+				authMethods: ["api_key"],
+				credential: { configured: input.apiKey !== undefined },
 				customHeaderNames: Object.keys(input.customHeaders ?? {}).sort(),
 				models: [],
 			};
@@ -181,15 +189,13 @@ export function createPreviewChatTransport(): ChatTransport {
 			if (input.displayName !== undefined) {
 				provider.displayName = input.displayName;
 			}
-			if (input.type !== undefined) {
-				provider.type = input.type;
+			if (input.api !== undefined) {
+				provider.api = input.api;
 			}
 			if (input.baseUrl !== undefined) {
 				provider.baseUrl = input.baseUrl;
 			}
-			if (input.apiKey !== undefined) {
-				provider.apiKeyMask = `••••••••${input.apiKey.slice(-4)}`;
-			}
+			if (input.apiKey !== undefined) provider.credential = { configured: true };
 			if (input.customHeaders !== undefined) {
 				provider.customHeaderNames = Object.keys(input.customHeaders).sort();
 			}
@@ -214,7 +220,7 @@ export function createPreviewChatTransport(): ChatTransport {
 		async fetchProviderModels(providerId: string) {
 			const provider = requireProvider(providerId);
 			const enabled = new Set(provider.models.filter((model) => model.enabled).map((m) => m.id));
-			provider.models = previewCatalog(provider.type).map((model) => ({
+			provider.models = previewCatalog(provider.api ?? "openai-completions").map((model) => ({
 				...model,
 				enabled: enabled.has(model.id),
 			}));
@@ -233,6 +239,46 @@ export function createPreviewChatTransport(): ChatTransport {
 			}
 			return structuredClone(provider);
 		},
+		async startProviderAuth(providerId: string, authType: ProviderAuthType) {
+			const provider = requireProvider(providerId);
+			const now = new Date().toISOString();
+			const attempt: ProviderAuthAttempt = {
+				schemaVersion: 2,
+				id: crypto.randomUUID(),
+				providerId,
+				authType,
+				status: "completed",
+				createdAt: now,
+				updatedAt: now,
+				notifications: [],
+			};
+			provider.credential = { configured: true, type: authType };
+			authAttempts.set(attempt.id, attempt);
+			return structuredClone(attempt);
+		},
+		async getProviderAuth(attemptId: string) {
+			const attempt = authAttempts.get(attemptId);
+			if (attempt === undefined) throw new Error("Authentication attempt was not found.");
+			return structuredClone(attempt);
+		},
+		async respondProviderAuth(attemptId: string, _challengeId: string, _value: string) {
+			const attempt = authAttempts.get(attemptId);
+			if (attempt === undefined) throw new Error("Authentication attempt was not found.");
+			return structuredClone(attempt);
+		},
+		async cancelProviderAuth(attemptId: string) {
+			const attempt = authAttempts.get(attemptId);
+			if (attempt === undefined) throw new Error("Authentication attempt was not found.");
+			attempt.status = "cancelled";
+			attempt.updatedAt = new Date().toISOString();
+			return structuredClone(attempt);
+		},
+		async logoutProvider(providerId: string) {
+			requireProvider(providerId).credential = { configured: false };
+		},
+		async openExternalUrl(url: string) {
+			window.open(url, "_blank", "noopener,noreferrer");
+		},
 		async listAvailableModels() {
 			const models: AvailableModel[] = [];
 			for (const provider of providers) {
@@ -246,12 +292,8 @@ export function createPreviewChatTransport(): ChatTransport {
 					models.push({
 						providerId: provider.id,
 						providerDisplayName: provider.displayName,
-						providerType: provider.type,
+						providerSource: provider.source,
 						model: structuredClone(model),
-						reasoning:
-							model.reasoningEfforts === undefined
-								? { kind: "none" }
-								: { kind: "effort", levels: [...model.reasoningEfforts] },
 					});
 				}
 			}
@@ -446,16 +488,19 @@ function splitIntoChunks(response: string) {
 	return chunks.length > 0 ? chunks : [response];
 }
 
-function previewCatalog(type: ProviderSummary["type"]): ProviderSummary["models"] {
-	if (type === "anthropic-compatible") {
+function previewCatalog(api: NonNullable<ProviderSummary["api"]>): ProviderSummary["models"] {
+	if (api === "anthropic-messages") {
 		return [
 			{
 				id: "claude-opus-4.6",
 				enabled: false,
 				displayName: "Claude Opus 4.6",
+				api,
+				input: ["text", "image"],
+				reasoning: true,
 				contextWindowTokens: 200_000,
 				maxOutputTokens: 64_000,
-				supportedEndpoints: ["/v1/messages"],
+				thinkingLevels: ["off", "low", "medium", "high"],
 			},
 		];
 	}
@@ -465,11 +510,23 @@ function previewCatalog(type: ProviderSummary["type"]): ProviderSummary["models"
 			id: "gpt-5.5",
 			enabled: false,
 			displayName: "GPT-5.5",
+			api,
+			input: ["text", "image"],
+			reasoning: true,
 			contextWindowTokens: 272_000,
 			maxOutputTokens: 128_000,
-			supportedEndpoints: ["/chat/completions", "/responses"],
-			reasoningEfforts: ["none", "low", "medium", "high", "xhigh"],
+			thinkingLevels: ["off", "low", "medium", "high", "xhigh"],
 		},
-		{ id: "gpt-4.1-mini", enabled: false, displayName: "GPT-4.1 mini" },
+		{
+			id: "gpt-4.1-mini",
+			enabled: false,
+			displayName: "GPT-4.1 mini",
+			api,
+			input: ["text"],
+			reasoning: false,
+			contextWindowTokens: 128_000,
+			maxOutputTokens: 16_384,
+			thinkingLevels: ["off"],
+		},
 	];
 }

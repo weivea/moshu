@@ -14,6 +14,10 @@ import type {
 	ListChatSessionsOutput,
 	ListProvidersOutput,
 	ProviderMutationOutput,
+	ProviderAuthAttemptOutput,
+	ProviderAuthType,
+	RespondProviderAuthInput,
+	StartProviderAuthInput,
 	SetChatSessionArchivedOutput,
 	SetChatSessionModelInput,
 	SetChatSessionModelOutput,
@@ -58,6 +62,12 @@ export interface RpcChatClient {
 	setProviderModelsEnabled(
 		input: SetProviderModelsEnabledInput,
 	): Promise<SetProviderModelsEnabledOutput>;
+	providerAuthStart(input: StartProviderAuthInput): Promise<ProviderAuthAttemptOutput>;
+	providerAuthGet(attemptId: string): Promise<ProviderAuthAttemptOutput>;
+	providerAuthRespond(input: RespondProviderAuthInput): Promise<ProviderAuthAttemptOutput>;
+	providerAuthCancel(attemptId: string): Promise<ProviderAuthAttemptOutput>;
+	providerLogout(providerId: string): Promise<unknown>;
+	openExternalUrl(url: string): Promise<{ opened: boolean }>;
 	listAvailableModels(): Promise<ListAvailableModelsOutput>;
 	getDefaultModel(): Promise<GetDefaultModelOutput>;
 	setDefaultModel(input: SetDefaultModelInput): Promise<SetDefaultModelOutput>;
@@ -161,11 +171,41 @@ export function createRpcChatTransport(
 			enabledModelIds: string[],
 		): Promise<ProviderSummary> {
 			const output = await client.setProviderModelsEnabled({
-				schemaVersion: 1,
+				schemaVersion: 2,
 				providerId,
 				enabledModelIds,
 			});
 			return output.provider;
+		},
+		async startProviderAuth(providerId: string, authType: ProviderAuthType) {
+			return (
+				await client.providerAuthStart({
+					schemaVersion: 2,
+					providerId,
+					authType,
+				})
+			).attempt;
+		},
+		async getProviderAuth(attemptId: string) {
+			return (await client.providerAuthGet(attemptId)).attempt;
+		},
+		async respondProviderAuth(attemptId: string, challengeId: string, value: string) {
+			return (
+				await client.providerAuthRespond({
+					attemptId,
+					challengeId,
+					value,
+				})
+			).attempt;
+		},
+		async cancelProviderAuth(attemptId: string) {
+			return (await client.providerAuthCancel(attemptId)).attempt;
+		},
+		async logoutProvider(providerId: string): Promise<void> {
+			await client.providerLogout(providerId);
+		},
+		async openExternalUrl(url: string): Promise<void> {
+			await client.openExternalUrl(url);
 		},
 		async listAvailableModels(): Promise<{
 			models: AvailableModel[];
@@ -183,7 +223,7 @@ export function createRpcChatTransport(
 		async setDefaultModel(
 			selection: DefaultModelSelection | null,
 		): Promise<DefaultModelSelection | undefined> {
-			const output = await client.setDefaultModel({ schemaVersion: 1, defaultModel: selection });
+			const output = await client.setDefaultModel({ schemaVersion: 2, defaultModel: selection });
 			return output.defaultModel;
 		},
 		async setSessionModel(

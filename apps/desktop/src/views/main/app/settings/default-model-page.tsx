@@ -96,19 +96,19 @@ export function DefaultModelSettingsPage({ transport }: DefaultModelSettingsPage
 									: {
 											providerId: selection.providerId,
 											modelId: selection.modelId,
-											...(selection.reasoning === undefined
+											...(selection.thinkingLevel === undefined
 												? {}
-												: { reasoning: selection.reasoning }),
+												: { thinkingLevel: selection.thinkingLevel }),
 										})}
 								onSelect={(providerId, modelId) => void save({ providerId, modelId })}
-								onReasoningChange={(reasoning) => {
+								onThinkingLevelChange={(thinkingLevel) => {
 									if (selection === undefined) {
 										return;
 									}
 									void save({
 										providerId: selection.providerId,
 										modelId: selection.modelId,
-										...(reasoning === undefined ? {} : { reasoning }),
+										...(thinkingLevel === undefined ? {} : { thinkingLevel }),
 									});
 								}}
 							/>

@@ -22,7 +22,6 @@ describe("Electrobun config", () => {
 			"../../packages/agent-runtime/src",
 			"../../packages/contracts/src",
 			"../../packages/database/src",
-			"../../packages/deepagents/src",
 			"../../packages/process-rpc/src",
 		]);
 	});

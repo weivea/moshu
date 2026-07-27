@@ -1,6 +1,6 @@
 import type Database from "bun:sqlite";
 
-export const currentAppDatabaseVersion = 9;
+export const currentAppDatabaseVersion = 10;
 
 export class AppDatabaseResetRequiredError extends Error {
 	readonly currentVersion: number;
@@ -54,7 +54,7 @@ export function applyAppMigrations(client: Database): void {
 
 	try {
 		client.exec(`
-			DROP TABLE IF EXISTS checkpoint_deletion_outbox;
+			DROP TABLE IF EXISTS agent_session_cleanup_outbox;
 			DROP TABLE IF EXISTS chat_run_events;
 			DROP TABLE IF EXISTS chat_runs;
 			DROP TABLE IF EXISTS chat_session_create_requests;
@@ -68,8 +68,8 @@ export function applyAppMigrations(client: Database): void {
 				default_mode TEXT NOT NULL,
 				provider_id TEXT,
 				model_id TEXT,
-				reasoning_effort TEXT,
-				reasoning_budget_tokens INTEGER,
+				thinking_level TEXT,
+				pi_session_id TEXT NOT NULL,
 				created_at_ms INTEGER NOT NULL,
 				updated_at_ms INTEGER NOT NULL,
 				last_message_at_ms INTEGER,
@@ -146,7 +146,7 @@ export function applyAppMigrations(client: Database): void {
 			CREATE INDEX IF NOT EXISTS retired_chat_sessions_retired_at_idx
 				ON retired_chat_sessions(retired_at_ms);
 
-			CREATE TABLE checkpoint_deletion_outbox (
+			CREATE TABLE agent_session_cleanup_outbox (
 				session_id TEXT PRIMARY KEY NOT NULL,
 				created_at_ms INTEGER NOT NULL,
 				attempt_count INTEGER NOT NULL DEFAULT 0,
@@ -154,8 +154,8 @@ export function applyAppMigrations(client: Database): void {
 				last_attempt_at_ms INTEGER,
 				last_error TEXT
 			);
-			CREATE INDEX checkpoint_deletion_outbox_next_attempt_idx
-				ON checkpoint_deletion_outbox(next_attempt_at_ms);
+			CREATE INDEX agent_session_cleanup_outbox_next_attempt_idx
+				ON agent_session_cleanup_outbox(next_attempt_at_ms);
 		`);
 
 		client.exec(`PRAGMA user_version = ${currentAppDatabaseVersion}`);

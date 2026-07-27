@@ -1,37 +1,19 @@
 import Database from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
-import { createHash } from "node:crypto";
-import {
-	chmodSync,
-	existsSync,
-	linkSync,
-	lstatSync,
-	mkdirSync,
-	mkdtempSync,
-	readdirSync,
-	readFileSync,
-	realpathSync,
-	rmSync,
-	symlinkSync,
-	unlinkSync,
-	writeFileSync,
-} from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { basename, dirname, join, resolve } from "node:path";
+import { join } from "node:path";
 
 import { type AppError, retiredSessionTombstoneTtlMs } from "@moshu/contracts";
 
 import {
 	applyAppMigrations,
-	type CoordinatedDatabaseResetBoundary,
 	chatRunsTable,
-	coordinatedDatabaseResetLockSuffix,
-	coordinatedDatabaseResetMarkerSuffix,
 	coordinatedDatabaseResetReason,
 	createUuidV7,
 	currentAppDatabaseVersion,
 	getDatabaseUserVersion,
-	maxCheckpointDeletionJobs,
+	maxAgentSessionCleanupJobs,
 	maxRetiredSessionTombstones,
 	maxSessionCreateIdempotencyRecords,
 	openAppDatabase,
@@ -50,16 +32,15 @@ function withTempDatabase(run: (databasePath: string) => void): void {
 }
 
 function makeProviderInput(secret = "sk-test-secret") {
+	void secret;
 	return {
 		schemaVersion: 1 as const,
 		providerId: createUuidV7(),
 		name: "OpenAI",
-		type: "openai-compatible" as const,
-		baseUrl: "https://api.openai.com/v1",
+		source: "custom" as const,
+		api: "openai-responses",
 		model: "gpt-5.4",
-		apiKey: secret,
-		customHeaders: { "X-Org": "acme-secret-header-value" },
-		reasoningEffort: "medium",
+		thinkingLevel: "medium" as const,
 	};
 }
 
@@ -68,8 +49,8 @@ function makeProviderState() {
 		schemaVersion: 1 as const,
 		providerId: createUuidV7(),
 		name: "OpenAI",
-		type: "openai-compatible" as const,
-		baseUrl: "https://api.openai.com/v1",
+		source: "custom" as const,
+		api: "openai-responses",
 		model: "gpt-5.4",
 		status: "ready" as const,
 	};
@@ -122,159 +103,6 @@ function getAssistantMessageId(run: ReturnType<typeof createRun>["run"]): string
 	return run.assistantMessageId;
 }
 
-function createLegacyResetFixture(productPath: string, checkpointPath: string): void {
-	const legacy = new Database(productPath);
-	legacy.exec("CREATE TABLE legacy_data (value TEXT); PRAGMA user_version = 6;");
-	legacy.close();
-	writeFileSync(checkpointPath, "legacy checkpoint");
-	for (const sidecar of [
-		`${productPath}-wal`,
-		`${productPath}-shm`,
-		`${checkpointPath}-wal`,
-		`${checkpointPath}-shm`,
-	]) {
-		writeFileSync(sidecar, "");
-	}
-}
-
-function expectResetStoresRecreated(productPath: string, checkpointPath: string): void {
-	expect(existsSync(productPath)).toBe(true);
-	expect(existsSync(checkpointPath)).toBe(true);
-	const product = new Database(productPath, { readonly: true, strict: true });
-	try {
-		expect(getDatabaseUserVersion(product)).toBe(currentAppDatabaseVersion);
-		expect(
-			product
-				.query<{ count: number }, []>(
-					"SELECT count(*) AS count FROM sqlite_master WHERE name = 'legacy_data'",
-				)
-				.get()?.count,
-		).toBe(0);
-	} finally {
-		product.close();
-	}
-	const checkpoint = new Database(checkpointPath, { readonly: true, strict: true });
-	try {
-		expect(
-			checkpoint.query<{ count: number }, []>("SELECT count(*) AS count FROM sqlite_master").get()
-				?.count,
-		).toBe(0);
-	} finally {
-		checkpoint.close();
-	}
-}
-
-function expectPersistentResetLockDatabase(productPath: string, checkpointPath: string): void {
-	const lockPath = `${productPath}${coordinatedDatabaseResetLockSuffix}`;
-	const metadata = lstatSync(lockPath);
-	expect(metadata.isFile()).toBe(true);
-	expect(metadata.isSymbolicLink()).toBe(false);
-	expect(metadata.nlink).toBe(1);
-	if (process.platform !== "win32") {
-		expect(metadata.mode & 0o777).toBe(0o600);
-	}
-	const lock = new Database(lockPath, { readonly: true, strict: true });
-	try {
-		expect(
-			lock.query<{ journal_mode: string }, []>("PRAGMA journal_mode").get()?.journal_mode,
-		).toBe("delete");
-		expect(
-			lock
-				.query<
-					{ schema_version: number; path_fingerprint: string; holder_token: string | null },
-					[]
-				>(
-					"SELECT schema_version, path_fingerprint, holder_token FROM coordinated_reset_lock WHERE id = 1",
-				)
-				.get(),
-		).toEqual({
-			schema_version: 1,
-			path_fingerprint: createResetPathFingerprint(productPath, checkpointPath),
-			holder_token: null,
-		});
-	} finally {
-		lock.close();
-	}
-	for (const sidecar of [`${lockPath}-journal`, `${lockPath}-wal`, `${lockPath}-shm`]) {
-		expect(existsSync(sidecar)).toBe(false);
-	}
-}
-
-function createResetMarkerPayload(
-	productPath: string,
-	checkpointPath: string,
-	previousProductVersion = 6,
-	phase = "prepared",
-): string {
-	return `${JSON.stringify({
-		schemaVersion: 2,
-		reason: coordinatedDatabaseResetReason,
-		previousProductVersion,
-		pathFingerprint: createResetPathFingerprint(productPath, checkpointPath),
-		phase,
-	})}\n`;
-}
-
-function createResetPathFingerprint(productPath: string, checkpointPath: string): string {
-	return createHash("sha256")
-		.update(canonicalResetTestPath(productPath))
-		.update("\0")
-		.update(canonicalResetTestPath(checkpointPath))
-		.digest("hex");
-}
-
-function canonicalResetTestPath(path: string): string {
-	const absolute = resolve(path);
-	return join(realpathSync(dirname(absolute)), basename(absolute));
-}
-
-function startResetWorker(
-	productPath: string,
-	checkpointPath: string,
-	readyPath?: string,
-	delayMs?: number,
-) {
-	const child = Bun.spawn({
-		cmd: [
-			process.execPath,
-			resolve(import.meta.dir, "reset-worker.ts"),
-			productPath,
-			checkpointPath,
-			...(readyPath === undefined ? [] : [readyPath, String(delayMs ?? 0)]),
-		],
-		cwd: resolve(import.meta.dir, "../../.."),
-		env: { ...process.env },
-		stdout: "pipe",
-		stderr: "pipe",
-	});
-	const completed = (async () => {
-		const [exitCode, stdout, stderr] = await Promise.all([
-			child.exited,
-			new Response(child.stdout).text(),
-			new Response(child.stderr).text(),
-		]);
-		if (exitCode !== 0) {
-			throw new Error(`Reset worker exited with ${exitCode}: ${stderr}`);
-		}
-		return JSON.parse(stdout.trim()) as {
-			reset: boolean;
-			reason?: string;
-			previousProductVersion?: number;
-		};
-	})();
-	return { child, completed };
-}
-
-async function waitForFile(filename: string, timeoutMs = 2_000): Promise<void> {
-	const deadline = Date.now() + timeoutMs;
-	while (!existsSync(filename)) {
-		if (Date.now() >= deadline) {
-			throw new Error(`Timed out waiting for ${filename}.`);
-		}
-		await Bun.sleep(10);
-	}
-}
-
 describe("application database", () => {
 	test("applies the current schema without a duplicate message table", () => {
 		withTempDatabase((databasePath) => {
@@ -301,1211 +129,64 @@ describe("application database", () => {
 		});
 	});
 
-	test("requires a coordinated reset instead of advertising unsupported replay coverage", () => {
+	test("resets an obsolete product database and its SQLite sidecars", () => {
 		withTempDatabase((databasePath) => {
-			const legacy = new Database(databasePath);
-			legacy.exec(`
-				CREATE TABLE chat_sessions (id TEXT PRIMARY KEY NOT NULL);
-				INSERT INTO chat_sessions (id) VALUES ('legacy-session');
-				CREATE TABLE retired_chat_runs (run_id TEXT PRIMARY KEY NOT NULL, retired_at_ms INTEGER NOT NULL);
-				INSERT INTO retired_chat_runs VALUES ('00000000-0000-7000-8000-000000000001', 1);
-				PRAGMA user_version = 6;
-			`);
-			legacy.close();
-
-			expect(() => openAppDatabase(databasePath)).toThrow("requires a coordinated reset");
-			const unchanged = new Database(databasePath, { readonly: true });
-			expect(getDatabaseUserVersion(unchanged)).toBe(6);
-			expect(
-				unchanged
-					.query<{ count: number }, []>("SELECT count(*) AS count FROM retired_chat_runs")
-					.get()?.count,
-			).toBe(1);
-			unchanged.close();
-		});
-	});
-
-	test("does not treat an existing unversioned schema as a new product store", () => {
-		withTempDatabase((databasePath) => {
-			const legacy = new Database(databasePath);
-			legacy.exec("CREATE TABLE legacy_data (value TEXT);");
-			legacy.close();
-
-			expect(() => openAppDatabase(databasePath)).toThrow("requires a coordinated reset");
-			const unchanged = new Database(databasePath, { readonly: true });
-			expect(
-				unchanged
-					.query<{ name: string }, []>(
-						"SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'legacy_data'",
-					)
-					.get()?.name,
-			).toBe("legacy_data");
-			unchanged.close();
-		});
-	});
-
-	test("coordinates reset of the immediately preceding product schema", () => {
-		withTempDatabase((databasePath) => {
-			const checkpointPath = join(dirname(databasePath), "checkpoints.db");
-			const previousVersion = currentAppDatabaseVersion - 1;
-			const previous = new Database(databasePath);
-			previous.exec(
-				`CREATE TABLE previous_schema (value TEXT); PRAGMA user_version = ${previousVersion};`,
-			);
-			previous.close();
-			writeFileSync(checkpointPath, "previous checkpoint");
-
-			expect(
-				prepareCoordinatedDatabaseReset({
-					productDatabase: databasePath,
-					checkpointDatabase: checkpointPath,
-				}),
-			).toEqual({
-				reset: true,
-				reason: coordinatedDatabaseResetReason,
-				previousProductVersion: previousVersion,
-			});
-			expectResetStoresRecreated(databasePath, checkpointPath);
-		});
-	});
-
-	test("resets product and checkpoint stores with sidecars while preserving provider config", () => {
-		withTempDatabase((databasePath) => {
-			const checkpointPath = join(dirname(databasePath), "checkpoints.db");
-			const providerPath = join(dirname(databasePath), "provider.json");
 			const legacy = new Database(databasePath);
 			legacy.exec("CREATE TABLE legacy_data (value TEXT); PRAGMA user_version = 6;");
 			legacy.close();
-			writeFileSync(checkpointPath, "legacy checkpoint");
-			writeFileSync(providerPath, "provider stays");
-			for (const sidecar of [
-				`${databasePath}-wal`,
-				`${databasePath}-shm`,
-				`${checkpointPath}-wal`,
-				`${checkpointPath}-shm`,
-			]) {
-				writeFileSync(sidecar, "");
-			}
-			const boundaries: CoordinatedDatabaseResetBoundary[] = [];
+			writeFileSync(`${databasePath}-wal`, "");
+			writeFileSync(`${databasePath}-shm`, "");
 
-			expect(
-				prepareCoordinatedDatabaseReset(
-					{
-						productDatabase: databasePath,
-						checkpointDatabase: checkpointPath,
-					},
-					{ beforeBoundary: (boundary) => boundaries.push(boundary) },
-				),
-			).toEqual({
+			const result = prepareCoordinatedDatabaseReset({ productDatabase: databasePath });
+			expect(result).toEqual({
 				reset: true,
 				reason: coordinatedDatabaseResetReason,
 				previousProductVersion: 6,
 			});
-			expect(boundaries).toEqual([
-				"create-marker",
-				"delete-checkpoint-database",
-				"delete-checkpoint-wal",
-				"delete-checkpoint-shm",
-				"delete-product-wal",
-				"delete-product-shm",
-				"delete-product-database",
-				"recreate-product-database",
-				"recreate-checkpoint-database",
-				"delete-marker",
-			]);
-			for (const removed of [
-				`${checkpointPath}-wal`,
-				`${checkpointPath}-shm`,
-				`${databasePath}${coordinatedDatabaseResetMarkerSuffix}`,
-			]) {
-				expect(existsSync(removed)).toBe(false);
-			}
-			expectResetStoresRecreated(databasePath, checkpointPath);
-			expectPersistentResetLockDatabase(databasePath, checkpointPath);
-			expect(readFileSync(providerPath, "utf8")).toBe("provider stays");
-		});
-	});
-
-	test("converges after an injected failure at every coordinated reset boundary", () => {
-		const boundaries: CoordinatedDatabaseResetBoundary[] = [
-			"create-marker",
-			"delete-checkpoint-database",
-			"delete-checkpoint-wal",
-			"delete-checkpoint-shm",
-			"delete-product-wal",
-			"delete-product-shm",
-			"delete-product-database",
-			"recreate-product-database",
-			"recreate-checkpoint-database",
-			"delete-marker",
-		];
-
-		for (const failedBoundary of boundaries) {
-			withTempDatabase((databasePath) => {
-				const checkpointPath = join(dirname(databasePath), "checkpoints.db");
-				const providerPath = join(dirname(databasePath), "provider.json");
-				const markerPath = `${databasePath}${coordinatedDatabaseResetMarkerSuffix}`;
-				const markerStagingPath = `${markerPath}.creating`;
-				createLegacyResetFixture(databasePath, checkpointPath);
-				writeFileSync(providerPath, "provider stays");
-				let injected = false;
-
-				expect(() =>
-					prepareCoordinatedDatabaseReset(
-						{
-							productDatabase: databasePath,
-							checkpointDatabase: checkpointPath,
-						},
-						{
-							beforeBoundary(boundary) {
-								if (!injected && boundary === failedBoundary) {
-									injected = true;
-									throw new Error(`injected ${boundary} failure`);
-								}
-							},
-						},
-					),
-				).toThrow("Failed to complete the coordinated local database reset.");
-				expect(injected).toBe(true);
-				expect(readFileSync(providerPath, "utf8")).toBe("provider stays");
-
-				if (failedBoundary === "create-marker") {
-					expect(existsSync(markerPath)).toBe(false);
-					expect(existsSync(databasePath)).toBe(true);
-					expect(existsSync(checkpointPath)).toBe(true);
-				} else {
-					const marker = readFileSync(markerPath, "utf8");
-					expect(Buffer.byteLength(marker)).toBeLessThan(8_192);
-					expect(marker).not.toContain(databasePath);
-					expect(marker).not.toContain("provider stays");
-				}
-				if (failedBoundary === "delete-product-database") {
-					expect(existsSync(databasePath)).toBe(true);
-					expect(existsSync(checkpointPath)).toBe(false);
-				}
-				if (failedBoundary === "delete-marker") {
-					expect(existsSync(databasePath)).toBe(true);
-					expect(existsSync(checkpointPath)).toBe(true);
-					expect(existsSync(markerPath)).toBe(true);
-				}
-
-				expect(
-					prepareCoordinatedDatabaseReset({
-						productDatabase: databasePath,
-						checkpointDatabase: checkpointPath,
-					}),
-				).toEqual({
-					reset: true,
-					reason: coordinatedDatabaseResetReason,
-					previousProductVersion: 6,
-				});
-				for (const removed of [
-					`${checkpointPath}-wal`,
-					`${checkpointPath}-shm`,
-					markerPath,
-					markerStagingPath,
-				]) {
-					expect(existsSync(removed)).toBe(false);
-				}
-				expectResetStoresRecreated(databasePath, checkpointPath);
-				expectPersistentResetLockDatabase(databasePath, checkpointPath);
-				expect(readFileSync(providerPath, "utf8")).toBe("provider stays");
-			});
-		}
-	});
-
-	test("continues a committed reset when user_version existed only in the deleted WAL", () => {
-		withTempDatabase((databasePath) => {
-			const checkpointPath = join(dirname(databasePath), "checkpoints.db");
-			const legacy = new Database(databasePath);
-			legacy.exec(`
-				PRAGMA journal_mode = WAL;
-				PRAGMA wal_autocheckpoint = 0;
-				CREATE TABLE legacy_data (value TEXT);
-				PRAGMA user_version = 6;
-			`);
-			writeFileSync(checkpointPath, "legacy checkpoint");
-			writeFileSync(`${checkpointPath}-wal`, "");
-			writeFileSync(`${checkpointPath}-shm`, "");
-			expect(readFileSync(databasePath).readUInt32BE(60)).toBe(0);
-			expect(existsSync(`${databasePath}-wal`)).toBe(true);
-
-			try {
-				expect(() =>
-					prepareCoordinatedDatabaseReset(
-						{
-							productDatabase: databasePath,
-							checkpointDatabase: checkpointPath,
-						},
-						{
-							beforeBoundary(boundary) {
-								if (boundary === "delete-product-shm") {
-									throw new Error("crash after deleting the product WAL");
-								}
-							},
-						},
-					),
-				).toThrow("Failed to complete the coordinated local database reset.");
-				expect(existsSync(`${databasePath}-wal`)).toBe(false);
-			} finally {
-				legacy.close();
-			}
-
-			expect(readFileSync(databasePath).readUInt32BE(60)).toBe(0);
-			expect(
-				prepareCoordinatedDatabaseReset({
-					productDatabase: databasePath,
-					checkpointDatabase: checkpointPath,
-				}),
-			).toEqual({
-				reset: true,
-				reason: coordinatedDatabaseResetReason,
-				previousProductVersion: 6,
-			});
-			for (const removed of [
-				`${checkpointPath}-wal`,
-				`${checkpointPath}-shm`,
-				`${databasePath}${coordinatedDatabaseResetMarkerSuffix}`,
-			]) {
-				expect(existsSync(removed)).toBe(false);
-			}
-			expectResetStoresRecreated(databasePath, checkpointPath);
-			expectPersistentResetLockDatabase(databasePath, checkpointPath);
-		});
-	});
-
-	test("serializes concurrent reset openers across processes", async () => {
-		const directoryPath = mkdtempSync(join(tmpdir(), "moshu-reset-processes-"));
-		const databasePath = join(directoryPath, "app.db");
-		const checkpointPath = join(directoryPath, "checkpoints.db");
-		const readyPath = join(directoryPath, "first-worker-ready");
-		createLegacyResetFixture(databasePath, checkpointPath);
-		const first = startResetWorker(databasePath, checkpointPath, readyPath, 300);
-		let second: ReturnType<typeof startResetWorker> | undefined;
-		try {
-			await waitForFile(readyPath);
-			second = startResetWorker(databasePath, checkpointPath);
-			const [firstResult, secondResult] = await Promise.all([first.completed, second.completed]);
-			expect(firstResult).toEqual({
-				reset: true,
-				reason: coordinatedDatabaseResetReason,
-				previousProductVersion: 6,
-			});
-			expect(secondResult).toEqual({ reset: false });
-			expectResetStoresRecreated(databasePath, checkpointPath);
-			expectPersistentResetLockDatabase(databasePath, checkpointPath);
-		} finally {
-			if (first.child.exitCode === null) {
-				first.child.kill();
-			}
-			if (second?.child.exitCode === null) {
-				second.child.kill();
-			}
-			rmSync(directoryPath, { force: true, recursive: true });
-		}
-	}, 10_000);
-
-	test("reuses a stale lock database without deleting or replacing it", () => {
-		withTempDatabase((databasePath) => {
-			const checkpointPath = join(dirname(databasePath), "checkpoints.db");
-			const lockPath = `${databasePath}${coordinatedDatabaseResetLockSuffix}`;
-			createLegacyResetFixture(databasePath, checkpointPath);
-
-			expect(
-				prepareCoordinatedDatabaseReset({
-					productDatabase: databasePath,
-					checkpointDatabase: checkpointPath,
-				}),
-			).toEqual({
-				reset: true,
-				reason: coordinatedDatabaseResetReason,
-				previousProductVersion: 6,
-			});
-			const firstIdentity = lstatSync(lockPath);
-			expectResetStoresRecreated(databasePath, checkpointPath);
-			expect(
-				prepareCoordinatedDatabaseReset({
-					productDatabase: databasePath,
-					checkpointDatabase: checkpointPath,
-				}),
-			).toEqual({ reset: false });
-			const secondIdentity = lstatSync(lockPath);
-			expect(secondIdentity.dev).toBe(firstIdentity.dev);
-			expect(secondIdentity.ino).toBe(firstIdentity.ino);
-			expectPersistentResetLockDatabase(databasePath, checkpointPath);
-		});
-	});
-
-	test("bounds lock waiting while a suspended holder retains ownership without expiry", async () => {
-		const directoryPath = mkdtempSync(join(tmpdir(), "moshu-reset-suspended-"));
-		const databasePath = join(directoryPath, "app.db");
-		const checkpointPath = join(directoryPath, "checkpoints.db");
-		const readyPath = join(directoryPath, "holder-ready");
-		createLegacyResetFixture(databasePath, checkpointPath);
-		const holder = startResetWorker(databasePath, checkpointPath, readyPath, 400);
-		try {
-			await waitForFile(readyPath);
-			const startedAt = Date.now();
-			expect(() =>
-				prepareCoordinatedDatabaseReset(
-					{ productDatabase: databasePath, checkpointDatabase: checkpointPath },
-					{ lockWaitTimeoutMs: 30 },
-				),
-			).toThrow("Failed to complete the coordinated local database reset.");
-			expect(Date.now() - startedAt).toBeLessThan(1_000);
-			expect(existsSync(databasePath)).toBe(true);
-			expect(existsSync(checkpointPath)).toBe(true);
-			await expect(holder.completed).resolves.toEqual({
-				reset: true,
-				reason: coordinatedDatabaseResetReason,
-				previousProductVersion: 6,
-			});
-			expectPersistentResetLockDatabase(databasePath, checkpointPath);
-		} finally {
-			if (holder.child.exitCode === null) {
-				holder.child.kill();
-			}
-			rmSync(directoryPath, { force: true, recursive: true });
-		}
-	}, 10_000);
-
-	test("releases the holder-bound SQLite lock on process death and converges", async () => {
-		const directoryPath = mkdtempSync(join(tmpdir(), "moshu-reset-crash-holder-"));
-		const databasePath = join(directoryPath, "app.db");
-		const checkpointPath = join(directoryPath, "checkpoints.db");
-		const readyPath = join(directoryPath, "holder-ready");
-		createLegacyResetFixture(databasePath, checkpointPath);
-		const holder = startResetWorker(databasePath, checkpointPath, readyPath, 10_000);
-		let successor: ReturnType<typeof startResetWorker> | undefined;
-		try {
-			await waitForFile(readyPath);
-			successor = startResetWorker(databasePath, checkpointPath);
-			await Bun.sleep(50);
-			holder.child.kill();
-			await holder.completed.catch(() => undefined);
-			await expect(successor.completed).resolves.toEqual({
-				reset: true,
-				reason: coordinatedDatabaseResetReason,
-				previousProductVersion: 6,
-			});
-			expectResetStoresRecreated(databasePath, checkpointPath);
-			expectPersistentResetLockDatabase(databasePath, checkpointPath);
-		} finally {
-			if (holder.child.exitCode === null) {
-				holder.child.kill();
-			}
-			if (successor?.child.exitCode === null) {
-				successor.child.kill();
-			}
-			rmSync(directoryPath, { force: true, recursive: true });
-		}
-	}, 10_000);
-
-	test("quarantines and preserves a replacement that mismatches the marker identity", () => {
-		withTempDatabase((databasePath) => {
-			const checkpointPath = join(dirname(databasePath), "checkpoints.db");
-			createLegacyResetFixture(databasePath, checkpointPath);
-			expect(() =>
-				prepareCoordinatedDatabaseReset(
-					{ productDatabase: databasePath, checkpointDatabase: checkpointPath },
-					{
-						beforeBoundary(boundary) {
-							if (boundary === "delete-product-database") {
-								throw new Error("crash immediately before recorded unlink");
-							}
-						},
-					},
-				),
-			).toThrow("Failed to complete the coordinated local database reset.");
-
-			unlinkSync(databasePath);
-			writeFileSync(databasePath, "new database owner");
-			expect(() =>
-				prepareCoordinatedDatabaseReset({
-					productDatabase: databasePath,
-					checkpointDatabase: checkpointPath,
-				}),
-			).toThrow("Failed to complete the coordinated local database reset.");
 			expect(existsSync(databasePath)).toBe(false);
-			const claims = readdirSync(dirname(databasePath))
-				.filter((entry) => entry.startsWith(".moshu-reset-claim-"))
-				.map((entry) => join(dirname(databasePath), entry));
-			expect(claims).toHaveLength(1);
-			expect(readFileSync(claims[0] ?? "", "utf8")).toBe("new database owner");
-		});
-	});
+			expect(existsSync(`${databasePath}-wal`)).toBe(false);
+			expect(existsSync(`${databasePath}-shm`)).toBe(false);
 
-	test("never deletes a successor created after the expected inode is atomically claimed", () => {
-		withTempDatabase((databasePath) => {
-			const checkpointPath = join(dirname(databasePath), "checkpoints.db");
-			createLegacyResetFixture(databasePath, checkpointPath);
-			let injected = false;
-
-			expect(() =>
-				prepareCoordinatedDatabaseReset(
-					{ productDatabase: databasePath, checkpointDatabase: checkpointPath },
-					{
-						afterArtifactClaim(boundary) {
-							if (!injected && boundary === "delete-product-database") {
-								injected = true;
-								writeFileSync(databasePath, "successor must survive");
-							}
-						},
-					},
-				),
-			).toThrow("Failed to complete the coordinated local database reset.");
-			expect(injected).toBe(true);
-			expect(readFileSync(databasePath, "utf8")).toBe("successor must survive");
-			const claims = readdirSync(dirname(databasePath)).filter((entry) =>
-				entry.startsWith(".moshu-reset-claim-"),
-			);
-			expect(claims).toHaveLength(1);
-
-			unlinkSync(databasePath);
-			expect(
-				prepareCoordinatedDatabaseReset({
-					productDatabase: databasePath,
-					checkpointDatabase: checkpointPath,
-				}),
-			).toEqual({
-				reset: true,
-				reason: coordinatedDatabaseResetReason,
-				previousProductVersion: 6,
-			});
-			expectResetStoresRecreated(databasePath, checkpointPath);
-			expect(
-				readdirSync(dirname(databasePath)).filter((entry) =>
-					entry.startsWith(".moshu-reset-claim-"),
-				),
-			).toEqual([]);
-		});
-	});
-
-	test("converges after holder death between an atomic claim and unlink", () => {
-		withTempDatabase((databasePath) => {
-			const checkpointPath = join(dirname(databasePath), "checkpoints.db");
-			createLegacyResetFixture(databasePath, checkpointPath);
-			let injected = false;
-
-			expect(() =>
-				prepareCoordinatedDatabaseReset(
-					{ productDatabase: databasePath, checkpointDatabase: checkpointPath },
-					{
-						afterArtifactClaim(boundary) {
-							if (!injected && boundary === "delete-checkpoint-database") {
-								injected = true;
-								throw new Error("crash after atomic claim");
-							}
-						},
-					},
-				),
-			).toThrow("Failed to complete the coordinated local database reset.");
-			expect(injected).toBe(true);
-			expect(existsSync(checkpointPath)).toBe(false);
-			expect(
-				readdirSync(dirname(databasePath)).filter((entry) =>
-					entry.startsWith(".moshu-reset-claim-"),
-				),
-			).toHaveLength(1);
-
-			expect(
-				prepareCoordinatedDatabaseReset({
-					productDatabase: databasePath,
-					checkpointDatabase: checkpointPath,
-				}),
-			).toEqual({
-				reset: true,
-				reason: coordinatedDatabaseResetReason,
-				previousProductVersion: 6,
-			});
-			expectResetStoresRecreated(databasePath, checkpointPath);
-			expect(
-				readdirSync(dirname(databasePath)).filter((entry) =>
-					entry.startsWith(".moshu-reset-claim-"),
-				),
-			).toEqual([]);
-		});
-	});
-
-	test("fails closed when an expected reset artifact becomes a symlink", () => {
-		withTempDatabase((databasePath) => {
-			const checkpointPath = join(dirname(databasePath), "checkpoints.db");
-			const sentinelPath = join(dirname(databasePath), "replacement-sentinel");
-			createLegacyResetFixture(databasePath, checkpointPath);
-			expect(() =>
-				prepareCoordinatedDatabaseReset(
-					{ productDatabase: databasePath, checkpointDatabase: checkpointPath },
-					{
-						beforeBoundary(boundary) {
-							if (boundary === "delete-product-database") {
-								throw new Error("pause before product deletion");
-							}
-						},
-					},
-				),
-			).toThrow("Failed to complete the coordinated local database reset.");
-
-			unlinkSync(databasePath);
-			writeFileSync(sentinelPath, "never delete");
-			symlinkSync(sentinelPath, databasePath);
-			expect(() =>
-				prepareCoordinatedDatabaseReset({
-					productDatabase: databasePath,
-					checkpointDatabase: checkpointPath,
-				}),
-			).toThrow("Failed to complete the coordinated local database reset.");
-			expect(readFileSync(sentinelPath, "utf8")).toBe("never delete");
-		});
-	});
-
-	test("fails closed when a marker-recorded absence becomes a file", () => {
-		withTempDatabase((databasePath) => {
-			const checkpointPath = join(dirname(databasePath), "checkpoints.db");
-			const checkpointWalPath = `${checkpointPath}-wal`;
-			createLegacyResetFixture(databasePath, checkpointPath);
-			unlinkSync(checkpointWalPath);
-
-			expect(() =>
-				prepareCoordinatedDatabaseReset(
-					{ productDatabase: databasePath, checkpointDatabase: checkpointPath },
-					{
-						beforeBoundary(boundary) {
-							if (boundary === "delete-checkpoint-wal") {
-								writeFileSync(checkpointWalPath, "new checkpoint writer");
-							}
-						},
-					},
-				),
-			).toThrow("Failed to complete the coordinated local database reset.");
-			expect(readFileSync(checkpointWalPath, "utf8")).toBe("new checkpoint writer");
-			expect(existsSync(databasePath)).toBe(true);
-		});
-	});
-
-	test("uses the persisted fingerprint when platform file ids are unavailable", () => {
-		withTempDatabase((databasePath) => {
-			const checkpointPath = join(dirname(databasePath), "checkpoints.db");
-			const markerPath = `${databasePath}${coordinatedDatabaseResetMarkerSuffix}`;
-			createLegacyResetFixture(databasePath, checkpointPath);
-			expect(() =>
-				prepareCoordinatedDatabaseReset(
-					{ productDatabase: databasePath, checkpointDatabase: checkpointPath },
-					{
-						beforeBoundary(boundary) {
-							if (boundary === "delete-product-database") {
-								throw new Error("capture marker identity");
-							}
-						},
-					},
-				),
-			).toThrow("Failed to complete the coordinated local database reset.");
-			const marker = JSON.parse(readFileSync(markerPath, "utf8")) as {
-				artifacts: Record<string, { dev: string; ino: string }>;
-			};
-			const productIdentity = marker.artifacts["delete-product-database"];
-			if (productIdentity === undefined) {
-				throw new Error("Expected a product database identity.");
+			const reopened = openAppDatabase(databasePath);
+			try {
+				expect(getDatabaseUserVersion(reopened.client)).toBe(currentAppDatabaseVersion);
+			} finally {
+				reopened.close();
 			}
-			productIdentity.dev = "0";
-			productIdentity.ino = "0";
-			writeFileSync(markerPath, `${JSON.stringify(marker)}\n`);
-
-			expect(
-				prepareCoordinatedDatabaseReset({
-					productDatabase: databasePath,
-					checkpointDatabase: checkpointPath,
-				}),
-			).toEqual({
-				reset: true,
-				reason: coordinatedDatabaseResetReason,
-				previousProductVersion: 6,
-			});
-			expectResetStoresRecreated(databasePath, checkpointPath);
 		});
 	});
 
-	test("fails closed for a symbolic reset lock without touching its target", () => {
+	test("does not reset a current product database", () => {
 		withTempDatabase((databasePath) => {
-			const checkpointPath = join(dirname(databasePath), "checkpoints.db");
-			const lockPath = `${databasePath}${coordinatedDatabaseResetLockSuffix}`;
-			const sentinelPath = join(dirname(databasePath), "lock-sentinel");
-			createLegacyResetFixture(databasePath, checkpointPath);
-			writeFileSync(sentinelPath, "never alter");
-			symlinkSync(sentinelPath, lockPath);
-
-			expect(() =>
-				prepareCoordinatedDatabaseReset({
-					productDatabase: databasePath,
-					checkpointDatabase: checkpointPath,
-				}),
-			).toThrow("Failed to complete the coordinated local database reset.");
-			expect(readFileSync(sentinelPath, "utf8")).toBe("never alter");
-			expect(existsSync(databasePath)).toBe(true);
-			expect(existsSync(checkpointPath)).toBe(true);
-		});
-	});
-
-	test("fails closed for unsafe reset lock permissions and hard-link identity", () => {
-		if (process.platform === "win32") {
-			return;
-		}
-		for (const unsafe of ["permissions", "hard-link"] as const) {
-			withTempDatabase((databasePath) => {
-				const checkpointPath = join(dirname(databasePath), "checkpoints.db");
-				const lockPath = `${databasePath}${coordinatedDatabaseResetLockSuffix}`;
-				createLegacyResetFixture(databasePath, checkpointPath);
-				writeFileSync(lockPath, "never alter", { mode: 0o600 });
-				if (unsafe === "permissions") {
-					chmodSync(lockPath, 0o644);
-				} else {
-					linkSync(lockPath, join(dirname(databasePath), "lock-alias"));
-				}
-
-				expect(() =>
-					prepareCoordinatedDatabaseReset({
-						productDatabase: databasePath,
-						checkpointDatabase: checkpointPath,
-					}),
-				).toThrow("Failed to complete the coordinated local database reset.");
-				expect(readFileSync(lockPath, "utf8")).toBe("never alter");
-				expect(existsSync(databasePath)).toBe(true);
-				expect(existsSync(checkpointPath)).toBe(true);
-			});
-		}
-	});
-
-	test("rejects path-bound or phase-tampered committed reset markers before deletion", () => {
-		withTempDatabase((sourceDatabasePath) => {
-			const sourceCheckpointPath = join(dirname(sourceDatabasePath), "source-checkpoints.db");
-			createLegacyResetFixture(sourceDatabasePath, sourceCheckpointPath);
-			expect(() =>
-				prepareCoordinatedDatabaseReset(
-					{
-						productDatabase: sourceDatabasePath,
-						checkpointDatabase: sourceCheckpointPath,
-					},
-					{
-						beforeBoundary(boundary) {
-							if (boundary === "delete-checkpoint-database") {
-								throw new Error("capture committed marker");
-							}
-						},
-					},
-				),
-			).toThrow("Failed to complete the coordinated local database reset.");
-			const sourceMarker = readFileSync(
-				`${sourceDatabasePath}${coordinatedDatabaseResetMarkerSuffix}`,
-				"utf8",
-			);
-
-			withTempDatabase((targetDatabasePath) => {
-				const targetCheckpointPath = join(dirname(targetDatabasePath), "target-checkpoints.db");
-				createLegacyResetFixture(targetDatabasePath, targetCheckpointPath);
-				writeFileSync(`${targetDatabasePath}${coordinatedDatabaseResetMarkerSuffix}`, sourceMarker);
-				expect(() =>
-					prepareCoordinatedDatabaseReset({
-						productDatabase: targetDatabasePath,
-						checkpointDatabase: targetCheckpointPath,
-					}),
-				).toThrow("Failed to complete the coordinated local database reset.");
-				expect(existsSync(targetDatabasePath)).toBe(true);
-				expect(existsSync(targetCheckpointPath)).toBe(true);
-			});
-
-			withTempDatabase((targetDatabasePath) => {
-				const targetCheckpointPath = join(dirname(targetDatabasePath), "target-checkpoints.db");
-				createLegacyResetFixture(targetDatabasePath, targetCheckpointPath);
-				writeFileSync(
-					`${targetDatabasePath}${coordinatedDatabaseResetMarkerSuffix}`,
-					createResetMarkerPayload(targetDatabasePath, targetCheckpointPath, 6, "complete"),
-				);
-				expect(() =>
-					prepareCoordinatedDatabaseReset({
-						productDatabase: targetDatabasePath,
-						checkpointDatabase: targetCheckpointPath,
-					}),
-				).toThrow("Failed to complete the coordinated local database reset.");
-				expect(existsSync(targetDatabasePath)).toBe(true);
-				expect(existsSync(targetCheckpointPath)).toBe(true);
-			});
-		});
-	});
-
-	test("converges from every interrupted marker staging commit state", () => {
-		const scenarios: Array<{
-			name: string;
-			arrange(markerPath: string, stagingPath: string, payload: string): void;
-		}> = [
-			{
-				name: "after staging open",
-				arrange: (_markerPath, stagingPath) => writeFileSync(stagingPath, ""),
-			},
-			{
-				name: "during staging write",
-				arrange: (_markerPath, stagingPath, payload) =>
-					writeFileSync(stagingPath, payload.slice(0, Math.floor(payload.length / 2))),
-			},
-			{
-				name: "after staging write before file fsync",
-				arrange: (_markerPath, stagingPath, payload) => writeFileSync(stagingPath, payload),
-			},
-			{
-				name: "after file fsync before atomic commit",
-				arrange: (_markerPath, stagingPath, payload) => writeFileSync(stagingPath, payload),
-			},
-			{
-				name: "after atomic commit before parent fsync",
-				arrange(markerPath, stagingPath, payload) {
-					writeFileSync(stagingPath, payload);
-					linkSync(stagingPath, markerPath);
-				},
-			},
-			{
-				name: "after parent fsync before staging cleanup",
-				arrange(markerPath, stagingPath, payload) {
-					writeFileSync(stagingPath, payload);
-					linkSync(stagingPath, markerPath);
-				},
-			},
-			{
-				name: "after staging cleanup before final parent fsync",
-				arrange: (markerPath, _stagingPath, payload) => writeFileSync(markerPath, payload),
-			},
-		];
-
-		for (const scenario of scenarios) {
-			withTempDatabase((databasePath) => {
-				const checkpointPath = join(dirname(databasePath), "checkpoints.db");
-				const markerPath = `${databasePath}${coordinatedDatabaseResetMarkerSuffix}`;
-				const stagingPath = `${markerPath}.creating`;
-				createLegacyResetFixture(databasePath, checkpointPath);
-				scenario.arrange(
-					markerPath,
-					stagingPath,
-					createResetMarkerPayload(databasePath, checkpointPath),
-				);
-
-				expect(
-					prepareCoordinatedDatabaseReset({
-						productDatabase: databasePath,
-						checkpointDatabase: checkpointPath,
-					}),
-					scenario.name,
-				).toEqual({
-					reset: true,
-					reason: coordinatedDatabaseResetReason,
-					previousProductVersion: 6,
-				});
-				expect(existsSync(markerPath), scenario.name).toBe(false);
-				expect(existsSync(stagingPath), scenario.name).toBe(false);
-				expectResetStoresRecreated(databasePath, checkpointPath);
-
-				expect(
-					prepareCoordinatedDatabaseReset({
-						productDatabase: databasePath,
-						checkpointDatabase: checkpointPath,
-					}),
-					`${scenario.name} next launch`,
-				).toEqual({ reset: false });
-			});
-		}
-	});
-
-	test("preserves committed recovery while cleaning an invalid stale staging marker", () => {
-		for (const [name, stalePayload] of [
-			["malformed", '{"schemaVersion":1'],
-			["oversized", "x".repeat(257)],
-		] as const) {
-			withTempDatabase((databasePath) => {
-				const checkpointPath = join(dirname(databasePath), "checkpoints.db");
-				const markerPath = `${databasePath}${coordinatedDatabaseResetMarkerSuffix}`;
-				const stagingPath = `${markerPath}.creating`;
-				createLegacyResetFixture(databasePath, checkpointPath);
-				writeFileSync(markerPath, createResetMarkerPayload(databasePath, checkpointPath));
-				writeFileSync(stagingPath, stalePayload);
-
-				expect(
-					prepareCoordinatedDatabaseReset({
-						productDatabase: databasePath,
-						checkpointDatabase: checkpointPath,
-					}),
-					name,
-				).toEqual({
-					reset: true,
-					reason: coordinatedDatabaseResetReason,
-					previousProductVersion: 6,
-				});
-				expect(existsSync(markerPath), name).toBe(false);
-				expect(existsSync(stagingPath), name).toBe(false);
-			});
-		}
-	});
-
-	test("replaces an oversized interrupted staging marker before starting a reset", () => {
-		withTempDatabase((databasePath) => {
-			const checkpointPath = join(dirname(databasePath), "checkpoints.db");
-			const markerPath = `${databasePath}${coordinatedDatabaseResetMarkerSuffix}`;
-			const stagingPath = `${markerPath}.creating`;
-			createLegacyResetFixture(databasePath, checkpointPath);
-			writeFileSync(stagingPath, "x".repeat(8_193));
-
-			expect(() =>
-				prepareCoordinatedDatabaseReset(
-					{
-						productDatabase: databasePath,
-						checkpointDatabase: checkpointPath,
-					},
-					{
-						beforeBoundary(boundary) {
-							if (boundary === "delete-checkpoint-database") {
-								throw new Error("inspect recreated marker");
-							}
-						},
-					},
-				),
-			).toThrow("Failed to complete the coordinated local database reset.");
-			expect(JSON.parse(readFileSync(markerPath, "utf8"))).toEqual(
-				expect.objectContaining({
-					schemaVersion: 4,
-					reason: coordinatedDatabaseResetReason,
-					previousProductVersion: 6,
-					phase: "delete-checkpoint-database",
-					resetId: expect.any(String),
-					artifacts: expect.objectContaining({
-						"delete-product-database": expect.objectContaining({ state: "file" }),
-						"delete-checkpoint-database": expect.objectContaining({ state: "file" }),
-					}),
-				}),
-			);
-			expect(existsSync(stagingPath)).toBe(false);
-
-			expect(
-				prepareCoordinatedDatabaseReset({
-					productDatabase: databasePath,
-					checkpointDatabase: checkpointPath,
-				}),
-			).toEqual({
-				reset: true,
-				reason: coordinatedDatabaseResetReason,
-				previousProductVersion: 6,
-			});
-		});
-	});
-
-	test("continues to reject malformed and oversized committed markers", () => {
-		for (const [name, payload] of [
-			["malformed", '{"schemaVersion":1'],
-			["oversized", "x".repeat(8_193)],
-		] as const) {
-			withTempDatabase((databasePath) => {
-				const checkpointPath = join(dirname(databasePath), "checkpoints.db");
-				const markerPath = `${databasePath}${coordinatedDatabaseResetMarkerSuffix}`;
-				createLegacyResetFixture(databasePath, checkpointPath);
-				writeFileSync(markerPath, payload);
-
-				expect(
-					() =>
-						prepareCoordinatedDatabaseReset({
-							productDatabase: databasePath,
-							checkpointDatabase: checkpointPath,
-						}),
-					name,
-				).toThrow("Failed to complete the coordinated local database reset.");
-				expect(readFileSync(markerPath, "utf8"), name).toBe(payload);
-				expect(existsSync(databasePath), name).toBe(true);
-				expect(existsSync(checkpointPath), name).toBe(true);
-			});
-		}
-	});
-
-	test("fails closed for committed marker symlinks, hard links, and wrong ownership", () => {
-		const anomalies =
-			process.getuid === undefined
-				? (["symlink", "hard-link"] as const)
-				: (["symlink", "hard-link", "wrong-owner"] as const);
-		for (const anomaly of anomalies) {
-			withTempDatabase((databasePath) => {
-				const checkpointPath = join(dirname(databasePath), "checkpoints.db");
-				const markerPath = `${databasePath}${coordinatedDatabaseResetMarkerSuffix}`;
-				const sentinelPath = join(dirname(databasePath), `${anomaly}-committed-sentinel`);
-				createLegacyResetFixture(databasePath, checkpointPath);
-				const markerPayload = createResetMarkerPayload(databasePath, checkpointPath);
-				writeFileSync(sentinelPath, markerPayload);
-				if (anomaly === "symlink") {
-					symlinkSync(sentinelPath, markerPath);
-				} else if (anomaly === "hard-link") {
-					linkSync(sentinelPath, markerPath);
-				} else {
-					writeFileSync(markerPath, markerPayload);
-				}
-
-				const originalGetuid = process.getuid;
-				if (anomaly === "wrong-owner" && originalGetuid !== undefined) {
-					process.getuid = () => originalGetuid() + 1;
-				}
-				try {
-					expect(() =>
-						prepareCoordinatedDatabaseReset({
-							productDatabase: databasePath,
-							checkpointDatabase: checkpointPath,
-						}),
-					).toThrow("Failed to complete the coordinated local database reset.");
-				} finally {
-					if (originalGetuid !== undefined) {
-						process.getuid = originalGetuid;
-					}
-				}
-				expect(readFileSync(sentinelPath, "utf8")).toBe(markerPayload);
-				expect(existsSync(databasePath)).toBe(true);
-				expect(existsSync(checkpointPath)).toBe(true);
-			});
-		}
-	});
-
-	test("fails closed for staging symlinks, hard links, and wrong ownership", () => {
-		const anomalies =
-			process.getuid === undefined
-				? (["symlink", "hard-link"] as const)
-				: (["symlink", "hard-link", "wrong-owner"] as const);
-		for (const anomaly of anomalies) {
-			withTempDatabase((databasePath) => {
-				const checkpointPath = join(dirname(databasePath), "checkpoints.db");
-				const markerPath = `${databasePath}${coordinatedDatabaseResetMarkerSuffix}`;
-				const stagingPath = `${markerPath}.creating`;
-				const sentinelPath = join(dirname(databasePath), `${anomaly}-sentinel`);
-				createLegacyResetFixture(databasePath, checkpointPath);
-				writeFileSync(sentinelPath, "do not alter");
-				if (anomaly === "symlink") {
-					symlinkSync(sentinelPath, stagingPath);
-				} else if (anomaly === "hard-link") {
-					linkSync(sentinelPath, stagingPath);
-				} else {
-					writeFileSync(stagingPath, "");
-				}
-
-				const originalGetuid = process.getuid;
-				if (anomaly === "wrong-owner" && originalGetuid !== undefined) {
-					process.getuid = () => originalGetuid() + 1;
-				}
-				try {
-					expect(() =>
-						prepareCoordinatedDatabaseReset({
-							productDatabase: databasePath,
-							checkpointDatabase: checkpointPath,
-						}),
-					).toThrow("Failed to complete the coordinated local database reset.");
-				} finally {
-					if (originalGetuid !== undefined) {
-						process.getuid = originalGetuid;
-					}
-				}
-				expect(readFileSync(sentinelPath, "utf8")).toBe("do not alter");
-				expect(existsSync(databasePath)).toBe(true);
-				expect(existsSync(checkpointPath)).toBe(true);
-				expect(existsSync(markerPath)).toBe(false);
-			});
-		}
-	});
-
-	test("removes a stale checkpoint store when a legacy interrupted reset lacks product main", () => {
-		withTempDatabase((databasePath) => {
-			const checkpointPath = join(dirname(databasePath), "checkpoints.db");
-			const staleCheckpoint = new Database(checkpointPath);
-			staleCheckpoint.exec(
-				"CREATE TABLE stale_checkpoint (value TEXT); INSERT INTO stale_checkpoint VALUES ('stale');",
-			);
-			staleCheckpoint.close();
-			for (const sidecar of [
-				`${databasePath}-wal`,
-				`${databasePath}-shm`,
-				`${checkpointPath}-wal`,
-				`${checkpointPath}-shm`,
-			]) {
-				writeFileSync(sidecar, "");
-			}
-
-			expect(
-				prepareCoordinatedDatabaseReset({
-					productDatabase: databasePath,
-					checkpointDatabase: checkpointPath,
-				}),
-			).toEqual({
-				reset: true,
-				reason: coordinatedDatabaseResetReason,
-			});
-			for (const removed of [
-				`${checkpointPath}-wal`,
-				`${checkpointPath}-shm`,
-				`${databasePath}${coordinatedDatabaseResetMarkerSuffix}`,
-			]) {
-				expect(existsSync(removed)).toBe(false);
-			}
-			expectResetStoresRecreated(databasePath, checkpointPath);
-			expectPersistentResetLockDatabase(databasePath, checkpointPath);
-
-			const freshCheckpoint = new Database(checkpointPath, { readonly: true, strict: true });
-			expect(
-				freshCheckpoint
-					.query<{ count: number }, []>(
-						"SELECT count(*) AS count FROM sqlite_master WHERE name = 'stale_checkpoint'",
-					)
-					.get()?.count,
-			).toBe(0);
-			freshCheckpoint.close();
-		});
-	});
-
-	test("fails closed for aliased or symbolic coordinated reset paths", () => {
-		withTempDatabase((databasePath) => {
-			const legacy = new Database(databasePath);
-			legacy.exec("CREATE TABLE legacy_data (value TEXT); PRAGMA user_version = 6;");
-			legacy.close();
-			expect(() =>
-				prepareCoordinatedDatabaseReset({
-					productDatabase: databasePath,
-					checkpointDatabase: databasePath,
-				}),
-			).toThrow("must be distinct");
-			expect(existsSync(databasePath)).toBe(true);
-
-			const checkpointPath = join(dirname(databasePath), "checkpoints.db");
-			const sentinelPath = join(dirname(databasePath), "checkpoint-sentinel");
-			writeFileSync(sentinelPath, "do not unlink");
-			symlinkSync(sentinelPath, checkpointPath);
-			expect(() =>
-				prepareCoordinatedDatabaseReset({
-					productDatabase: databasePath,
-					checkpointDatabase: checkpointPath,
-				}),
-			).toThrow("Failed to complete the coordinated local database reset.");
-			expect(readFileSync(sentinelPath, "utf8")).toBe("do not unlink");
-			expect(existsSync(databasePath)).toBe(true);
-			expect(existsSync(`${databasePath}${coordinatedDatabaseResetMarkerSuffix}`)).toBe(false);
-
-			rmSync(checkpointPath);
-			linkSync(databasePath, checkpointPath);
-			expect(() =>
-				prepareCoordinatedDatabaseReset({
-					productDatabase: databasePath,
-					checkpointDatabase: checkpointPath,
-				}),
-			).toThrow("Failed to complete the coordinated local database reset.");
-			expect(existsSync(databasePath)).toBe(true);
-			expect(existsSync(checkpointPath)).toBe(true);
-			expect(existsSync(`${databasePath}${coordinatedDatabaseResetMarkerSuffix}`)).toBe(false);
-
-			rmSync(checkpointPath);
-			writeFileSync(
-				`${databasePath}${coordinatedDatabaseResetMarkerSuffix}`,
-				`${JSON.stringify({
-					schemaVersion: 1,
-					reason: coordinatedDatabaseResetReason,
-					previousProductVersion: 5,
-				})}\n`,
-			);
-			expect(() =>
-				prepareCoordinatedDatabaseReset({
-					productDatabase: databasePath,
-					checkpointDatabase: checkpointPath,
-				}),
-			).toThrow("Failed to complete the coordinated local database reset.");
-			expect(existsSync(databasePath)).toBe(true);
-		});
-	});
-
-	test("does not reset coordinated stores at the current product schema", () => {
-		withTempDatabase((databasePath) => {
-			const checkpointPath = join(dirname(databasePath), "checkpoints.db");
 			const database = openAppDatabase(databasePath);
-			database.close();
-			writeFileSync(checkpointPath, "current checkpoint marker");
-
-			expect(
-				prepareCoordinatedDatabaseReset({
-					productDatabase: databasePath,
-					checkpointDatabase: checkpointPath,
-				}),
-			).toEqual({ reset: false });
-			expect(readFileSync(checkpointPath, "utf8")).toBe("current checkpoint marker");
-		});
-	});
-
-	test("validates current-schema checkpoint paths before returning without a reset", () => {
-		for (const anomaly of ["checkpoint-symlink", "checkpoint-alias", "sidecar-symlink"] as const) {
-			withTempDatabase((databasePath) => {
-				const checkpointPath = join(dirname(databasePath), "checkpoints.db");
-				const sentinelPath = join(dirname(databasePath), `${anomaly}-sentinel`);
-				const database = openAppDatabase(databasePath);
-				database.close();
-
-				if (anomaly === "checkpoint-symlink") {
-					writeFileSync(sentinelPath, "do not open as a checkpoint");
-					symlinkSync(sentinelPath, checkpointPath);
-				} else if (anomaly === "checkpoint-alias") {
-					linkSync(databasePath, checkpointPath);
-				} else {
-					writeFileSync(sentinelPath, "do not unlink");
-					symlinkSync(sentinelPath, `${checkpointPath}-wal`);
-				}
-
-				expect(() =>
-					prepareCoordinatedDatabaseReset({
-						productDatabase: databasePath,
-						checkpointDatabase: checkpointPath,
-					}),
-				).toThrow("Failed to complete the coordinated local database reset.");
-				expect(existsSync(databasePath)).toBe(true);
-				if (anomaly !== "checkpoint-alias") {
-					expect(readFileSync(sentinelPath, "utf8")).toStartWith("do not");
-				}
-			});
-		}
-	});
-
-	test("accepts an absent checkpoint path for a current product schema", () => {
-		withTempDatabase((databasePath) => {
-			const checkpointPath = join(dirname(databasePath), "checkpoints.db");
-			const database = openAppDatabase(databasePath);
+			database.sessions.create({ title: "keep me" });
 			database.close();
 
-			expect(
-				prepareCoordinatedDatabaseReset({
-					productDatabase: databasePath,
-					checkpointDatabase: checkpointPath,
-				}),
-			).toEqual({ reset: false });
-			expect(existsSync(checkpointPath)).toBe(false);
+			expect(prepareCoordinatedDatabaseReset({ productDatabase: databasePath })).toEqual({
+				reset: false,
+			});
+			const reopened = openAppDatabase(databasePath);
+			try {
+				expect(reopened.sessions.list().items).toHaveLength(1);
+			} finally {
+				reopened.close();
+			}
 		});
 	});
 
-	test("rejects symlinked parent components before a current-schema fast path", () => {
-		for (const selectedPath of ["product", "checkpoint"] as const) {
-			withTempDatabase((databasePath) => {
-				const root = dirname(databasePath);
-				const realDirectory = join(root, `${selectedPath}-store`);
-				const linkedDirectory = join(root, `${selectedPath}-store-link`);
-				mkdirSync(realDirectory);
-				symlinkSync(realDirectory, linkedDirectory);
-				const realProductPath =
-					selectedPath === "product" ? join(realDirectory, "app.db") : databasePath;
-				const productPath =
-					selectedPath === "product" ? join(linkedDirectory, "app.db") : databasePath;
-				const checkpointPath =
-					selectedPath === "checkpoint"
-						? join(linkedDirectory, "checkpoints.db")
-						: join(root, "checkpoints.db");
-				const database = openAppDatabase(realProductPath);
-				database.close();
-
-				expect(() =>
-					prepareCoordinatedDatabaseReset({
-						productDatabase: productPath,
-						checkpointDatabase: checkpointPath,
-					}),
-				).toThrow("Failed to complete the coordinated local database reset.");
-				expect(existsSync(realProductPath)).toBe(true);
+	test("accepts an absent product database and rejects symbolic database paths", () => {
+		withTempDatabase((databasePath) => {
+			expect(prepareCoordinatedDatabaseReset({ productDatabase: databasePath })).toEqual({
+				reset: false,
 			});
-		}
+			const targetPath = `${databasePath}.target`;
+			writeFileSync(targetPath, "target");
+			symlinkSync(targetPath, databasePath);
+			expect(() => prepareCoordinatedDatabaseReset({ productDatabase: databasePath })).toThrow(
+				"regular file",
+			);
+			expect(readFileSync(targetPath, "utf8")).toBe("target");
+		});
 	});
 
 	test("enables SQLite safety settings and run foreign keys", () => {
@@ -1633,10 +314,11 @@ describe("application database", () => {
 						SELECT value + 1 FROM fixture WHERE value < $count
 					)
 					INSERT INTO chat_sessions (
-						id, title, default_mode, created_at_ms, updated_at_ms,
+						id, pi_session_id, title, default_mode, created_at_ms, updated_at_ms,
 						last_message_at_ms, archived_at_ms
 					)
 					SELECT
+						printf('00000000-0000-7000-8000-%012x', value),
 						printf('00000000-0000-7000-8000-%012x', value),
 						'capacity fixture',
 						'ask',
@@ -2058,8 +740,9 @@ describe("application database", () => {
 					assistantMessageId: createUuidV7(),
 				});
 				expect("customHeaders" in created.run.provider).toBe(false);
-				expect(created.run.provider.type).toBe("openai-compatible");
-				expect(created.run.provider.reasoningEffort).toBe("medium");
+				expect(created.run.provider.source).toBe("custom");
+				expect(created.run.provider.api).toBe("openai-responses");
+				expect(created.run.provider.thinkingLevel).toBe("medium");
 				expect(JSON.stringify(created.run)).not.toContain(headerSecret);
 			} finally {
 				database.close();
@@ -2073,38 +756,6 @@ describe("application database", () => {
 		});
 	});
 
-	test("reads run journals written with legacy protocol-shaped Provider types", () => {
-		const database = openAppDatabase(":memory:");
-		try {
-			const session = database.sessions.create({ title: "Legacy Provider types" }).session;
-			const created = database.runs.create({
-				clientRequestId: crypto.randomUUID(),
-				sessionId: session.id,
-				mode: "ask",
-				provider: makeProviderInput(),
-				userMessageId: createUuidV7(),
-				userContent: "Legacy Provider prompt",
-				assistantMessageId: createUuidV7(),
-			});
-
-			for (const [legacyType, expectedType] of [
-				["openai-chat-completions", "openai-compatible"],
-				["openai-responses", "openai-compatible"],
-				["anthropic-messages", "anthropic-compatible"],
-			] as const) {
-				database.client
-					.query("UPDATE chat_runs SET provider_json = $providerJson WHERE id = $runId")
-					.run({
-						runId: created.run.id,
-						providerJson: JSON.stringify({ ...created.run.provider, type: legacyType }),
-					});
-				expect(database.runs.get(created.run.id).provider.type).toBe(expectedType);
-			}
-		} finally {
-			database.close();
-		}
-	});
-
 	test("stores and clears the Session model selection", () => {
 		const database = openAppDatabase(":memory:");
 		try {
@@ -2112,25 +763,25 @@ describe("application database", () => {
 			const created = database.sessions.create({ title: "Model selection" }).session;
 			expect(created.model).toBeUndefined();
 
-			const withEffort = database.sessions.setModel({
+			const withThinking = database.sessions.setModel({
 				sessionId: created.id,
-				model: { providerId, modelId: "gpt-5.5", reasoning: { effort: "high" } },
+				model: { providerId, modelId: "gpt-5.5", thinkingLevel: "high" },
 			}).session;
-			expect(withEffort.model).toEqual({
+			expect(withThinking.model).toEqual({
 				providerId,
 				modelId: "gpt-5.5",
-				reasoning: { effort: "high" },
+				thinkingLevel: "high",
 			});
 
-			const withBudget = database.sessions.setModel({
+			const withMinimalThinking = database.sessions.setModel({
 				sessionId: created.id,
 				model: {
 					providerId,
 					modelId: "claude-opus-4.6",
-					reasoning: { budgetTokens: 8_192 },
+					thinkingLevel: "minimal",
 				},
 			}).session;
-			expect(withBudget.model?.reasoning).toEqual({ budgetTokens: 8_192 });
+			expect(withMinimalThinking.model?.thinkingLevel).toBe("minimal");
 
 			const cleared = database.sessions.setModel({ sessionId: created.id, model: null }).session;
 			expect(cleared.model).toBeUndefined();
@@ -2253,19 +904,19 @@ describe("application database", () => {
 		}
 	});
 
-	test("writes checkpoint deletion jobs atomically and acknowledges them idempotently", () => {
+	test("writes agent-session cleanup jobs atomically and acknowledges them idempotently", () => {
 		const database = openAppDatabase(":memory:");
 		try {
 			const session = database.sessions.create({ title: "Crash durable cleanup" }).session;
 			database.runs.deleteSessionAndRetireRuns(session.id);
 
 			expect(database.sessions.list().items).toEqual([]);
-			expect(database.runs.listPendingCheckpointDeletions(10, true)).toEqual([
+			expect(database.runs.listPendingAgentSessionCleanups(10, true)).toEqual([
 				expect.objectContaining({ sessionId: session.id, attemptCount: 0 }),
 			]);
-			database.runs.ackCheckpointDeletion(session.id);
-			database.runs.ackCheckpointDeletion(session.id);
-			expect(database.runs.listPendingCheckpointDeletions(10, true)).toEqual([]);
+			database.runs.ackAgentSessionCleanup(session.id);
+			database.runs.ackAgentSessionCleanup(session.id);
+			expect(database.runs.listPendingAgentSessionCleanups(10, true)).toEqual([]);
 		} finally {
 			database.close();
 		}
@@ -2285,7 +936,7 @@ describe("application database", () => {
 				expect(reopened.runs.deleteSessionAndRetireRuns(session.id)).toEqual({
 					sessionId: session.id,
 				});
-				expect(reopened.runs.listPendingCheckpointDeletions(10, true)).toHaveLength(1);
+				expect(reopened.runs.listPendingAgentSessionCleanups(10, true)).toHaveLength(1);
 				expect(
 					reopened.client
 						.query<{ count: number }, [string]>(
@@ -2300,7 +951,7 @@ describe("application database", () => {
 		});
 	});
 
-	test("backpressures Session deletion when the durable checkpoint outbox is full", () => {
+	test("backpressures Session deletion when the durable agent-session outbox is full", () => {
 		const database = openAppDatabase(":memory:");
 		try {
 			database.client
@@ -2310,7 +961,7 @@ describe("application database", () => {
 						UNION ALL
 						SELECT value + 1 FROM fixture WHERE value < $count
 					)
-					INSERT INTO checkpoint_deletion_outbox (
+					INSERT INTO agent_session_cleanup_outbox (
 						session_id, created_at_ms, attempt_count, next_attempt_at_ms
 					)
 					SELECT
@@ -2320,20 +971,22 @@ describe("application database", () => {
 						0
 					FROM fixture`,
 				)
-				.run({ count: maxCheckpointDeletionJobs });
+				.run({ count: maxAgentSessionCleanupJobs });
 			const session = database.sessions.create({ title: "Outbox capacity" }).session;
 
 			expect(() => database.runs.deleteSessionAndRetireRuns(session.id)).toThrow(
-				"Checkpoint deletion recovery capacity is full",
+				"Agent session cleanup recovery capacity is full",
 			);
 			expect(database.sessions.get({ sessionId: session.id }).id).toBe(session.id);
-			database.runs.ackCheckpointDeletion("00000000-0000-7000-8000-000000000001");
+			database.runs.ackAgentSessionCleanup("00000000-0000-7000-8000-000000000001");
 			expect(database.runs.deleteSessionAndRetireRuns(session.id).sessionId).toBe(session.id);
 			expect(
 				database.client
-					.query<{ count: number }, []>("SELECT count(*) AS count FROM checkpoint_deletion_outbox")
+					.query<{ count: number }, []>(
+						"SELECT count(*) AS count FROM agent_session_cleanup_outbox",
+					)
 					.get()?.count,
-			).toBe(maxCheckpointDeletionJobs);
+			).toBe(maxAgentSessionCleanupJobs);
 		} finally {
 			database.close();
 		}

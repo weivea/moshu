@@ -19,27 +19,53 @@ const createdProviderId = "01984df0-cf17-7e6e-9a7d-4d98c1f0d5cc";
 interface MakeProviderOptions {
 	id: string;
 	displayName?: string;
-	type?: ProviderSummary["type"];
+	api?: ProviderSummary["api"];
 	baseUrl?: string;
 	enabled?: boolean;
 	apiKeyMask?: string;
 	customHeaderNames?: string[];
 	models?: ProviderModel[];
 	modelsFetchedAt?: string;
+	source?: ProviderSummary["source"];
 }
 
 function makeProvider(options: MakeProviderOptions): ProviderSummary {
 	return {
-		schemaVersion: 1,
+		schemaVersion: 2,
 		id: options.id,
 		displayName: options.displayName ?? "OpenAI",
-		type: options.type ?? "openai-compatible",
+		source: options.source ?? "custom",
+		api: options.api ?? "openai-responses",
 		baseUrl: options.baseUrl ?? "https://api.openai.com/v1",
 		enabled: options.enabled ?? true,
+		authMethods: ["api_key"],
+		credential: {
+			configured: options.apiKeyMask !== undefined,
+			...(options.apiKeyMask === undefined ? {} : { type: "api_key" as const }),
+		},
 		customHeaderNames: options.customHeaderNames ?? [],
 		models: options.models ?? [],
-		...(options.apiKeyMask === undefined ? {} : { apiKeyMask: options.apiKeyMask }),
 		...(options.modelsFetchedAt === undefined ? {} : { modelsFetchedAt: options.modelsFetchedAt }),
+	};
+}
+
+function makeModel(
+	id: string,
+	displayName: string,
+	enabled: boolean,
+	overrides: Partial<ProviderModel> = {},
+): ProviderModel {
+	return {
+		id,
+		displayName,
+		enabled,
+		api: "openai-responses",
+		input: ["text"],
+		reasoning: false,
+		contextWindowTokens: 128_000,
+		maxOutputTokens: 8_192,
+		thinkingLevels: [],
+		...overrides,
 	};
 }
 
@@ -74,7 +100,7 @@ class FakeProvidersTransport {
 		return makeProvider({
 			id: createdProviderId,
 			displayName: input.displayName,
-			type: input.type,
+			api: input.api,
 			baseUrl: input.baseUrl,
 			apiKeyMask: "****",
 			customHeaderNames: Object.keys(input.customHeaders ?? {}),
@@ -139,7 +165,7 @@ describe("ProvidersSettingsPage", () => {
 	test("renders the configured providers and selects the first one", async () => {
 		const transport = new FakeProvidersTransport([
 			makeProvider({ id: providerAId, displayName: "OpenAI" }),
-			makeProvider({ id: providerBId, displayName: "Anthropic", type: "anthropic-compatible" }),
+			makeProvider({ id: providerBId, displayName: "Anthropic", api: "anthropic-messages" }),
 		]);
 
 		renderPage(transport);
@@ -161,13 +187,15 @@ describe("ProvidersSettingsPage", () => {
 		const typeOptions = within(within(form).getByLabelText(/Type/)).getAllByRole("option");
 		expect(typeOptions.map((option) => option.textContent)).toEqual([
 			"OpenAI Compatible",
+			"OpenAI Compatible",
 			"Anthropic Compatible",
+			"OpenAI Compatible",
 		]);
 		fireEvent.change(within(form).getByLabelText(/Display name/), {
 			target: { value: "Claude" },
 		});
 		fireEvent.change(within(form).getByLabelText(/Type/), {
-			target: { value: "anthropic-compatible" },
+			target: { value: "anthropic-messages" },
 		});
 		fireEvent.change(within(form).getByLabelText(/Base URL/), {
 			target: { value: "https://api.anthropic.com" },
@@ -182,9 +210,9 @@ describe("ProvidersSettingsPage", () => {
 
 		await waitFor(() => expect(transport.createInputs).toHaveLength(1));
 		expect(transport.createInputs[0]).toEqual({
-			schemaVersion: 1,
+			schemaVersion: 2,
 			displayName: "Claude",
-			type: "anthropic-compatible",
+			api: "anthropic-messages",
 			baseUrl: "https://api.anthropic.com",
 			apiKey: "sk-anthropic",
 			customHeaders: { "X-Org": "acme" },
@@ -209,40 +237,39 @@ describe("ProvidersSettingsPage", () => {
 		expect(transport.updateInputs).toHaveLength(0);
 	});
 
-	test("omits the API key when it is left blank so the stored key is kept", async () => {
+	test("keeps API-key replacement out of the endpoint edit form", async () => {
 		const transport = new FakeProvidersTransport([
 			makeProvider({ id: providerAId, displayName: "OpenAI", apiKeyMask: "********cret" }),
 		]);
 		renderPage(transport);
 
 		const form = await screen.findByRole("form", { name: "Provider settings" });
-		expect(within(form).getByLabelText(/API key/)).toHaveValue("");
+		expect(within(form).queryByLabelText(/API key/)).toBeNull();
 		fireEvent.click(within(form).getByRole("button", { name: "Save changes" }));
 
 		await waitFor(() => expect(transport.updateInputs).toHaveLength(1));
 		const input = transport.updateInputs[0];
 		expect(input).toEqual({
-			schemaVersion: 1,
+			schemaVersion: 2,
 			providerId: providerAId,
 			displayName: "OpenAI",
-			type: "openai-compatible",
+			api: "openai-responses",
 			baseUrl: "https://api.openai.com/v1",
 		});
 		expect(input !== undefined && "apiKey" in input).toBe(false);
 	});
 
 	test("fetches the model list and renders badges only for advertised metadata", async () => {
-		const transport = new FakeProvidersTransport([makeProvider({ id: providerAId })]);
+		const transport = new FakeProvidersTransport([
+			makeProvider({ id: providerAId, apiKeyMask: "configured" }),
+		]);
 		transport.fetchModelsResult = [
-			{
-				id: "gpt-5.4",
-				enabled: true,
-				displayName: "GPT-5.4",
+			makeModel("gpt-5.4", "GPT-5.4", true, {
 				contextWindowTokens: 272_000,
-				supportedEndpoints: ["/responses", "/chat/completions"],
-				reasoningEfforts: ["low", "medium", "high"],
-			},
-			{ id: "text-embed", enabled: false, displayName: "Text Embed" },
+				reasoning: true,
+				thinkingLevels: ["low", "medium", "high"],
+			}),
+			makeModel("text-embed", "Text Embed", false),
 		];
 		renderPage(transport);
 
@@ -252,21 +279,18 @@ describe("ProvidersSettingsPage", () => {
 		await waitFor(() => expect(transport.fetchedIds).toEqual([providerAId]));
 		expect(await screen.findByText("272K ctx")).toBeVisible();
 		expect(screen.getByText("3 effort levels")).toBeVisible();
-		expect(screen.getByText("/responses")).toBeVisible();
-		expect(screen.getByText("/chat/completions")).toBeVisible();
+		expect(screen.getAllByText("openai-responses")).toHaveLength(2);
 
 		const embedItem = screen.getByRole("checkbox", { name: "Enable Text Embed" }).closest("li");
-		expect(embedItem?.querySelector(".provider-models__badge")).toBeNull();
+		expect(within(embedItem as HTMLElement).queryByText(/effort levels/)).toBeNull();
 	});
 
 	test("saves the new enabled model ids when a checkbox is toggled", async () => {
 		const transport = new FakeProvidersTransport([
 			makeProvider({
 				id: providerAId,
-				models: [
-					{ id: "gpt-5.4", enabled: true, displayName: "GPT-5.4" },
-					{ id: "o3-mini", enabled: false, displayName: "o3-mini" },
-				],
+				apiKeyMask: "configured",
+				models: [makeModel("gpt-5.4", "GPT-5.4", true), makeModel("o3-mini", "o3-mini", false)],
 			}),
 		]);
 		renderPage(transport);
@@ -309,12 +333,35 @@ describe("ProvidersSettingsPage", () => {
 		renderPage(transport);
 
 		const form = await screen.findByRole("form", { name: "Provider settings" });
-		const apiKeyInput = within(form).getByLabelText(/API key/);
-		expect(apiKeyInput).toHaveValue("");
-		expect(apiKeyInput).toHaveAttribute("placeholder", "Saved key: sk-…abcd");
+		expect(within(form).queryByLabelText(/API key/)).toBeNull();
 
 		const headersInput = within(form).getByLabelText(/Custom headers/);
 		expect(headersInput).toHaveValue("");
 		expect(within(form).getByText("Stored header names: X-Org, X-Trace")).toBeVisible();
+	});
+
+	test("keeps built-in identity read-only while allowing enablement and authentication", async () => {
+		const transport = new FakeProvidersTransport([
+			makeProvider({
+				id: providerAId,
+				displayName: "Anthropic",
+				source: "builtin",
+			}),
+		]);
+		renderPage(transport);
+
+		const form = await screen.findByRole("form", { name: "Provider settings" });
+		expect(within(form).queryByLabelText("Display name")).toBeNull();
+		expect(within(form).queryByLabelText("Base URL")).toBeNull();
+		expect(within(form).queryByLabelText("Custom headers (JSON)")).toBeNull();
+		expect(within(form).queryByRole("button", { name: "Delete Provider" })).toBeNull();
+		expect(within(form).getByText("Built-in")).toBeVisible();
+
+		fireEvent.click(within(form).getByRole("checkbox", { name: "Enabled" }));
+		await waitFor(() =>
+			expect(transport.updateInputs).toEqual([
+				{ schemaVersion: 2, providerId: providerAId, enabled: false },
+			]),
+		);
 	});
 });

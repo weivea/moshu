@@ -23,6 +23,7 @@ export function ProviderModelList({
 	const { t } = useI18n();
 	const searchId = useId();
 	const [query, setQuery] = useState("");
+	const isReady = provider.enabled && provider.credential.configured;
 	const enabledCount = provider.models.filter((model) => model.enabled).length;
 	const visibleModels = useMemo(() => {
 		const normalized = query.trim().toLocaleLowerCase();
@@ -63,12 +64,17 @@ export function ProviderModelList({
 				</div>
 				<Button
 					className="chat-button chat-button--primary"
-					isDisabled={isFetching || isSaving}
+					isDisabled={isFetching || isSaving || !isReady}
 					onPress={onFetch}
 				>
 					{isFetching ? t("providers.models.fetching") : t("providers.models.fetch")}
 				</Button>
 			</div>
+			{isReady ? null : (
+				<p className="provider-models__hint" role="status">
+					{t("providers.models.authRequired")}
+				</p>
+			)}
 
 			{provider.models.length === 0 ? (
 				<div className="provider-models__empty">
@@ -91,14 +97,14 @@ export function ProviderModelList({
 						<div className="provider-models__bulk">
 							<Button
 								className="chat-button chat-button--inline"
-								isDisabled={isSaving}
+								isDisabled={isSaving || isFetching || !isReady}
 								onPress={() => onEnabledChange(provider.models.map((model) => model.id))}
 							>
 								{t("providers.models.selectAll")}
 							</Button>
 							<Button
 								className="chat-button chat-button--inline"
-								isDisabled={isSaving}
+								isDisabled={isSaving || isFetching || !isReady}
 								onPress={() => onEnabledChange([])}
 							>
 								{t("providers.models.selectNone")}
@@ -116,7 +122,7 @@ export function ProviderModelList({
 										<input
 											type="checkbox"
 											checked={model.enabled}
-											disabled={isSaving}
+											disabled={isSaving || isFetching || !isReady}
 											aria-label={t("providers.models.enableLabel", model.displayName ?? model.id)}
 											onChange={(event) => toggleModel(model.id, event.currentTarget.checked)}
 										/>
@@ -148,18 +154,11 @@ function ModelBadges({ model }: { model: ProviderModel }) {
 	if (model.maxOutputTokens !== undefined) {
 		badges.push(t("providers.models.output", formatTokenCount(model.maxOutputTokens)));
 	}
-	if (model.reasoningEfforts !== undefined && model.reasoningEfforts.length > 0) {
-		badges.push(t("providers.models.effort", String(model.reasoningEfforts.length)));
-	}
-	if (model.thinking !== undefined) {
+	if (model.reasoning) {
+		badges.push(t("providers.models.effort", String(model.thinkingLevels.length)));
 		badges.push(t("providers.models.thinking"));
 	}
-	if (model.kind !== undefined) {
-		badges.push(model.kind);
-	}
-	if (model.supportedEndpoints !== undefined) {
-		badges.push(...model.supportedEndpoints);
-	}
+	badges.push(model.api);
 
 	return badges.length === 0 ? null : (
 		<div className="provider-models__badges">

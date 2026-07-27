@@ -1,3 +1,4 @@
+import { initializeBunAgentRuntime } from "@moshu/agent-runtime";
 import {
 	type AgentsServerReadyRecord,
 	companionBootstrapChannel,
@@ -14,11 +15,9 @@ import { type CreateAgentsServerOptions, createAgentsServer } from "./create-age
 const PROCESS_VERSION = "0.0.1";
 
 export async function runAgentsServerProcess(
-	options: Pick<
-		CreateAgentsServerOptions,
-		"createRuntime" | "testProviderConnection" | "fetchProviderModels"
-	> = {},
+	options: Pick<CreateAgentsServerOptions, "createRuntime" | "fetchProviderModels"> = {},
 ): Promise<void> {
+	initializeBunAgentRuntime();
 	const controlChannel = await openBootstrapControlChannel(Bun.stdin.stream());
 	const bootstrap = parseAgentsServerBootstrapRecord(controlChannel.input);
 	const instance = await createAgentsServer({

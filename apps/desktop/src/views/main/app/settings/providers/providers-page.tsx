@@ -6,6 +6,7 @@ import type { ChatTransport } from "../../chat/transport";
 import { type MessageKey, useI18n } from "../../i18n";
 import { providerTypeLabelKey } from "../provider-shared";
 import { AddProviderDialog } from "./add-provider-dialog";
+import { ProviderAuthPanel } from "./provider-auth-panel";
 import { ProviderForm, type ProviderFormAction } from "./provider-form";
 import { ProviderModelList } from "./provider-model-list";
 
@@ -28,21 +29,23 @@ export function ProvidersSettingsPage({ transport }: ProvidersSettingsPageProps)
 	const [pendingAction, setPendingAction] = useState<PendingAction>();
 	const [feedback, setFeedback] = useState<Feedback>();
 	const selectedProvider = providers.find((provider) => provider.id === selectedProviderId);
+	const refreshProviders = useCallback(async () => {
+		const nextProviders = await transport.listProviders();
+		setProviders(nextProviders);
+		setSelectedProviderId((current) =>
+			current !== undefined && nextProviders.some((provider) => provider.id === current)
+				? current
+				: nextProviders[0]?.id,
+		);
+	}, [transport]);
 
 	useEffect(() => {
 		let active = true;
-		void transport
-			.listProviders()
-			.then((nextProviders) => {
+		void refreshProviders()
+			.then(() => {
 				if (!active) {
 					return;
 				}
-				setProviders(nextProviders);
-				setSelectedProviderId((current) =>
-					current !== undefined && nextProviders.some((provider) => provider.id === current)
-						? current
-						: nextProviders[0]?.id,
-				);
 			})
 			.catch(() => {
 				if (active) {
@@ -58,7 +61,7 @@ export function ProvidersSettingsPage({ transport }: ProvidersSettingsPageProps)
 		return () => {
 			active = false;
 		};
-	}, [transport]);
+	}, [refreshProviders]);
 
 	const replaceProvider = useCallback((provider: ProviderSummary) => {
 		setProviders((current) =>
@@ -113,7 +116,7 @@ export function ProvidersSettingsPage({ transport }: ProvidersSettingsPageProps)
 
 	const testProvider = (providerId: string) =>
 		void run("test", "providers.error.test", async () => {
-			const result = await transport.testProvider({ schemaVersion: 1, providerId });
+			const result = await transport.testProvider({ schemaVersion: 2, providerId });
 			if (result.ok) {
 				return {
 					tone: "info",
@@ -192,7 +195,11 @@ export function ProvidersSettingsPage({ transport }: ProvidersSettingsPageProps)
 										>
 											<span className="providers-settings__item-name">{provider.displayName}</span>
 											<span className="providers-settings__item-meta">
-												{t(providerTypeLabelKey(provider.type))}
+												{provider.source === "builtin"
+													? t("providers.source.builtin")
+													: `${t("providers.source.custom")} · ${t(
+															providerTypeLabelKey(provider.api ?? "openai-completions"),
+														)}`}
 											</span>
 											<span
 												className={
@@ -201,7 +208,11 @@ export function ProvidersSettingsPage({ transport }: ProvidersSettingsPageProps)
 														: "provider-status"
 												}
 											>
-												{provider.enabled ? t("providers.enabled") : t("providers.disabled")}
+												{!provider.enabled
+													? t("providers.disabled")
+													: provider.credential.configured
+														? t("providers.auth.ready")
+														: t("providers.auth.required")}
 											</span>
 										</button>
 									</li>
@@ -239,6 +250,12 @@ export function ProvidersSettingsPage({ transport }: ProvidersSettingsPageProps)
 									onTest={() => testProvider(selectedProvider.id)}
 									onDelete={() => deleteProvider(selectedProvider.id)}
 									onInvalid={(messageKey) => setFeedback({ tone: "danger", messageKey })}
+								/>
+								<ProviderAuthPanel
+									key={selectedProvider.id}
+									provider={selectedProvider}
+									transport={transport}
+									onProviderChanged={refreshProviders}
 								/>
 								<ProviderModelList
 									provider={selectedProvider}

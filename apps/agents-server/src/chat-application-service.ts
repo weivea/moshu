@@ -3,14 +3,11 @@ import {
 	type AskChatMessage,
 	type AskChatRuntime,
 	AskChatRuntimeError,
-	normalizeReasoningSelection,
 	ProviderModelNotFoundError,
 	ProviderNotFoundError,
 	type ProviderRecord,
 	type ProviderRegistry,
 	type ResolvedProviderConfiguration,
-	resolveModelProtocol,
-	resolveReasoningCapability,
 	toProviderSummary,
 } from "@moshu/agent-runtime";
 import {
@@ -101,55 +98,48 @@ import {
 	ChatSessionNotFoundError,
 	createUuidV7,
 	type ListRunPageOutput,
-	maxCheckpointDeletionBatchSize,
+	maxAgentSessionCleanupBatchSize,
 	maxRunEventPageSize,
 	type RunJournalPageItem,
 	type RunJournalRepository,
 	type RunPageCursor,
 	type SessionRepository,
 } from "@moshu/database";
-import {
-	anthropicApiVersion,
-	fetchProviderModelCatalog,
-	type ProviderCatalogRequest,
-} from "./provider-catalog";
 
 const STREAMED_DELTA_FLUSH_LATENCY_MS = 20;
 const replayTextEncoder = new TextEncoder();
 
 type ChatEventListener = (event: ChatRunEvent) => void | PromiseLike<void>;
 type ChatTaskScheduler = (task: () => void) => void;
-type ProviderConnectionTester = (configuration: ResolvedProviderConfiguration) => Promise<void>;
-type ProviderModelCatalogFetcher = (
-	request: ProviderCatalogRequest,
-) => Promise<readonly ProviderModel[]>;
+type ProviderModelCatalogFetcher = (providerId: string) => Promise<readonly ProviderModel[]>;
+const defaultProviderModelFetcher: ProviderModelCatalogFetcher = async () => [];
 
 interface ChatServiceLogger {
 	error(message: string, error: unknown): void;
 	info?(message: string): void;
 }
 
-export interface CheckpointDeletionRetryResult {
+export interface AgentSessionCleanupRetryResult {
 	attempted: number;
 	succeeded: number;
 	failed: number;
 	remaining: number;
 }
 
-type CheckpointDeletionAttemptOutcome =
+type AgentSessionCleanupAttemptOutcome =
 	| "succeeded"
 	| "failed"
 	| "ineligible"
 	| "retry-state-persistence-failed"
 	| "stopped";
 
-const checkpointDeletionStartupBatchSize = 64;
-const defaultCheckpointDeletionRetryBaseMs = 1_000;
-const defaultCheckpointDeletionRetryMaxMs = 60_000;
-const defaultCheckpointDeletionAttemptTimeoutMs = 5_000;
-const defaultCheckpointDeletionMaxInFlightAttempts = 4;
-const defaultCheckpointDeletionStartupTimeoutMs = 2_000;
-const defaultCheckpointDeletionStartupMaxAttempts = 64;
+const agentSessionCleanupStartupBatchSize = 64;
+const defaultAgentSessionCleanupRetryBaseMs = 1_000;
+const defaultAgentSessionCleanupRetryMaxMs = 60_000;
+const defaultAgentSessionCleanupAttemptTimeoutMs = 5_000;
+const defaultAgentSessionCleanupMaxInFlightAttempts = 4;
+const defaultAgentSessionCleanupStartupTimeoutMs = 2_000;
+const defaultAgentSessionCleanupStartupMaxAttempts = 64;
 const defaultShutdownTimeoutMs = 5_000;
 
 export interface ChatApplicationServiceOptions {
@@ -160,14 +150,13 @@ export interface ChatApplicationServiceOptions {
 	fetchProviderModels?: ProviderModelCatalogFetcher;
 	schedule?: ChatTaskScheduler;
 	logger?: ChatServiceLogger;
-	testProviderConnection?: ProviderConnectionTester;
 	isRuntimeReady?: () => boolean;
-	checkpointDeletionRetryBaseMs?: number;
-	checkpointDeletionRetryMaxMs?: number;
-	checkpointDeletionAttemptTimeoutMs?: number;
-	checkpointDeletionMaxInFlightAttempts?: number;
-	checkpointDeletionStartupTimeoutMs?: number;
-	checkpointDeletionStartupMaxAttempts?: number;
+	agentSessionCleanupRetryBaseMs?: number;
+	agentSessionCleanupRetryMaxMs?: number;
+	agentSessionCleanupAttemptTimeoutMs?: number;
+	agentSessionCleanupMaxInFlightAttempts?: number;
+	agentSessionCleanupStartupTimeoutMs?: number;
+	agentSessionCleanupStartupMaxAttempts?: number;
 	shutdownTimeoutMs?: number;
 }
 
@@ -180,6 +169,7 @@ export interface SendChatMessageInput {
 interface ActiveChatRun {
 	runId: string;
 	sessionId: string;
+	agentSessionId: string;
 	assistantMessageId: string;
 	provider: ResolvedProviderConfiguration;
 	messages: AskChatMessage[];
@@ -202,9 +192,7 @@ export class ChatApplicationService {
 	readonly #runtime: AskChatRuntime;
 	readonly #schedule: ChatTaskScheduler;
 	readonly #logger: ChatServiceLogger;
-	readonly #testProviderConnection: ProviderConnectionTester;
 	readonly #isRuntimeReady: () => boolean;
-	readonly #providerId = createUuidV7();
 	readonly #listeners = new Set<ChatEventListener>();
 	readonly #publicationQueue: ChatRunEvent[][] = [];
 	readonly #activeRuns = new Map<string, ActiveChatRun>();
@@ -213,27 +201,27 @@ export class ChatApplicationService {
 	readonly #deletingSessions = new Set<string>();
 	readonly #sessionDeletions = new Map<string, Promise<DeleteChatSessionOutput>>();
 	readonly #executions = new Set<Promise<void>>();
-	readonly #checkpointCleanupExecutions = new Set<Promise<unknown>>();
-	readonly #checkpointDeletionRetryBaseMs: number;
-	readonly #checkpointDeletionRetryMaxMs: number;
-	readonly #checkpointDeletionAttemptTimeoutMs: number;
-	readonly #checkpointDeletionMaxInFlightAttempts: number;
-	readonly #checkpointDeletionStartupTimeoutMs: number;
-	readonly #checkpointDeletionStartupMaxAttempts: number;
+	readonly #agentSessionCleanupExecutions = new Set<Promise<unknown>>();
+	readonly #agentSessionCleanupRetryBaseMs: number;
+	readonly #agentSessionCleanupRetryMaxMs: number;
+	readonly #agentSessionCleanupAttemptTimeoutMs: number;
+	readonly #agentSessionCleanupMaxInFlightAttempts: number;
+	readonly #agentSessionCleanupStartupTimeoutMs: number;
+	readonly #agentSessionCleanupStartupMaxAttempts: number;
 	readonly #shutdownTimeoutMs: number;
-	readonly #checkpointDeletionAttempts = new Map<
+	readonly #agentSessionCleanupAttempts = new Map<
 		string,
-		Promise<CheckpointDeletionAttemptOutcome>
+		Promise<AgentSessionCleanupAttemptOutcome>
 	>();
-	readonly #checkpointDeletionOperations = new Map<string, Promise<void>>();
+	readonly #agentSessionCleanupOperations = new Map<string, Promise<void>>();
 	readonly #shutdownController = new AbortController();
-	#checkpointRecoveryExecution: Promise<void> | undefined;
-	#checkpointWorkerExecution: Promise<void> | undefined;
-	#checkpointRetryWait:
+	#agentSessionRecoveryExecution: Promise<void> | undefined;
+	#agentSessionWorkerExecution: Promise<void> | undefined;
+	#agentSessionRetryWait:
 		| { timer: ReturnType<typeof setTimeout>; resolve: () => void; wakeable: boolean }
 		| undefined;
-	#checkpointRetryStatePersistenceFailureCount = 0;
-	#checkpointRetryStatePersistenceBackoffUntilMs = 0;
+	#agentSessionRetryStatePersistenceFailureCount = 0;
+	#agentSessionRetryStatePersistenceBackoffUntilMs = 0;
 	#shutdownExecution: Promise<void> | undefined;
 	#publishing = false;
 	#shuttingDown = false;
@@ -243,40 +231,40 @@ export class ChatApplicationService {
 		this.#sessions = options.sessions;
 		this.#runs = options.runs;
 		this.#providers = options.providers;
-		this.#fetchProviderModels = options.fetchProviderModels ?? fetchProviderModelCatalog;
+		this.#fetchProviderModels = options.fetchProviderModels ?? defaultProviderModelFetcher;
 		this.#runtime = options.runtime;
 		this.#schedule = options.schedule ?? ((task) => setTimeout(task, 0));
 		this.#logger = options.logger ?? console;
-		this.#testProviderConnection = options.testProviderConnection ?? testProviderConnection;
 		this.#isRuntimeReady = options.isRuntimeReady ?? (() => true);
-		this.#checkpointDeletionRetryBaseMs = requirePositiveSafeInteger(
-			options.checkpointDeletionRetryBaseMs ?? defaultCheckpointDeletionRetryBaseMs,
-			"checkpointDeletionRetryBaseMs",
+		this.#agentSessionCleanupRetryBaseMs = requirePositiveSafeInteger(
+			options.agentSessionCleanupRetryBaseMs ?? defaultAgentSessionCleanupRetryBaseMs,
+			"agentSessionCleanupRetryBaseMs",
 		);
-		this.#checkpointDeletionRetryMaxMs = requirePositiveSafeInteger(
-			options.checkpointDeletionRetryMaxMs ?? defaultCheckpointDeletionRetryMaxMs,
-			"checkpointDeletionRetryMaxMs",
+		this.#agentSessionCleanupRetryMaxMs = requirePositiveSafeInteger(
+			options.agentSessionCleanupRetryMaxMs ?? defaultAgentSessionCleanupRetryMaxMs,
+			"agentSessionCleanupRetryMaxMs",
 		);
-		if (this.#checkpointDeletionRetryMaxMs < this.#checkpointDeletionRetryBaseMs) {
+		if (this.#agentSessionCleanupRetryMaxMs < this.#agentSessionCleanupRetryBaseMs) {
 			throw new TypeError(
-				"checkpointDeletionRetryMaxMs must be greater than or equal to checkpointDeletionRetryBaseMs.",
+				"agentSessionCleanupRetryMaxMs must be greater than or equal to agentSessionCleanupRetryBaseMs.",
 			);
 		}
-		this.#checkpointDeletionAttemptTimeoutMs = requirePositiveSafeInteger(
-			options.checkpointDeletionAttemptTimeoutMs ?? defaultCheckpointDeletionAttemptTimeoutMs,
-			"checkpointDeletionAttemptTimeoutMs",
+		this.#agentSessionCleanupAttemptTimeoutMs = requirePositiveSafeInteger(
+			options.agentSessionCleanupAttemptTimeoutMs ?? defaultAgentSessionCleanupAttemptTimeoutMs,
+			"agentSessionCleanupAttemptTimeoutMs",
 		);
-		this.#checkpointDeletionMaxInFlightAttempts = requirePositiveSafeInteger(
-			options.checkpointDeletionMaxInFlightAttempts ?? defaultCheckpointDeletionMaxInFlightAttempts,
-			"checkpointDeletionMaxInFlightAttempts",
+		this.#agentSessionCleanupMaxInFlightAttempts = requirePositiveSafeInteger(
+			options.agentSessionCleanupMaxInFlightAttempts ??
+				defaultAgentSessionCleanupMaxInFlightAttempts,
+			"agentSessionCleanupMaxInFlightAttempts",
 		);
-		this.#checkpointDeletionStartupTimeoutMs = requirePositiveSafeInteger(
-			options.checkpointDeletionStartupTimeoutMs ?? defaultCheckpointDeletionStartupTimeoutMs,
-			"checkpointDeletionStartupTimeoutMs",
+		this.#agentSessionCleanupStartupTimeoutMs = requirePositiveSafeInteger(
+			options.agentSessionCleanupStartupTimeoutMs ?? defaultAgentSessionCleanupStartupTimeoutMs,
+			"agentSessionCleanupStartupTimeoutMs",
 		);
-		this.#checkpointDeletionStartupMaxAttempts = requirePositiveSafeInteger(
-			options.checkpointDeletionStartupMaxAttempts ?? defaultCheckpointDeletionStartupMaxAttempts,
-			"checkpointDeletionStartupMaxAttempts",
+		this.#agentSessionCleanupStartupMaxAttempts = requirePositiveSafeInteger(
+			options.agentSessionCleanupStartupMaxAttempts ?? defaultAgentSessionCleanupStartupMaxAttempts,
+			"agentSessionCleanupStartupMaxAttempts",
 		);
 		this.#shutdownTimeoutMs = requirePositiveSafeInteger(
 			options.shutdownTimeoutMs ?? defaultShutdownTimeoutMs,
@@ -293,48 +281,58 @@ export class ChatApplicationService {
 
 	listProviders(): ListProvidersOutput {
 		return listProvidersOutputSchema.parse({
-			schemaVersion: 1,
+			schemaVersion: 2,
 			providers: this.#providers.list().map(toProviderSummary),
 		});
 	}
 
-	createProvider(input: CreateProviderInput): ProviderMutationOutput {
+	async createProvider(input: CreateProviderInput): Promise<ProviderMutationOutput> {
 		const parsedInput = createProviderInputSchema.parse(input);
 		this.#assertProviderCanChange();
-		const record = this.#providers.create({
+		const record = await this.#providers.create({
 			displayName: parsedInput.displayName,
-			type: parsedInput.type,
+			api: parsedInput.api,
 			baseUrl: parsedInput.baseUrl,
-			apiKey: parsedInput.apiKey,
+			...(parsedInput.apiKey === undefined ? {} : { apiKey: parsedInput.apiKey }),
 			...(parsedInput.customHeaders === undefined
 				? {}
 				: { customHeaders: parsedInput.customHeaders }),
 		});
 
 		return providerMutationOutputSchema.parse({
-			schemaVersion: 1,
+			schemaVersion: 2,
 			provider: toProviderSummary(record),
 		});
 	}
 
-	updateProvider(input: UpdateProviderInput): ProviderMutationOutput {
+	async updateProvider(input: UpdateProviderInput): Promise<ProviderMutationOutput> {
 		const parsedInput = updateProviderInputSchema.parse(input);
 		this.#assertProviderCanChange();
-		const record = this.#providers.update(parsedInput);
+		const record = await this.#providers.update({
+			providerId: parsedInput.providerId,
+			...(parsedInput.displayName === undefined ? {} : { displayName: parsedInput.displayName }),
+			...(parsedInput.api === undefined ? {} : { api: parsedInput.api }),
+			...(parsedInput.baseUrl === undefined ? {} : { baseUrl: parsedInput.baseUrl }),
+			...(parsedInput.apiKey === undefined ? {} : { apiKey: parsedInput.apiKey }),
+			...(parsedInput.customHeaders === undefined
+				? {}
+				: { customHeaders: parsedInput.customHeaders }),
+			...(parsedInput.enabled === undefined ? {} : { enabled: parsedInput.enabled }),
+		});
 
 		return providerMutationOutputSchema.parse({
-			schemaVersion: 1,
+			schemaVersion: 2,
 			provider: toProviderSummary(record),
 		});
 	}
 
-	deleteProvider(input: DeleteProviderInput): DeleteProviderOutput {
+	async deleteProvider(input: DeleteProviderInput): Promise<DeleteProviderOutput> {
 		const parsedInput = deleteProviderInputSchema.parse(input);
 		this.#assertProviderCanChange();
-		this.#providers.delete(parsedInput.providerId);
+		await this.#providers.delete(parsedInput.providerId);
 
 		return deleteProviderOutputSchema.parse({
-			schemaVersion: 1,
+			schemaVersion: 2,
 			providerId: parsedInput.providerId,
 		});
 	}
@@ -344,15 +342,30 @@ export class ChatApplicationService {
 		const startedAt = Date.now();
 
 		try {
-			await this.#testProviderConnection(this.#resolveTestConfiguration(input));
+			const parsed = testProviderInputSchema.parse(input);
+			if (parsed.providerId === undefined) {
+				throw new AskChatRuntimeError({
+					kind: "not_configured",
+					message: "Save the custom Provider before testing it.",
+					retryable: false,
+				});
+			}
+			const provider = this.#requireProvider(parsed.providerId);
+			if (!provider.credential.configured) {
+				throw new AskChatRuntimeError({
+					kind: "not_configured",
+					message: "Provider credentials are not configured.",
+					retryable: false,
+				});
+			}
 			return testProviderOutputSchema.parse({
-				schemaVersion: 1,
+				schemaVersion: 2,
 				ok: true,
 				latencyMs: Date.now() - startedAt,
 			});
 		} catch (error) {
 			return testProviderOutputSchema.parse({
-				schemaVersion: 1,
+				schemaVersion: 2,
 				ok: false,
 				latencyMs: Date.now() - startedAt,
 				error: toAppError(error, "provider-connection-test"),
@@ -364,20 +377,19 @@ export class ChatApplicationService {
 		const parsedInput = fetchProviderModelsInputSchema.parse(input);
 		this.#assertDataPlaneAvailable();
 		const record = this.#requireProvider(parsedInput.providerId);
-		const models = await this.#fetchProviderModels({
-			type: record.type,
-			baseUrl: record.baseUrl,
-			apiKey: record.apiKey,
-			...(record.customHeaders === undefined ? {} : { customHeaders: record.customHeaders }),
-		});
-		const updated = this.#providers.setModels(
-			record.id,
-			models.map((model) => ({ ...model })),
-			new Date().toISOString(),
-		);
+		const updated =
+			this.#fetchProviderModels === defaultProviderModelFetcher
+				? await this.#providers.refreshModels(record.id)
+				: record.source === "custom"
+					? await this.#providers.setModels(
+							record.id,
+							(await this.#fetchProviderModels(record.id)).map((model) => ({ ...model })),
+							new Date().toISOString(),
+						)
+					: record;
 
 		return fetchProviderModelsOutputSchema.parse({
-			schemaVersion: 1,
+			schemaVersion: 2,
 			provider: toProviderSummary(updated),
 		});
 	}
@@ -391,7 +403,7 @@ export class ChatApplicationService {
 		);
 
 		return setProviderModelsEnabledOutputSchema.parse({
-			schemaVersion: 1,
+			schemaVersion: 2,
 			provider: toProviderSummary(updated),
 		});
 	}
@@ -409,16 +421,15 @@ export class ChatApplicationService {
 				models.push({
 					providerId: record.id,
 					providerDisplayName: record.displayName,
-					providerType: record.type,
+					providerSource: record.source,
 					model: { ...model },
-					reasoning: resolveReasoningCapability(record.type, model),
 				});
 			}
 		}
 		const defaultModel = this.#providers.getDefaultModel();
 
 		return listAvailableModelsOutputSchema.parse({
-			schemaVersion: 1,
+			schemaVersion: 2,
 			models,
 			...(defaultModel === null ? {} : { defaultModel }),
 		});
@@ -427,7 +438,7 @@ export class ChatApplicationService {
 	getDefaultModel(): GetDefaultModelOutput {
 		const defaultModel = this.#providers.getDefaultModel();
 		return getDefaultModelOutputSchema.parse({
-			schemaVersion: 1,
+			schemaVersion: 2,
 			...(defaultModel === null ? {} : { defaultModel }),
 		});
 	}
@@ -440,7 +451,7 @@ export class ChatApplicationService {
 		const stored = this.#providers.setDefaultModel(selection);
 
 		return setDefaultModelOutputSchema.parse({
-			schemaVersion: 1,
+			schemaVersion: 2,
 			...(stored === null ? {} : { defaultModel: stored }),
 		});
 	}
@@ -517,15 +528,15 @@ export class ChatApplicationService {
 		}
 		const result = Promise.resolve({ sessionId: deleted.sessionId });
 		this.#sessionDeletions.set(parsedInput.sessionId, result);
-		const cleanup = this.#attemptCheckpointDeletion(parsedInput.sessionId, 0);
-		this.#checkpointCleanupExecutions.add(cleanup);
+		const cleanup = this.#attemptAgentSessionCleanup(parsedInput.sessionId, 0);
+		this.#agentSessionCleanupExecutions.add(cleanup);
 		const finishCleanup = (): void => {
-			this.#checkpointCleanupExecutions.delete(cleanup);
+			this.#agentSessionCleanupExecutions.delete(cleanup);
 			this.#deletingSessions.delete(parsedInput.sessionId);
 			if (this.#sessionDeletions.get(parsedInput.sessionId) === result) {
 				this.#sessionDeletions.delete(parsedInput.sessionId);
 			}
-			this.#ensureCheckpointDeletionWorker();
+			this.#ensureAgentSessionCleanupWorker();
 		};
 		void cleanup.then(finishCleanup, finishCleanup);
 		return result;
@@ -663,19 +674,12 @@ export class ChatApplicationService {
 					schemaVersion: 1,
 					providerId: provider.providerId,
 					name: provider.providerName,
-					type: provider.type,
-					baseUrl: provider.baseUrl,
+					source: provider.source,
+					api: provider.api,
 					model: provider.model,
-					apiKey: provider.apiKey,
-					...(provider.customHeaders === undefined
+					...(provider.thinkingLevel === undefined
 						? {}
-						: { customHeaders: provider.customHeaders }),
-					...(provider.reasoning?.effort === undefined
-						? {}
-						: { reasoningEffort: provider.reasoning.effort }),
-					...(provider.reasoning?.budgetTokens === undefined
-						? {}
-						: { reasoningBudgetTokens: provider.reasoning.budgetTokens }),
+						: { thinkingLevel: provider.thinkingLevel }),
 				},
 				userMessageId,
 				userContent: input.content,
@@ -684,6 +688,7 @@ export class ChatApplicationService {
 			const activeRun: ActiveChatRun = {
 				runId: created.run.id,
 				sessionId: input.sessionId,
+				agentSessionId: currentSession.agentSessionId,
 				assistantMessageId,
 				messages: [{ role: "user", content: input.content, id: userMessageId }],
 				durableAssistantContent: "",
@@ -868,18 +873,18 @@ export class ChatApplicationService {
 		});
 	}
 
-	async retryPendingCheckpointDeletions(
+	async retryPendingAgentSessionCleanups(
 		options: { limit?: number; includeDeferred?: boolean } = {},
-	): Promise<CheckpointDeletionRetryResult> {
-		const limit = options.limit ?? checkpointDeletionStartupBatchSize;
-		const jobs = this.#listEligibleCheckpointDeletionJobs(limit, options.includeDeferred ?? false);
+	): Promise<AgentSessionCleanupRetryResult> {
+		const limit = options.limit ?? agentSessionCleanupStartupBatchSize;
+		const jobs = this.#listEligibleAgentSessionCleanupJobs(limit, options.includeDeferred ?? false);
 		let succeeded = 0;
 		let failed = 0;
 		for (const job of jobs) {
 			if (this.#shuttingDown) {
 				break;
 			}
-			const outcome = await this.#attemptCheckpointDeletion(job.sessionId, job.attemptCount);
+			const outcome = await this.#attemptAgentSessionCleanup(job.sessionId, job.attemptCount);
 			if (outcome === "succeeded") {
 				succeeded += 1;
 			} else if (outcome !== "ineligible") {
@@ -889,33 +894,33 @@ export class ChatApplicationService {
 				break;
 			}
 		}
-		const remaining = this.#runs.listPendingCheckpointDeletions(
-			checkpointDeletionStartupBatchSize,
+		const remaining = this.#runs.listPendingAgentSessionCleanups(
+			agentSessionCleanupStartupBatchSize,
 			true,
 		).length;
 		const result = { attempted: succeeded + failed, succeeded, failed, remaining };
 		if (remaining > 0) {
-			this.#ensureCheckpointDeletionWorker();
+			this.#ensureAgentSessionCleanupWorker();
 		}
 		this.#logger.info?.(
-			`Checkpoint deletion recovery attempted ${result.attempted} job(s): ${succeeded} succeeded, ${failed} failed, at least ${remaining} remain.`,
+			`Agent session cleanup recovery attempted ${result.attempted} job(s): ${succeeded} succeeded, ${failed} failed, at least ${remaining} remain.`,
 		);
 		return result;
 	}
 
-	drainPendingCheckpointDeletions(options: { batchSize?: number } = {}): Promise<void> {
-		if (this.#checkpointRecoveryExecution !== undefined) {
-			return this.#checkpointRecoveryExecution;
+	drainPendingAgentSessionCleanups(options: { batchSize?: number } = {}): Promise<void> {
+		if (this.#agentSessionRecoveryExecution !== undefined) {
+			return this.#agentSessionRecoveryExecution;
 		}
-		const batchSize = options.batchSize ?? checkpointDeletionStartupBatchSize;
-		const execution = this.#runInitialCheckpointDeletionSweep(batchSize);
-		this.#checkpointRecoveryExecution = execution;
-		this.#checkpointCleanupExecutions.add(execution);
+		const batchSize = options.batchSize ?? agentSessionCleanupStartupBatchSize;
+		const execution = this.#runInitialAgentSessionCleanupSweep(batchSize);
+		this.#agentSessionRecoveryExecution = execution;
+		this.#agentSessionCleanupExecutions.add(execution);
 		const cleanup = (): void => {
-			if (this.#checkpointRecoveryExecution === execution) {
-				this.#checkpointRecoveryExecution = undefined;
+			if (this.#agentSessionRecoveryExecution === execution) {
+				this.#agentSessionRecoveryExecution = undefined;
 			}
-			this.#checkpointCleanupExecutions.delete(execution);
+			this.#agentSessionCleanupExecutions.delete(execution);
 		};
 		void execution.then(cleanup, cleanup);
 		return execution;
@@ -941,7 +946,7 @@ export class ChatApplicationService {
 	async #performShutdown(): Promise<void> {
 		this.#shuttingDown = true;
 		this.#shutdownController.abort();
-		this.#wakeCheckpointRetry(true);
+		this.#wakeAgentSessionCleanupRetry(true);
 		for (const runId of [...this.#activeRuns.keys()]) {
 			try {
 				this.cancel({
@@ -953,9 +958,9 @@ export class ChatApplicationService {
 			}
 		}
 
-		const checkpointCleanup = Promise.allSettled([...this.#checkpointCleanupExecutions]);
+		const agentSessionCleanup = Promise.allSettled([...this.#agentSessionCleanupExecutions]);
 		const runtimeShutdown = Promise.resolve().then(() => this.#runtime.shutdown());
-		const shutdown = Promise.allSettled([checkpointCleanup, runtimeShutdown]).then((results) => {
+		const shutdown = Promise.allSettled([agentSessionCleanup, runtimeShutdown]).then((results) => {
 			const runtimeResult = results[1];
 			if (runtimeResult?.status === "rejected") {
 				this.#logger.error("Chat runtime shutdown failed.", runtimeResult.reason);
@@ -969,18 +974,18 @@ export class ChatApplicationService {
 		}
 	}
 
-	async #runInitialCheckpointDeletionSweep(batchSize: number): Promise<void> {
-		const jobs = this.#listEligibleCheckpointDeletionJobs(batchSize, true).slice(
+	async #runInitialAgentSessionCleanupSweep(batchSize: number): Promise<void> {
+		const jobs = this.#listEligibleAgentSessionCleanupJobs(batchSize, true).slice(
 			0,
-			this.#checkpointDeletionStartupMaxAttempts,
+			this.#agentSessionCleanupStartupMaxAttempts,
 		);
-		const deadline = Date.now() + this.#checkpointDeletionStartupTimeoutMs;
+		const deadline = Date.now() + this.#agentSessionCleanupStartupTimeoutMs;
 		for (const job of jobs) {
 			if (this.#shuttingDown) {
 				return;
 			}
-			const attempt = this.#getOrStartCheckpointDeletion(job.sessionId, job.attemptCount);
-			const outcome = await this.#waitForCheckpointAttempt(attempt, deadline);
+			const attempt = this.#getOrStartAgentSessionCleanup(job.sessionId, job.attemptCount);
+			const outcome = await this.#waitForAgentSessionCleanupAttempt(attempt, deadline);
 			if (
 				outcome === undefined ||
 				outcome === "retry-state-persistence-failed" ||
@@ -989,51 +994,51 @@ export class ChatApplicationService {
 				break;
 			}
 		}
-		this.#ensureCheckpointDeletionWorker();
+		this.#ensureAgentSessionCleanupWorker();
 	}
 
-	async #attemptCheckpointDeletion(
+	async #attemptAgentSessionCleanup(
 		sessionId: string,
 		attemptCount: number,
-	): Promise<CheckpointDeletionAttemptOutcome> {
-		return this.#getOrStartCheckpointDeletion(sessionId, attemptCount);
+	): Promise<AgentSessionCleanupAttemptOutcome> {
+		return this.#getOrStartAgentSessionCleanup(sessionId, attemptCount);
 	}
 
-	#getOrStartCheckpointDeletion(
+	#getOrStartAgentSessionCleanup(
 		sessionId: string,
 		attemptCount: number,
-	): Promise<CheckpointDeletionAttemptOutcome> {
-		const existing = this.#checkpointDeletionAttempts.get(sessionId);
+	): Promise<AgentSessionCleanupAttemptOutcome> {
+		const existing = this.#agentSessionCleanupAttempts.get(sessionId);
 		if (existing !== undefined) {
 			return existing;
 		}
-		if (this.#checkpointDeletionOperations.has(sessionId)) {
+		if (this.#agentSessionCleanupOperations.has(sessionId)) {
 			return Promise.resolve("ineligible");
 		}
-		const execution = this.#performCheckpointDeletion(sessionId, attemptCount);
-		this.#checkpointDeletionAttempts.set(sessionId, execution);
+		const execution = this.#performAgentSessionCleanup(sessionId, attemptCount);
+		this.#agentSessionCleanupAttempts.set(sessionId, execution);
 		const cleanup = (): void => {
-			if (this.#checkpointDeletionAttempts.get(sessionId) === execution) {
-				this.#checkpointDeletionAttempts.delete(sessionId);
+			if (this.#agentSessionCleanupAttempts.get(sessionId) === execution) {
+				this.#agentSessionCleanupAttempts.delete(sessionId);
 			}
-			this.#wakeCheckpointRetry();
+			this.#wakeAgentSessionCleanupRetry();
 		};
 		void execution.then(cleanup, cleanup);
 		return execution;
 	}
 
-	async #performCheckpointDeletion(
+	async #performAgentSessionCleanup(
 		sessionId: string,
 		attemptCount: number,
-	): Promise<CheckpointDeletionAttemptOutcome> {
-		if (this.#checkpointDeletionOperations.has(sessionId)) {
+	): Promise<AgentSessionCleanupAttemptOutcome> {
+		if (this.#agentSessionCleanupOperations.has(sessionId)) {
 			return "ineligible";
 		}
-		if (this.#checkpointDeletionOperations.size >= this.#checkpointDeletionMaxInFlightAttempts) {
-			return this.#recordCheckpointDeletionFailure(
+		if (this.#agentSessionCleanupOperations.size >= this.#agentSessionCleanupMaxInFlightAttempts) {
+			return this.#recordAgentSessionCleanupFailure(
 				sessionId,
 				attemptCount,
-				new Error("Checkpoint deletion attempt capacity is temporarily exhausted."),
+				new Error("Agent session cleanup attempt capacity is temporarily exhausted."),
 			);
 		}
 
@@ -1044,38 +1049,38 @@ export class ChatApplicationService {
 		} catch (error) {
 			operation = Promise.reject(error);
 		}
-		this.#checkpointDeletionOperations.set(sessionId, operation);
+		this.#agentSessionCleanupOperations.set(sessionId, operation);
 		const releaseOperation = (): void => {
-			if (this.#checkpointDeletionOperations.get(sessionId) === operation) {
-				this.#checkpointDeletionOperations.delete(sessionId);
+			if (this.#agentSessionCleanupOperations.get(sessionId) === operation) {
+				this.#agentSessionCleanupOperations.delete(sessionId);
 			}
-			this.#wakeCheckpointRetry();
+			this.#wakeAgentSessionCleanupRetry();
 		};
 		void operation.then(releaseOperation, releaseOperation);
 
 		try {
-			await this.#waitForCheckpointDeletionOperation(operation, controller);
+			await this.#waitForAgentSessionCleanupOperation(operation, controller);
 			if (this.#shuttingDown) {
 				return "stopped";
 			}
-			this.#runs.ackCheckpointDeletion(sessionId);
-			this.#clearCheckpointRetryStatePersistenceBackoff();
+			this.#runs.ackAgentSessionCleanup(sessionId);
+			this.#clearAgentSessionCleanupRetryStatePersistenceBackoff();
 			return "succeeded";
 		} catch (error) {
-			if (this.#shuttingDown || error instanceof CheckpointDeletionShutdownError) {
+			if (this.#shuttingDown || error instanceof AgentSessionCleanupShutdownError) {
 				return "stopped";
 			}
-			return this.#recordCheckpointDeletionFailure(sessionId, attemptCount, error);
+			return this.#recordAgentSessionCleanupFailure(sessionId, attemptCount, error);
 		}
 	}
 
-	#waitForCheckpointDeletionOperation(
+	#waitForAgentSessionCleanupOperation(
 		operation: Promise<void>,
 		controller: AbortController,
 	): Promise<void> {
 		if (this.#shuttingDown) {
-			controller.abort(new CheckpointDeletionShutdownError());
-			return Promise.reject(new CheckpointDeletionShutdownError());
+			controller.abort(new AgentSessionCleanupShutdownError());
+			return Promise.reject(new AgentSessionCleanupShutdownError());
 		}
 		return new Promise<void>((resolve, reject) => {
 			let settled = false;
@@ -1093,17 +1098,17 @@ export class ChatApplicationService {
 				}
 			};
 			const onShutdown = (): void => {
-				const error = new CheckpointDeletionShutdownError();
+				const error = new AgentSessionCleanupShutdownError();
 				controller.abort(error);
 				finish(error);
 			};
 			const timer = setTimeout(() => {
 				const error = new Error(
-					`Checkpoint deletion attempt exceeded ${this.#checkpointDeletionAttemptTimeoutMs}ms.`,
+					`Agent session cleanup attempt exceeded ${this.#agentSessionCleanupAttemptTimeoutMs}ms.`,
 				);
 				controller.abort(error);
 				finish(error);
-			}, this.#checkpointDeletionAttemptTimeoutMs);
+			}, this.#agentSessionCleanupAttemptTimeoutMs);
 			this.#shutdownController.signal.addEventListener("abort", onShutdown, { once: true });
 			void operation.then(
 				() => finish(),
@@ -1115,108 +1120,108 @@ export class ChatApplicationService {
 		});
 	}
 
-	#recordCheckpointDeletionFailure(
+	#recordAgentSessionCleanupFailure(
 		sessionId: string,
 		attemptCount: number,
 		error: unknown,
-	): Exclude<CheckpointDeletionAttemptOutcome, "succeeded"> {
+	): Exclude<AgentSessionCleanupAttemptOutcome, "succeeded"> {
 		if (this.#shuttingDown) {
 			return "stopped";
 		}
 		const backoffMs = Math.min(
-			this.#checkpointDeletionRetryMaxMs,
-			this.#checkpointDeletionRetryBaseMs * 2 ** Math.min(attemptCount, 16),
+			this.#agentSessionCleanupRetryMaxMs,
+			this.#agentSessionCleanupRetryBaseMs * 2 ** Math.min(attemptCount, 16),
 		);
 		try {
 			const nowMs = this.#runs.getReplayCursorSupport().serverTimeMs;
-			this.#runs.recordCheckpointDeletionFailure(
+			this.#runs.recordAgentSessionCleanupFailure(
 				sessionId,
 				error instanceof Error ? error.message : String(error),
 				nowMs + backoffMs,
 			);
-			this.#clearCheckpointRetryStatePersistenceBackoff();
+			this.#clearAgentSessionCleanupRetryStatePersistenceBackoff();
 		} catch (recordError) {
-			const persistenceBackoffMs = this.#setCheckpointRetryStatePersistenceBackoff();
+			const persistenceBackoffMs = this.#setAgentSessionCleanupRetryStatePersistenceBackoff();
 			this.#logger.error(
-				`Failed to record checkpoint cleanup retry for deleted Session ${sessionId}; pausing cleanup retries for ${persistenceBackoffMs}ms.`,
+				`Failed to record agent session cleanup retry for deleted Session ${sessionId}; pausing cleanup retries for ${persistenceBackoffMs}ms.`,
 				recordError,
 			);
 			return "retry-state-persistence-failed";
 		}
-		this.#logger.error(`Checkpoint cleanup failed for deleted Session ${sessionId}.`, error);
+		this.#logger.error(`Agent session cleanup failed for deleted Session ${sessionId}.`, error);
 		return "failed";
 	}
 
-	#setCheckpointRetryStatePersistenceBackoff(): number {
-		this.#checkpointRetryStatePersistenceFailureCount += 1;
+	#setAgentSessionCleanupRetryStatePersistenceBackoff(): number {
+		this.#agentSessionRetryStatePersistenceFailureCount += 1;
 		const backoffMs = Math.min(
-			this.#checkpointDeletionRetryMaxMs,
-			this.#checkpointDeletionRetryBaseMs *
-				2 ** Math.min(this.#checkpointRetryStatePersistenceFailureCount - 1, 16),
+			this.#agentSessionCleanupRetryMaxMs,
+			this.#agentSessionCleanupRetryBaseMs *
+				2 ** Math.min(this.#agentSessionRetryStatePersistenceFailureCount - 1, 16),
 		);
-		this.#checkpointRetryStatePersistenceBackoffUntilMs = Math.max(
-			this.#checkpointRetryStatePersistenceBackoffUntilMs,
+		this.#agentSessionRetryStatePersistenceBackoffUntilMs = Math.max(
+			this.#agentSessionRetryStatePersistenceBackoffUntilMs,
 			Date.now() + backoffMs,
 		);
 		return backoffMs;
 	}
 
-	#clearCheckpointRetryStatePersistenceBackoff(): void {
+	#clearAgentSessionCleanupRetryStatePersistenceBackoff(): void {
 		if (
-			this.#checkpointRetryStatePersistenceFailureCount === 0 &&
-			this.#checkpointRetryStatePersistenceBackoffUntilMs === 0
+			this.#agentSessionRetryStatePersistenceFailureCount === 0 &&
+			this.#agentSessionRetryStatePersistenceBackoffUntilMs === 0
 		) {
 			return;
 		}
-		this.#checkpointRetryStatePersistenceFailureCount = 0;
-		this.#checkpointRetryStatePersistenceBackoffUntilMs = 0;
-		this.#wakeCheckpointRetry(true);
+		this.#agentSessionRetryStatePersistenceFailureCount = 0;
+		this.#agentSessionRetryStatePersistenceBackoffUntilMs = 0;
+		this.#wakeAgentSessionCleanupRetry(true);
 	}
 
-	#ensureCheckpointDeletionWorker(): void {
-		if (this.#shuttingDown || this.#checkpointWorkerExecution !== undefined) {
+	#ensureAgentSessionCleanupWorker(): void {
+		if (this.#shuttingDown || this.#agentSessionWorkerExecution !== undefined) {
 			return;
 		}
 		if (
-			this.#checkpointRetryStatePersistenceBackoffUntilMs <= Date.now() &&
-			this.#runs.listPendingCheckpointDeletions(1, true).length === 0
+			this.#agentSessionRetryStatePersistenceBackoffUntilMs <= Date.now() &&
+			this.#runs.listPendingAgentSessionCleanups(1, true).length === 0
 		) {
 			return;
 		}
-		const execution = this.#runCheckpointDeletionWorker();
-		this.#checkpointWorkerExecution = execution;
-		this.#checkpointCleanupExecutions.add(execution);
+		const execution = this.#runAgentSessionCleanupWorker();
+		this.#agentSessionWorkerExecution = execution;
+		this.#agentSessionCleanupExecutions.add(execution);
 		const cleanup = (): void => {
-			if (this.#checkpointWorkerExecution === execution) {
-				this.#checkpointWorkerExecution = undefined;
+			if (this.#agentSessionWorkerExecution === execution) {
+				this.#agentSessionWorkerExecution = undefined;
 			}
-			this.#checkpointCleanupExecutions.delete(execution);
+			this.#agentSessionCleanupExecutions.delete(execution);
 		};
 		void execution.then(cleanup, cleanup);
 	}
 
-	async #runCheckpointDeletionWorker(): Promise<void> {
+	async #runAgentSessionCleanupWorker(): Promise<void> {
 		while (!this.#shuttingDown) {
-			await this.#waitForCheckpointRetryStatePersistenceBackoff();
+			await this.#waitForAgentSessionCleanupRetryStatePersistenceBackoff();
 			if (this.#shuttingDown) {
 				return;
 			}
-			const dueJobs = this.#runs.listPendingCheckpointDeletions(
-				checkpointDeletionStartupBatchSize,
+			const dueJobs = this.#runs.listPendingAgentSessionCleanups(
+				agentSessionCleanupStartupBatchSize,
 				false,
 			);
 			const jobs = dueJobs.filter(
 				(job) =>
-					!this.#checkpointDeletionOperations.has(job.sessionId) &&
-					!this.#checkpointDeletionAttempts.has(job.sessionId),
+					!this.#agentSessionCleanupOperations.has(job.sessionId) &&
+					!this.#agentSessionCleanupAttempts.has(job.sessionId),
 			);
 			if (jobs.length > 0) {
 				for (const job of jobs) {
 					if (this.#shuttingDown) {
 						return;
 					}
-					const attempt = this.#getOrStartCheckpointDeletion(job.sessionId, job.attemptCount);
-					const outcome = await this.#waitForCheckpointAttempt(attempt);
+					const attempt = this.#getOrStartAgentSessionCleanup(job.sessionId, job.attemptCount);
+					const outcome = await this.#waitForAgentSessionCleanupAttempt(attempt);
 					if (outcome === undefined || outcome === "stopped") {
 						return;
 					}
@@ -1227,51 +1232,51 @@ export class ChatApplicationService {
 				continue;
 			}
 			if (dueJobs.length > 0) {
-				await this.#waitForCheckpointRetry(this.#checkpointDeletionRetryMaxMs);
+				await this.#waitForAgentSessionCleanupRetry(this.#agentSessionCleanupRetryMaxMs);
 				continue;
 			}
-			const next = this.#runs.listPendingCheckpointDeletions(1, true)[0];
+			const next = this.#runs.listPendingAgentSessionCleanups(1, true)[0];
 			if (next === undefined) {
 				return;
 			}
 			const nowMs = this.#runs.getReplayCursorSupport().serverTimeMs;
-			await this.#waitForCheckpointRetry(Math.max(1, next.nextAttemptAtMs - nowMs));
+			await this.#waitForAgentSessionCleanupRetry(Math.max(1, next.nextAttemptAtMs - nowMs));
 		}
 	}
 
-	#listEligibleCheckpointDeletionJobs(
+	#listEligibleAgentSessionCleanupJobs(
 		limit: number,
 		includeDeferred: boolean,
-	): ReturnType<RunJournalRepository["listPendingCheckpointDeletions"]> {
-		if (!Number.isSafeInteger(limit) || limit < 1 || limit > maxCheckpointDeletionBatchSize) {
+	): ReturnType<RunJournalRepository["listPendingAgentSessionCleanups"]> {
+		if (!Number.isSafeInteger(limit) || limit < 1 || limit > maxAgentSessionCleanupBatchSize) {
 			throw new Error(
-				`Checkpoint deletion batch limit must be between 1 and ${maxCheckpointDeletionBatchSize}.`,
+				`Agent session cleanup batch limit must be between 1 and ${maxAgentSessionCleanupBatchSize}.`,
 			);
 		}
 		return this.#runs
-			.listPendingCheckpointDeletions(maxCheckpointDeletionBatchSize, includeDeferred)
+			.listPendingAgentSessionCleanups(maxAgentSessionCleanupBatchSize, includeDeferred)
 			.filter(
 				(job) =>
-					!this.#checkpointDeletionOperations.has(job.sessionId) &&
-					!this.#checkpointDeletionAttempts.has(job.sessionId),
+					!this.#agentSessionCleanupOperations.has(job.sessionId) &&
+					!this.#agentSessionCleanupAttempts.has(job.sessionId),
 			)
 			.slice(0, limit);
 	}
 
-	async #waitForCheckpointRetryStatePersistenceBackoff(): Promise<void> {
+	async #waitForAgentSessionCleanupRetryStatePersistenceBackoff(): Promise<void> {
 		while (!this.#shuttingDown) {
-			const delayMs = this.#checkpointRetryStatePersistenceBackoffUntilMs - Date.now();
+			const delayMs = this.#agentSessionRetryStatePersistenceBackoffUntilMs - Date.now();
 			if (delayMs <= 0) {
 				return;
 			}
-			await this.#waitForCheckpointRetry(delayMs, false);
+			await this.#waitForAgentSessionCleanupRetry(delayMs, false);
 		}
 	}
 
-	#waitForCheckpointAttempt(
-		execution: Promise<CheckpointDeletionAttemptOutcome>,
+	#waitForAgentSessionCleanupAttempt(
+		execution: Promise<AgentSessionCleanupAttemptOutcome>,
 		deadline?: number,
-	): Promise<CheckpointDeletionAttemptOutcome | undefined> {
+	): Promise<AgentSessionCleanupAttemptOutcome | undefined> {
 		if (this.#shuttingDown) {
 			return Promise.resolve(undefined);
 		}
@@ -1282,10 +1287,10 @@ export class ChatApplicationService {
 		if (timeoutMs === 0) {
 			return Promise.resolve(undefined);
 		}
-		return new Promise<CheckpointDeletionAttemptOutcome | undefined>((resolve) => {
+		return new Promise<AgentSessionCleanupAttemptOutcome | undefined>((resolve) => {
 			let settled = false;
 			let timer: ReturnType<typeof setTimeout> | undefined;
-			const finish = (outcome: CheckpointDeletionAttemptOutcome | undefined): void => {
+			const finish = (outcome: AgentSessionCleanupAttemptOutcome | undefined): void => {
 				if (settled) {
 					return;
 				}
@@ -1308,24 +1313,24 @@ export class ChatApplicationService {
 		});
 	}
 
-	#waitForCheckpointRetry(delayMs: number, wakeable = true): Promise<void> {
+	#waitForAgentSessionCleanupRetry(delayMs: number, wakeable = true): Promise<void> {
 		if (this.#shuttingDown) {
 			return Promise.resolve();
 		}
 		return new Promise<void>((resolve) => {
 			const finish = (): void => {
-				if (this.#checkpointRetryWait?.resolve === finish) {
-					this.#checkpointRetryWait = undefined;
+				if (this.#agentSessionRetryWait?.resolve === finish) {
+					this.#agentSessionRetryWait = undefined;
 				}
 				resolve();
 			};
 			const timer = setTimeout(finish, Math.min(delayMs, 2_147_483_647));
-			this.#checkpointRetryWait = { timer, resolve: finish, wakeable };
+			this.#agentSessionRetryWait = { timer, resolve: finish, wakeable };
 		});
 	}
 
-	#wakeCheckpointRetry(force = false): void {
-		const wait = this.#checkpointRetryWait;
+	#wakeAgentSessionCleanupRetry(force = false): void {
+		const wait = this.#agentSessionRetryWait;
 		if (wait === undefined || (!force && !wait.wakeable)) {
 			return;
 		}
@@ -1356,7 +1361,7 @@ export class ChatApplicationService {
 
 			const result = await this.#runtime.run({
 				runId: activeRun.runId,
-				threadId: activeRun.sessionId,
+				threadId: activeRun.agentSessionId,
 				provider: activeRun.provider,
 				messages: activeRun.messages,
 				signal: activeRun.abortController.signal,
@@ -1907,29 +1912,28 @@ export class ChatApplicationService {
 	#requireProviderModel(providerId: string, modelId: string): ProviderModel {
 		const record = this.#requireProvider(providerId);
 		const model = record.models.find((candidate) => candidate.id === modelId);
-		if (model === undefined) {
+		if (!record.enabled || model === undefined || !model.enabled) {
 			throw new ProviderModelNotFoundError(providerId, modelId);
 		}
 		return model;
 	}
 
-	/** Rebuilds the selection, dropping any reasoning setting the model no longer advertises. */
 	#normalizeSelection(selection: {
 		providerId: string;
 		modelId: string;
-		reasoning?: { effort?: string | undefined; budgetTokens?: number | undefined } | undefined;
+		thinkingLevel?: DefaultModelSelection["thinkingLevel"];
 	}): DefaultModelSelection {
-		const record = this.#requireProvider(selection.providerId);
 		const model = this.#requireProviderModel(selection.providerId, selection.modelId);
-		const reasoning = normalizeReasoningSelection(
-			resolveReasoningCapability(record.type, model),
-			selection.reasoning,
-		);
-
+		if (
+			selection.thinkingLevel !== undefined &&
+			!model.thinkingLevels.includes(selection.thinkingLevel)
+		) {
+			throw new TypeError("The selected thinking level is not supported by this model.");
+		}
 		return {
 			providerId: selection.providerId,
 			modelId: selection.modelId,
-			...(reasoning === undefined ? {} : { reasoning }),
+			...(selection.thinkingLevel === undefined ? {} : { thinkingLevel: selection.thinkingLevel }),
 		};
 	}
 
@@ -1952,74 +1956,22 @@ export class ChatApplicationService {
 			if (model === undefined || !model.enabled) {
 				continue;
 			}
-			const reasoning = normalizeReasoningSelection(
-				resolveReasoningCapability(record.type, model),
-				candidate.reasoning,
-			);
-
 			return {
 				providerId: record.id,
 				providerName: record.displayName,
-				type: record.type,
-				protocol: resolveModelProtocol(record.type, model),
-				baseUrl: record.baseUrl,
-				apiKey: record.apiKey,
-				...(record.customHeaders === undefined ? {} : { customHeaders: record.customHeaders }),
+				source: record.source,
+				api: model.api,
 				model: model.id,
-				...(model.maxOutputTokens === undefined ? {} : { maxOutputTokens: model.maxOutputTokens }),
-				...(reasoning === undefined ? {} : { reasoning }),
+				...(candidate.thinkingLevel === undefined ||
+				!model.thinkingLevels.includes(candidate.thinkingLevel)
+					? {}
+					: { thinkingLevel: candidate.thinkingLevel }),
 			};
 		}
 
 		throw new AskChatRuntimeError({
 			kind: "not_configured",
 			message: "No Provider and model are selected for this chat.",
-			retryable: false,
-		});
-	}
-
-	#resolveTestConfiguration(input: TestProviderInput): ResolvedProviderConfiguration {
-		const parsedInput = testProviderInputSchema.parse(input);
-		if (parsedInput.providerId !== undefined) {
-			const record = this.#requireProvider(parsedInput.providerId);
-			return {
-				providerId: record.id,
-				providerName: record.displayName,
-				type: record.type,
-				protocol: resolveModelProtocol(record.type),
-				baseUrl: record.baseUrl,
-				apiKey: record.apiKey,
-				...(record.customHeaders === undefined ? {} : { customHeaders: record.customHeaders }),
-				model: record.models.find((model) => model.enabled)?.id ?? "",
-			};
-		}
-
-		const draft = parsedInput.draft ?? fail("Provider test input lost its draft.");
-		const apiKey = draft.apiKey ?? this.#resolveDraftApiKey(draft.baseUrl);
-
-		return {
-			providerId: this.#providerId,
-			providerName: draft.displayName,
-			type: draft.type,
-			protocol: resolveModelProtocol(draft.type),
-			baseUrl: draft.baseUrl,
-			apiKey,
-			...(draft.customHeaders === undefined ? {} : { customHeaders: draft.customHeaders }),
-			model: "",
-		};
-	}
-
-	/** Reuses a stored key only for the same origin so keys never cross Provider hosts. */
-	#resolveDraftApiKey(baseUrl: string): string {
-		for (const record of this.#providers.list()) {
-			if (haveSameOrigin(record.baseUrl, baseUrl)) {
-				return record.apiKey;
-			}
-		}
-
-		throw new AskChatRuntimeError({
-			kind: "not_configured",
-			message: "A new API key is required to test a Provider on a different Endpoint origin.",
 			retryable: false,
 		});
 	}
@@ -2148,14 +2100,6 @@ export class ChatApplicationService {
 	}
 }
 
-function haveSameOrigin(left: string, right: string): boolean {
-	try {
-		return new URL(left).origin === new URL(right).origin;
-	} catch {
-		return false;
-	}
-}
-
 function createSessionTitle(content: string): string {
 	const normalized = content.trim().replace(/\s+/g, " ");
 	return normalized.length <= 60 ? normalized : `${normalized.slice(0, 57)}...`;
@@ -2203,68 +2147,6 @@ function createAssistantMessage(
 		updatedAt: run.updatedAt,
 		...(error === undefined ? {} : { error }),
 	});
-}
-
-async function testProviderConnection(configuration: ResolvedProviderConfiguration): Promise<void> {
-	const controller = new AbortController();
-	const timeout = setTimeout(() => controller.abort(), 10_000);
-	const authenticationHeaders =
-		configuration.type === "anthropic-compatible"
-			? { "x-api-key": configuration.apiKey, "anthropic-version": anthropicApiVersion }
-			: { Authorization: `${"Bearer"} ${configuration.apiKey}` };
-
-	try {
-		const response = await fetch(`${configuration.baseUrl.replace(/\/+$/, "")}/models`, {
-			method: "GET",
-			redirect: "error",
-			headers: {
-				...authenticationHeaders,
-				...(configuration.customHeaders ?? {}),
-				Accept: "application/json",
-			},
-			signal: controller.signal,
-		});
-
-		if (response.ok) {
-			return;
-		}
-		if (response.status === 401 || response.status === 403) {
-			throw new AskChatRuntimeError({
-				kind: "provider_authentication",
-				message: "Provider authentication failed.",
-				retryable: false,
-				statusCode: response.status,
-			});
-		}
-		if (response.status === 429) {
-			throw new AskChatRuntimeError({
-				kind: "provider_rate_limited",
-				message: "Provider rate limit reached.",
-				retryable: true,
-				statusCode: response.status,
-			});
-		}
-		throw new AskChatRuntimeError({
-			kind: "provider_failure",
-			message: `Provider connection test failed with status ${response.status}.`,
-			retryable: response.status >= 500,
-			statusCode: response.status,
-		});
-	} catch (error) {
-		if (error instanceof AskChatRuntimeError) {
-			throw error;
-		}
-		throw new AskChatRuntimeError({
-			kind: "provider_network",
-			message:
-				error instanceof Error && error.name === "AbortError"
-					? "Provider connection test timed out."
-					: "Provider connection test could not reach the endpoint.",
-			retryable: true,
-		});
-	} finally {
-		clearTimeout(timeout);
-	}
 }
 
 function isCancellation(error: unknown): boolean {
@@ -2322,10 +2204,10 @@ function decodeRunPageCursor(value: string): RunPageCursor {
 	return { createdAtMs: parsed.createdAtMs, id: parsed.id };
 }
 
-class CheckpointDeletionShutdownError extends Error {
+class AgentSessionCleanupShutdownError extends Error {
 	constructor() {
-		super("Checkpoint deletion stopped during application shutdown.");
-		this.name = "CheckpointDeletionShutdownError";
+		super("Agent session cleanup stopped during application shutdown.");
+		this.name = "AgentSessionCleanupShutdownError";
 	}
 }
 
@@ -2457,9 +2339,9 @@ const runtimeErrorDetails: Record<
 		category: "runtime",
 		messageKey: "errors.chatRuntimeUnavailable",
 	},
-	shutdown_timeout: {
-		code: "CHAT_RUNTIME_SHUTDOWN_TIMEOUT",
-		category: "runtime",
-		messageKey: "errors.chatRuntimeShutdownTimeout",
+	unexpected_tool_activity: {
+		code: "CHAT_UNEXPECTED_TOOL_ACTIVITY",
+		category: "tool",
+		messageKey: "errors.chatUnexpectedToolActivity",
 	},
 };

@@ -1,5 +1,6 @@
 import {
 	AskChatRuntimeError,
+	type HeadlessAuthController,
 	ProviderCapacityError,
 	ProviderModelNotFoundError,
 	ProviderNotFoundError,
@@ -43,6 +44,7 @@ export interface ProductRpcDependencies {
 	executorReadiness: ExecutorReadiness;
 	eventRouter: ProductEventRouter;
 	serverVersion: string;
+	authController: HeadlessAuthController;
 }
 
 interface ProductEventRouteBinding {
@@ -156,19 +158,19 @@ export const agentsServerMethodAllowlist: RpcMethodAllowlist = {
 };
 
 export function createProductRpcHandlers(dependencies: ProductRpcDependencies): RpcHandlers {
-	const { chatService, executorReadiness, eventRouter } = dependencies;
+	const { chatService, executorReadiness, eventRouter, authController } = dependencies;
 	return {
 		requests: {
 			[productRpcMethods.runtimeGet]: createRequestHandler(
 				productRpcRequestSchemas[productRpcMethods.runtimeGet],
 				() =>
 					agentsRuntimeInfoSchema.parse({
-						apiVersion: 1,
+						apiVersion: 2,
 						serverVersion: dependencies.serverVersion,
 						bunVersion: Bun.version,
 						platform: process.platform,
 						arch: process.arch,
-						deepAgents: probeAgentRuntime(),
+						agentRuntime: probeAgentRuntime(),
 						ready: executorReadiness.isReady(),
 						executor: executorReadiness.getInfo(),
 					}),
@@ -212,6 +214,26 @@ export function createProductRpcHandlers(dependencies: ProductRpcDependencies): 
 			[productRpcMethods.defaultModelSet]: createRequestHandler(
 				productRpcRequestSchemas[productRpcMethods.defaultModelSet],
 				(input) => chatService.setDefaultModel(input),
+			),
+			[productRpcMethods.providerAuthStart]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.providerAuthStart],
+				(input) => authController.start(input),
+			),
+			[productRpcMethods.providerAuthGet]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.providerAuthGet],
+				(input) => authController.get(input.attemptId),
+			),
+			[productRpcMethods.providerAuthRespond]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.providerAuthRespond],
+				(input) => authController.respond(input),
+			),
+			[productRpcMethods.providerAuthCancel]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.providerAuthCancel],
+				(input) => authController.cancel(input.attemptId),
+			),
+			[productRpcMethods.providerLogout]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.providerLogout],
+				(input) => authController.logout(input.providerId),
 			),
 			[productRpcMethods.sessionCreate]: createRequestHandler(
 				productRpcRequestSchemas[productRpcMethods.sessionCreate],

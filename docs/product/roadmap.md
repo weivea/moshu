@@ -11,20 +11,22 @@
 
 ## 2. 阶段 0：技术底座与高风险验证
 
-**目标：** 建立 Electrobun client、agents server、executor 三应用角色的可打包基础，并把当前单进程 Ask slice 迁移到正确所有者。
+**目标：** 建立 Electrobun client、agents server、executor 三应用角色的可打包基础，并把 no-tools Ask
+迁移到正确所有者。A0/A1 已完成，A2 只完成 executor 注册/readiness 基础。
 
 ### 2.1 架构交付主线
 
 | 阶段 | 出口 |
 | --- | --- |
 | A0 RPC / binary POC | 两个 TypeScript + Bun compiled companion 可由 client 启停、注册、RPC、关闭和打包 |
-| A1 agents-server extraction | Provider、Ask runtime、业务 DB/checkpoint 和 Run 状态迁入 server，当前 Chat 行为等价 |
+| A1 agents-server extraction | dynamic Provider/auth、public Pi Ask、产品 DB/Pi Session JSONL 和 Run 状态迁入 server（已完成） |
 | A2 Executor / Agent registry | 一个 local executor、多个 Agent、stable identity、注册 full capability sync、syncing/offline Run gate |
 | A3 Tool Bridge / Action Broker | server Policy/approval/intent/grant，executor Tool/process tree，result 回到 server |
 | A4 MCP / Skills | executor-owned persistence/secret/lifecycle，epoch/revision inventory reconciliation、routed UI、resource refs/prompt fetch |
 | A5 recovery/release hardening | capped restart、重连对账、协作退出、故障矩阵和签名 package |
 
-旧的 in-process/conditional-sidecar Go/No-Go 与 F0-16 不再适用。三角色是批准基线；当前代码尚未实现 companion/RPC/registry。
+旧的 in-process/conditional-sidecar Go/No-Go 与 F0-16 不再适用。三角色是批准基线；compiled companion、
+authenticated RPC 和 Provider registry 已实现，Agent/executor inventory registry 尚未实现。
 
 ### 2.2 范围
 
@@ -33,12 +35,13 @@
 - Electrobun client、agents server、executor companion skeleton；WebSocket + versioned JSON RPC。
 - 动态 loopback bootstrap、client/executor registration、stable ID、instance ID/generation 和注册后 full inventory sync。
 - client 对两个 companion 的 cooperative shutdown、capped backoff 和 recovery UX。
-- agents server 单写 `bun:sqlite` 业务数据库、事件、`BunSqliteSaver` 和 store。
-- Deep Agents/Provider/Run/Policy 位于 agents server；实际 Tool/进程树位于 executor。
-- 当前 host-backed local executor 与 Agent N:1 binding；offline 时相关 Agent 不能启动 Run。
-- 一个 OpenAI 或 Anthropic Provider 端到端 POC。
+- agents server 单写产品数据库/event，并用 public `SessionManager` 保存 Pi Session JSONL。
+- Pi/Provider/Run 位于 agents server；Policy/Tool/进程树是后续 server/executor 边界。
+- current host-backed local executor 已可注册和报告 readiness；Agent N:1 binding 尚未实现。
+- runtime 动态 builtin/custom Provider、异步 auth attempt、模型刷新和 no-network test gate。
 - server Policy/approval/Action intent -> one-time execution grant -> executor 文件/命令 Tool -> typed result POC。
-- server Provider `SecretVault` 的 macOS Keychain FFI/native adapter POC，以及 local executor `ExecutorSecretStore` private-file adapter POC。
+- server Provider `SecretVaultCredentialStore` 的 app-owned permission-safe file adapter；Keychain 与 local
+  executor `ExecutorSecretStore` 仍待 POC。
 - sandbox `BrowserView` 的 RPC、本地文件和子资源默认断网 POC。
 - 两个 Bun compiled companion 随 desktop 的签名、公证、Updater 和 packaged E2E POC。
 
@@ -47,11 +50,11 @@
 - package 可启动 client、agents server、executor；终端用户无需安装 Bun/Node。
 - server 只绑定动态 loopback；未认证本机进程不能注册。
 - `client <-> server <-> executor` 是唯一应用 RPC 拓扑，旧 generation 的消息被拒绝。
-- Provider/graph/Tool 错误不影响其他 Run；server/executor 分别强退后状态可对账。
+- Provider/Pi runtime 错误不影响其他 Run；server/executor 分别强退后状态可对账。
 - WebView/client 无法直接读取 API Key、业务 DB、任意文件或 executor API。
 - 未经 server Policy/approval/intent 和一次性 grant，executor 不执行。
 - 一个带文件修改与审批的 Run 可完整持久化和回放，命令进程树可取消/清理。
-- `BunSqliteSaver` 通过当前 schema、WAL、关闭重开和 server restart 测试。
+- `SessionManager` 通过当前 schema、WAL、关闭重开和 server restart 测试。
 - executor offline 时绑定 Agent 不能启动新 Run。
 - executor 注册/重连后 full snapshot 原子替换完成前保持 syncing，绑定 Agent 不 runnable。
 - MCP/Skill command 只有 owning executor 持久化后成功；server 产品数据无 recoverable config/content/credential copy。
@@ -59,7 +62,7 @@
 - local executor root/credential file 的 `0700`/`0600`、owner、atomic replace、symlink/no-follow gate 通过。
 - Web Canvas 无法访问 Electrobun RPC、Bun/Node、任意本地文件或默认网络。
 - 外部 E2E harness 可验证签名 package 中的两个 companion、Provider、Keychain 和 BrowserView；stable 产物不包含 test driver。
-- 当前开发数据可明确 reset；本阶段不声称迁移旧单进程 DB/checkpoint。
+- 当前开发数据可明确 reset；本阶段不声称迁移旧 runtime 数据。
 
 ## 3. 阶段 1：核心 MVP
 
@@ -69,8 +72,9 @@
 
 - macOS 安装包；无需登录。
 - 中英双语、跟随系统、浅色/深色。
-- OpenAI、Anthropic、Gemini、DeepSeek、Kimi、智谱。
-- Custom OpenAI-compatible 与 Custom Claude-compatible。
+- public Pi runtime 动态枚举的 builtin Provider。
+- custom endpoint 限 `openai-completions`、`openai-responses`、`anthropic-messages`、
+  `google-generative-ai`。
 - Provider 连接测试、模型列表/手工 ID、基础能力标签。
 - Token 和估算费用；日/月预算提醒。
 
@@ -81,7 +85,7 @@
 - Ask、Plan、Agent。
 - 流式 Markdown、代码、引用和用量。
 - 计划、待办、文件、命令、Tool、子 Agent 和错误事件。
-- 停止、重试、安全检查点恢复。
+- 停止、重试、Session context restore 和 orphan Run 安全终结。
 - 自动标题、搜索、重命名、归档、删除、Markdown/JSON 导出。
 
 ### 3.3 执行与安全
@@ -232,7 +236,7 @@
 
 1. Run 完成部分文件操作后分别强制结束 agents server 与 executor。
 2. client 按 capped backoff 监管重启；达到上限时停止 crash loop 并显示恢复 UX。
-3. 重连后显示最后安全检查点、已完成动作和 executor registry 状态。
+3. 重连后显示最后已持久化状态、已完成动作和 executor registry 状态。
 4. 恢复不重复已成功的副作用工具；旧 instance/generation 的结果被拒绝。
 5. 状态不确定的动作要求人工确认。
 
@@ -344,7 +348,7 @@
 | 事项 | 最晚决策点 |
 | --- | --- |
 | 品牌视觉和第三方 NOTICE 策略（正式名称“墨枢”、MIT 许可证已确定） | 阶段 1 |
-| `BunSqliteSaver` 当前 schema/reset、LangGraph 升级及首次发布后的 migration 策略 | 阶段 0 |
+| Product DB / Pi Session JSONL reset、Pi `0.82.1` 升级及首次发布后的 migration 策略 | 阶段 0 |
 | Electrobun 版本、实际 packaged runtime 和跨 runtime 升级策略 | 阶段 0 |
 | Desktop bootstrap、本机注册认证和 protocol version policy | A0 |
 | stable ID、instance/generation 和 executor lease 细节 | A0–A2 |

@@ -1,375 +1,316 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { ProviderCapacityError } from "@moshu/agent-runtime";
-import { maxProviderCount } from "@moshu/contracts";
+import {
+	type CredentialStore,
+	ModelRuntime,
+	ProviderCapacityError,
+	SecretVaultCredentialStore,
+} from "@moshu/agent-runtime";
+import { maxProviderCount, type ProviderModel } from "@moshu/contracts";
 
 import { FileProviderRegistryStore } from "./file-provider-registry-store";
 
-interface PersistedRegistryDocument {
-	schemaVersion: number;
-	providers: Array<{
-		id: string;
-		type: string;
-		apiKey: string;
-		baseUrl: string;
-		models: Array<{ id: string; enabled: boolean; supportedEndpoints?: string[] }>;
-	}>;
-	defaultModel?: { providerId: string; modelId: string };
-}
-
-const modelsFetchedAt = "2026-07-27T00:00:00.000Z";
-
-function withRegistryFile<T>(run: (filename: string) => T): T {
-	const directory = mkdtempSync(join(tmpdir(), "moshu-registry-"));
-	const filename = join(directory, "providers.json");
-	try {
-		return run(filename);
-	} finally {
-		rmSync(directory, { recursive: true, force: true });
-	}
-}
-
-function readDocument(filename: string): PersistedRegistryDocument {
-	return JSON.parse(readFileSync(filename, "utf8")) as PersistedRegistryDocument;
-}
-
 describe("FileProviderRegistryStore", () => {
-	test("persists create, update, and delete round-trips across restarts", () => {
-		withRegistryFile((filename) => {
-			const store = new FileProviderRegistryStore(filename);
-			const created = store.create({
-				displayName: "OpenAI",
-				type: "openai-compatible",
-				baseUrl: "https://api.openai.com/v1/",
-				apiKey: "sk-secret",
-				customHeaders: { "X-Org": "acme-secret" },
-			});
-			expect(created.enabled).toBe(true);
-			expect(created.models).toEqual([]);
-			expect(created.baseUrl).toBe("https://api.openai.com/v1");
-
-			const afterCreate = new FileProviderRegistryStore(filename);
-			expect(afterCreate.get(created.id)).toMatchObject({
-				displayName: "OpenAI",
-				type: "openai-compatible",
-				apiKey: "sk-secret",
-				customHeaders: { "X-Org": "acme-secret" },
-			});
-
-			afterCreate.update({ providerId: created.id, displayName: "OpenAI Prod", enabled: false });
-			const afterUpdate = new FileProviderRegistryStore(filename);
-			expect(afterUpdate.get(created.id)).toMatchObject({
-				displayName: "OpenAI Prod",
-				enabled: false,
-				apiKey: "sk-secret",
-			});
-
-			afterUpdate.delete(created.id);
-			const afterDelete = new FileProviderRegistryStore(filename);
-			expect(afterDelete.get(created.id)).toBeNull();
-			expect(afterDelete.list()).toEqual([]);
-		});
-	});
-
-	test("writes owner-only files and clears a stale temporary sibling on construction", () => {
-		withRegistryFile((filename) => {
-			writeFileSync(`${filename}.tmp`, "stale-secret");
-			const store = new FileProviderRegistryStore(filename);
-			expect(existsSync(`${filename}.tmp`)).toBe(false);
-
-			store.create({
-				displayName: "OpenAI",
-				type: "openai-compatible",
-				baseUrl: "https://api.openai.com/v1",
-				apiKey: "sk-secret",
-			});
-			expect(statSync(filename).mode & 0o777).toBe(0o600);
-			expect(readFileSync(filename, "utf8")).toContain("sk-secret");
-			expect(existsSync(`${filename}.tmp`)).toBe(false);
-		});
-	});
-
-	test("keeps the stored API key when it is omitted and clears empty custom headers", () => {
-		withRegistryFile((filename) => {
-			const store = new FileProviderRegistryStore(filename);
-			const created = store.create({
-				displayName: "OpenAI",
-				type: "openai-compatible",
-				baseUrl: "https://api.openai.com/v1",
-				apiKey: "sk-original",
-				customHeaders: { "X-Org": "acme-secret" },
-			});
-
-			const renamed = store.update({ providerId: created.id, displayName: "Renamed" });
-			expect(renamed.apiKey).toBe("sk-original");
-			expect(renamed.customHeaders).toEqual({ "X-Org": "acme-secret" });
-
-			const cleared = store.update({ providerId: created.id, customHeaders: {} });
-			expect(cleared.apiKey).toBe("sk-original");
-			expect(cleared.customHeaders).toBeUndefined();
-
-			const rotated = store.update({ providerId: created.id, apiKey: "sk-rotated" });
-			expect(rotated.apiKey).toBe("sk-rotated");
-		});
-	});
-
-	test("preserves previously-enabled model ids and refreshes the fetch timestamp", () => {
-		withRegistryFile((filename) => {
-			const store = new FileProviderRegistryStore(filename);
-			const created = store.create({
-				displayName: "OpenAI",
-				type: "openai-compatible",
-				baseUrl: "https://api.openai.com/v1",
-				apiKey: "sk-secret",
-			});
-			store.setModels(
-				created.id,
-				[
-					{ id: "gpt-5.4", enabled: false },
-					{ id: "gpt-4o", enabled: false },
-				],
-				"2026-01-01T00:00:00.000Z",
-			);
-			store.setModelsEnabled(created.id, ["gpt-5.4"]);
-
-			const refreshed = store.setModels(
-				created.id,
-				[
-					{ id: "gpt-5.4", enabled: false },
-					{ id: "gpt-4o", enabled: false },
-					{ id: "o5", enabled: false },
-				],
-				"2026-02-02T00:00:00.000Z",
-			);
-			const enabledById = new Map(refreshed.models.map((model) => [model.id, model.enabled]));
-			expect(enabledById.get("gpt-5.4")).toBe(true);
-			expect(enabledById.get("gpt-4o")).toBe(false);
-			expect(enabledById.get("o5")).toBe(false);
-			expect(refreshed.modelsFetchedAt).toBe("2026-02-02T00:00:00.000Z");
-		});
-	});
-
-	test("drops a default model when its model is disabled", () => {
-		withRegistryFile((filename) => {
-			const store = new FileProviderRegistryStore(filename);
-			const created = store.create({
-				displayName: "OpenAI",
-				type: "openai-compatible",
-				baseUrl: "https://api.openai.com/v1",
-				apiKey: "sk-secret",
-			});
-			store.setModels(
-				created.id,
-				[
-					{ id: "gpt-5.4", enabled: false },
-					{ id: "gpt-4o", enabled: false },
-				],
-				"2026-01-01T00:00:00.000Z",
-			);
-			store.setModelsEnabled(created.id, ["gpt-5.4", "gpt-4o"]);
-			store.setDefaultModel({ providerId: created.id, modelId: "gpt-4o" });
-			expect(store.getDefaultModel()).toEqual({ providerId: created.id, modelId: "gpt-4o" });
-
-			const flipped = store.setModelsEnabled(created.id, ["gpt-5.4"]);
-			const enabledById = new Map(flipped.models.map((model) => [model.id, model.enabled]));
-			expect(enabledById.get("gpt-5.4")).toBe(true);
-			expect(enabledById.get("gpt-4o")).toBe(false);
-			expect(store.getDefaultModel()).toBeNull();
-		});
-	});
-
-	test("clears the default model when its provider is deleted", () => {
-		withRegistryFile((filename) => {
-			const store = new FileProviderRegistryStore(filename);
-			const created = store.create({
-				displayName: "OpenAI",
-				type: "openai-compatible",
-				baseUrl: "https://api.openai.com/v1",
-				apiKey: "sk-secret",
-			});
-			store.setModels(created.id, [{ id: "gpt-5.4", enabled: false }], "2026-01-01T00:00:00.000Z");
-			store.setModelsEnabled(created.id, ["gpt-5.4"]);
-			store.setDefaultModel({ providerId: created.id, modelId: "gpt-5.4" });
-			expect(store.getDefaultModel()).not.toBeNull();
-
-			store.delete(created.id);
-			expect(store.getDefaultModel()).toBeNull();
-		});
-	});
-
-	test("migrates a legacy single-provider document in place", () => {
-		withRegistryFile((filename) => {
-			writeFileSync(
-				filename,
-				JSON.stringify({
-					schemaVersion: 1,
-					configuration: {
-						provider: "openai-compatible",
-						apiKey: "sk-legacy",
-						model: "gpt-4.1-mini",
-						baseUrl: "https://api.openai.com/v1",
-					},
-				}),
-			);
-
-			const store = new FileProviderRegistryStore(filename);
-			const providers = store.list();
-			expect(providers).toHaveLength(1);
-			const provider = providers[0];
-			expect(provider?.apiKey).toBe("sk-legacy");
-			expect(provider?.type).toBe("openai-compatible");
-			expect(provider?.models).toEqual([{ id: "gpt-4.1-mini", enabled: true }]);
-			expect(store.getDefaultModel()).toEqual({
-				providerId: provider?.id ?? "",
-				modelId: "gpt-4.1-mini",
-			});
-
-			const persisted = readDocument(filename);
-			expect(persisted.schemaVersion).toBe(3);
-			expect(persisted.providers).toHaveLength(1);
-			expect(persisted.providers[0]?.models).toEqual([{ id: "gpt-4.1-mini", enabled: true }]);
-			expect(persisted.defaultModel?.modelId).toBe("gpt-4.1-mini");
-			expect(statSync(filename).mode & 0o777).toBe(0o600);
-		});
-	});
-
-	test("migrates v2 protocol types while preserving legacy Responses routing", () => {
-		withRegistryFile((filename) => {
-			const chatProviderId = "0192f0aa-0000-7000-8000-000000000011";
-			const responsesProviderId = "0192f0aa-0000-7000-8000-000000000012";
-			const anthropicProviderId = "0192f0aa-0000-7000-8000-000000000013";
-			writeFileSync(
-				filename,
-				JSON.stringify({
-					schemaVersion: 2,
-					providers: [
-						{
-							id: chatProviderId,
-							displayName: "Chat gateway",
-							type: "openai-chat-completions",
-							baseUrl: "https://chat.example/v1",
-							apiKey: "sk-chat",
-							enabled: true,
-							models: [{ id: "chat-model", enabled: true }],
-						},
-						{
-							id: responsesProviderId,
-							displayName: "Responses gateway",
-							type: "openai-responses",
-							baseUrl: "https://responses.example/v1",
-							apiKey: "sk-responses",
-							enabled: true,
-							models: [{ id: "responses-model", enabled: true }],
-						},
-						{
-							id: anthropicProviderId,
-							displayName: "Anthropic gateway",
-							type: "anthropic-messages",
-							baseUrl: "https://anthropic.example/v1",
-							apiKey: "sk-anthropic",
-							enabled: true,
-							models: [{ id: "claude-model", enabled: true }],
-						},
-					],
-					defaultModel: {
-						providerId: responsesProviderId,
-						modelId: "responses-model",
-					},
-				}),
-			);
-
-			const store = new FileProviderRegistryStore(filename);
-			expect(store.list().map((provider) => provider.type)).toEqual([
-				"openai-compatible",
-				"openai-compatible",
-				"anthropic-compatible",
-			]);
-			expect(store.get(responsesProviderId)?.models[0]?.supportedEndpoints).toEqual(["/responses"]);
-			expect(store.getDefaultModel()).toEqual({
-				providerId: responsesProviderId,
-				modelId: "responses-model",
-			});
-
-			const persisted = readDocument(filename);
-			expect(persisted.schemaVersion).toBe(3);
-			expect(persisted.providers.map((provider) => provider.type)).toEqual([
-				"openai-compatible",
-				"openai-compatible",
-				"anthropic-compatible",
-			]);
-		});
-	});
-
-	test("never writes a catalog entry it cannot read back", () => {
-		withRegistryFile((filename) => {
-			const store = new FileProviderRegistryStore(filename);
-			const created = store.create({
+	test("persists secret-free custom providers while credentials remain in the vault", async () => {
+		await withRegistry(async ({ filename, vault, open }) => {
+			const store = await open();
+			const created = await store.create({
 				displayName: "Gateway",
-				type: "openai-compatible",
+				api: "openai-responses",
+				baseUrl: "https://gateway.example/v1/",
+				apiKey: "fake-create-secret",
+				customHeaders: { "X-Org": "fake-header-secret" },
+				models: [model("model-a")],
+			});
+			expect(created).toMatchObject({
+				displayName: "Gateway",
+				source: "custom",
+				api: "openai-responses",
 				baseUrl: "https://gateway.example/v1",
-				apiKey: "sk-gateway",
+				authMethods: ["api_key"],
+				credential: { configured: true, type: "api_key" },
+			});
+			expect(readFileSync(filename, "utf8")).not.toContain("fake-create-secret");
+			expect(readFileSync(filename, "utf8")).not.toContain("fake-header-secret");
+			expect(await vault.read(created.id)).toEqual({
+				type: "api_key",
+				key: "fake-create-secret",
+				env: { "X-Org": "fake-header-secret" },
 			});
 
-			const stored = store.setModels(
+			await store.update({ providerId: created.id, displayName: "Renamed", enabled: false });
+			const reopened = await open();
+			expect(reopened.get(created.id)).toMatchObject({
+				displayName: "Renamed",
+				enabled: false,
+				customHeaderNames: ["X-Org"],
+			});
+			expect(await vault.read(created.id)).toMatchObject({ key: "fake-create-secret" });
+
+			await reopened.delete(created.id);
+			expect((await open()).get(created.id)).toBeNull();
+			expect(await vault.read(created.id)).toBeUndefined();
+		});
+	});
+
+	test("writes owner-only configuration and parent directories", async () => {
+		await withRegistry(async ({ filename, root, open }) => {
+			const store = await open();
+			await store.create({
+				displayName: "Gateway",
+				api: "anthropic-messages",
+				baseUrl: "https://gateway.example/v1",
+				apiKey: "fake-permission-secret",
+			});
+			expect(statSync(filename).mode & 0o777).toBe(0o600);
+			expect(statSync(root).mode & 0o777).toBe(0o700);
+		});
+	});
+
+	test("preserves enabled model ids and clears invalid default selections", async () => {
+		await withRegistry(async ({ open }) => {
+			const store = await open();
+			const created = await store.create({
+				displayName: "Gateway",
+				api: "openai-completions",
+				baseUrl: "https://gateway.example/v1",
+				models: [model("model-a"), model("model-b")],
+			});
+			store.setModelsEnabled(created.id, ["model-a", "model-b"]);
+			store.setDefaultModel({ providerId: created.id, modelId: "model-b", thinkingLevel: "high" });
+			expect(store.getDefaultModel()).toEqual({
+				providerId: created.id,
+				modelId: "model-b",
+				thinkingLevel: "high",
+			});
+
+			const refreshed = await store.setModels(
 				created.id,
-				[
-					{ id: "good-model", enabled: false },
-					{ id: "x".repeat(400), enabled: false },
-				],
+				[model("model-a", false), model("model-b", false), model("model-c", false)],
 				"2026-07-27T00:00:00.000Z",
 			);
-
-			expect(stored.models.map((model) => model.id)).toEqual(["good-model"]);
-			expect(() => new FileProviderRegistryStore(filename)).not.toThrow();
-			expect(new FileProviderRegistryStore(filename).list()[0]?.models).toHaveLength(1);
-		});
-	});
-
-	test("skips an unreadable stored model instead of failing to open the registry", () => {
-		withRegistryFile((filename) => {
-			const store = new FileProviderRegistryStore(filename);
-			const created = store.create({
-				displayName: "Gateway",
-				type: "openai-compatible",
-				baseUrl: "https://gateway.example/v1",
-				apiKey: "sk-gateway",
+			expect(
+				Object.fromEntries(refreshed.models.map((entry) => [entry.id, entry.enabled])),
+			).toEqual({
+				"model-a": true,
+				"model-b": true,
+				"model-c": false,
 			});
-			store.setModels(created.id, [{ id: "good-model", enabled: false }], modelsFetchedAt);
-
-			const document = readDocument(filename) as PersistedRegistryDocument & {
-				providers: Array<{ models: unknown[] }>;
-			};
-			document.providers[0]?.models.push({ id: 42, enabled: "yes" });
-			writeFileSync(filename, JSON.stringify(document), "utf8");
-
-			const reopened = new FileProviderRegistryStore(filename);
-			expect(reopened.list()[0]?.models.map((model) => model.id)).toEqual(["good-model"]);
+			store.setModelsEnabled(created.id, ["model-a"]);
+			expect(store.getDefaultModel()).toBeNull();
 		});
 	});
 
-	test("rejects creating more providers than the configured capacity", () => {
-		withRegistryFile((filename) => {
-			const store = new FileProviderRegistryStore(filename);
+	test("enforces custom provider capacity without hardcoding builtin providers", async () => {
+		await withRegistry(async ({ open }) => {
+			const store = await open();
 			for (let index = 0; index < maxProviderCount; index += 1) {
-				store.create({
+				await store.create({
 					displayName: `Provider ${index}`,
-					type: "openai-compatible",
-					baseUrl: "https://api.openai.com/v1",
-					apiKey: `sk-${index}`,
+					api: "openai-responses",
+					baseUrl: `https://provider-${index}.example/v1`,
 				});
 			}
-			expect(store.list()).toHaveLength(maxProviderCount);
-			expect(() =>
+			expect(store.list().filter((provider) => provider.source === "custom")).toHaveLength(
+				maxProviderCount,
+			);
+			await expect(
 				store.create({
 					displayName: "Overflow",
-					type: "openai-compatible",
-					baseUrl: "https://api.openai.com/v1",
-					apiKey: "sk-overflow",
+					api: "openai-responses",
+					baseUrl: "https://overflow.example/v1",
 				}),
-			).toThrow(ProviderCapacityError);
+			).rejects.toBeInstanceOf(ProviderCapacityError);
 		});
 	});
+
+	test("persists builtin enabled and model preferences and clears a disabled default", async () => {
+		await withRegistry(async ({ open }) => {
+			const store = await open();
+			const builtin = store
+				.list()
+				.find((provider) => provider.source === "builtin" && provider.models.length > 0);
+			if (builtin === undefined) throw new Error("Expected a built-in Provider with models.");
+			const selectedModel = builtin.models[0];
+			if (selectedModel === undefined) throw new Error("Expected a built-in Provider model.");
+			store.setModelsEnabled(builtin.id, [selectedModel.id]);
+			store.setDefaultModel({ providerId: builtin.id, modelId: selectedModel.id });
+			await store.update({ providerId: builtin.id, enabled: false });
+			expect(store.getDefaultModel()).toBeNull();
+
+			const reopened = await open();
+			expect(reopened.get(builtin.id)).toMatchObject({ source: "builtin", enabled: false });
+			expect(
+				reopened
+					.get(builtin.id)
+					?.models.filter((candidate) => candidate.enabled)
+					.map((m) => m.id),
+			).toEqual([selectedModel.id]);
+			await expect(
+				reopened.update({ providerId: builtin.id, displayName: "Not allowed" }),
+			).rejects.toThrow("read-only");
+		});
+	});
+
+	test("rejects malformed current-schema configuration instead of silently resetting it", async () => {
+		await withRegistry(async ({ filename, open }) => {
+			writeFileSync(
+				filename,
+				JSON.stringify({
+					schemaVersion: 5,
+					providers: "not-an-array",
+					builtinPreferences: [],
+				}),
+			);
+			await expect(open()).rejects.toThrow("configuration file is invalid");
+		});
+	});
+
+	test("does not create an empty credential and removes registered secret headers after logout", async () => {
+		await withRegistry(async ({ vault, open, getRuntime }) => {
+			const store = await open();
+			const empty = await store.create({
+				displayName: "No credentials",
+				api: "openai-responses",
+				baseUrl: "https://empty.example/v1",
+			});
+			expect(await vault.read(empty.id)).toBeUndefined();
+			expect(empty.credential.configured).toBe(false);
+
+			const secured = await store.create({
+				displayName: "Secured",
+				api: "openai-responses",
+				baseUrl: "https://secured.example/v1",
+				apiKey: "fake-key",
+				customHeaders: { "X-Secret": "fake-header" },
+			});
+			await vault.delete(secured.id);
+			await store.onCredentialChanged(secured.id);
+			expect(store.get(secured.id)?.credential.configured).toBe(false);
+			expect(JSON.stringify(getRuntime().getRegisteredProviderConfig(secured.id))).not.toContain(
+				"fake-header",
+			);
+		});
+	});
+
+	test("serializes concurrent mutations without losing either Provider update", async () => {
+		await withRegistry(async ({ open }) => {
+			const store = await open();
+			const first = await store.create({
+				displayName: "First",
+				api: "openai-responses",
+				baseUrl: "https://first.example/v1",
+			});
+			const second = await store.create({
+				displayName: "Second",
+				api: "openai-responses",
+				baseUrl: "https://second.example/v1",
+			});
+			await Promise.all([
+				store.update({ providerId: first.id, displayName: "First updated" }),
+				store.update({ providerId: second.id, enabled: false }),
+			]);
+			expect(store.get(first.id)?.displayName).toBe("First updated");
+			expect(store.get(second.id)?.enabled).toBe(false);
+		});
+	});
+
+	test("refreshes only the selected public Pi Provider", async () => {
+		const root = join(process.cwd(), ".test-artifacts", `provider-refresh-${crypto.randomUUID()}`);
+		const refreshed: string[] = [];
+		const providers = ["provider-a", "provider-b"].map((id) => ({
+			id,
+			name: id,
+			auth: {},
+			getModels: () => [],
+			refreshModels: async () => {
+				refreshed.push(id);
+				return [];
+			},
+			stream: () => {
+				throw new Error("not used");
+			},
+			streamSimple: () => {
+				throw new Error("not used");
+			},
+		}));
+		const runtime = {
+			getProviders: () => providers,
+			getProvider: (id: string) => providers.find((provider) => provider.id === id),
+			getModels: () => [],
+			getProviderAuthStatus: () => ({ configured: false }),
+			isUsingOAuth: () => false,
+		} as unknown as ModelRuntime;
+		const credentials = {
+			read: async () => undefined,
+		} as unknown as CredentialStore;
+		try {
+			const store = new FileProviderRegistryStore(
+				join(root, "providers.json"),
+				runtime,
+				credentials,
+			);
+			await store.refreshModels("provider-b");
+			expect(refreshed).toEqual(["provider-b"]);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
 });
+
+function model(id: string, enabled = true): ProviderModel {
+	return {
+		id,
+		displayName: id,
+		api: "openai-responses",
+		input: ["text"],
+		reasoning: true,
+		contextWindowTokens: 128_000,
+		maxOutputTokens: 8_192,
+		thinkingLevels: ["off", "minimal", "low", "medium", "high"],
+		enabled,
+	};
+}
+
+async function withRegistry(
+	run: (context: {
+		root: string;
+		filename: string;
+		vault: SecretVaultCredentialStore;
+		open(): Promise<FileProviderRegistryStore>;
+		getRuntime(): ModelRuntime;
+	}) => Promise<void>,
+): Promise<void> {
+	const root = join(process.cwd(), ".test-artifacts", `provider-store-${crypto.randomUUID()}`);
+	const filename = join(root, "providers.json");
+	mkdirSync(root, { recursive: true, mode: 0o700 });
+	const vault = new SecretVaultCredentialStore(join(root, "credentials", "vault.json"));
+	let latestRuntime: ModelRuntime | undefined;
+	const open = async (): Promise<FileProviderRegistryStore> => {
+		const runtime = await ModelRuntime.create({
+			credentials: vault,
+			modelsPath: null,
+			allowModelNetwork: false,
+		});
+		latestRuntime = runtime;
+		const store = new FileProviderRegistryStore(filename, runtime, vault);
+		await store.initialize();
+		return store;
+	};
+	try {
+		await run({
+			root,
+			filename,
+			vault,
+			open,
+			getRuntime() {
+				if (latestRuntime === undefined) throw new Error("Registry is not open.");
+				return latestRuntime;
+			},
+		});
+	} finally {
+		rmSync(root, { recursive: true, force: true });
+	}
+}

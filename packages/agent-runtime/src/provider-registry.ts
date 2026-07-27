@@ -1,68 +1,67 @@
+import { getSupportedThinkingLevels } from "@earendil-works/pi-ai";
+import type { ModelRuntime } from "@earendil-works/pi-coding-agent";
 import type {
-	CustomHeaders,
+	CustomProviderApi,
 	DefaultModelSelection,
 	ProviderModel,
 	ProviderSummary,
-	ProviderType,
-	ReasoningSelection,
+	ThinkingLevel,
 } from "@moshu/contracts";
-
-import type { ModelProtocol } from "./model-catalog";
 
 export interface ProviderRecord {
 	id: string;
 	displayName: string;
-	type: ProviderType;
-	baseUrl: string;
-	apiKey: string;
-	customHeaders?: CustomHeaders | undefined;
+	source: "builtin" | "custom";
+	api?: CustomProviderApi;
+	baseUrl?: string;
 	enabled: boolean;
+	authMethods: Array<"api_key" | "oauth">;
+	credential: ProviderSummary["credential"];
+	customHeaderNames: string[];
 	models: ProviderModel[];
-	modelsFetchedAt?: string | undefined;
+	modelsFetchedAt?: string;
 }
 
 export interface CreateProviderRecordInput {
 	displayName: string;
-	type: ProviderType;
+	api: CustomProviderApi;
 	baseUrl: string;
-	apiKey: string;
-	customHeaders?: CustomHeaders | undefined;
+	apiKey?: string;
+	customHeaders?: Record<string, string>;
+	models?: ProviderModel[];
 }
 
 export interface UpdateProviderRecordInput {
 	providerId: string;
-	displayName?: string | undefined;
-	type?: ProviderType | undefined;
-	baseUrl?: string | undefined;
-	apiKey?: string | undefined;
-	customHeaders?: CustomHeaders | undefined;
-	enabled?: boolean | undefined;
+	displayName?: string;
+	api?: CustomProviderApi;
+	baseUrl?: string;
+	apiKey?: string;
+	customHeaders?: Record<string, string>;
+	enabled?: boolean;
 }
 
-/**
- * A provider plus a concrete model, ready for the runtime to build a chat model from.
- * `reasoning` is already validated against the model's declared capability.
- */
 export interface ResolvedProviderConfiguration {
 	providerId: string;
 	providerName: string;
-	type: ProviderType;
-	protocol: ModelProtocol;
-	baseUrl: string;
-	apiKey: string;
-	customHeaders?: CustomHeaders | undefined;
+	source: "builtin" | "custom";
+	api: string;
 	model: string;
-	maxOutputTokens?: number | undefined;
-	reasoning?: ReasoningSelection | undefined;
+	thinkingLevel?: ThinkingLevel;
 }
 
 export interface ProviderRegistry {
 	list(): ProviderRecord[];
 	get(providerId: string): ProviderRecord | null;
-	create(input: CreateProviderRecordInput): ProviderRecord;
-	update(input: UpdateProviderRecordInput): ProviderRecord;
-	delete(providerId: string): void;
-	setModels(providerId: string, models: ProviderModel[], fetchedAt: string): ProviderRecord;
+	create(input: CreateProviderRecordInput): Promise<ProviderRecord>;
+	update(input: UpdateProviderRecordInput): Promise<ProviderRecord>;
+	delete(providerId: string): Promise<void>;
+	refreshModels(providerId: string): Promise<ProviderRecord>;
+	setModels(
+		providerId: string,
+		models: ProviderModel[],
+		fetchedAt: string,
+	): Promise<ProviderRecord>;
 	setModelsEnabled(providerId: string, enabledModelIds: readonly string[]): ProviderRecord;
 	getDefaultModel(): DefaultModelSelection | null;
 	setDefaultModel(selection: DefaultModelSelection | null): DefaultModelSelection | null;
@@ -87,57 +86,109 @@ export class ProviderModelNotFoundError extends Error {
 
 export class ProviderCapacityError extends Error {
 	constructor(limit: number) {
-		super(`At most ${limit} providers can be configured.`);
+		super(`At most ${limit} custom providers can be configured.`);
 		this.name = "ProviderCapacityError";
 	}
 }
 
-export function maskProviderApiKey(apiKey: string): string {
-	const normalized = requireNonEmptyString(apiKey, "apiKey");
-	const visibleSuffix = normalized.length > 4 ? normalized.slice(-4) : "";
-	return `${"•".repeat(8)}${visibleSuffix}`;
+export function listProviderSummaries(
+	modelRuntime: ModelRuntime,
+	customProviders: readonly ProviderRecord[],
+): ProviderSummary[] {
+	const customById = new Map(customProviders.map((provider) => [provider.id, provider]));
+	return modelRuntime.getProviders().map((provider) => {
+		const custom = customById.get(provider.id);
+		return {
+			schemaVersion: 2,
+			id: provider.id,
+			displayName: custom?.displayName ?? provider.name,
+			source: custom === undefined ? "builtin" : "custom",
+			enabled: custom?.enabled ?? true,
+			authMethods: toAuthMethods(modelRuntime, provider.id),
+			credential: toCredentialStatus(modelRuntime, provider.id),
+			customHeaderNames: [],
+			models: modelRuntime.getModels(provider.id).map(toProviderModel),
+		};
+	});
 }
 
-/** Projects a stored record into the client-facing summary, dropping every secret value. */
 export function toProviderSummary(record: ProviderRecord): ProviderSummary {
 	return {
-		schemaVersion: 1,
+		schemaVersion: 2,
 		id: record.id,
 		displayName: record.displayName,
-		type: record.type,
-		baseUrl: record.baseUrl,
+		source: record.source,
 		enabled: record.enabled,
-		apiKeyMask: maskProviderApiKey(record.apiKey),
-		customHeaderNames: Object.keys(record.customHeaders ?? {}).sort(),
+		...(record.api === undefined ? {} : { api: record.api }),
+		...(record.baseUrl === undefined ? {} : { baseUrl: record.baseUrl }),
+		authMethods: [...record.authMethods],
+		credential: { ...record.credential },
+		customHeaderNames: [...record.customHeaderNames],
 		models: record.models.map((model) => ({ ...model })),
 		...(record.modelsFetchedAt === undefined ? {} : { modelsFetchedAt: record.modelsFetchedAt }),
 	};
 }
 
-export function normalizeProviderBaseUrl(value: string): string {
-	const normalized = value.trim().replace(/\/+$/, "");
-	if (normalized.length === 0) {
-		throw new TypeError("baseUrl must be a non-empty string.");
+export function resolveProviderConfiguration(input: {
+	modelRuntime: ModelRuntime;
+	providerId: string;
+	modelId: string;
+	thinkingLevel?: ThinkingLevel;
+}): ResolvedProviderConfiguration {
+	const provider = input.modelRuntime.getProvider(input.providerId);
+	if (provider === undefined) {
+		throw new ProviderNotFoundError(input.providerId);
 	}
-	return normalized;
+	const model = input.modelRuntime.getModel(input.providerId, input.modelId);
+	if (model === undefined) {
+		throw new ProviderModelNotFoundError(input.providerId, input.modelId);
+	}
+	return {
+		providerId: provider.id,
+		providerName: provider.name,
+		source: input.modelRuntime.getRegisteredProviderIds().includes(provider.id)
+			? "custom"
+			: "builtin",
+		api: model.api,
+		model: model.id,
+		...(input.thinkingLevel === undefined ? {} : { thinkingLevel: input.thinkingLevel }),
+	};
 }
 
-export function normalizeCustomHeaders(
-	headers: CustomHeaders | undefined,
-): CustomHeaders | undefined {
-	if (headers === undefined) {
-		return undefined;
-	}
-	const entries = Object.entries(headers)
-		.map(([name, value]) => [name.trim(), value] as const)
-		.filter(([name]) => name.length > 0);
-	return entries.length === 0 ? undefined : Object.fromEntries(entries);
+function toAuthMethods(runtime: ModelRuntime, providerId: string): ProviderSummary["authMethods"] {
+	const auth = runtime.getProvider(providerId)?.auth;
+	return [
+		...(auth?.apiKey === undefined ? [] : (["api_key"] as const)),
+		...(auth?.oauth === undefined ? [] : (["oauth"] as const)),
+	];
 }
 
-export function requireNonEmptyString(value: string, fieldName: string): string {
-	const normalized = value.trim();
-	if (normalized.length === 0) {
-		throw new TypeError(`${fieldName} must be a non-empty string.`);
-	}
-	return normalized;
+function toCredentialStatus(
+	runtime: ModelRuntime,
+	providerId: string,
+): ProviderSummary["credential"] {
+	const status = runtime.getProviderAuthStatus(providerId);
+	return {
+		configured: status.configured,
+		...(status.configured
+			? { type: runtime.isUsingOAuth(providerId) ? ("oauth" as const) : ("api_key" as const) }
+			: {}),
+		...(status.label === undefined ? {} : { label: status.label }),
+	};
+}
+
+export function toProviderModel(
+	model: ReturnType<ModelRuntime["getModels"]>[number],
+): ProviderModel {
+	return {
+		id: model.id,
+		displayName: model.name,
+		api: model.api,
+		input: [...model.input],
+		reasoning: model.reasoning,
+		contextWindowTokens: model.contextWindow,
+		maxOutputTokens: model.maxTokens,
+		thinkingLevels: [...getSupportedThinkingLevels(model)],
+		enabled: true,
+	};
 }

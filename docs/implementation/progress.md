@@ -1,162 +1,106 @@
 # 实施进度
 
-> 更新日期：2026-07-25
+> 更新日期：2026-07-27
 > 当前产品阶段：Phase 0
-> 当前架构里程碑：A0 RPC / companion binary POC（未开始）
-> 当前代码基线：单进程 Ask Chat 切片
-> 对应基线提交：`dac37bd`
+> 当前架构里程碑：A1 agents-server extraction（已完成）
+> 当前代码基线：三应用角色、公开 Pi Ask runtime
 
-本文只记录代码或自动化测试已经证明的能力。批准的目标见[技术架构](./architecture.md)，工作顺序见[工程交付计划](./delivery-plan.md)。
+本文只记录代码或自动化测试已经证明的能力。批准的目标见[技术架构](./architecture.md)，后续顺序见[工程交付计划](./delivery-plan.md)。
 
-## 1. 两种状态必须分开
+## 1. 当前架构状态
 
 | 口径 | 状态 |
 | --- | --- |
-| 批准的目标架构 | Electrobun client、agents server、executor 三个应用角色 |
-| 当前仓库实现 | 单个 Electrobun Application Host 内的 ChatService、Deep Agents Ask、Provider 和 SQLite/checkpoint |
-
-因此，文档中关于 WebSocket、动态 loopback、companion supervisor、Executor registry、execution grant、MCP/Skill split 的描述都是**待实现目标**，不是当前能力。
-
-“三进程”表示三个应用角色；Electrobun framework 自身仍可能有 launcher、application worker 和 WebView 等额外进程。
-
-## 2. 状态口径
-
-| 状态 | 含义 |
-| --- | --- |
-| 已完成 | 目标工作包已落地，且对应自动化出口通过 |
-| 部分完成 | 有可运行切片，但关键合同或目标角色边界尚未完成 |
-| 未开始 | 没有可作为目标工作包验收依据的实现 |
-| 延后 | 已明确需要，按当前优先级推迟 |
-
-旧单进程能力可作为迁移输入，但不能让目标三角色工作包标记为部分完成。
-
-## 3. 当前已经实现：单进程 Ask Chat
-
-当前实际链路：
+| 批准的应用角色 | Electrobun client、agents server、executor |
+| 当前仓库实现 | client 监管两个 compiled companion；Provider、Ask、产品 DB 和 Agent Session 位于 agents server |
 
 ```text
-React Chat UI
+React WebView
   -> typed Electrobun RPC
-  -> Application Host ChatService
-  -> in-process Deep Agents Ask runtime
-  -> OpenAI-compatible Provider
-  -> SQLite SessionCatalog / RunJournal
-  -> independent LangGraph checkpoint DB
-  -> Electrobun RPC event stream
-  -> UI reconciliation
+  -> authenticated client/agents-server JSON RPC
+  -> ChatApplicationService
+  -> public Pi ModelRuntime + headless AgentSession
+  -> Product DB RunJournal + Pi SessionManager JSONL
+
+executor
+  -> authenticated registration/readiness
+  -> Tool/MCP/Skill execution（尚未实现）
 ```
 
-已验证能力：
+“三进程”表示三个应用角色；Electrobun framework 仍会创建 launcher、application worker 和 WebView 等额外进程。
 
-- 设置页改为左侧栏导航：Providers、Default Model、General 已实现，MCP/Skills/Usage/Security 为占位页。
-- `/settings/providers` 支持配置多个 Provider（Display name、Type、Base URL、API key、Custom headers JSON），
-  以及连接测试、删除和「获取模型列表」后按勾选启用模型。
-- Provider Type 只有 `openai-compatible` 和 `anthropic-compatible`；实际请求协议由模型
-  `supported_endpoints` 解析，多 endpoint 优先匹配 Provider 协议族并保持目录顺序，缺失时按 Type 回退。
-- Chat Completions、Responses 和 Anthropic Messages 分别使用显式的 `ChatOpenAICompletions`、
-  `ChatOpenAIResponses` 和 `ChatAnthropic` adapter，不允许通用 `ChatOpenAI` 自动切换协议。
-- Responses 多轮请求统一使用官方 v1 content blocks，区分 user/system `input_text` 与 assistant
-  `output_text`，兼容既有字符串 checkpoint 且不丢失 metadata。
-- 模型目录只解析 `/models` 响应（OpenAI、GitHub Copilot、Anthropic、OpenRouter 四种形态）；
-  接口未返回的 context window、输出上限和推理能力一律不展示。
-- 推理控制区分 effort 档位与 Anthropic thinking budget，按目录声明推导；未声明或未开启的参数不下发。
-- Session 输入框底部可切换模型与推理设置，选择持久化在 `chat_sessions`；新会话继承全局默认模型。
-- Provider 开发配置写入 app-data JSON（`provider.json`，`schemaVersion: 3`），使用原子替换和 `0600` 权限；
-  WebView 只读到掩码和 header 名称，读不到 API Key 或 header 值。
-- 普通 Chat 支持流式回复、停止、继续已有 Session 和失败状态。
-- Session 支持新建、选择、搜索、标题、重命名、归档/恢复和永久删除。
+## 2. 已完成的基础
+
+- 两个 TypeScript + Bun compiled companion 由 desktop supervisor 启动、认证、监管和协作关闭。
+- 动态 loopback bootstrap、stable identity、instance/generation fencing、请求 allowlist、取消和 event replay 已有合同与测试。
+- packaged canary、standalone binary、three-process、parent-death 和 companion smoke 构成当前发布门槛。
+- 产品数据库只有 agents server 写入，保存 SessionCatalog、RunJournal、durable events、retirement tombstone 和
+  agent-session cleanup outbox。
+- 每个 Chat Session 拥有稳定 Pi session ID；conversation context 由显式
+  `agentDataDirectory/sessions` 下的 `SessionManager` JSONL 保存和恢复。
+- 删除 Session 先建立持久 cleanup job，再经 lease/dispose、路径 containment 和 targeted unlink 清理 Pi 文件；
+  失败按有界 backoff 重试。
+
+## 3. 当前 Ask 与 Provider 实现
+
+- `@earendil-works/pi-ai`、`pi-agent-core`、`pi-coding-agent` 固定为 `0.82.1`，生产代码只使用公开导出。
+- `ModelRuntime` 动态枚举内置 Provider；不保存静态 Provider 清单。
+- 自定义 Provider 仅支持 `openai-completions`、`openai-responses`、`anthropic-messages` 和
+  `google-generative-ai`，可使用稳定的多个实例 ID。
+- builtin/custom 启用状态、模型勾选和默认模型由 app-owned Provider registry 保存；刷新只针对选中的
+  public Pi Provider。
+- Provider credential 由 `SecretVaultCredentialStore` 保存：目录 `0700`、文件 `0600`、provider lock、
+  whole-file commit lock、fresh read/apply、atomic rename 和 fsync。
+- API Key/OAuth 通过 `Models.login/logout` 和异步 auth attempt 驱动。UI 轮询 attempt，支持
+  text/secret/select/manual code、info/auth URL/device code/progress；secret 回答不回显、不持久化。
+- Ask 使用 `createAgentSession`、`DefaultResourceLoader`、`SettingsManager` 和 `SessionManager`。
+  当前固定 `noTools: "all"`，并禁用 extensions、skills、prompt templates、themes、context files、
+  default tools 和 TUI；意外 Tool activity fail closed。
+- streaming text、final usage、Provider 错误、abort/cancel、同 Session 单 owner、跨 Session 并发、restore、
+  disposal 和安全删除已有自动化覆盖。
+- 模型推理使用 Pi `ThinkingLevel`。设置时拒绝无效档位；运行时若已保存档位不再被刷新后的模型支持，则安全省略，
+  不让 Chat 因 capability drift 持久失败。
+
+## 4. 当前产品能力
+
+- Providers 页面区分动态 builtin 与 custom Provider；builtin 身份/Endpoint 只读，custom 可编辑和删除。
+- Provider auth、退出、连接测试、按 Provider 刷新模型、模型启停和 authentication readiness 已贯通
+  renderer、Electrobun RPC 和 Product RPC。
+- 普通 Chat 支持流式回复、停止、继续已有 Session、失败状态、自动标题、搜索、重命名、归档和永久删除。
 - `/chat/new` 与 `/chat/:sessionId` 是当前 Session 选择事实来源。
-- 默认 Ask 路径通过仓内 `@moshu/deepagents` 的 `createDeepAgent` 执行。
-- `BunSqliteSaver` 使用独立 checkpoint DB、WAL 和当前 schema，并覆盖 thread/list/pending writes/delete/重开合同。
-- 当前 Ask 不暴露 Tool；filesystem、todo、subagent 和 HITL 被显式禁用。
-- Session 映射稳定 checkpoint thread；conversation transcript 来自 checkpoint，业务 DB 保存 SessionCatalog/RunJournal。
-- typed RPC 与 Zod 已覆盖当前 Chat command、query、snapshot 和 event。
-- 事件先持久化再发布；UI 可用 snapshot、cursor 和 reconciliation 处理重放。
-- 取消链路覆盖 UI、RPC、Application Host、`AbortController` 和持久 Run 状态。
-- 应用重启后遗留的 `queued/running/cancelling` Run 当前收敛为取消。
-- Runtime、Repository、ChatService、RPC adapter/controller 和页面有自动化测试。
+- 事件先持久化再发布；snapshot、cursor、replay、tombstone 和 reconciliation 可处理重连。
+- 非终态 orphan Run 在启动时安全终结；当前不宣称可从进程崩溃点继续执行同一个 Run。
 
-这些证据证明 Ask slice 可运行，不证明目标 agents server/executor 已存在。
+## 5. 当前明确未实现
 
-## 4. 当前明确未实现
+- executor 尚无文件、命令、Git 或通用 Tool Bridge。
+- 尚无 Action Broker、Policy Engine、approval、execution grant 或 invocation recovery。
+- MCP lifecycle、MCP credential、Skills 安装/版本/content store 和资源 inventory 尚未实现。
+- Plan、Agent、自定义 Agent、subagent、任务中心、Diff/撤销和桌面通知仍是后续产品范围。
+- 当前 Ask 不暴露 Tool、MCP、Skill 或 subagent；文档中的相关合同是未来 Moshu-owned 边界，不是现成功能。
+- macOS Provider vault 当前是权限加固的 app-owned 文件；Keychain adapter 仍是外部分发前安全工作。
+- remote client/executor、Docker、cloud VM、TLS 配对和多租户不在当前 desktop 范围。
 
-- 没有独立 `agents-server` 或 `executor` compiled binary。
-- 没有 `client <-> agents server <-> executor` WebSocket/JSON RPC。
-- 没有动态 loopback bootstrap、角色认证、stable ID、instance ID 或 generation registry。
-- client 尚未监管两个 companion，也没有 capped backoff/recovery UX 或协作式三角色退出。
-- Deep Agents、Provider、业务 DB 和 checkpoint 仍在 Electrobun Application Host，而非 agents server。
-- 没有 Executor/Agent N:1 registry、executor 列表或 offline Run gate。
-- 没有 Tool Bridge、Action Broker、Policy Engine、approval、execution grant 或 invocation reconciliation。
-- 没有 Project 文件/命令/Git Tool、Diff/撤销、任务中心或桌面通知。
-- 没有 MCP lifecycle 或 Skill storage/prompt/execution split。
-- checkpoint 尚未接入 application 强退后的 graph resume；orphan Run 当前只安全收敛为取消。
-- Secret Vault/Keychain 尚未接入；开发期 Provider Key 与 Custom header 值仍存在 owner-only 的 app-data 文件中。
-- 业务库 schema 升到 `user_version 9`（`chat_sessions` 新增模型选择列）；旧的本地开发数据会在启动时协同重置。
-- 没有 signed/packaged three-role desktop E2E。
-
-## 5. 架构迁移状态
+## 6. 架构迁移状态
 
 | 阶段 | 状态 | 下一项可验证结果 |
 | --- | --- | --- |
-| A0 RPC / binary POC | 未开始 | client 启动两个 Bun compiled companion，完成动态 loopback 注册、RPC 和关闭 |
-| A1 agents-server extraction | 未开始 | 现有 Provider/Ask/DB/checkpoint 经 server RPC 保持行为等价 |
-| A2 Executor / Agent registry | 未开始 | 一个 local executor、多 Agent 绑定、注册后 full capability sync 和 offline Run gate |
-| A3 Tool Bridge / Action Broker | 未开始 | server policy/approval/intent/grant -> executor Tool -> server result |
-| A4 MCP / Skills | 未开始 | executor-owned MCP/Skill data、epoch/revision inventory reconciliation、routed UI 和 resource refs |
-| A5 Recovery / release hardening | 未开始 | capped restart、kill matrix、协作退出、签名 package |
+| A0 RPC / binary POC | 已完成 | compiled companion、动态 loopback、认证 RPC、监管、关闭和 package gate |
+| A1 agents-server extraction | 已完成 | Pi Ask、Provider/auth、产品 DB、Session JSONL 和 cleanup 全部归 agents server |
+| A2 Executor / Agent registry | 部分完成 | executor 注册/readiness 已有；Agent N:1 binding 和 inventory 尚未实现 |
+| A3 Tool Bridge / Action Broker | 未开始 | server policy/intent/grant -> executor Tool -> typed result |
+| A4 MCP / Skills | 未开始 | executor-owned secret/lifecycle/store、inventory reconciliation、resource refs |
+| A5 Recovery / release hardening | 部分完成 | restart/package/smoke 已有；签名、公证、Keychain 和完整故障矩阵待完成 |
 
-旧 `F0-16 条件性 sidecar POC` 已从计划中删除。旧 `DEC-004` 和 `ARC-011` 的“先保持 in-process、实测失败再决定 sidecar”口径已被批准的三角色架构取代。
+## 7. 开发数据策略
 
-## 6. 下一里程碑：A0 RPC / Binary POC
+当前仍处于首次外部分发前。产品 DB 与 Provider registry 使用当前 schema；不兼容的旧开发数据可明确 reset，
+不会保留已删除 runtime 的转换 adapter。Pi Session JSONL 是当前 conversation context 格式。
+首次外部发布冻结 schema 后，升级必须遵守 backup、migration、rollback 和 fixture gate。
 
-本里程碑只证明进程、协议、身份和 package 基线，不迁移完整业务。
+## 8. 下一优先级
 
-目标链路：
-
-```text
-Electrobun client supervisor
-  -> start agents-server binary
-  -> receive dynamic loopback bootstrap
-  -> client register
-  -> start executor binary
-  -> executor register
-  -> versioned JSON RPC request/event/cancel
-  -> cooperative shutdown
-```
-
-出口：
-
-- client、agents-server、executor 三个角色在开发和 package 中都可识别。
-- 两个 companion 是 TypeScript + Bun compiled binaries，终端用户无需安装 Bun/Node。
-- server 只绑定动态 loopback；未认证本机进程不能注册。
-- `clientId`/`executorId` 可稳定恢复；每次启动/注册使用新 `instanceId` 和 generation。
-- 旧 generation 的 event/response 被拒绝。
-- client 分别监管 server/executor，异常使用 capped backoff；达到上限停止 crash loop。
-- 正常退出先协作关闭，超时才升级终止。
-- stable package 无固定 token、测试 method 或调试 listener。
-
-完成 A0 后再开始 A1，不在 POC 中提前复制当前业务 DB 或 Agent runtime。
-
-## 7. 迁移约束
-
-- A1 按领域一次切换一个唯一 writer，禁止 client/server 双写业务 DB。
-- 当前 Ask UI 和用户行为在 A1 保持等价；transport 变化不应被包装为产品新功能。
-- A2 前不在 UI 硬编码“executor 总在线”；registry 是可用性事实来源。
-- A3 前继续保持 Ask 无 Tool，不加入可绕过 grant 的临时文件/命令 API。
-- A4 复用 A3 Action/grant，不为 MCP/Skill 建旁路。
-- A5 前不把架构迁移描述为可外部分发完成。
-
-## 8. 开发数据策略
-
-本次重构不迁移当前 `app.db`、checkpoint、Provider 开发配置或旧 fixture。目标实现可在 schema 不兼容时提供明确 reset；不得静默误读，也不得宣称已完成跨版本迁移。
-
-该例外只适用于开发阶段。首次外部发布后，数据库升级仍必须遵守 backup、migration、rollback 和 fixture gate。
-
-## 9. 当前功能优先级
-
-在 A0/A1 期间：
-
-- 现有 Provider 设置、普通 Chat、Session 和无 Tool Ask 保持可用、可测试。
-- 新的 Agent 写操作、命令、MCP 或 Skill 执行不得先于 A3/A4。
-- Keychain 仍是外部分发前门槛；迁移期开发配置不宣称是安全保险库。
-- graph resume、Policy、Action recovery 和 packaged E2E 仍是发布阻断项。
+1. 冻结 Executor/Agent identity、binding、inventory 和 offline Run gate。
+2. 建立 Moshu-owned Tool/Policy/approval/grant 边界，再开放任何本机副作用。
+3. 在同一边界上实现 executor-owned MCP 与 Skill storage，不给 Agent runtime 建旁路。
+4. 完成 Keychain、签名、公证、故障矩阵和外部 packaged E2E 后再声明可发布。

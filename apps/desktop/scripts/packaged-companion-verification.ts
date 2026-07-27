@@ -14,8 +14,7 @@ export async function verifyPackagedCompanionLaunch(
 		},
 		dataPaths: {
 			productDatabase: join(directory, "moshu.db"),
-			checkpointDatabase: join(directory, "moshu-checkpoints.db"),
-			providerConfig: join(directory, "provider.json"),
+			agentDataDirectory: join(directory, "agent-data"),
 		},
 		restartPolicy: { maxAttempts: 0, baseDelayMs: 0, maxDelayMs: 0 },
 	});

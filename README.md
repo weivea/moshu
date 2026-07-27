@@ -1,11 +1,11 @@
 # 墨枢
 
-墨枢是一款 Local-first 桌面 Agent 应用，目前处于三应用角色架构迁移阶段，尚未面向外部分发。
+墨枢是一款 Local-first 桌面 Agent 应用，当前三应用角色基础架构已经落地，尚未面向外部分发。
 
 当前仓库已经实现：
 
 - Electrobun client 启动并监管两个 Bun compiled companion。
-- agents server 独立承载 Provider、Ask runtime、业务数据库和 checkpoint。
+- agents server 独立承载 Provider、基于公开 Pi 0.82.1 API 的 Ask runtime、产品数据库和 Agent Session。
 - executor 完成独立进程、认证注册和生命周期基线；Tool、MCP 和 Skill 执行能力仍在后续阶段。
 - client、agents server 和 executor 通过动态 loopback endpoint 上的版本化 JSON RPC 通信。
 
@@ -52,7 +52,7 @@ bun run dev:hmr
 
 React WebView 使用 Vite HMR，通常不重开窗口。agents server 和 executor 使用完整自动重载：修改它们或当前引用的
 共享包源码后，Electrobun 会进行 300ms 防抖、停止当前应用、重新编译两个 companion，再构建并启动 desktop。
-该过程会重开桌面窗口，不保留 WebView 内存状态；持久化数据库和 checkpoint 不受影响。构建失败时应用保持停止，
+该过程会重开桌面窗口，不保留 WebView 内存状态；产品数据库和 Pi SessionManager JSONL 不受影响。构建失败时应用保持停止，
 修复源码并再次保存后会重新尝试。
 
 当前 companion 自动重载覆盖：
@@ -63,7 +63,6 @@ apps/executor/src/
 packages/agent-runtime/src/
 packages/contracts/src/
 packages/database/src/
-packages/deepagents/src/
 packages/process-rpc/src/
 ```
 
@@ -109,7 +108,7 @@ Companion binary 按当前构建主机编译，因此暂不支持交叉平台打
 | --- | --- |
 | `bun run format` | 使用 Biome 写入格式化结果 |
 | `bun run lint` | 运行 Biome lint |
-| `bun run typecheck` | 生成 Deep Agents 类型并检查所有 `@moshu/*` workspace |
+| `bun run typecheck` | 检查所有 `@moshu/*` workspace |
 | `bun run test:packages` | 运行 `packages/*` 测试 |
 | `bun run test:companions` | 运行 agents server 和 executor 测试 |
 | `bun run test:web` | 运行 desktop Bun/Vitest 测试 |
@@ -120,6 +119,16 @@ Companion binary 按当前构建主机编译，因此暂不支持交叉平台打
 | `bun run smoke:parent-death` | 验证 desktop parent 异常退出后 companion 不残留 |
 
 `bun run check` 不包含 smoke test 或桌面打包；发布流水线需要单独执行相应命令。
+
+## Agent runtime
+
+Ask 使用固定版本 `@earendil-works/pi-ai`、`pi-agent-core` 和 `pi-coding-agent` 的公开 API。
+agents server 通过 `ModelRuntime` 动态枚举内置 Provider，并支持四类公开 API 的自定义 Provider。
+凭据由 app-owned `SecretVaultCredentialStore` 保存；交互式登录使用异步 auth attempt，secret 回答只作为输入传递。
+
+每个 Chat Session 映射到显式 `agentDataDirectory/sessions` 下的 Pi `SessionManager` JSONL。产品数据库只保存
+Session/Run/event UI 投影和通用 agent-session cleanup outbox。当前 Ask 创建 headless、`noTools: "all"` 的
+`AgentSession`；Tool、MCP、Skill 和 subagent 尚未实现，后续只能通过墨枢自有 Policy、grant 和 executor 边界接入。
 
 ## 文档
 

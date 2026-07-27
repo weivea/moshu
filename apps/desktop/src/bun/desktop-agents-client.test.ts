@@ -3164,7 +3164,7 @@ function createConnectOptions(): DesktopAgentsConnectOptions {
 	return {
 		agentsServer: {
 			channel: "moshu-companion-bootstrap",
-			controlVersion: 1,
+			controlVersion: 2,
 			type: "READY",
 			role: "agents-server",
 			pid: 101,
@@ -3193,6 +3193,7 @@ function createSessionPayload(index: number): JsonValue {
 		session: {
 			schemaVersion: 1,
 			id: `01984df0-cf17-7e6e-9a7d-${index.toString(16).padStart(12, "0")}`,
+			agentSessionId: `01984df0-cf17-7e6e-9a7d-${index.toString(16).padStart(12, "0")}`,
 			title: "New chat",
 			defaultMode: "ask",
 			createdAt,
@@ -3218,8 +3219,8 @@ function createAcceptedPayload(
 				schemaVersion: 1,
 				providerId: "01984df0-cf16-7df0-8a4a-a1fc9dc9299d",
 				name: "OpenAI",
-				type: "openai-compatible",
-				baseUrl: "https://api.openai.com/v1",
+				source: "builtin",
+				api: "openai-responses",
 				model: "gpt-4.1-mini",
 				status: "ready",
 			},
@@ -3260,6 +3261,7 @@ function createSessionPagePayload(): JsonValue {
 		session: {
 			schemaVersion: 1,
 			id: sessionId,
+			agentSessionId: sessionId,
 			title: "Recovered Session",
 			defaultMode: "ask",
 			createdAt,

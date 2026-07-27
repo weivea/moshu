@@ -1,7 +1,7 @@
 import { z } from "zod";
 
 export const companionBootstrapChannel = "moshu-companion-bootstrap" as const;
-export const companionControlVersion = 1 as const;
+export const companionControlVersion = 2 as const;
 export const maxCompanionControlRecordBytes = 4096;
 
 const identifierSchema = z.string().trim().min(1).max(256);
@@ -54,8 +54,7 @@ export const rpcCredentialBindingSchema = z
 export const agentsServerDataPathsSchema = z
 	.object({
 		productDatabase: absolutePathSchema,
-		checkpointDatabase: absolutePathSchema,
-		providerConfig: absolutePathSchema,
+		agentDataDirectory: absolutePathSchema,
 	})
 	.strict();
 

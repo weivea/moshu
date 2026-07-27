@@ -13,7 +13,6 @@ import {
 	ProviderNotFoundError,
 	type ProviderRecord,
 	type ProviderRegistry,
-	type ResolvedProviderConfiguration,
 } from "@moshu/agent-runtime";
 import {
 	type ChatRunEvent,
@@ -36,7 +35,6 @@ import {
 import { ZodError } from "zod";
 
 import { ChatApplicationService } from "./chat-application-service";
-import type { ProviderCatalogRequest } from "./provider-catalog";
 
 describe("ChatApplicationService", () => {
 	test("persists every streamed event before publishing it", async () => {
@@ -699,20 +697,20 @@ describe("ChatApplicationService", () => {
 			expect(() =>
 				service.sendMessage({ sessionId: orphaned.sessionId, content: "still fenced" }),
 			).toThrow("persistence is unavailable");
-			expect(() =>
+			await expect(
 				service.createProvider({
-					schemaVersion: 1,
+					schemaVersion: 2,
 					displayName: "Other",
-					type: "openai-compatible",
+					api: "openai-responses",
 					baseUrl: "https://api.openai.com/v1",
 					apiKey: "sk-other",
 				}),
-			).toThrow("persistence is unavailable");
-			expect(() =>
-				service.deleteProvider({ schemaVersion: 1, providerId: createUuidV7() }),
-			).toThrow("persistence is unavailable");
+			).rejects.toThrow("persistence is unavailable");
 			await expect(
-				service.testProvider({ schemaVersion: 1, providerId: createUuidV7() }),
+				service.deleteProvider({ schemaVersion: 2, providerId: createUuidV7() }),
+			).rejects.toThrow("persistence is unavailable");
+			await expect(
+				service.testProvider({ schemaVersion: 2, providerId: createUuidV7() }),
 			).rejects.toThrow("persistence is unavailable");
 			expect(commitAttempts).toBe(1);
 			await Promise.resolve();
@@ -1173,7 +1171,7 @@ describe("ChatApplicationService", () => {
 		}
 	});
 
-	test("submits only the current turn and lets Deep Agents restore prior messages", async () => {
+	test("submits only the current turn and lets Pi restore prior messages", async () => {
 		const database = openAppDatabase(":memory:");
 		const scheduler = new ManualScheduler();
 		const runtime = new FakeAskChatRuntime({ deltas: ["Reply"] });
@@ -1315,8 +1313,8 @@ describe("ChatApplicationService", () => {
 			const { providers } = service.listProviders();
 			const provider = providers[0];
 			expect(provider?.baseUrl).toBe("https://api.openai.com/v1");
-			expect(provider?.apiKeyMask).toBe("••••••••cret");
-			expect(provider?.models).toEqual([{ id: "gpt-5.4", enabled: true }]);
+			expect(provider?.credential).toEqual({ configured: true, type: "api_key" });
+			expect(provider?.models.map((model) => model.id)).toEqual(["gpt-5.4"]);
 			expect(JSON.stringify(providers)).not.toContain("sk-test-secret");
 
 			const { session } = service.createSession();
@@ -1495,15 +1493,15 @@ describe("ChatApplicationService", () => {
 		});
 
 		try {
-			const created = service.createProvider({
-				schemaVersion: 1,
+			const created = await service.createProvider({
+				schemaVersion: 2,
 				displayName: "OpenAI",
-				type: "openai-compatible",
+				api: "openai-responses",
 				baseUrl: "https://api.openai.com/v1",
 				apiKey: "sk-test-secret",
 			});
-			const updated = service.updateProvider({
-				schemaVersion: 1,
+			const updated = await service.updateProvider({
+				schemaVersion: 2,
 				providerId: created.provider.id,
 				displayName: "OpenAI Compatible",
 				baseUrl: "https://api.openai.com/compatible/v1",
@@ -1511,35 +1509,30 @@ describe("ChatApplicationService", () => {
 
 			expect(updated.provider.baseUrl).toBe("https://api.openai.com/compatible/v1");
 			expect(updated.provider.displayName).toBe("OpenAI Compatible");
-			expect(registry.get(created.provider.id)?.apiKey).toBe("sk-test-secret");
+			expect(updated.provider.credential.configured).toBe(true);
+			expect(JSON.stringify(updated)).not.toContain("sk-test-secret");
 		} finally {
 			await service.shutdown();
 			database.close();
 		}
 	});
 
-	test("requires a new API key before testing a Provider on another origin", async () => {
+	test("requires a saved Provider before testing a draft", async () => {
 		const database = openAppDatabase(":memory:");
 		const scheduler = new ManualScheduler();
-		const testedConfigurations: ResolvedProviderConfiguration[] = [];
-		const service = createService(database, new FakeAskChatRuntime({}), scheduler, {
-			testProviderConnection: async (configuration) => {
-				testedConfigurations.push(configuration);
-			},
-		});
+		const service = createService(database, new FakeAskChatRuntime({}), scheduler);
 
 		try {
 			const output = await service.testProvider({
-				schemaVersion: 1,
+				schemaVersion: 2,
 				draft: {
 					displayName: "Untrusted",
-					type: "openai-compatible",
+					api: "openai-responses",
 					baseUrl: "https://untrusted.example/v1",
 				},
 			});
 			expect(output.ok).toBe(false);
-			expect(output.error?.safeMessage).toContain("new API key");
-			expect(testedConfigurations).toEqual([]);
+			expect(output.error?.safeMessage).toContain("Save the custom Provider");
 		} finally {
 			await service.shutdown();
 			database.close();
@@ -1549,19 +1542,13 @@ describe("ChatApplicationService", () => {
 	test("tests Provider settings without exposing the API key", async () => {
 		const database = openAppDatabase(":memory:");
 		const scheduler = new ManualScheduler();
-		const testedConfigurations: ResolvedProviderConfiguration[] = [];
-		const service = createService(database, new FakeAskChatRuntime({}), scheduler, {
-			testProviderConnection: async (configuration) => {
-				testedConfigurations.push(configuration);
-			},
-		});
+		const service = createService(database, new FakeAskChatRuntime({}), scheduler);
 
 		try {
 			const providerId = service.listProviders().providers[0]?.id ?? "";
-			const output = await service.testProvider({ schemaVersion: 1, providerId });
+			const output = await service.testProvider({ schemaVersion: 2, providerId });
 
 			expect(output.ok).toBe(true);
-			expect(testedConfigurations[0]?.apiKey).toBe("sk-test-secret");
 			expect(JSON.stringify(output)).not.toContain("sk-test-secret");
 		} finally {
 			await service.shutdown();
@@ -1569,27 +1556,28 @@ describe("ChatApplicationService", () => {
 		}
 	});
 
-	test("maps Provider connection failures to safe errors", async () => {
+	test("maps missing Provider credentials to a safe error", async () => {
 		const database = openAppDatabase(":memory:");
 		const scheduler = new ManualScheduler();
+		const registry = createTestProviderRegistry({ seed: false });
 		const service = createService(database, new FakeAskChatRuntime({}), scheduler, {
-			testProviderConnection: async () => {
-				throw new AskChatRuntimeError({
-					kind: "provider_authentication",
-					message: "Provider authentication failed.",
-					retryable: false,
-					statusCode: 401,
-				});
-			},
+			providers: registry,
 		});
 
 		try {
-			const providerId = service.listProviders().providers[0]?.id ?? "";
-			const output = await service.testProvider({ schemaVersion: 1, providerId });
+			const created = await service.createProvider({
+				schemaVersion: 2,
+				displayName: "No credential",
+				api: "openai-responses",
+				baseUrl: "https://example.invalid/v1",
+			});
+			const output = await service.testProvider({
+				schemaVersion: 2,
+				providerId: created.provider.id,
+			});
 
 			expect(output.ok).toBe(false);
-			expect(output.error?.safeMessage).toBe("Provider authentication failed.");
-			expect(JSON.stringify(output)).not.toContain("sk-test-secret");
+			expect(output.error?.safeMessage).toBe("Provider credentials are not configured.");
 		} finally {
 			await service.shutdown();
 			database.close();
@@ -1604,17 +1592,17 @@ describe("ChatApplicationService", () => {
 		});
 
 		try {
-			const created = service.createProvider({
-				schemaVersion: 1,
+			const created = await service.createProvider({
+				schemaVersion: 2,
 				displayName: "OpenAI",
-				type: "openai-compatible",
+				api: "openai-responses",
 				baseUrl: "https://api.openai.com/v1",
 				apiKey: "sk-test-secret",
 			});
 			expect(service.listProviders().providers).toHaveLength(1);
 
-			const output = service.deleteProvider({
-				schemaVersion: 1,
+			const output = await service.deleteProvider({
+				schemaVersion: 2,
 				providerId: created.provider.id,
 			});
 
@@ -1735,11 +1723,11 @@ describe("ChatApplicationService", () => {
 				"being deleted",
 			);
 			expect(runtime.deletedThreadIds).toEqual([session.id]);
-			expect(database.runs.listPendingCheckpointDeletions(10, true)).toHaveLength(1);
+			expect(database.runs.listPendingAgentSessionCleanups(10, true)).toHaveLength(1);
 
 			deletionGate.resolve();
 			await waitUntil(
-				() => database.runs.listPendingCheckpointDeletions(10, true).length === 0,
+				() => database.runs.listPendingAgentSessionCleanups(10, true).length === 0,
 				100,
 				"coalesced deletion cleanup",
 			);
@@ -1757,7 +1745,7 @@ describe("ChatApplicationService", () => {
 	test("returns durable deletion success after response loss and restart without duplicating cleanup", async () => {
 		const database = openAppDatabase(":memory:");
 		const failedRuntime = new FakeAskChatRuntime({
-			deleteThreadError: new Error("checkpoint cleanup failed"),
+			deleteThreadError: new Error("agent session cleanup failed"),
 		});
 		const service = createService(database, failedRuntime, new ManualScheduler(), {
 			logger: { error() {} },
@@ -1771,12 +1759,12 @@ describe("ChatApplicationService", () => {
 				sessionId: session.id,
 			});
 			await waitUntil(
-				() => database.runs.listPendingCheckpointDeletions(10, true)[0]?.attemptCount === 1,
+				() => database.runs.listPendingAgentSessionCleanups(10, true)[0]?.attemptCount === 1,
 				100,
-				"failed checkpoint cleanup persistence",
+				"failed agent session cleanup persistence",
 			);
 			expect(failedRuntime.deletedThreadIds).toEqual([session.id]);
-			expect(database.runs.listPendingCheckpointDeletions(10, true)).toHaveLength(1);
+			expect(database.runs.listPendingAgentSessionCleanups(10, true)).toHaveLength(1);
 			expect(database.runs.isSessionRetired(session.id)).toBe(true);
 
 			await service.shutdown();
@@ -1786,7 +1774,7 @@ describe("ChatApplicationService", () => {
 				sessionId: session.id,
 			});
 			expect(restartedRuntime.deletedThreadIds).toEqual([]);
-			expect(database.runs.listPendingCheckpointDeletions(10, true)).toHaveLength(1);
+			expect(database.runs.listPendingAgentSessionCleanups(10, true)).toHaveLength(1);
 			expect(() => restarted?.deleteSession({ sessionId: createUuidV7() })).toThrow("not found");
 		} finally {
 			await restarted?.shutdown();
@@ -1795,7 +1783,7 @@ describe("ChatApplicationService", () => {
 		}
 	});
 
-	test("keeps product deletion authoritative when checkpoint cleanup fails", async () => {
+	test("keeps product deletion authoritative when agent session cleanup fails", async () => {
 		const database = openAppDatabase(":memory:");
 		const scheduler = new ManualScheduler();
 		const failedRuntime = new FakeAskChatRuntime({
@@ -1810,12 +1798,12 @@ describe("ChatApplicationService", () => {
 				sessionId: session.id,
 			});
 			await waitUntil(
-				() => database.runs.listPendingCheckpointDeletions(10, true)[0]?.attemptCount === 1,
+				() => database.runs.listPendingAgentSessionCleanups(10, true)[0]?.attemptCount === 1,
 				100,
 				"authoritative deletion cleanup failure",
 			);
 			await expect(service.getSession({ sessionId: session.id })).rejects.toThrow("not found");
-			const [failedJob] = database.runs.listPendingCheckpointDeletions(10, true);
+			const [failedJob] = database.runs.listPendingAgentSessionCleanups(10, true);
 			expect(failedJob).toEqual(
 				expect.objectContaining({
 					sessionId: session.id,
@@ -1828,13 +1816,13 @@ describe("ChatApplicationService", () => {
 			const recoveryRuntime = new FakeAskChatRuntime({});
 			restarted = createService(database, recoveryRuntime, new ManualScheduler());
 			expect(
-				await restarted.retryPendingCheckpointDeletions({
+				await restarted.retryPendingAgentSessionCleanups({
 					limit: 10,
 					includeDeferred: true,
 				}),
 			).toEqual({ attempted: 1, succeeded: 1, failed: 0, remaining: 0 });
 			expect(recoveryRuntime.deletedThreadIds).toEqual([session.id]);
-			expect(await restarted.retryPendingCheckpointDeletions({ limit: 10 })).toEqual({
+			expect(await restarted.retryPendingAgentSessionCleanups({ limit: 10 })).toEqual({
 				attempted: 0,
 				succeeded: 0,
 				failed: 0,
@@ -1847,40 +1835,40 @@ describe("ChatApplicationService", () => {
 		}
 	});
 
-	test("drains checkpoint deletion jobs in bounded retries until they succeed", async () => {
+	test("drains agent session cleanup jobs in bounded retries until they succeed", async () => {
 		const database = openAppDatabase(":memory:");
 		const session = database.sessions.create({ title: "Retry cleanup" }).session;
 		database.runs.deleteSessionAndRetireRuns(session.id);
 		const runtime = new FakeAskChatRuntime({
-			deleteThreadError: new Error("transient checkpoint failure"),
+			deleteThreadError: new Error("transient agent-session cleanup failure"),
 			deleteThreadFailures: 2,
 		});
 		const service = createService(database, runtime, new ManualScheduler(), {
-			checkpointDeletionRetryBaseMs: 1,
-			checkpointDeletionRetryMaxMs: 2,
+			agentSessionCleanupRetryBaseMs: 1,
+			agentSessionCleanupRetryMaxMs: 2,
 			logger: { error() {} },
 		});
 
 		try {
 			await withDeadline(
-				service.drainPendingCheckpointDeletions({ batchSize: 1 }),
+				service.drainPendingAgentSessionCleanups({ batchSize: 1 }),
 				250,
-				"checkpoint deletion recovery",
+				"agent session cleanup recovery",
 			);
 			await waitUntil(
-				() => database.runs.listPendingCheckpointDeletions(10, true).length === 0,
+				() => database.runs.listPendingAgentSessionCleanups(10, true).length === 0,
 				250,
-				"checkpoint deletion background retry",
+				"agent session cleanup background retry",
 			);
 			expect(runtime.deletedThreadIds).toEqual([session.id, session.id, session.id]);
-			expect(database.runs.listPendingCheckpointDeletions(10, true)).toEqual([]);
+			expect(database.runs.listPendingAgentSessionCleanups(10, true)).toEqual([]);
 		} finally {
 			await service.shutdown();
 			database.close();
 		}
 	});
 
-	test("times out one hung checkpoint deletion without blocking later jobs in the batch", async () => {
+	test("times out one hung agent session cleanup without blocking later jobs in the batch", async () => {
 		const database = openAppDatabase(":memory:");
 		const first = database.sessions.create({ title: "Hung cleanup" }).session;
 		const second = database.sessions.create({ title: "Later cleanup" }).session;
@@ -1895,25 +1883,25 @@ describe("ChatApplicationService", () => {
 			},
 		});
 		const service = createService(database, runtime, new ManualScheduler(), {
-			checkpointDeletionAttemptTimeoutMs: 10,
-			checkpointDeletionRetryBaseMs: 1_000,
-			checkpointDeletionRetryMaxMs: 1_000,
+			agentSessionCleanupAttemptTimeoutMs: 10,
+			agentSessionCleanupRetryBaseMs: 1_000,
+			agentSessionCleanupRetryMaxMs: 1_000,
 			logger: { error() {} },
 		});
 
 		try {
 			expect(
 				await withDeadline(
-					service.retryPendingCheckpointDeletions({
+					service.retryPendingAgentSessionCleanups({
 						limit: 2,
 						includeDeferred: true,
 					}),
 					100,
-					"checkpoint deletion batch",
+					"agent session cleanup batch",
 				),
 			).toEqual({ attempted: 2, succeeded: 1, failed: 1, remaining: 1 });
 			expect(runtime.deletedThreadIds).toEqual([first.id, second.id]);
-			expect(database.runs.listPendingCheckpointDeletions(10, true)).toEqual([
+			expect(database.runs.listPendingAgentSessionCleanups(10, true)).toEqual([
 				expect.objectContaining({ sessionId: first.id, attemptCount: 1 }),
 			]);
 		} finally {
@@ -1923,7 +1911,7 @@ describe("ChatApplicationService", () => {
 		}
 	});
 
-	test("keeps one hung operation per Session while fairly deleting healthy checkpoint jobs", async () => {
+	test("keeps one hung operation per Session while fairly deleting healthy agent session jobs", async () => {
 		const database = openAppDatabase(":memory:");
 		const hung = database.sessions.create({ title: "Permanent hang" }).session;
 		const healthyOne = database.sessions.create({ title: "Healthy one" }).session;
@@ -1936,21 +1924,21 @@ describe("ChatApplicationService", () => {
 				threadId === hung.id ? new Promise<void>(() => undefined) : Promise.resolve(),
 		});
 		const service = createService(database, runtime, new ManualScheduler(), {
-			checkpointDeletionAttemptTimeoutMs: 5,
-			checkpointDeletionMaxInFlightAttempts: 4,
-			checkpointDeletionRetryBaseMs: 1,
-			checkpointDeletionRetryMaxMs: 1,
-			checkpointDeletionStartupTimeoutMs: 25,
+			agentSessionCleanupAttemptTimeoutMs: 5,
+			agentSessionCleanupMaxInFlightAttempts: 4,
+			agentSessionCleanupRetryBaseMs: 1,
+			agentSessionCleanupRetryMaxMs: 1,
+			agentSessionCleanupStartupTimeoutMs: 25,
 			shutdownTimeoutMs: 25,
 			logger: { error() {} },
 		});
 
 		try {
-			await service.drainPendingCheckpointDeletions({ batchSize: 3 });
+			await service.drainPendingAgentSessionCleanups({ batchSize: 3 });
 			await waitUntil(
-				() => database.runs.listPendingCheckpointDeletions(10, true).length === 1,
+				() => database.runs.listPendingAgentSessionCleanups(10, true).length === 1,
 				100,
-				"healthy checkpoint deletion fairness",
+				"healthy agent session cleanup fairness",
 			);
 			await Bun.sleep(25);
 			expect(runtime.deletedThreadIds.filter((threadId) => threadId === hung.id)).toEqual([
@@ -1958,7 +1946,7 @@ describe("ChatApplicationService", () => {
 			]);
 			expect(runtime.deletedThreadIds).toContain(healthyOne.id);
 			expect(runtime.deletedThreadIds).toContain(healthyTwo.id);
-			expect(database.runs.listPendingCheckpointDeletions(10, true)).toEqual([
+			expect(database.runs.listPendingAgentSessionCleanups(10, true)).toEqual([
 				expect.objectContaining({ sessionId: hung.id, attemptCount: 1 }),
 			]);
 			await withDeadline(service.shutdown(), 100, "bounded hung deletion shutdown");
@@ -1968,7 +1956,7 @@ describe("ChatApplicationService", () => {
 		}
 	});
 
-	test("retries a timed-out Session only after its underlying checkpoint deletion settles", async () => {
+	test("retries a timed-out Session only after its underlying agent session cleanup settles", async () => {
 		const database = openAppDatabase(":memory:");
 		const session = database.sessions.create({ title: "Eventually released" }).session;
 		database.runs.deleteSessionAndRetireRuns(session.id);
@@ -1983,21 +1971,21 @@ describe("ChatApplicationService", () => {
 			},
 		});
 		const service = createService(database, runtime, new ManualScheduler(), {
-			checkpointDeletionAttemptTimeoutMs: 5,
-			checkpointDeletionRetryBaseMs: 1,
-			checkpointDeletionRetryMaxMs: 1,
+			agentSessionCleanupAttemptTimeoutMs: 5,
+			agentSessionCleanupRetryBaseMs: 1,
+			agentSessionCleanupRetryMaxMs: 1,
 			logger: { error() {} },
 		});
 
 		try {
 			expect(
-				await service.retryPendingCheckpointDeletions({
+				await service.retryPendingAgentSessionCleanups({
 					limit: 1,
 					includeDeferred: true,
 				}),
 			).toEqual({ attempted: 1, succeeded: 0, failed: 1, remaining: 1 });
 			expect(
-				await service.retryPendingCheckpointDeletions({
+				await service.retryPendingAgentSessionCleanups({
 					limit: 1,
 					includeDeferred: true,
 				}),
@@ -2006,9 +1994,9 @@ describe("ChatApplicationService", () => {
 
 			firstGate.resolve();
 			await waitUntil(
-				() => database.runs.listPendingCheckpointDeletions(10, true).length === 0,
+				() => database.runs.listPendingAgentSessionCleanups(10, true).length === 0,
 				100,
-				"released checkpoint deletion retry",
+				"released agent session cleanup retry",
 			);
 			expect(calls).toBe(2);
 		} finally {
@@ -2018,7 +2006,7 @@ describe("ChatApplicationService", () => {
 		}
 	});
 
-	test("observes a checkpoint deletion rejection that arrives after its deadline", async () => {
+	test("observes a agent session cleanup rejection that arrives after its deadline", async () => {
 		const database = openAppDatabase(":memory:");
 		const session = database.sessions.create({ title: "Late rejection" }).session;
 		database.runs.deleteSessionAndRetireRuns(session.id);
@@ -2028,9 +2016,9 @@ describe("ChatApplicationService", () => {
 		});
 		const runtime = new FakeAskChatRuntime({ deleteThreadImplementation: () => deletion });
 		const service = createService(database, runtime, new ManualScheduler(), {
-			checkpointDeletionAttemptTimeoutMs: 5,
-			checkpointDeletionRetryBaseMs: 1_000,
-			checkpointDeletionRetryMaxMs: 1_000,
+			agentSessionCleanupAttemptTimeoutMs: 5,
+			agentSessionCleanupRetryBaseMs: 1_000,
+			agentSessionCleanupRetryMaxMs: 1_000,
 			logger: { error() {} },
 		});
 		const unhandled: unknown[] = [];
@@ -2041,15 +2029,15 @@ describe("ChatApplicationService", () => {
 
 		try {
 			expect(
-				await service.retryPendingCheckpointDeletions({
+				await service.retryPendingAgentSessionCleanups({
 					limit: 1,
 					includeDeferred: true,
 				}),
 			).toEqual({ attempted: 1, succeeded: 0, failed: 1, remaining: 1 });
-			rejectDeletion?.(new Error("late checkpoint rejection"));
+			rejectDeletion?.(new Error("late agent-session cleanup rejection"));
 			await Bun.sleep(10);
 			expect(unhandled).toEqual([]);
-			expect(database.runs.listPendingCheckpointDeletions(10, true)).toHaveLength(1);
+			expect(database.runs.listPendingAgentSessionCleanups(10, true)).toHaveLength(1);
 		} finally {
 			process.off("unhandledRejection", onUnhandled);
 			await service.shutdown();
@@ -2057,20 +2045,20 @@ describe("ChatApplicationService", () => {
 		}
 	});
 
-	test("repeats idempotent checkpoint deletion when acknowledgement crashes", async () => {
+	test("repeats idempotent agent session cleanup when acknowledgement crashes", async () => {
 		const database = openAppDatabase(":memory:");
 		const session = database.sessions.create({ title: "Ack crash" }).session;
 		database.runs.deleteSessionAndRetireRuns(session.id);
 		let acknowledgementCalls = 0;
 		const runs: RunJournalRepository = new Proxy(database.runs, {
 			get(target, property) {
-				if (property === "ackCheckpointDeletion") {
+				if (property === "ackAgentSessionCleanup") {
 					return (sessionId: string) => {
 						acknowledgementCalls += 1;
 						if (acknowledgementCalls === 1) {
 							throw new Error("simulated acknowledgement crash");
 						}
-						return target.ackCheckpointDeletion(sessionId);
+						return target.ackAgentSessionCleanup(sessionId);
 					};
 				}
 				const value = Reflect.get(target, property, target);
@@ -2080,25 +2068,25 @@ describe("ChatApplicationService", () => {
 		const runtime = new FakeAskChatRuntime({});
 		const service = createService(database, runtime, new ManualScheduler(), {
 			runs,
-			checkpointDeletionRetryBaseMs: 1,
-			checkpointDeletionRetryMaxMs: 1,
+			agentSessionCleanupRetryBaseMs: 1,
+			agentSessionCleanupRetryMaxMs: 1,
 			logger: { error() {} },
 		});
 
 		try {
 			await withDeadline(
-				service.drainPendingCheckpointDeletions({ batchSize: 1 }),
+				service.drainPendingAgentSessionCleanups({ batchSize: 1 }),
 				250,
-				"checkpoint acknowledgement recovery",
+				"agent-session cleanup acknowledgement recovery",
 			);
 			await waitUntil(
-				() => database.runs.listPendingCheckpointDeletions(10, true).length === 0,
+				() => database.runs.listPendingAgentSessionCleanups(10, true).length === 0,
 				250,
-				"checkpoint acknowledgement background retry",
+				"agent-session cleanup acknowledgement background retry",
 			);
 			expect(runtime.deletedThreadIds).toEqual([session.id, session.id]);
 			expect(acknowledgementCalls).toBe(2);
-			expect(database.runs.listPendingCheckpointDeletions(10, true)).toEqual([]);
+			expect(database.runs.listPendingAgentSessionCleanups(10, true)).toEqual([]);
 		} finally {
 			await service.shutdown();
 			database.close();
@@ -2110,28 +2098,28 @@ describe("ChatApplicationService", () => {
 		const session = database.sessions.create({ title: "Permanent cleanup failure" }).session;
 		database.runs.deleteSessionAndRetireRuns(session.id);
 		const runtime = new FakeAskChatRuntime({
-			deleteThreadError: new Error("permanent checkpoint failure"),
+			deleteThreadError: new Error("permanent agent-session cleanup failure"),
 		});
 		const service = createService(database, runtime, new ManualScheduler(), {
-			checkpointDeletionRetryBaseMs: 1_000,
-			checkpointDeletionRetryMaxMs: 1_000,
-			checkpointDeletionStartupTimeoutMs: 20,
-			checkpointDeletionStartupMaxAttempts: 1,
+			agentSessionCleanupRetryBaseMs: 1_000,
+			agentSessionCleanupRetryMaxMs: 1_000,
+			agentSessionCleanupStartupTimeoutMs: 20,
+			agentSessionCleanupStartupMaxAttempts: 1,
 			logger: { error() {} },
 		});
 
 		try {
 			await withDeadline(
-				service.drainPendingCheckpointDeletions({ batchSize: 1 }),
+				service.drainPendingAgentSessionCleanups({ batchSize: 1 }),
 				100,
-				"bounded permanent checkpoint recovery",
+				"bounded permanent agent-session cleanup recovery",
 			);
 			expect(runtime.deletedThreadIds).toEqual([session.id]);
 			await Bun.sleep(25);
 			expect(runtime.deletedThreadIds).toEqual([session.id]);
-			expect(database.runs.listPendingCheckpointDeletions(10, true)).toHaveLength(1);
+			expect(database.runs.listPendingAgentSessionCleanups(10, true)).toHaveLength(1);
 		} finally {
-			await withDeadline(service.shutdown(), 100, "permanent checkpoint worker shutdown");
+			await withDeadline(service.shutdown(), 100, "permanent agent-session worker shutdown");
 			const callsAfterShutdown = runtime.deletedThreadIds.length;
 			await Bun.sleep(25);
 			expect(runtime.deletedThreadIds).toHaveLength(callsAfterShutdown);
@@ -2139,7 +2127,7 @@ describe("ChatApplicationService", () => {
 		}
 	});
 
-	test("backs off when checkpoint retry-state persistence fails and recovers after restart", async () => {
+	test("backs off when cleanup retry-state persistence fails and recovers after restart", async () => {
 		const database = openAppDatabase(":memory:");
 		const session = database.sessions.create({ title: "Retry-state persistence" }).session;
 		database.runs.deleteSessionAndRetireRuns(session.id);
@@ -2149,28 +2137,28 @@ describe("ChatApplicationService", () => {
 		let pendingListCalls = 0;
 		const runs: RunJournalRepository = new Proxy(database.runs, {
 			get(target, property) {
-				if (property === "listPendingCheckpointDeletions") {
+				if (property === "listPendingAgentSessionCleanups") {
 					return (limit: number, includeDeferred?: boolean) => {
 						pendingListCalls += 1;
-						return target.listPendingCheckpointDeletions(limit, includeDeferred);
+						return target.listPendingAgentSessionCleanups(limit, includeDeferred);
 					};
 				}
-				if (property === "recordCheckpointDeletionFailure") {
+				if (property === "recordAgentSessionCleanupFailure") {
 					return (sessionId: string, error: string, nextAttemptAtMs: number) => {
 						retryStateWriteCalls += 1;
 						if (!repositoryWritesAllowed) {
 							throw new Error("simulated retry-state write failure");
 						}
-						return target.recordCheckpointDeletionFailure(sessionId, error, nextAttemptAtMs);
+						return target.recordAgentSessionCleanupFailure(sessionId, error, nextAttemptAtMs);
 					};
 				}
-				if (property === "ackCheckpointDeletion") {
+				if (property === "ackAgentSessionCleanup") {
 					return (sessionId: string) => {
 						acknowledgementCalls += 1;
 						if (!repositoryWritesAllowed) {
 							throw new Error("simulated acknowledgement write failure");
 						}
-						return target.ackCheckpointDeletion(sessionId);
+						return target.ackAgentSessionCleanup(sessionId);
 					};
 				}
 				const value = Reflect.get(target, property, target);
@@ -2178,7 +2166,7 @@ describe("ChatApplicationService", () => {
 			},
 		});
 		const runtime = new FakeAskChatRuntime({
-			deleteThreadError: new Error("checkpoint deletion failed"),
+			deleteThreadError: new Error("agent session cleanup failed"),
 			deleteThreadFailures: 1,
 		});
 		const errors: unknown[] = [];
@@ -2189,15 +2177,15 @@ describe("ChatApplicationService", () => {
 		process.on("unhandledRejection", onUnhandled);
 		const service = createService(database, runtime, new ManualScheduler(), {
 			runs,
-			checkpointDeletionRetryBaseMs: 60_000,
-			checkpointDeletionRetryMaxMs: 60_000,
+			agentSessionCleanupRetryBaseMs: 60_000,
+			agentSessionCleanupRetryMaxMs: 60_000,
 			logger: { error: (_message, error) => errors.push(error) },
 		});
 		let restarted: ChatApplicationService | undefined;
 
 		try {
 			await withDeadline(
-				service.drainPendingCheckpointDeletions({ batchSize: 1 }),
+				service.drainPendingAgentSessionCleanups({ batchSize: 1 }),
 				100,
 				"retry-state persistence readiness",
 			);
@@ -2207,7 +2195,7 @@ describe("ChatApplicationService", () => {
 			expect(pendingListCalls).toBe(1);
 			expect(errors).toHaveLength(1);
 			expect(unhandled).toEqual([]);
-			expect(database.runs.listPendingCheckpointDeletions(10, true)).toEqual([
+			expect(database.runs.listPendingAgentSessionCleanups(10, true)).toEqual([
 				expect.objectContaining({ sessionId: session.id, attemptCount: 0 }),
 			]);
 			await withDeadline(service.shutdown(), 100, "retry-state backoff shutdown");
@@ -2215,18 +2203,18 @@ describe("ChatApplicationService", () => {
 			repositoryWritesAllowed = true;
 			restarted = createService(database, runtime, new ManualScheduler(), {
 				runs,
-				checkpointDeletionRetryBaseMs: 1,
-				checkpointDeletionRetryMaxMs: 1,
+				agentSessionCleanupRetryBaseMs: 1,
+				agentSessionCleanupRetryMaxMs: 1,
 			});
 			await withDeadline(
-				restarted.drainPendingCheckpointDeletions({ batchSize: 1 }),
+				restarted.drainPendingAgentSessionCleanups({ batchSize: 1 }),
 				100,
 				"retry-state persistence recovery",
 			);
 			await waitUntil(
-				() => database.runs.listPendingCheckpointDeletions(10, true).length === 0,
+				() => database.runs.listPendingAgentSessionCleanups(10, true).length === 0,
 				100,
-				"checkpoint acknowledgement recovery",
+				"agent-session cleanup acknowledgement recovery",
 			);
 			expect(runtime.deletedThreadIds).toEqual([session.id, session.id]);
 			expect(acknowledgementCalls).toBe(1);
@@ -2239,27 +2227,27 @@ describe("ChatApplicationService", () => {
 		}
 	});
 
-	test("bounds readiness when checkpoint deletion hangs and cleans the worker on shutdown", async () => {
+	test("bounds readiness when agent session cleanup hangs and cleans the worker on shutdown", async () => {
 		const database = openAppDatabase(":memory:");
 		const session = database.sessions.create({ title: "Hung cleanup" }).session;
 		database.runs.deleteSessionAndRetireRuns(session.id);
 		const gate = createDeferred();
 		const runtime = new FakeAskChatRuntime({ deleteThreadGate: gate.promise });
 		const service = createService(database, runtime, new ManualScheduler(), {
-			checkpointDeletionStartupTimeoutMs: 10,
-			checkpointDeletionStartupMaxAttempts: 1,
+			agentSessionCleanupStartupTimeoutMs: 10,
+			agentSessionCleanupStartupMaxAttempts: 1,
 			logger: { error() {} },
 		});
 
 		try {
 			await withDeadline(
-				service.drainPendingCheckpointDeletions({ batchSize: 1 }),
+				service.drainPendingAgentSessionCleanups({ batchSize: 1 }),
 				100,
-				"hung checkpoint readiness",
+				"hung agent-session cleanup readiness",
 			);
 			expect(runtime.deletedThreadIds).toEqual([session.id]);
-			await withDeadline(service.shutdown(), 100, "hung checkpoint worker shutdown");
-			expect(database.runs.listPendingCheckpointDeletions(10, true)).toHaveLength(1);
+			await withDeadline(service.shutdown(), 100, "hung agent-session worker shutdown");
+			expect(database.runs.listPendingAgentSessionCleanups(10, true)).toHaveLength(1);
 		} finally {
 			gate.resolve();
 			await Promise.resolve();
@@ -2268,29 +2256,29 @@ describe("ChatApplicationService", () => {
 		}
 	});
 
-	test("interrupts checkpoint retry backoff safely during shutdown", async () => {
+	test("interrupts agent-session retry backoff safely during shutdown", async () => {
 		const database = openAppDatabase(":memory:");
 		const session = database.sessions.create({ title: "Shutdown cleanup" }).session;
 		database.runs.deleteSessionAndRetireRuns(session.id);
 		const runtime = new FakeAskChatRuntime({
-			deleteThreadError: new Error("persistent checkpoint failure"),
+			deleteThreadError: new Error("persistent agent-session cleanup failure"),
 		});
 		const service = createService(database, runtime, new ManualScheduler(), {
-			checkpointDeletionRetryBaseMs: 60_000,
-			checkpointDeletionRetryMaxMs: 60_000,
+			agentSessionCleanupRetryBaseMs: 60_000,
+			agentSessionCleanupRetryMaxMs: 60_000,
 			logger: { error() {} },
 		});
-		const draining = service.drainPendingCheckpointDeletions({ batchSize: 1 });
+		const draining = service.drainPendingAgentSessionCleanups({ batchSize: 1 });
 		let shutDown = false;
 
 		try {
 			while (runtime.deletedThreadIds.length === 0) {
 				await Promise.resolve();
 			}
-			await withDeadline(service.shutdown(), 250, "checkpoint recovery shutdown");
+			await withDeadline(service.shutdown(), 250, "agent-session cleanup shutdown");
 			shutDown = true;
 			await draining;
-			expect(database.runs.listPendingCheckpointDeletions(10, true)).toHaveLength(1);
+			expect(database.runs.listPendingAgentSessionCleanups(10, true)).toHaveLength(1);
 		} finally {
 			if (!shutDown) {
 				await service.shutdown();
@@ -2457,12 +2445,12 @@ describe("ChatApplicationService", () => {
 		}
 	});
 
-	test("settles shutdown without waiting for a hung post-commit checkpoint cleanup", async () => {
+	test("settles shutdown without waiting for a hung post-commit agent session cleanup", async () => {
 		const database = openAppDatabase(":memory:");
 		const deletionGate = createDeferred();
 		const runtime = new FakeAskChatRuntime({ deleteThreadGate: deletionGate.promise });
 		const service = createService(database, runtime, new ManualScheduler(), {
-			checkpointDeletionAttemptTimeoutMs: 1_000,
+			agentSessionCleanupAttemptTimeoutMs: 1_000,
 			shutdownTimeoutMs: 20,
 			logger: { error() {} },
 		});
@@ -2470,9 +2458,9 @@ describe("ChatApplicationService", () => {
 			const { session } = service.createSession();
 			const deletion = service.deleteSession({ sessionId: session.id });
 			expect(runtime.deletedThreadIds).toEqual([session.id]);
-			await withDeadline(service.shutdown(), 100, "post-commit checkpoint shutdown");
+			await withDeadline(service.shutdown(), 100, "post-commit agent-session shutdown");
 			await deletion;
-			expect(database.runs.listPendingCheckpointDeletions(10, true)).toHaveLength(1);
+			expect(database.runs.listPendingAgentSessionCleanups(10, true)).toHaveLength(1);
 		} finally {
 			deletionGate.resolve();
 			await service.shutdown();
@@ -2495,18 +2483,18 @@ describe("ChatApplicationService", () => {
 			expect(() => service.deleteSession({ sessionId: session.id })).toThrow(
 				"Stop the active response",
 			);
-			expect(() =>
+			await expect(
 				service.createProvider({
-					schemaVersion: 1,
+					schemaVersion: 2,
 					displayName: "Another",
-					type: "openai-compatible",
+					api: "openai-responses",
 					baseUrl: "https://example.test/v1",
 					apiKey: "sk-another",
 				}),
-			).toThrow("Stop active responses");
-			expect(() =>
-				service.deleteProvider({ schemaVersion: 1, providerId: createUuidV7() }),
-			).toThrow("Stop active responses");
+			).rejects.toThrow("Stop active responses");
+			await expect(
+				service.deleteProvider({ schemaVersion: 2, providerId: createUuidV7() }),
+			).rejects.toThrow("Stop active responses");
 			service.cancel({ runId: accepted.run.id });
 		} finally {
 			await service.shutdown();
@@ -2751,10 +2739,9 @@ function createOrphanedRun(
 			schemaVersion: 1,
 			providerId: createUuidV7(),
 			name: "OpenAI",
-			type: "openai-compatible",
-			baseUrl: "https://api.openai.com/v1",
+			source: "custom",
+			api: "openai-responses",
 			model: "gpt-4.1-mini",
-			apiKey: "sk-test-secret",
 		},
 		userMessageId: createUuidV7(),
 		userContent: "Interrupted prompt",
@@ -2829,15 +2816,14 @@ function createService(
 		sessions?: SessionRepository;
 		logger?: { error(message: string, error: unknown): void };
 		providers?: ProviderRegistry;
-		fetchProviderModels?: (request: ProviderCatalogRequest) => Promise<readonly ProviderModel[]>;
-		testProviderConnection?: (configuration: ResolvedProviderConfiguration) => Promise<void>;
+		fetchProviderModels?: (providerId: string) => Promise<readonly ProviderModel[]>;
 		isRuntimeReady?: () => boolean;
-		checkpointDeletionRetryBaseMs?: number;
-		checkpointDeletionRetryMaxMs?: number;
-		checkpointDeletionAttemptTimeoutMs?: number;
-		checkpointDeletionMaxInFlightAttempts?: number;
-		checkpointDeletionStartupTimeoutMs?: number;
-		checkpointDeletionStartupMaxAttempts?: number;
+		agentSessionCleanupRetryBaseMs?: number;
+		agentSessionCleanupRetryMaxMs?: number;
+		agentSessionCleanupAttemptTimeoutMs?: number;
+		agentSessionCleanupMaxInFlightAttempts?: number;
+		agentSessionCleanupStartupTimeoutMs?: number;
+		agentSessionCleanupStartupMaxAttempts?: number;
 		shutdownTimeoutMs?: number;
 	} = {},
 ) {
@@ -2851,30 +2837,27 @@ function createService(
 			? {}
 			: { fetchProviderModels: options.fetchProviderModels }),
 		...(options.logger === undefined ? {} : { logger: options.logger }),
-		...(options.testProviderConnection === undefined
-			? {}
-			: { testProviderConnection: options.testProviderConnection }),
 		...(options.isRuntimeReady === undefined ? {} : { isRuntimeReady: options.isRuntimeReady }),
-		...(options.checkpointDeletionRetryBaseMs === undefined
+		...(options.agentSessionCleanupRetryBaseMs === undefined
 			? {}
-			: { checkpointDeletionRetryBaseMs: options.checkpointDeletionRetryBaseMs }),
-		...(options.checkpointDeletionRetryMaxMs === undefined
+			: { agentSessionCleanupRetryBaseMs: options.agentSessionCleanupRetryBaseMs }),
+		...(options.agentSessionCleanupRetryMaxMs === undefined
 			? {}
-			: { checkpointDeletionRetryMaxMs: options.checkpointDeletionRetryMaxMs }),
-		...(options.checkpointDeletionAttemptTimeoutMs === undefined
+			: { agentSessionCleanupRetryMaxMs: options.agentSessionCleanupRetryMaxMs }),
+		...(options.agentSessionCleanupAttemptTimeoutMs === undefined
 			? {}
-			: { checkpointDeletionAttemptTimeoutMs: options.checkpointDeletionAttemptTimeoutMs }),
-		...(options.checkpointDeletionMaxInFlightAttempts === undefined
+			: { agentSessionCleanupAttemptTimeoutMs: options.agentSessionCleanupAttemptTimeoutMs }),
+		...(options.agentSessionCleanupMaxInFlightAttempts === undefined
 			? {}
 			: {
-					checkpointDeletionMaxInFlightAttempts: options.checkpointDeletionMaxInFlightAttempts,
+					agentSessionCleanupMaxInFlightAttempts: options.agentSessionCleanupMaxInFlightAttempts,
 				}),
-		...(options.checkpointDeletionStartupTimeoutMs === undefined
+		...(options.agentSessionCleanupStartupTimeoutMs === undefined
 			? {}
-			: { checkpointDeletionStartupTimeoutMs: options.checkpointDeletionStartupTimeoutMs }),
-		...(options.checkpointDeletionStartupMaxAttempts === undefined
+			: { agentSessionCleanupStartupTimeoutMs: options.agentSessionCleanupStartupTimeoutMs }),
+		...(options.agentSessionCleanupStartupMaxAttempts === undefined
 			? {}
-			: { checkpointDeletionStartupMaxAttempts: options.checkpointDeletionStartupMaxAttempts }),
+			: { agentSessionCleanupStartupMaxAttempts: options.agentSessionCleanupStartupMaxAttempts }),
 		...(options.shutdownTimeoutMs === undefined
 			? {}
 			: { shutdownTimeoutMs: options.shutdownTimeoutMs }),
@@ -2911,50 +2894,48 @@ function createTestProviderRegistry(options: { seed?: boolean } = {}): ProviderR
 			const record = find(providerId);
 			return record === undefined ? null : structuredClone(record);
 		},
-		create: (input) => {
+		create: async (input) => {
 			if (providers.length >= maxProviderCount) {
 				throw new ProviderCapacityError(maxProviderCount);
 			}
 			const record: ProviderRecord = {
 				id: createUuidV7(),
 				displayName: input.displayName,
-				type: input.type,
+				source: "custom",
+				api: input.api,
 				baseUrl: input.baseUrl,
-				apiKey: input.apiKey,
 				enabled: true,
+				authMethods: ["api_key"],
+				credential: { configured: input.apiKey !== undefined, type: "api_key" },
+				customHeaderNames: Object.keys(input.customHeaders ?? {}).sort(),
 				models: [],
-				...(input.customHeaders === undefined ? {} : { customHeaders: input.customHeaders }),
 			};
 			providers.push(record);
 			return structuredClone(record);
 		},
-		update: (input) => {
+		update: async (input) => {
 			const record = requireRecord(input.providerId);
 			if (input.displayName !== undefined) {
 				record.displayName = input.displayName;
 			}
-			if (input.type !== undefined) {
-				record.type = input.type;
+			if (input.api !== undefined) {
+				record.api = input.api;
 			}
 			if (input.baseUrl !== undefined) {
 				record.baseUrl = input.baseUrl;
 			}
 			if (input.apiKey !== undefined) {
-				record.apiKey = input.apiKey;
+				record.credential = { configured: true, type: "api_key" };
 			}
 			if (input.customHeaders !== undefined) {
-				if (Object.keys(input.customHeaders).length === 0) {
-					delete record.customHeaders;
-				} else {
-					record.customHeaders = input.customHeaders;
-				}
+				record.customHeaderNames = Object.keys(input.customHeaders).sort();
 			}
 			if (input.enabled !== undefined) {
 				record.enabled = input.enabled;
 			}
 			return structuredClone(record);
 		},
-		delete: (providerId) => {
+		delete: async (providerId) => {
 			const index = providers.findIndex((provider) => provider.id === providerId);
 			if (index < 0) {
 				throw new ProviderNotFoundError(providerId);
@@ -2964,7 +2945,8 @@ function createTestProviderRegistry(options: { seed?: boolean } = {}): ProviderR
 				defaultModel = null;
 			}
 		},
-		setModels: (providerId, models, fetchedAt) => {
+		refreshModels: async (providerId) => structuredClone(requireRecord(providerId)),
+		setModels: async (providerId, models, fetchedAt) => {
 			const record = requireRecord(providerId);
 			const previouslyEnabled = new Set(
 				record.models.filter((model) => model.enabled).map((model) => model.id),
@@ -3003,18 +2985,39 @@ function createTestProviderRegistry(options: { seed?: boolean } = {}): ProviderR
 	};
 
 	if (options.seed !== false) {
-		const record = registry.create({
+		const record: ProviderRecord = {
+			id: createUuidV7(),
 			displayName: "OpenAI",
-			type: "openai-compatible",
+			source: "custom",
+			api: "openai-responses",
 			baseUrl: "https://api.openai.com/v1",
-			apiKey: "sk-test-secret",
-		});
-		registry.setModels(record.id, [{ id: "gpt-5.4", enabled: false }], "2026-01-01T00:00:00.000Z");
-		registry.setModelsEnabled(record.id, ["gpt-5.4"]);
+			enabled: true,
+			authMethods: ["api_key"],
+			credential: { configured: true, type: "api_key" },
+			customHeaderNames: [],
+			models: [createProviderModel("gpt-5.4")],
+			modelsFetchedAt: "2026-01-01T00:00:00.000Z",
+		};
+		providers.push(record);
 		registry.setDefaultModel({ providerId: record.id, modelId: "gpt-5.4" });
 	}
 
 	return registry;
+}
+
+function createProviderModel(id: string, overrides: Partial<ProviderModel> = {}): ProviderModel {
+	return {
+		id,
+		displayName: id,
+		api: "openai-responses",
+		input: ["text"],
+		reasoning: true,
+		contextWindowTokens: 128_000,
+		maxOutputTokens: 8_192,
+		thinkingLevels: ["off", "minimal", "low", "medium", "high"],
+		enabled: true,
+		...overrides,
+	};
 }
 
 class ManualScheduler {
@@ -3218,10 +3221,10 @@ describe("ChatApplicationService provider registry security", () => {
 		});
 
 		try {
-			const created = service.createProvider({
-				schemaVersion: 1,
+			const created = await service.createProvider({
+				schemaVersion: 2,
 				displayName: "OpenAI",
-				type: "openai-compatible",
+				api: "openai-responses",
 				baseUrl: "https://api.openai.com/v1",
 				apiKey: "sk-create-secret",
 				customHeaders: { "X-Org-Id": "org-secret-value" },
@@ -3232,8 +3235,8 @@ describe("ChatApplicationService provider registry security", () => {
 			expect(created.provider.customHeaderNames).toEqual(["X-Org-Id"]);
 			expect(createdJson).toContain("X-Org-Id");
 
-			const updated = service.updateProvider({
-				schemaVersion: 1,
+			const updated = await service.updateProvider({
+				schemaVersion: 2,
 				providerId: created.provider.id,
 				apiKey: "sk-update-secret",
 				customHeaders: { "X-Update-Header": "update-secret-value" },
@@ -3263,16 +3266,16 @@ describe("ChatApplicationService provider registry security", () => {
 		const publishedEvents: ChatRunEvent[] = [];
 
 		try {
-			const provider = registry.create({
+			const provider = await registry.create({
 				displayName: "OpenAI",
-				type: "openai-compatible",
+				api: "openai-responses",
 				baseUrl: "https://api.openai.com/v1",
 				apiKey: "sk-page-secret",
 				customHeaders: { "X-Secret-Header": "super-secret-header-value" },
 			});
-			registry.setModels(
+			await registry.setModels(
 				provider.id,
-				[{ id: "gpt-5.4", enabled: false }],
+				[createProviderModel("gpt-5.4", { enabled: false })],
 				"2026-01-01T00:00:00.000Z",
 			);
 			registry.setModelsEnabled(provider.id, ["gpt-5.4"]);
@@ -3309,25 +3312,30 @@ describe("ChatApplicationService provider registry security", () => {
 describe("ChatApplicationService provider and model resolution", () => {
 	const modelsFetchedAt = "2026-01-01T00:00:00.000Z";
 
-	function seedProvider(
+	async function seedProvider(
 		registry: ProviderRegistry,
 		options: {
 			displayName: string;
-			type?: ProviderRecord["type"];
+			api?: "openai-responses" | "anthropic-messages";
 			baseUrl: string;
 			apiKey: string;
 			models: ProviderModel[];
 			enabledModelIds: string[];
 			defaultModelId?: string;
 		},
-	): string {
-		const created = registry.create({
+	): Promise<string> {
+		const api = options.api ?? "openai-responses";
+		const created = await registry.create({
 			displayName: options.displayName,
-			type: options.type ?? "openai-compatible",
+			api,
 			baseUrl: options.baseUrl,
 			apiKey: options.apiKey,
 		});
-		registry.setModels(created.id, options.models, modelsFetchedAt);
+		await registry.setModels(
+			created.id,
+			options.models.map((model) => ({ ...model, api })),
+			modelsFetchedAt,
+		);
 		registry.setModelsEnabled(created.id, options.enabledModelIds);
 		if (options.defaultModelId !== undefined) {
 			registry.setDefaultModel({ providerId: created.id, modelId: options.defaultModelId });
@@ -3343,31 +3351,24 @@ describe("ChatApplicationService provider and model resolution", () => {
 		const service = createService(database, runtime, scheduler, { providers: registry });
 
 		try {
-			const primaryId = seedProvider(registry, {
+			const primaryId = await seedProvider(registry, {
 				displayName: "Primary",
 				baseUrl: "https://primary.example/v1",
 				apiKey: "sk-primary",
-				models: [
-					{
-						id: "gpt-5.4",
-						enabled: false,
-						supportedEndpoints: ["/v1/messages", "/responses", "/chat/completions"],
-					},
-				],
+				models: [createProviderModel("gpt-5.4", { enabled: false })],
 				enabledModelIds: ["gpt-5.4"],
 				defaultModelId: "gpt-5.4",
 			});
-			const secondaryId = seedProvider(registry, {
+			const secondaryId = await seedProvider(registry, {
 				displayName: "Secondary",
-				type: "anthropic-compatible",
+				api: "anthropic-messages",
 				baseUrl: "https://secondary.example/v1",
 				apiKey: "sk-secondary",
 				models: [
-					{
-						id: "claude-4",
+					createProviderModel("claude-4", {
+						api: "anthropic-messages",
 						enabled: false,
-						supportedEndpoints: ["/chat/completions", "/v1/messages"],
-					},
+					}),
 				],
 				enabledModelIds: ["claude-4"],
 			});
@@ -3378,7 +3379,7 @@ describe("ChatApplicationService provider and model resolution", () => {
 			await service.waitForIdle();
 			expect(runtime.inputs[0]?.provider.providerId).toBe(primaryId);
 			expect(runtime.inputs[0]?.provider.model).toBe("gpt-5.4");
-			expect(runtime.inputs[0]?.provider.protocol).toBe("openai-responses");
+			expect(runtime.inputs[0]?.provider.api).toBe("openai-responses");
 
 			const pinnedSession = service.createSession().session;
 			service.setSessionModel({
@@ -3390,8 +3391,7 @@ describe("ChatApplicationService provider and model resolution", () => {
 			await service.waitForIdle();
 			expect(runtime.inputs[1]?.provider.providerId).toBe(secondaryId);
 			expect(runtime.inputs[1]?.provider.model).toBe("claude-4");
-			expect(runtime.inputs[1]?.provider.type).toBe("anthropic-compatible");
-			expect(runtime.inputs[1]?.provider.protocol).toBe("anthropic-messages");
+			expect(runtime.inputs[1]?.provider.api).toBe("anthropic-messages");
 		} finally {
 			await service.shutdown();
 			database.close();
@@ -3406,20 +3406,20 @@ describe("ChatApplicationService provider and model resolution", () => {
 		const service = createService(database, runtime, scheduler, { providers: registry });
 
 		try {
-			const fallbackId = seedProvider(registry, {
+			const fallbackId = await seedProvider(registry, {
 				displayName: "Fallback",
 				baseUrl: "https://fallback.example/v1",
 				apiKey: "sk-fallback",
-				models: [{ id: "gpt-5.4", enabled: false }],
+				models: [createProviderModel("gpt-5.4", { enabled: false })],
 				enabledModelIds: ["gpt-5.4"],
 				defaultModelId: "gpt-5.4",
 			});
 
-			const removableId = seedProvider(registry, {
+			const removableId = await seedProvider(registry, {
 				displayName: "Removable",
 				baseUrl: "https://removable.example/v1",
 				apiKey: "sk-removable",
-				models: [{ id: "temp-model", enabled: false }],
+				models: [createProviderModel("temp-model", { enabled: false })],
 				enabledModelIds: ["temp-model"],
 			});
 			const removableSession = service.createSession().session;
@@ -3427,17 +3427,17 @@ describe("ChatApplicationService provider and model resolution", () => {
 				sessionId: removableSession.id,
 				model: { providerId: removableId, modelId: "temp-model" },
 			});
-			registry.delete(removableId);
+			await registry.delete(removableId);
 			service.sendMessage({ sessionId: removableSession.id, content: "provider deleted" });
 			scheduler.runAll();
 			await service.waitForIdle();
 			expect(runtime.inputs[0]?.provider.providerId).toBe(fallbackId);
 
-			const disabledId = seedProvider(registry, {
+			const disabledId = await seedProvider(registry, {
 				displayName: "Disabled",
 				baseUrl: "https://disabled.example/v1",
 				apiKey: "sk-disabled",
-				models: [{ id: "off-model", enabled: false }],
+				models: [createProviderModel("off-model", { enabled: false })],
 				enabledModelIds: ["off-model"],
 			});
 			const disabledSession = service.createSession().session;
@@ -3445,17 +3445,17 @@ describe("ChatApplicationService provider and model resolution", () => {
 				sessionId: disabledSession.id,
 				model: { providerId: disabledId, modelId: "off-model" },
 			});
-			registry.update({ providerId: disabledId, enabled: false });
+			await registry.update({ providerId: disabledId, enabled: false });
 			service.sendMessage({ sessionId: disabledSession.id, content: "provider disabled" });
 			scheduler.runAll();
 			await service.waitForIdle();
 			expect(runtime.inputs[1]?.provider.providerId).toBe(fallbackId);
 
-			const droppedId = seedProvider(registry, {
+			const droppedId = await seedProvider(registry, {
 				displayName: "Dropped",
 				baseUrl: "https://dropped.example/v1",
 				apiKey: "sk-dropped",
-				models: [{ id: "gone-model", enabled: false }],
+				models: [createProviderModel("gone-model", { enabled: false })],
 				enabledModelIds: ["gone-model"],
 			});
 			const droppedSession = service.createSession().session;
@@ -3463,17 +3463,21 @@ describe("ChatApplicationService provider and model resolution", () => {
 				sessionId: droppedSession.id,
 				model: { providerId: droppedId, modelId: "gone-model" },
 			});
-			registry.setModels(droppedId, [{ id: "other-model", enabled: false }], modelsFetchedAt);
+			await registry.setModels(
+				droppedId,
+				[createProviderModel("other-model", { enabled: false })],
+				modelsFetchedAt,
+			);
 			service.sendMessage({ sessionId: droppedSession.id, content: "model dropped" });
 			scheduler.runAll();
 			await service.waitForIdle();
 			expect(runtime.inputs[2]?.provider.providerId).toBe(fallbackId);
 
-			const disabledModelId = seedProvider(registry, {
+			const disabledModelId = await seedProvider(registry, {
 				displayName: "Disabled model",
 				baseUrl: "https://disabled-model.example/v1",
 				apiKey: "sk-disabled-model",
-				models: [{ id: "kept-model", enabled: false }],
+				models: [createProviderModel("kept-model", { enabled: false })],
 				enabledModelIds: ["kept-model"],
 			});
 			const disabledModelSession = service.createSession().session;
@@ -3519,11 +3523,11 @@ describe("ChatApplicationService provider and model resolution", () => {
 		});
 
 		try {
-			const providerId = seedProvider(registry, {
+			const providerId = await seedProvider(registry, {
 				displayName: "OpenAI",
 				baseUrl: "https://api.openai.com/v1",
 				apiKey: "sk-secret",
-				models: [{ id: "gpt-5.4", enabled: false }],
+				models: [createProviderModel("gpt-5.4", { enabled: false })],
 				enabledModelIds: ["gpt-5.4"],
 			});
 			const { session } = service.createSession();
@@ -3555,7 +3559,7 @@ describe("ChatApplicationService provider and model resolution", () => {
 		}
 	});
 
-	test("drops an unadvertised reasoning effort and clamps the thinking budget", async () => {
+	test("keeps supported thinking levels and rejects unsupported ones", async () => {
 		const database = openAppDatabase(":memory:");
 		const scheduler = new ManualScheduler();
 		const registry = createTestProviderRegistry({ seed: false });
@@ -3564,18 +3568,17 @@ describe("ChatApplicationService provider and model resolution", () => {
 		});
 
 		try {
-			const providerId = seedProvider(registry, {
+			const providerId = await seedProvider(registry, {
 				displayName: "Claude gateway",
-				type: "anthropic-compatible",
+				api: "anthropic-messages",
 				baseUrl: "https://api.anthropic.com/v1",
 				apiKey: "sk-secret",
 				models: [
-					{
-						id: "claude-opus-4.6",
+					createProviderModel("claude-opus-4.6", {
+						api: "anthropic-messages",
 						enabled: false,
-						reasoningEfforts: ["low", "high"],
-						thinking: { minBudgetTokens: 1024, maxBudgetTokens: 8192 },
-					},
+						thinkingLevels: ["off", "low", "high"],
+					}),
 				],
 				enabledModelIds: ["claude-opus-4.6"],
 			});
@@ -3586,30 +3589,88 @@ describe("ChatApplicationService provider and model resolution", () => {
 				model: {
 					providerId,
 					modelId: "claude-opus-4.6",
-					reasoning: { effort: "high", budgetTokens: 100_000 },
+					thinkingLevel: "high",
 				},
 			});
-			expect(kept.session.model?.reasoning).toEqual({ effort: "high", budgetTokens: 8192 });
+			expect(kept.session.model?.thinkingLevel).toBe("high");
 
-			const dropped = service.setSessionModel({
-				sessionId: session.id,
-				model: {
-					providerId,
-					modelId: "claude-opus-4.6",
-					reasoning: { effort: "medium", budgetTokens: 100 },
-				},
-			});
-			expect(dropped.session.model?.reasoning).toEqual({ budgetTokens: 1024 });
+			expect(() =>
+				service.setSessionModel({
+					sessionId: session.id,
+					model: {
+						providerId,
+						modelId: "claude-opus-4.6",
+						thinkingLevel: "medium",
+					},
+				}),
+			).toThrow("thinking level");
 
 			const cleared = service.setSessionModel({
 				sessionId: session.id,
 				model: {
 					providerId,
 					modelId: "claude-opus-4.6",
-					reasoning: { effort: "unsupported" },
+					thinkingLevel: "off",
 				},
 			});
-			expect(cleared.session.model).toEqual({ providerId, modelId: "claude-opus-4.6" });
+			expect(cleared.session.model?.thinkingLevel).toBe("off");
+		} finally {
+			await service.shutdown();
+			database.close();
+		}
+	});
+
+	test("omits a stored thinking level after refreshed model capabilities drop it", async () => {
+		const database = openAppDatabase(":memory:");
+		const scheduler = new ManualScheduler();
+		const registry = createTestProviderRegistry({ seed: false });
+		const runtime = new FakeAskChatRuntime({ deltas: ["ok"] });
+		const service = createService(database, runtime, scheduler, { providers: registry });
+
+		try {
+			const providerId = await seedProvider(registry, {
+				displayName: "Capability drift",
+				api: "anthropic-messages",
+				baseUrl: "https://capability.example/v1",
+				apiKey: "sk-secret",
+				models: [
+					createProviderModel("drifting-model", {
+						api: "anthropic-messages",
+						enabled: false,
+						thinkingLevels: ["off", "high"],
+					}),
+				],
+				enabledModelIds: ["drifting-model"],
+			});
+			const { session } = service.createSession();
+			service.setSessionModel({
+				sessionId: session.id,
+				model: { providerId, modelId: "drifting-model", thinkingLevel: "high" },
+			});
+			await registry.setModels(
+				providerId,
+				[
+					createProviderModel("drifting-model", {
+						api: "anthropic-messages",
+						enabled: false,
+						thinkingLevels: ["off"],
+					}),
+				],
+				modelsFetchedAt,
+			);
+
+			service.sendMessage({ sessionId: session.id, content: "use current capabilities" });
+			scheduler.runAll();
+			await service.waitForIdle();
+
+			expect(runtime.inputs[0]?.provider).toMatchObject({
+				providerId,
+				model: "drifting-model",
+			});
+			expect(runtime.inputs[0]?.provider.thinkingLevel).toBeUndefined();
+			expect(
+				(await service.getSession({ sessionId: session.id })).session.model?.thinkingLevel,
+			).toBe("high");
 		} finally {
 			await service.shutdown();
 			database.close();
@@ -3620,38 +3681,34 @@ describe("ChatApplicationService provider and model resolution", () => {
 		const database = openAppDatabase(":memory:");
 		const scheduler = new ManualScheduler();
 		const registry = createTestProviderRegistry({ seed: false });
-		const requests: ProviderCatalogRequest[] = [];
+		const requests: string[] = [];
 		const service = createService(database, new FakeAskChatRuntime({}), scheduler, {
 			providers: registry,
 			fetchProviderModels: async (request) => {
 				requests.push(request);
-				return [
-					{ id: "m1", enabled: true },
-					{ id: "m2", enabled: true },
-					{ id: "m3", enabled: true },
-				];
+				return [createProviderModel("m1"), createProviderModel("m2"), createProviderModel("m3")];
 			},
 		});
 
 		try {
-			const providerId = seedProvider(registry, {
+			const providerId = await seedProvider(registry, {
 				displayName: "OpenAI",
 				baseUrl: "https://api.openai.com/v1",
 				apiKey: "sk-catalog-secret",
 				models: [
-					{ id: "m1", enabled: false },
-					{ id: "m2", enabled: false },
+					createProviderModel("m1", { enabled: false }),
+					createProviderModel("m2", { enabled: false }),
 				],
 				enabledModelIds: ["m1"],
 			});
 
-			const output = await service.fetchProviderModels({ schemaVersion: 1, providerId });
+			const output = await service.fetchProviderModels({ schemaVersion: 2, providerId });
 			const enabledById = new Map(output.provider.models.map((model) => [model.id, model.enabled]));
 			expect(enabledById.get("m1")).toBe(true);
 			expect(enabledById.get("m2")).toBe(false);
 			expect(enabledById.get("m3")).toBe(false);
 			expect(output.provider.modelsFetchedAt).toBeDefined();
-			expect(requests[0]?.apiKey).toBe("sk-catalog-secret");
+			expect(requests).toEqual([providerId]);
 		} finally {
 			await service.shutdown();
 			database.close();
@@ -3667,32 +3724,38 @@ describe("ChatApplicationService provider and model resolution", () => {
 		});
 
 		try {
-			const openAiId = seedProvider(registry, {
+			const openAiId = await seedProvider(registry, {
 				displayName: "OpenAI",
 				baseUrl: "https://api.openai.com/v1",
 				apiKey: "sk-openai",
 				models: [
-					{ id: "gpt-5.4", enabled: false },
-					{ id: "gpt-legacy", enabled: false },
+					createProviderModel("gpt-5.4", { enabled: false }),
+					createProviderModel("gpt-legacy", { enabled: false }),
 				],
 				enabledModelIds: ["gpt-5.4"],
 			});
-			const anthropicId = seedProvider(registry, {
+			const anthropicId = await seedProvider(registry, {
 				displayName: "Anthropic",
-				type: "anthropic-compatible",
+				api: "anthropic-messages",
 				baseUrl: "https://api.anthropic.com/v1",
 				apiKey: "sk-anthropic",
-				models: [{ id: "claude-4", enabled: false, thinking: { minBudgetTokens: 1024 } }],
+				models: [
+					createProviderModel("claude-4", {
+						api: "anthropic-messages",
+						enabled: false,
+						thinkingLevels: ["off", "low", "medium", "high"],
+					}),
+				],
 				enabledModelIds: ["claude-4"],
 			});
-			const disabledProviderId = seedProvider(registry, {
+			const disabledProviderId = await seedProvider(registry, {
 				displayName: "Disabled",
 				baseUrl: "https://disabled.example/v1",
 				apiKey: "sk-disabled",
-				models: [{ id: "hidden", enabled: false }],
+				models: [createProviderModel("hidden", { enabled: false })],
 				enabledModelIds: ["hidden"],
 			});
-			registry.update({ providerId: disabledProviderId, enabled: false });
+			await registry.update({ providerId: disabledProviderId, enabled: false });
 
 			const output = service.listAvailableModels();
 			const identities = output.models.map((entry) => `${entry.providerId}:${entry.model.id}`);
@@ -3700,8 +3763,8 @@ describe("ChatApplicationService provider and model resolution", () => {
 
 			const openAiModel = output.models.find((entry) => entry.providerId === openAiId);
 			const anthropicModel = output.models.find((entry) => entry.providerId === anthropicId);
-			expect(openAiModel?.reasoning).toEqual({ kind: "none" });
-			expect(anthropicModel?.reasoning.kind).toBe("budget");
+			expect(openAiModel?.model.thinkingLevels).toContain("high");
+			expect(anthropicModel?.model.thinkingLevels).toEqual(["off", "low", "medium", "high"]);
 		} finally {
 			await service.shutdown();
 			database.close();

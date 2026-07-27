@@ -41,6 +41,14 @@ import {
 	testProviderOutputSchema,
 	updateProviderInputSchema,
 } from "./provider";
+import {
+	logoutProviderInputSchema,
+	logoutProviderOutputSchema,
+	providerAuthAttemptInputSchema,
+	providerAuthAttemptOutputSchema,
+	respondProviderAuthInputSchema,
+	startProviderAuthInputSchema,
+} from "./provider-auth";
 import { agentsRuntimeInfoSchema, emptyParamsSchema } from "./runtime";
 
 export const productRpcMethods = {
@@ -55,6 +63,11 @@ export const productRpcMethods = {
 	modelsListAvailable: "moshu.v1.models.listAvailable",
 	defaultModelGet: "moshu.v1.settings.defaultModel.get",
 	defaultModelSet: "moshu.v1.settings.defaultModel.set",
+	providerAuthStart: "moshu.v2.providerAuth.start",
+	providerAuthGet: "moshu.v2.providerAuth.get",
+	providerAuthRespond: "moshu.v2.providerAuth.respond",
+	providerAuthCancel: "moshu.v2.providerAuth.cancel",
+	providerLogout: "moshu.v2.provider.logout",
 	sessionCreate: "moshu.v1.session.create",
 	sessionGet: "moshu.v1.session.get",
 	sessionList: "moshu.v1.session.list",
@@ -209,6 +222,26 @@ export const productRpcRequestSchemas = {
 		input: setDefaultModelInputSchema,
 		output: setDefaultModelOutputSchema,
 	},
+	[productRpcMethods.providerAuthStart]: {
+		input: startProviderAuthInputSchema,
+		output: providerAuthAttemptOutputSchema,
+	},
+	[productRpcMethods.providerAuthGet]: {
+		input: providerAuthAttemptInputSchema,
+		output: providerAuthAttemptOutputSchema,
+	},
+	[productRpcMethods.providerAuthRespond]: {
+		input: respondProviderAuthInputSchema,
+		output: providerAuthAttemptOutputSchema,
+	},
+	[productRpcMethods.providerAuthCancel]: {
+		input: providerAuthAttemptInputSchema,
+		output: providerAuthAttemptOutputSchema,
+	},
+	[productRpcMethods.providerLogout]: {
+		input: logoutProviderInputSchema,
+		output: logoutProviderOutputSchema,
+	},
 	[productRpcMethods.sessionCreate]: {
 		input: createProcessChatSessionInputSchema,
 		output: createChatSessionOutputSchema,
@@ -271,6 +304,11 @@ export const clientProductRequestMethods = [
 	productRpcMethods.modelsListAvailable,
 	productRpcMethods.defaultModelGet,
 	productRpcMethods.defaultModelSet,
+	productRpcMethods.providerAuthStart,
+	productRpcMethods.providerAuthGet,
+	productRpcMethods.providerAuthRespond,
+	productRpcMethods.providerAuthCancel,
+	productRpcMethods.providerLogout,
 	productRpcMethods.sessionCreate,
 	productRpcMethods.sessionGet,
 	productRpcMethods.sessionList,

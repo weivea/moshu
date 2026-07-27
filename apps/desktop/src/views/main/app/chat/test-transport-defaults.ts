@@ -3,6 +3,8 @@ import type {
 	CreateProviderInput,
 	DefaultModelSelection,
 	ProviderModel,
+	ProviderAuthAttempt,
+	ProviderAuthType,
 	SessionModelSelection,
 	TestProviderInput,
 	UpdateProviderInput,
@@ -16,16 +18,19 @@ export const testProviderModel: ProviderModel = {
 	id: "gpt-5.4",
 	enabled: true,
 	displayName: "GPT-5.4",
+	api: "openai-responses",
+	input: ["text"],
+	reasoning: true,
 	contextWindowTokens: 272_000,
-	reasoningEfforts: ["low", "medium", "high"],
+	maxOutputTokens: 128_000,
+	thinkingLevels: ["off", "low", "medium", "high"],
 };
 
 export const testAvailableModel: AvailableModel = {
 	providerId: testProviderId,
 	providerDisplayName: "Test provider",
-	providerType: "openai-compatible",
+	providerSource: "custom",
 	model: testProviderModel,
-	reasoning: { kind: "effort", levels: ["low", "medium", "high"] },
 };
 
 export const testDefaultModel: DefaultModelSelection = {
@@ -98,6 +103,33 @@ export class ProviderModelTransportDefaults {
 	): Promise<ProviderSummary> {
 		throw new Error("setProviderModelsEnabled is not implemented in this test transport.");
 	}
+
+	async startProviderAuth(
+		_providerId: string,
+		_authType: ProviderAuthType,
+	): Promise<ProviderAuthAttempt> {
+		throw new Error("startProviderAuth is not implemented in this test transport.");
+	}
+
+	async getProviderAuth(_attemptId: string): Promise<ProviderAuthAttempt> {
+		throw new Error("getProviderAuth is not implemented in this test transport.");
+	}
+
+	async respondProviderAuth(
+		_attemptId: string,
+		_challengeId: string,
+		_value: string,
+	): Promise<ProviderAuthAttempt> {
+		throw new Error("respondProviderAuth is not implemented in this test transport.");
+	}
+
+	async cancelProviderAuth(_attemptId: string): Promise<ProviderAuthAttempt> {
+		throw new Error("cancelProviderAuth is not implemented in this test transport.");
+	}
+
+	async logoutProvider(_providerId: string): Promise<void> {}
+
+	async openExternalUrl(_url: string): Promise<void> {}
 
 	async listAvailableModels(): Promise<{
 		models: AvailableModel[];

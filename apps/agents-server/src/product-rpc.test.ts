@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 
 import {
+	type HeadlessAuthController,
 	ProviderCapacityError,
 	ProviderModelNotFoundError,
 	ProviderNotFoundError,
@@ -21,6 +22,8 @@ import type { ChatApplicationService } from "./chat-application-service";
 import type { ExecutorReadiness } from "./executor-readiness";
 import { createProductRpcHandlers, ProductEventRouter, publishChatEvent } from "./product-rpc";
 import { ProviderCatalogError } from "./provider-catalog";
+
+const authController = {} as HeadlessAuthController;
 
 describe("product RPC event broadcast", () => {
 	test("isolates a failed client peer and continues broadcasting", () => {
@@ -293,6 +296,7 @@ describe("product RPC event broadcast", () => {
 		const peer = createPeer({ emitEvent: () => "event", close() {} });
 		let malformedInputDispatched = false;
 		const malformedInputHandler = createProductRpcHandlers({
+			authController,
 			chatService: {
 				getSessionPage() {
 					malformedInputDispatched = true;
@@ -304,6 +308,7 @@ describe("product RPC event broadcast", () => {
 			serverVersion: "test",
 		}).requests?.[productRpcMethods.sessionGet];
 		const malformedOutputHandler = createProductRpcHandlers({
+			authController,
 			chatService: {
 				getSessionPage() {
 					return { privateOutput: "private-output-secret" };
@@ -314,6 +319,7 @@ describe("product RPC event broadcast", () => {
 			serverVersion: "test",
 		}).requests?.[productRpcMethods.sessionGet];
 		const internalZodHandler = createProductRpcHandlers({
+			authController,
 			chatService: {
 				getSessionPage() {
 					return z.string().parse({ privateValue: "private-zod-secret" });
@@ -370,6 +376,7 @@ describe("product RPC event broadcast", () => {
 		const peer = createPeer({ emitEvent: () => "event", close() {} });
 		const completedOperations: string[] = [];
 		const handlers = createProductRpcHandlers({
+			authController,
 			chatService: {
 				createSessionIdempotently() {
 					completedOperations.push("session-create");
@@ -421,6 +428,7 @@ describe("product RPC event broadcast", () => {
 	test("maps a conclusive missing Session to a stable product RPC error", async () => {
 		const peer = createPeer({ emitEvent: () => "event", close() {} });
 		const handler = createProductRpcHandlers({
+			authController,
 			chatService: {
 				getSessionPage() {
 					throw new ChatSessionNotFoundError("01984df0-cf17-7e6e-9a7d-4d98c1f0d5ce");
@@ -462,6 +470,7 @@ describe("product RPC event broadcast", () => {
 		const database = openAppDatabase(":memory:");
 		const peer = createPeer({ emitEvent: () => "event", close() {} });
 		const handler = createProductRpcHandlers({
+			authController,
 			chatService: {
 				deleteSession(input) {
 					return Promise.resolve(database.runs.deleteSessionAndRetireRuns(input.sessionId));
@@ -505,6 +514,7 @@ describe("product RPC event broadcast", () => {
 		const session = database.sessions.create({ title: "Delete through RPC" }).session;
 		const peer = createPeer({ emitEvent: () => "event", close() {} });
 		const handler = createProductRpcHandlers({
+			authController,
 			chatService: {
 				deleteSession(input) {
 					return Promise.resolve(database.runs.deleteSessionAndRetireRuns(input.sessionId));
@@ -530,7 +540,7 @@ describe("product RPC event broadcast", () => {
 			);
 			expect(retried).toEqual(first);
 			expect(retried).toEqual({ sessionId: session.id });
-			expect(database.runs.listPendingCheckpointDeletions(10, true)).toHaveLength(1);
+			expect(database.runs.listPendingAgentSessionCleanups(10, true)).toHaveLength(1);
 		} finally {
 			database.close();
 		}
@@ -548,6 +558,7 @@ describe("product RPC event broadcast", () => {
 			{ instanceId: "other-create-instance", generation: 4 },
 		);
 		const handler = createProductRpcHandlers({
+			authController,
 			chatService: {
 				createSessionIdempotently(input, peerIdentity) {
 					return database.sessions.createIdempotently({
@@ -663,20 +674,34 @@ function createTerminalEvent(): ChatRunEvent {
 describe("product RPC provider and model handlers", () => {
 	const providerId = "01984df0-cf17-7e6e-9a7d-4d98c1f0d5ce";
 	const sessionId = "01984df0-cf17-7e6e-9a7d-4d98c1f0d5cf";
+	const providerModel = {
+		id: "gpt-5.4",
+		displayName: "GPT-5.4",
+		api: "openai-responses",
+		input: ["text"],
+		reasoning: true,
+		contextWindowTokens: 128_000,
+		maxOutputTokens: 8_192,
+		thinkingLevels: ["off", "low", "medium", "high"],
+		enabled: true,
+	};
 	const providerSummary = {
-		schemaVersion: 1,
+		schemaVersion: 2,
 		id: providerId,
 		displayName: "OpenAI",
-		type: "openai-compatible",
+		source: "custom",
+		api: "openai-responses",
 		baseUrl: "https://api.openai.com/v1",
 		enabled: true,
-		apiKeyMask: "••••••••cret",
+		authMethods: ["api_key"],
+		credential: { configured: true, type: "api_key" },
 		customHeaderNames: [],
-		models: [{ id: "gpt-5.4", enabled: true }],
+		models: [providerModel],
 	};
 	const chatSession = {
 		schemaVersion: 1,
 		id: sessionId,
+		agentSessionId: sessionId,
 		title: "New chat",
 		defaultMode: "ask",
 		model: { providerId, modelId: "gpt-5.4" },
@@ -692,13 +717,13 @@ describe("product RPC provider and model handlers", () => {
 			return output;
 		};
 
-		const listOutput = { schemaVersion: 1, providers: [providerSummary] };
-		const mutationOutput = { schemaVersion: 1, provider: providerSummary };
-		const deleteOutput = { schemaVersion: 1, providerId };
-		const testOutput = { schemaVersion: 1, ok: true, latencyMs: 12 };
-		const availableOutput = { schemaVersion: 1, models: [] };
-		const defaultGetOutput = { schemaVersion: 1 };
-		const defaultSetOutput = { schemaVersion: 1, defaultModel: { providerId, modelId: "gpt-5.4" } };
+		const listOutput = { schemaVersion: 2, providers: [providerSummary] };
+		const mutationOutput = { schemaVersion: 2, provider: providerSummary };
+		const deleteOutput = { schemaVersion: 2, providerId };
+		const testOutput = { schemaVersion: 2, ok: true, latencyMs: 12 };
+		const availableOutput = { schemaVersion: 2, models: [] };
+		const defaultGetOutput = { schemaVersion: 2 };
+		const defaultSetOutput = { schemaVersion: 2, defaultModel: { providerId, modelId: "gpt-5.4" } };
 		const sessionOutput = { session: chatSession };
 
 		const chatService = {
@@ -715,6 +740,7 @@ describe("product RPC provider and model handlers", () => {
 			setSessionModel: record("setSessionModel", sessionOutput),
 		} as unknown as ChatApplicationService;
 		const handlers = createProductRpcHandlers({
+			authController,
 			chatService,
 			executorReadiness: {} as ExecutorReadiness,
 			eventRouter: new ProductEventRouter(),
@@ -732,9 +758,9 @@ describe("product RPC provider and model handlers", () => {
 				method: productRpcMethods.providersCreate,
 				serviceMethod: "createProvider",
 				input: {
-					schemaVersion: 1,
+					schemaVersion: 2,
 					displayName: "OpenAI",
-					type: "openai-compatible",
+					api: "openai-responses",
 					baseUrl: "https://api.openai.com/v1",
 					apiKey: "sk-secret",
 				},
@@ -743,31 +769,31 @@ describe("product RPC provider and model handlers", () => {
 			{
 				method: productRpcMethods.providersUpdate,
 				serviceMethod: "updateProvider",
-				input: { schemaVersion: 1, providerId, displayName: "Renamed" },
+				input: { schemaVersion: 2, providerId, displayName: "Renamed" },
 				output: mutationOutput,
 			},
 			{
 				method: productRpcMethods.providersDelete,
 				serviceMethod: "deleteProvider",
-				input: { schemaVersion: 1, providerId },
+				input: { schemaVersion: 2, providerId },
 				output: deleteOutput,
 			},
 			{
 				method: productRpcMethods.providersTest,
 				serviceMethod: "testProvider",
-				input: { schemaVersion: 1, providerId },
+				input: { schemaVersion: 2, providerId },
 				output: testOutput,
 			},
 			{
 				method: productRpcMethods.providersFetchModels,
 				serviceMethod: "fetchProviderModels",
-				input: { schemaVersion: 1, providerId },
+				input: { schemaVersion: 2, providerId },
 				output: mutationOutput,
 			},
 			{
 				method: productRpcMethods.providersSetModelsEnabled,
 				serviceMethod: "setProviderModelsEnabled",
-				input: { schemaVersion: 1, providerId, enabledModelIds: ["gpt-5.4"] },
+				input: { schemaVersion: 2, providerId, enabledModelIds: ["gpt-5.4"] },
 				output: mutationOutput,
 			},
 			{
@@ -785,7 +811,7 @@ describe("product RPC provider and model handlers", () => {
 			{
 				method: productRpcMethods.defaultModelSet,
 				serviceMethod: "setDefaultModel",
-				input: { schemaVersion: 1, defaultModel: { providerId, modelId: "gpt-5.4" } },
+				input: { schemaVersion: 2, defaultModel: { providerId, modelId: "gpt-5.4" } },
 				output: defaultSetOutput,
 			},
 			{
@@ -816,7 +842,7 @@ describe("product RPC provider and model handlers", () => {
 			{
 				method: productRpcMethods.providersDelete,
 				serviceMethod: "deleteProvider",
-				input: { schemaVersion: 1, providerId },
+				input: { schemaVersion: 2, providerId },
 				error: new ProviderNotFoundError(providerId),
 				code: "PROVIDER_NOT_FOUND",
 			},
@@ -831,9 +857,9 @@ describe("product RPC provider and model handlers", () => {
 				method: productRpcMethods.providersCreate,
 				serviceMethod: "createProvider",
 				input: {
-					schemaVersion: 1,
+					schemaVersion: 2,
 					displayName: "OpenAI",
-					type: "openai-compatible",
+					api: "openai-responses",
 					baseUrl: "https://api.openai.com/v1",
 					apiKey: "sk-secret",
 				},
@@ -843,7 +869,7 @@ describe("product RPC provider and model handlers", () => {
 			{
 				method: productRpcMethods.providersFetchModels,
 				serviceMethod: "fetchProviderModels",
-				input: { schemaVersion: 1, providerId },
+				input: { schemaVersion: 2, providerId },
 				error: new ProviderCatalogError("The Provider rejected the model list request.", 502),
 				code: "PROVIDER_MODEL_LIST_FAILED",
 			},
@@ -856,6 +882,7 @@ describe("product RPC provider and model handlers", () => {
 				},
 			} as unknown as ChatApplicationService;
 			const handler = createProductRpcHandlers({
+				authController,
 				chatService,
 				executorReadiness: {} as ExecutorReadiness,
 				eventRouter: new ProductEventRouter(),
@@ -872,8 +899,86 @@ describe("product RPC provider and model handlers", () => {
 		}
 	});
 
+	test("dispatches auth attempts without projecting secret responses", async () => {
+		const peer = createPeer({ emitEvent: () => "event", close() {} });
+		const attemptId = crypto.randomUUID();
+		const challengeId = crypto.randomUUID();
+		const attempt = {
+			schemaVersion: 2 as const,
+			id: attemptId,
+			providerId,
+			authType: "api_key" as const,
+			status: "created" as const,
+			createdAt: "2026-07-25T04:15:28.349Z",
+			updatedAt: "2026-07-25T04:15:28.349Z",
+			notifications: [],
+		};
+		const calls: Array<{ method: string; input: unknown }> = [];
+		const fakeAuthController = {
+			start(input: unknown) {
+				calls.push({ method: "start", input });
+				return { attempt };
+			},
+			get(input: unknown) {
+				calls.push({ method: "get", input });
+				return { attempt };
+			},
+			respond(input: unknown) {
+				calls.push({ method: "respond", input });
+				return { attempt };
+			},
+			cancel(input: unknown) {
+				calls.push({ method: "cancel", input });
+				return { attempt };
+			},
+			logout(input: unknown) {
+				calls.push({ method: "logout", input });
+				return { schemaVersion: 2, providerId, configured: false };
+			},
+		} as unknown as HeadlessAuthController;
+		const handlers = createProductRpcHandlers({
+			authController: fakeAuthController,
+			chatService: {} as ChatApplicationService,
+			executorReadiness: {} as ExecutorReadiness,
+			eventRouter: new ProductEventRouter(),
+			serverVersion: "test",
+		}).requests;
+		const secret = "fake-input-only-secret";
+		const cases = [
+			{
+				method: productRpcMethods.providerAuthStart,
+				input: { schemaVersion: 2, providerId, authType: "api_key" },
+			},
+			{ method: productRpcMethods.providerAuthGet, input: { attemptId } },
+			{
+				method: productRpcMethods.providerAuthRespond,
+				input: { attemptId, challengeId, value: secret },
+			},
+			{ method: productRpcMethods.providerAuthCancel, input: { attemptId } },
+			{ method: productRpcMethods.providerLogout, input: { schemaVersion: 2, providerId } },
+		];
+		const outputs: unknown[] = [];
+		for (const testCase of cases) {
+			const handler = handlers?.[testCase.method];
+			if (handler === undefined) {
+				throw new Error(`Missing ${testCase.method} product RPC handler.`);
+			}
+			outputs.push(await handler(testCase.input, createRequestContext(peer, testCase.method)));
+		}
+
+		expect(calls.map((call) => call.method)).toEqual([
+			"start",
+			"get",
+			"respond",
+			"cancel",
+			"logout",
+		]);
+		expect(JSON.stringify(outputs)).not.toContain(secret);
+	});
+
 	test("registers a handler for every client and executor product request method", () => {
 		const handlers = createProductRpcHandlers({
+			authController,
 			chatService: {} as unknown as ChatApplicationService,
 			executorReadiness: {} as ExecutorReadiness,
 			eventRouter: new ProductEventRouter(),

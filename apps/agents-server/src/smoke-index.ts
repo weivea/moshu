@@ -80,14 +80,17 @@ class SmokeAskChatRuntime implements AskChatRuntime {
 if (import.meta.main) {
 	await runAgentsServerProcess({
 		createRuntime: () => new SmokeAskChatRuntime(),
-		testProviderConnection: async () => {},
 		fetchProviderModels: async () => [
 			{
 				id: "smoke-model",
 				enabled: false,
 				displayName: "Smoke model",
+				api: "openai-completions",
+				input: ["text"],
+				reasoning: true,
 				contextWindowTokens: 128_000,
-				reasoningEfforts: ["low", "medium", "high"],
+				maxOutputTokens: 8_192,
+				thinkingLevels: ["off", "low", "medium", "high"],
 			},
 		],
 	}).catch((error: unknown) => {

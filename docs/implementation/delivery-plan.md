@@ -40,8 +40,8 @@ flowchart LR
 
 - 在 client 保留新的 Agent/Provider/DB 业务实现。
 - 增加 client 直连 executor 的临时通道。
-- 让 executor 写业务 DB/checkpoint 或自行批准 Action。
-- 用现有单进程 Ask 测试替代 A0–A5 验收。
+- 让 executor 写产品 DB/Pi Session JSONL 或自行批准 Action。
+- 用当前 no-tools Ask 测试替代尚未实现的 Tool/MCP/Skill 验收。
 
 ## 3. A0：RPC / Companion Binary POC
 
@@ -69,12 +69,12 @@ flowchart LR
 
 ### 3.3 A0 出口
 
-- [ ] 开发构建和 packaged app 都能启动两个编译 companion。
-- [ ] `client <-> server <-> executor` 是唯一应用 RPC 拓扑。
-- [ ] protocol/version/role/identity Schema 冻结到首个可迁移版本。
-- [ ] 旧 generation 的连接和消息无法覆盖新实例。
-- [ ] stable package 不包含固定 token、调试端口或通用 method forwarder。
-- [ ] 终端用户未安装 Bun/Node 时 package smoke 仍通过。
+- [x] 开发构建和 packaged app 都能启动两个编译 companion。
+- [x] `client <-> server <-> executor` 是唯一应用 RPC 拓扑。
+- [x] protocol/version/role/identity Schema 冻结到首个可迁移版本。
+- [x] 旧 generation 的连接和消息无法覆盖新实例。
+- [x] stable package 不包含固定 token、调试端口或通用 method forwarder。
+- [x] 终端用户未安装 Bun/Node 时 package smoke 仍通过。
 
 ## 4. A1：agents-server Extraction
 
@@ -86,24 +86,24 @@ flowchart LR
 | --- | --- | --- | --- | --- |
 | A1-01 | Server composition root | 配置、日志、lifecycle、共享 contract wiring | A0 | M |
 | A1-02 | Business DB extraction | SessionCatalog、RunJournal、migration/reset、单 writer | A1-01 | L |
-| A1-03 | Checkpoint extraction | `BunSqliteSaver`、thread lifecycle、单 writer | A1-02 | L |
-| A1-04 | Provider extraction | OpenAI-compatible config/test/invoke、Secret boundary | A1-01 | L |
-| A1-05 | Ask runtime extraction | Deep Agents Ask、stream/cancel、Run Registry | A1-03,A1-04 | XL |
+| A1-03 | Pi Session extraction | `SessionManager` JSONL、stable ID、restore/dispose/cleanup、单 writer | A1-02 | L |
+| A1-04 | Provider extraction | dynamic builtin/custom registry、auth attempt、credential vault | A1-01 | L |
+| A1-05 | Ask runtime extraction | public Pi headless no-tools Ask、stream/cancel、Run Registry | A1-03,A1-04 | XL |
 | A1-06 | Client API adapter | 现有 UI 通过 client-server RPC 读取/订阅，不改产品语义 | A1-02,A1-05 | L |
 | A1-07 | Parity cleanup | 移除 client 中已迁移 writer/runtime 和双写兼容层 | A1-06 | M |
 
 迁移使用一次一个领域的 strangler adapter；过渡期允许 client 调用 server fake，但不允许 DB 双写。当前处于开发阶段，旧 app data 可明确重置，不为本阶段增加旧 schema migration。
 
-A1 的无 Tool Ask 仍要求 A0 local executor connection online；A2 再把这项临时 local binding 替换为持久 Executor/Agent registry 和完整 capability gate。
+当前 A1 no-tools Ask 不依赖 executor Tool capability；A2 再建立持久 Executor/Agent binding 与完整 capability gate。
 
 ### 4.2 A1 出口
 
-- [ ] Provider 设置、普通 Chat、Session 管理、stream、stop 和 restart 后读取与当前切片行为等价。
-- [ ] Deep Agents、Provider adapter、业务 DB 和 checkpoint 只存在于 agents server runtime。
-- [ ] client 不打开业务 DB/checkpoint，不读取 Provider Key，不创建 Agent graph。
-- [ ] event 由 server 先落库后推送；client 重连可按 cursor 补齐。
-- [ ] server restart 后能识别非终态 Run；未实现的 graph resume 不得伪装已恢复。
-- [ ] 当前 Ask service/package/WebView 测试迁移或替换为跨角色 contract，而非保留一套永久旧路径。
+- [x] Provider 设置、普通 Chat、Session 管理、stream、stop 和 restart 后读取行为等价。
+- [x] Pi runtime、Provider adapter、产品 DB 和 Pi Session JSONL 只存在于 agents server runtime。
+- [x] client 不打开产品 DB/Pi Session JSONL，不读取 Provider Key，不创建 Agent runtime。
+- [x] event 由 server 先落库后推送；client 重连可按 cursor 补齐。
+- [x] server restart 后识别并安全终结非终态 orphan Run，不伪装 runtime resume。
+- [x] Ask service/package/WebView 测试已迁移为跨角色 contract，没有永久旧 transport 路径。
 
 ## 5. A2：Executor / Agent Registry
 
@@ -239,15 +239,15 @@ A4 先交付 backend ownership、协议和安全 gate，默认保持 feature fla
 | --- | --- | --- |
 | React WebView、路由、设置和 Chat UI | client | 保留，A1 改 transport |
 | Application Host `ChatService` | agents server application service | A1 |
-| Deep Agents Ask runtime | agents server | A1 |
-| OpenAI-compatible Provider adapter | agents server | A1 |
+| public Pi no-tools Ask runtime | agents server | A1（已迁移） |
+| dynamic builtin/custom Provider registry + auth | agents server | A1（已迁移） |
 | SessionCatalog / RunJournal | agents server | A1 |
-| `BunSqliteSaver` | agents server | A1 |
+| Pi `SessionManager` JSONL | agents server | A1（已迁移） |
 | 当前无 Tool Ask guard | server effective Tool policy | A1 保持，A3 泛化 |
 | 文件/命令/Action Broker | executor + server Action Broker | A3 新增 |
 | MCP/Skills | executor-owned config/secret/content + server-routed UI/resource refs | A4 新增 |
 
-该表是迁移意图，不代表目标组件已经存在。
+该表同时记录已迁移组件与后续新增组件；完成度以[实施进度](./progress.md)为准。
 
 ## 11. Definition of Ready / Done
 
@@ -276,7 +276,7 @@ A4 先交付 backend ownership、协议和安全 gate，默认保持 feature fla
 | ADR-003 Desktop bootstrap and local authentication | A0 |
 | ADR-004 Stable identity / instance / generation | A0 |
 | ADR-005 Companion supervisor and shutdown | A0 |
-| ADR-006 Business DB / checkpoint single writer | A1 |
+| ADR-006 Product DB / Pi Session JSONL single writer | A1（已完成） |
 | ADR-007 Executor / Agent registry | A2 |
 | ADR-008 Action Broker / execution grant | A3 |
 | ADR-009 Tool cancellation and process trees | A3 |

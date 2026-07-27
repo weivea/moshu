@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 
-import { productRpcMethods } from "@moshu/contracts";
+import { companionControlVersion, productRpcMethods } from "@moshu/contracts";
 import {
 	type JsonValue,
 	type RpcCloseInfo,
@@ -26,7 +26,7 @@ const expected = {
 
 const bootstrapRecord = {
 	channel: "moshu-companion-bootstrap",
-	controlVersion: 1,
+	controlVersion: companionControlVersion,
 	type: "START",
 	role: "executor",
 	nonce: "executor-generation-2",

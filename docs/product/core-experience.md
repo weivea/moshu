@@ -216,7 +216,8 @@ Project Chat 属于一个 Project。Project 指向一个本地文件夹，可以
 ### 9.2 中断与恢复
 
 - 关闭页面或窗口不自动停止 Run；只要 desktop client 仍运行，任务可在 agents server/executor 中继续。
-- 用户退出应用时，client 先停止接受新 Run，再协作式要求 agents server 保存检查点、executor 取消/清理 invocation 和进程树；不留下孤儿 companion。
+- 用户退出应用时，client 先停止接受新 Run，再协作式要求 agents server flush 产品状态并 dispose Pi Session、
+  executor 取消/清理 invocation 和进程树；不留下孤儿 companion。
 - 再次打开后，Session 显示“可继续”“需确认状态”或“不可恢复”。
 - 恢复前展示已完成动作、待审批动作和下一步。
 - 对执行结果不确定的副作用操作，不得自动重放；要求用户确认或重新检查外部状态。
@@ -255,19 +256,17 @@ Project Chat 属于一个 Project。Project 指向一个本地文件夹，可以
 - 暂停/停止、恢复、打开会话和查看错误。
 - Executor syncing/online/offline、inventory fresh/stale、重连状态和“当前无法启动新 Run”的原因。
 
-## 11. Deep Agents 运行时映射
+## 11. Pi 运行时映射
 
-| Deep Agents 能力 | 产品表现 |
+| 当前 public Pi 能力 | 产品表现 |
 | --- | --- |
-| todo middleware | 可视化计划与待办进度 |
-| filesystem backend | agents server 形成 Action，executor 在 grant 校验后访问项目文件和会话工作区 |
-| synchronous subagents | Run 内委派卡片和分支轨迹 |
-| asynchronous subagents | 后台子任务卡片，可查看、更新或取消 |
-| summarization | “已压缩上下文”事件及压缩前后 Token 摘要 |
-| checkpointer | agents server 持久化 Session/Run 中断恢复 |
-| human-in-the-loop | agents server 持久化审批，client 展示，executor 只执行一次性 grant |
-| Skills/Memory | Agent 保存 assigned executor stable ref；server 按 version/hash 获取 Skill metadata/`SKILL.md`，executor 管理 immutable content/resources/scripts |
-| event streaming | 消息、工具、子 Agent 和状态的实时 UI |
+| `ModelRuntime` | 动态 builtin/custom Provider、模型、auth method 与 `ThinkingLevel` |
+| `createAgentSession` | headless no-tools Ask；全部动态 resource 与 TUI 禁用 |
+| `SessionManager` | app-owned JSONL conversation context、restore 和 explicit disposal |
+| Agent event stream | 规范化文本 delta、final usage、取消和安全错误 |
+
+Plan、待办、Tool、MCP、Skills、审批和 subagent 不直接采用 SDK 产品合同；它们将在后续阶段通过
+Moshu-owned Agent/Policy/Action/executor contract 实现。当前 UI 不应暗示这些能力已经开放。
 
 ## 12. 文件变更与 Git
 
@@ -295,7 +294,7 @@ Project Chat 属于一个 Project。Project 指向一个本地文件夹，可以
 | CORE-003 | Ask/Plan/Agent 的副作用边界由运行时强制执行 | P0 |
 | CORE-004 | 执行轨迹流式展示且刷新后可恢复 | P0 |
 | CORE-005 | 会话支持保存、搜索、归档、删除和导出 | P0 |
-| CORE-006 | Run 可停止、失败重试和从安全检查点继续 | P0 |
+| CORE-006 | Run 可停止、失败后创建新 Run 重试，并读取已持久化 Session context | P0 |
 | CORE-007 | 最多 1–5 个并发 Session，默认 3，超出排队 | P0 |
 | CORE-008 | 完成和待审批支持桌面通知 | P0 |
 | CORE-009 | Git/非 Git 项目都能追踪并撤销 Agent 变更 | P0 |

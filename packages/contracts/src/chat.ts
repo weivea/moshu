@@ -2,7 +2,12 @@ import { z } from "zod";
 
 import { appErrorSchema } from "./app-error";
 import { agentModeSchema } from "./mode";
-import { customHeadersSchema, providerTypeSchema, sessionModelSelectionSchema } from "./provider";
+import {
+	providerIdSchema,
+	providerSourceSchema,
+	sessionModelSelectionSchema,
+	thinkingLevelSchema,
+} from "./provider";
 
 export const contractSchemaVersion = 1 as const;
 
@@ -13,10 +18,7 @@ export const uuidV7Schema = z.string().regex(uuidV7Pattern, "Expected UUIDv7.");
 export const isoDateTimeSchema = z.string().datetime({ offset: true });
 
 const providerNameSchema = z.string().trim().min(1).max(120);
-const providerBaseUrlSchema = z.string().trim().url().max(2048);
 const providerModelSchema = z.string().trim().min(1).max(200);
-const providerOrganizationSchema = z.string().trim().min(1).max(200);
-const providerApiKeySchema = z.string().trim().min(1).max(4096);
 const sessionTitleSchema = z.string().trim().min(1).max(200);
 const sessionSearchQuerySchema = z.string().trim().max(200);
 const userMessageContentSchema = z.string().trim().min(1).max(20_000);
@@ -26,22 +28,16 @@ const assistantMessageContentSchema = z.string().max(maxAssistantMessageContentC
 const deltaContentSchema = z.string().min(1).max(maxChatDeltaCharacters);
 const cancellationReasonSchema = z.string().trim().min(1).max(500);
 const positiveSequenceSchema = z.int().min(1);
-const reasoningEffortSchema = z.string().trim().min(1).max(32);
-const reasoningBudgetTokensSchema = z.int().min(0).max(100_000_000);
 
 export const runProviderConfigInputSchema = z
 	.object({
 		schemaVersion: z.literal(contractSchemaVersion),
-		providerId: uuidV7Schema,
+		providerId: providerIdSchema,
 		name: providerNameSchema,
-		type: providerTypeSchema,
-		baseUrl: providerBaseUrlSchema,
+		source: providerSourceSchema,
+		api: z.string().trim().min(1).max(100),
 		model: providerModelSchema,
-		apiKey: providerApiKeySchema,
-		customHeaders: customHeadersSchema.optional(),
-		organization: providerOrganizationSchema.optional(),
-		reasoningEffort: reasoningEffortSchema.optional(),
-		reasoningBudgetTokens: reasoningBudgetTokensSchema.optional(),
+		thinkingLevel: thinkingLevelSchema.optional(),
 	})
 	.strict();
 
@@ -51,14 +47,12 @@ export const runProviderStatusSchema = z.enum(providerStatusValues);
 const providerStateBaseSchema = z
 	.object({
 		schemaVersion: z.literal(contractSchemaVersion),
-		providerId: uuidV7Schema,
+		providerId: providerIdSchema,
 		name: providerNameSchema,
-		type: providerTypeSchema,
-		baseUrl: providerBaseUrlSchema,
+		source: providerSourceSchema,
+		api: z.string().trim().min(1).max(100),
 		model: providerModelSchema,
-		organization: providerOrganizationSchema.optional(),
-		reasoningEffort: reasoningEffortSchema.optional(),
-		reasoningBudgetTokens: reasoningBudgetTokensSchema.optional(),
+		thinkingLevel: thinkingLevelSchema.optional(),
 	})
 	.strict();
 
@@ -153,6 +147,7 @@ export const chatSessionSchema = z
 	.object({
 		schemaVersion: z.literal(contractSchemaVersion),
 		id: uuidV7Schema,
+		agentSessionId: uuidV7Schema,
 		title: sessionTitleSchema,
 		defaultMode: agentModeSchema,
 		model: sessionModelSelectionSchema.optional(),

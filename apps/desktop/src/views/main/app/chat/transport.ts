@@ -2,6 +2,8 @@ import type {
 	AvailableModel,
 	CreateProviderInput,
 	DefaultModelSelection,
+	ProviderAuthAttempt,
+	ProviderAuthType,
 	ProviderSummary,
 	SessionModelSelection,
 	TestProviderInput,
@@ -129,6 +131,16 @@ export interface ChatTransport {
 	testProvider(input: TestProviderInput): Promise<ProviderConnectionTestResult>;
 	fetchProviderModels(providerId: string): Promise<ProviderSummary>;
 	setProviderModelsEnabled(providerId: string, enabledModelIds: string[]): Promise<ProviderSummary>;
+	startProviderAuth(providerId: string, authType: ProviderAuthType): Promise<ProviderAuthAttempt>;
+	getProviderAuth(attemptId: string): Promise<ProviderAuthAttempt>;
+	respondProviderAuth(
+		attemptId: string,
+		challengeId: string,
+		value: string,
+	): Promise<ProviderAuthAttempt>;
+	cancelProviderAuth(attemptId: string): Promise<ProviderAuthAttempt>;
+	logoutProvider(providerId: string): Promise<void>;
+	openExternalUrl(url: string): Promise<void>;
 	listAvailableModels(): Promise<{
 		models: AvailableModel[];
 		defaultModel?: DefaultModelSelection;

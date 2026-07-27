@@ -2,21 +2,28 @@ import { z } from "zod";
 
 export const emptyParamsSchema = z.object({}).strict();
 
-export const deepAgentsRuntimeInfoSchema = z
+export const agentRuntimeInfoSchema = z
 	.object({
 		loaded: z.boolean(),
-		version: z.string().min(1),
+		foundation: z.literal("pi-agent"),
+		versions: z
+			.object({
+				piAi: z.string().min(1),
+				piAgentCore: z.string().min(1),
+				piCodingAgent: z.string().min(1),
+			})
+			.strict(),
 	})
 	.strict();
 
 export const agentsRuntimeInfoSchema = z
 	.object({
-		apiVersion: z.literal(1),
+		apiVersion: z.literal(2),
 		serverVersion: z.string().min(1),
 		bunVersion: z.string().min(1),
 		platform: z.enum(["darwin", "win32", "linux"]),
 		arch: z.string().min(1),
-		deepAgents: deepAgentsRuntimeInfoSchema,
+		agentRuntime: agentRuntimeInfoSchema,
 		ready: z.boolean(),
 		executor: z
 			.object({
@@ -31,7 +38,7 @@ export const agentsRuntimeInfoSchema = z
 	.strict();
 
 export const runtimeInfoSchema = z.object({
-	apiVersion: z.literal(1),
+	apiVersion: z.literal(2),
 	appName: z.string().min(1),
 	appVersion: z.string().min(1),
 	channel: z.enum(["dev", "canary", "stable"]),
@@ -39,9 +46,10 @@ export const runtimeInfoSchema = z.object({
 	bunVersion: z.string().min(1),
 	platform: z.enum(["darwin", "win32", "linux"]),
 	arch: z.string().min(1),
-	deepAgents: deepAgentsRuntimeInfoSchema,
+	agentRuntime: agentRuntimeInfoSchema,
 });
 
 export type EmptyParams = z.infer<typeof emptyParamsSchema>;
+export type AgentRuntimeInfo = z.infer<typeof agentRuntimeInfoSchema>;
 export type AgentsRuntimeInfo = z.infer<typeof agentsRuntimeInfoSchema>;
 export type RuntimeInfo = z.infer<typeof runtimeInfoSchema>;

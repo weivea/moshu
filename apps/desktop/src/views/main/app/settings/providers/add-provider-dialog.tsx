@@ -1,5 +1,5 @@
 import { Button } from "@heroui/react";
-import type { CreateProviderInput, ProviderType } from "@moshu/contracts";
+import type { CreateProviderInput, CustomProviderApi } from "@moshu/contracts";
 import { type FormEvent, useId, useState } from "react";
 
 import { useI18n } from "../../i18n";
@@ -19,7 +19,7 @@ export function AddProviderDialog({ isPending, onCancel, onSubmit }: AddProvider
 	const { t } = useI18n();
 	const fieldId = useId();
 	const [displayName, setDisplayName] = useState("");
-	const [type, setType] = useState<ProviderType>("openai-compatible");
+	const [api, setApi] = useState<CustomProviderApi>("openai-completions");
 	const [baseUrl, setBaseUrl] = useState("https://api.openai.com/v1");
 	const [apiKey, setApiKey] = useState("");
 	const [customHeaders, setCustomHeaders] = useState("");
@@ -50,9 +50,9 @@ export function AddProviderDialog({ isPending, onCancel, onSubmit }: AddProvider
 
 		setError(undefined);
 		onSubmit({
-			schemaVersion: 1,
+			schemaVersion: 2,
 			displayName: displayName.trim(),
-			type,
+			api,
 			baseUrl: baseUrl.trim(),
 			apiKey: apiKey.trim(),
 			...(headers === undefined ? {} : { customHeaders: headers }),
@@ -84,9 +84,9 @@ export function AddProviderDialog({ isPending, onCancel, onSubmit }: AddProvider
 				<span>{t("providers.type")}</span>
 				<select
 					id={`${fieldId}-type`}
-					value={type}
+					value={api}
 					disabled={isPending}
-					onChange={(event) => setType(event.currentTarget.value as ProviderType)}
+					onChange={(event) => setApi(event.currentTarget.value as CustomProviderApi)}
 				>
 					{providerTypeOptions.map((option) => (
 						<option key={option.value} value={option.value}>

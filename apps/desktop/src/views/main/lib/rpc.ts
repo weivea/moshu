@@ -20,8 +20,16 @@ import {
 	listChatSessionsInputSchema,
 	listChatSessionsOutputSchema,
 	listProvidersOutputSchema,
+	logoutProviderInputSchema,
+	logoutProviderOutputSchema,
 	providerMutationOutputSchema,
+	providerAuthAttemptInputSchema,
+	providerAuthAttemptOutputSchema,
+	respondProviderAuthInputSchema,
 	runtimeInfoSchema,
+	startProviderAuthInputSchema,
+	type StartProviderAuthInput,
+	type RespondProviderAuthInput,
 	type SessionModelSelection,
 	type SetChatSessionModelInput,
 	type SetDefaultModelInput,
@@ -49,6 +57,8 @@ import {
 	type ChatSessionInvalidation,
 	chatSessionInvalidationSchema,
 	type DesktopRpc,
+	openExternalUrlInputSchema,
+	openExternalUrlOutputSchema,
 } from "../../../shared/rpc";
 import { normalizeDesktopRpcError } from "../../../shared/rpc-errors";
 import { ChatSessionInvalidationBridge } from "./session-invalidation-bridge";
@@ -128,7 +138,7 @@ export const desktopClient = {
 		);
 	},
 	async deleteProvider(providerId: string) {
-		const parsedInput = deleteProviderInputSchema.parse({ schemaVersion: 1, providerId });
+		const parsedInput = deleteProviderInputSchema.parse({ schemaVersion: 2, providerId });
 		return deleteProviderOutputSchema.parse(
 			await requestDesktop(() => getRequest().deleteProvider(parsedInput)),
 		);
@@ -140,7 +150,7 @@ export const desktopClient = {
 		);
 	},
 	async fetchProviderModels(providerId: string) {
-		const parsedInput = fetchProviderModelsInputSchema.parse({ schemaVersion: 1, providerId });
+		const parsedInput = fetchProviderModelsInputSchema.parse({ schemaVersion: 2, providerId });
 		return fetchProviderModelsOutputSchema.parse(
 			await requestDesktop(() => getRequest().fetchProviderModels(parsedInput)),
 		);
@@ -149,6 +159,42 @@ export const desktopClient = {
 		const parsedInput = setProviderModelsEnabledInputSchema.parse(input);
 		return setProviderModelsEnabledOutputSchema.parse(
 			await requestDesktop(() => getRequest().setProviderModelsEnabled(parsedInput)),
+		);
+	},
+	async providerAuthStart(input: StartProviderAuthInput) {
+		const parsedInput = startProviderAuthInputSchema.parse(input);
+		return providerAuthAttemptOutputSchema.parse(
+			await requestDesktop(() => getRequest().providerAuthStart(parsedInput)),
+		);
+	},
+	async providerAuthGet(attemptId: string) {
+		const parsedInput = providerAuthAttemptInputSchema.parse({ attemptId });
+		return providerAuthAttemptOutputSchema.parse(
+			await requestDesktop(() => getRequest().providerAuthGet(parsedInput)),
+		);
+	},
+	async providerAuthRespond(input: RespondProviderAuthInput) {
+		const parsedInput = respondProviderAuthInputSchema.parse(input);
+		return providerAuthAttemptOutputSchema.parse(
+			await requestDesktop(() => getRequest().providerAuthRespond(parsedInput)),
+		);
+	},
+	async providerAuthCancel(attemptId: string) {
+		const parsedInput = providerAuthAttemptInputSchema.parse({ attemptId });
+		return providerAuthAttemptOutputSchema.parse(
+			await requestDesktop(() => getRequest().providerAuthCancel(parsedInput)),
+		);
+	},
+	async providerLogout(providerId: string) {
+		const parsedInput = logoutProviderInputSchema.parse({ schemaVersion: 2, providerId });
+		return logoutProviderOutputSchema.parse(
+			await requestDesktop(() => getRequest().providerLogout(parsedInput)),
+		);
+	},
+	async openExternalUrl(url: string) {
+		const input = openExternalUrlInputSchema.parse({ url });
+		return openExternalUrlOutputSchema.parse(
+			await requestDesktop(() => getRequest().openExternalUrl(input)),
 		);
 	},
 	async listAvailableModels() {

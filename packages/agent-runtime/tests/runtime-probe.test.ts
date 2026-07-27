@@ -1,14 +1,21 @@
 import { describe, expect, test } from "bun:test";
-import { DEEP_AGENTS_VERSION, probeAgentRuntime } from "../src";
+import {
+	PI_AGENT_CORE_VERSION,
+	PI_AI_VERSION,
+	PI_CODING_AGENT_VERSION,
+	probeAgentRuntime,
+} from "../src";
 
-describe("Deep Agents runtime probe", () => {
-	test("imports the locked workspace Deep Agents build in Bun", () => {
-		expect(import.meta.resolve("@moshu/deepagents/browser")).toContain(
-			"/packages/deepagents/src/browser.ts",
-		);
+describe("Pi runtime probe", () => {
+	test("reports the pinned public Pi packages", () => {
 		expect(probeAgentRuntime()).toEqual({
 			loaded: true,
-			version: DEEP_AGENTS_VERSION,
+			foundation: "pi-agent",
+			versions: {
+				piAi: PI_AI_VERSION,
+				piAgentCore: PI_AGENT_CORE_VERSION,
+				piCodingAgent: PI_CODING_AGENT_VERSION,
+			},
 		});
 	});
 });

@@ -1,7 +1,7 @@
 import Database from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 
 import type { AskChatRuntime } from "@moshu/agent-runtime";
 import type { AgentsServerBootstrapRecord } from "@moshu/contracts";
@@ -14,282 +14,163 @@ import {
 import { createAgentsServer } from "./create-agents-server";
 
 describe("createAgentsServer", () => {
-	test("retries crash-durable checkpoint deletion jobs before the server can become ready", async () => {
-		const directory = resolve(process.cwd(), `.agents-startup-${crypto.randomUUID()}`);
-		mkdirSync(directory, { recursive: true });
-		const bootstrap = createBootstrap(directory);
-		const database = openAppDatabase(bootstrap.paths.productDatabase);
-		const session = database.sessions.create({ title: "Committed before crash" }).session;
-		database.runs.deleteSessionAndRetireRuns(session.id);
-		database.close();
-
-		const deletionStarted = createDeferred();
-		const allowDeletion = createDeferred();
-		const deletedThreadIds: string[] = [];
-		const runtime = {
-			async deleteThread(threadId: string) {
-				deletedThreadIds.push(threadId);
+	test("retries durable agent-session cleanup before readiness", async () => {
+		await withServerDirectory(async (directory) => {
+			const bootstrap = createBootstrap(directory);
+			const database = openAppDatabase(bootstrap.paths.productDatabase);
+			const session = database.sessions.create({ title: "Committed before crash" }).session;
+			database.runs.deleteSessionAndRetireRuns(session.id);
+			database.close();
+			const deletionStarted = Promise.withResolvers<void>();
+			const allowDeletion = Promise.withResolvers<void>();
+			const deleted: string[] = [];
+			const runtime = fakeRuntime(async (id) => {
+				deleted.push(id);
 				deletionStarted.resolve();
 				await allowDeletion.promise;
-			},
-			async shutdown() {},
-		} as unknown as AskChatRuntime;
-		let instance: Awaited<ReturnType<typeof createAgentsServer>> | undefined;
-		try {
-			instance = await createAgentsServer({
+			});
+			const instance = await createAgentsServer({
 				bootstrap,
 				serverVersion: "test",
 				createRuntime: () => runtime,
 			});
-			let ready = false;
-			void instance.ready.then(() => {
-				ready = true;
-			});
-			await deletionStarted.promise;
-			await Promise.resolve();
-			expect(ready).toBe(false);
-
-			allowDeletion.resolve();
-			await instance.ready;
-			expect(deletedThreadIds).toEqual([session.id]);
-			await instance.shutdown();
-			instance = undefined;
-
-			const reopened = openAppDatabase(bootstrap.paths.productDatabase);
 			try {
-				expect(reopened.runs.listPendingCheckpointDeletions(10, true)).toEqual([]);
-			} finally {
+				let ready = false;
+				void instance.ready.then(() => {
+					ready = true;
+				});
+				await deletionStarted.promise;
+				await Promise.resolve();
+				expect(ready).toBe(false);
+				allowDeletion.resolve();
+				await instance.ready;
+				expect(deleted).toEqual([session.agentSessionId]);
+				const reopened = openAppDatabase(bootstrap.paths.productDatabase);
+				expect(reopened.runs.listPendingAgentSessionCleanups(10, true)).toEqual([]);
 				reopened.close();
+			} finally {
+				await instance.shutdown();
 			}
-		} finally {
-			await instance?.shutdown();
-			rmSync(directory, { force: true, recursive: true });
-		}
-	});
-
-	test("settles readiness after a bounded permanent cleanup attempt and keeps the job durable", async () => {
-		const directory = resolve(process.cwd(), `.agents-startup-${crypto.randomUUID()}`);
-		mkdirSync(directory, { recursive: true });
-		const bootstrap = createBootstrap(directory);
-		const database = openAppDatabase(bootstrap.paths.productDatabase);
-		const session = database.sessions.create({ title: "Permanent cleanup" }).session;
-		database.runs.deleteSessionAndRetireRuns(session.id);
-		database.close();
-		const deletedThreadIds: string[] = [];
-		const runtime = {
-			async deleteThread(threadId: string) {
-				deletedThreadIds.push(threadId);
-				throw new Error("permanent cleanup failure");
-			},
-			async shutdown() {},
-		} as unknown as AskChatRuntime;
-		let instance: Awaited<ReturnType<typeof createAgentsServer>> | undefined;
-
-		try {
-			instance = await createAgentsServer({
-				bootstrap,
-				serverVersion: "test",
-				createRuntime: () => runtime,
-				checkpointDeletionStartupTimeoutMs: 25,
-				checkpointDeletionStartupMaxAttempts: 1,
-			});
-			await withDeadline(instance.ready, 100, "agents readiness");
-			expect(deletedThreadIds).toEqual([session.id]);
-			const reopened = openAppDatabase(bootstrap.paths.productDatabase);
-			expect(reopened.runs.listPendingCheckpointDeletions(10, true)).toHaveLength(1);
-			reopened.close();
-		} finally {
-			await instance?.shutdown();
-			rmSync(directory, { force: true, recursive: true });
-		}
-	});
-
-	test("coordinately resets old product and checkpoint stores before opening either service", async () => {
-		const directory = resolve(process.cwd(), `.agents-startup-${crypto.randomUUID()}`);
-		mkdirSync(directory, { recursive: true });
-		const bootstrap = createBootstrap(directory);
-		const legacyProduct = new Database(bootstrap.paths.productDatabase);
-		legacyProduct.exec("CREATE TABLE legacy_product (value TEXT); PRAGMA user_version = 6;");
-		legacyProduct.close();
-		writeFileSync(bootstrap.paths.checkpointDatabase, "legacy checkpoint bytes");
-		const providerDocument = JSON.stringify({
-			schemaVersion: 1,
-			configuration: {
-				provider: "openai-compatible",
-				apiKey: "sk-preserved",
-				baseUrl: "https://api.openai.com/v1",
-				model: "gpt-4.1-mini",
-			},
 		});
-		writeFileSync(bootstrap.paths.providerConfig, providerDocument);
-		for (const sidecar of [
-			`${bootstrap.paths.productDatabase}-wal`,
-			`${bootstrap.paths.productDatabase}-shm`,
-			`${bootstrap.paths.checkpointDatabase}-wal`,
-			`${bootstrap.paths.checkpointDatabase}-shm`,
-		]) {
-			writeFileSync(sidecar, "");
-		}
-		const runtime = {
-			async deleteThread() {},
-			async shutdown() {},
-		} as unknown as AskChatRuntime;
-		const diagnostics: string[] = [];
-		let instance: Awaited<ReturnType<typeof createAgentsServer>> | undefined;
-
-		try {
-			instance = await createAgentsServer({
-				bootstrap,
-				serverVersion: "test",
-				createRuntime: () => runtime,
-				reportDiagnostic: (message) => diagnostics.push(message),
-			});
-			await instance.ready;
-			const product = openAppDatabase(bootstrap.paths.productDatabase);
-			expect(getDatabaseUserVersion(product.client)).toBe(currentAppDatabaseVersion);
-			expect(
-				product.client
-					.query<{ count: number }, []>(
-						"SELECT count(*) AS count FROM sqlite_master WHERE name = 'legacy_product'",
-					)
-					.get()?.count,
-			).toBe(0);
-			product.close();
-			const checkpoint = new Database(bootstrap.paths.checkpointDatabase, { readonly: true });
-			expect(
-				checkpoint.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version,
-			).toBe(1);
-			checkpoint.close();
-			// The coordinated reset leaves the Provider store untouched; constructing the registry
-			// then migrates the legacy v1 document in place while preserving its credentials.
-			const migratedProviderConfig = JSON.parse(
-				readFileSync(bootstrap.paths.providerConfig, "utf8"),
-			) as {
-				schemaVersion: number;
-				providers: Array<{
-					apiKey: string;
-					baseUrl: string;
-					type: string;
-					models: Array<{ id: string; enabled: boolean }>;
-				}>;
-				defaultModel?: { modelId: string };
-			};
-			expect(migratedProviderConfig.schemaVersion).toBe(3);
-			expect(migratedProviderConfig.providers).toHaveLength(1);
-			expect(migratedProviderConfig.providers[0]?.apiKey).toBe("sk-preserved");
-			expect(migratedProviderConfig.providers[0]?.baseUrl).toBe("https://api.openai.com/v1");
-			expect(migratedProviderConfig.providers[0]?.type).toBe("openai-compatible");
-			expect(migratedProviderConfig.providers[0]?.models).toEqual([
-				{ id: "gpt-4.1-mini", enabled: true },
-			]);
-			expect(migratedProviderConfig.defaultModel?.modelId).toBe("gpt-4.1-mini");
-			expect(diagnostics).toEqual([
-				"Reset local product and checkpoint stores (product-schema-cutover, previous product schema 6).",
-			]);
-			expect(diagnostics[0]).not.toContain(directory);
-			expect(diagnostics[0]).not.toContain("sk-preserved");
-		} finally {
-			await instance?.shutdown();
-			rmSync(directory, { force: true, recursive: true });
-		}
 	});
 
-	test("resets a stale checkpoint before opening it when an interrupted reset lost product main", async () => {
-		const directory = resolve(process.cwd(), `.agents-startup-${crypto.randomUUID()}`);
-		mkdirSync(directory, { recursive: true });
-		const bootstrap = createBootstrap(directory);
-		const staleCheckpoint = new Database(bootstrap.paths.checkpointDatabase);
-		staleCheckpoint.exec(
-			"CREATE TABLE stale_checkpoint (value TEXT); INSERT INTO stale_checkpoint VALUES ('stale');",
-		);
-		staleCheckpoint.close();
-		for (const sidecar of [
-			`${bootstrap.paths.productDatabase}-wal`,
-			`${bootstrap.paths.productDatabase}-shm`,
-			`${bootstrap.paths.checkpointDatabase}-wal`,
-			`${bootstrap.paths.checkpointDatabase}-shm`,
-		]) {
-			writeFileSync(sidecar, "");
-		}
-		const runtime = {
-			async deleteThread() {},
-			async shutdown() {},
-		} as unknown as AskChatRuntime;
-		const diagnostics: string[] = [];
-		let instance: Awaited<ReturnType<typeof createAgentsServer>> | undefined;
-
-		try {
-			instance = await createAgentsServer({
+	test("bounds permanent startup cleanup failures and retains the durable job", async () => {
+		await withServerDirectory(async (directory) => {
+			const bootstrap = createBootstrap(directory);
+			const database = openAppDatabase(bootstrap.paths.productDatabase);
+			const session = database.sessions.create({ title: "Permanent cleanup" }).session;
+			database.runs.deleteSessionAndRetireRuns(session.id);
+			database.close();
+			const deleted: string[] = [];
+			const instance = await createAgentsServer({
 				bootstrap,
 				serverVersion: "test",
-				createRuntime: () => runtime,
-				reportDiagnostic: (message) => diagnostics.push(message),
+				createRuntime: () =>
+					fakeRuntime(async (id) => {
+						deleted.push(id);
+						throw new Error("permanent fake cleanup failure");
+					}),
+				agentSessionCleanupStartupTimeoutMs: 25,
+				agentSessionCleanupStartupMaxAttempts: 1,
 			});
-			await instance.ready;
-			const product = openAppDatabase(bootstrap.paths.productDatabase);
-			expect(getDatabaseUserVersion(product.client)).toBe(currentAppDatabaseVersion);
-			product.close();
-			const checkpoint = new Database(bootstrap.paths.checkpointDatabase, { readonly: true });
-			expect(
-				checkpoint
-					.query<{ count: number }, []>(
-						"SELECT count(*) AS count FROM sqlite_master WHERE name = 'stale_checkpoint'",
-					)
-					.get()?.count,
-			).toBe(0);
-			checkpoint.close();
-			expect(diagnostics).toEqual([
-				"Reset local product and checkpoint stores (product-schema-cutover, previous product schema unavailable after interrupted reset).",
-			]);
-		} finally {
-			await instance?.shutdown();
-			rmSync(directory, { force: true, recursive: true });
-		}
+			try {
+				await withDeadline(instance.ready, 150, "agents readiness");
+				expect(deleted).toEqual([session.agentSessionId]);
+				const reopened = openAppDatabase(bootstrap.paths.productDatabase);
+				expect(reopened.runs.listPendingAgentSessionCleanups(10, true)).toHaveLength(1);
+				reopened.close();
+			} finally {
+				await instance.shutdown();
+			}
+		});
 	});
 
-	test("leaves a current product schema and checkpoint store intact", async () => {
-		const directory = resolve(process.cwd(), `.agents-startup-${crypto.randomUUID()}`);
-		mkdirSync(directory, { recursive: true });
-		const bootstrap = createBootstrap(directory);
-		const product = openAppDatabase(bootstrap.paths.productDatabase);
-		product.close();
-		const checkpoint = new Database(bootstrap.paths.checkpointDatabase);
-		checkpoint.exec(
-			"CREATE TABLE checkpoint_marker (value TEXT); INSERT INTO checkpoint_marker VALUES ('kept'); PRAGMA user_version = 1;",
-		);
-		checkpoint.close();
-		const runtime = {
-			async deleteThread() {},
-			async shutdown() {},
-		} as unknown as AskChatRuntime;
-		const diagnostics: string[] = [];
-		let instance: Awaited<ReturnType<typeof createAgentsServer>> | undefined;
-
-		try {
-			instance = await createAgentsServer({
+	test("resets an old product schema without deleting app-owned Pi data", async () => {
+		await withServerDirectory(async (directory) => {
+			const bootstrap = createBootstrap(directory);
+			const legacy = new Database(bootstrap.paths.productDatabase);
+			legacy.exec("CREATE TABLE legacy_product (value TEXT); PRAGMA user_version = 6;");
+			legacy.close();
+			mkdirSync(bootstrap.paths.agentDataDirectory, { recursive: true });
+			const marker = join(bootstrap.paths.agentDataDirectory, "pi-data-marker");
+			writeFileSync(marker, "keep");
+			const diagnostics: string[] = [];
+			const instance = await createAgentsServer({
 				bootstrap,
 				serverVersion: "test",
-				createRuntime: () => runtime,
+				createRuntime: () => fakeRuntime(),
 				reportDiagnostic: (message) => diagnostics.push(message),
 			});
-			await instance.ready;
-			const retained = new Database(bootstrap.paths.checkpointDatabase, { readonly: true });
-			expect(
-				retained.query<{ value: string }, []>("SELECT value FROM checkpoint_marker").get()?.value,
-			).toBe("kept");
-			retained.close();
-			expect(diagnostics).toEqual([]);
-		} finally {
-			await instance?.shutdown();
-			rmSync(directory, { force: true, recursive: true });
-		}
+			try {
+				await instance.ready;
+				const product = openAppDatabase(bootstrap.paths.productDatabase);
+				expect(getDatabaseUserVersion(product.client)).toBe(currentAppDatabaseVersion);
+				expect(
+					product.client
+						.query<{ count: number }, []>(
+							"SELECT count(*) AS count FROM sqlite_master WHERE name = 'legacy_product'",
+						)
+						.get()?.count,
+				).toBe(0);
+				product.close();
+				expect(readFileSync(marker, "utf8")).toBe("keep");
+				expect(diagnostics).toEqual([
+					"Reset the local product store (product-schema-cutover, previous product schema 6).",
+				]);
+				expect(diagnostics[0]).not.toContain(directory);
+			} finally {
+				await instance.shutdown();
+			}
+		});
+	});
+
+	test("leaves a current product schema intact without reset diagnostics", async () => {
+		await withServerDirectory(async (directory) => {
+			const bootstrap = createBootstrap(directory);
+			const product = openAppDatabase(bootstrap.paths.productDatabase);
+			const session = product.sessions.create({ title: "Retained" }).session;
+			product.close();
+			const diagnostics: string[] = [];
+			const instance = await createAgentsServer({
+				bootstrap,
+				serverVersion: "test",
+				createRuntime: () => fakeRuntime(),
+				reportDiagnostic: (message) => diagnostics.push(message),
+			});
+			try {
+				await instance.ready;
+				const reopened = openAppDatabase(bootstrap.paths.productDatabase);
+				expect(reopened.sessions.get({ sessionId: session.id }).title).toBe("Retained");
+				reopened.close();
+				expect(diagnostics).toEqual([]);
+			} finally {
+				await instance.shutdown();
+			}
+		});
 	});
 });
+
+function fakeRuntime(
+	deleteThread: (threadId: string) => Promise<void> = async () => {},
+): AskChatRuntime {
+	return {
+		run: async () => {
+			throw new Error("Not used.");
+		},
+		stream: () => {
+			throw new Error("Not used.");
+		},
+		cancel: () => false,
+		getThreadMessages: async () => [],
+		deleteThread,
+		shutdown: async () => {},
+	};
+}
 
 function createBootstrap(directory: string): AgentsServerBootstrapRecord {
 	return {
 		channel: "moshu-companion-bootstrap",
-		controlVersion: 1,
+		controlVersion: 2,
 		type: "START",
 		role: "agents-server",
 		nonce: "startup-test",
@@ -312,23 +193,23 @@ function createBootstrap(directory: string): AgentsServerBootstrapRecord {
 		],
 		paths: {
 			productDatabase: resolve(directory, "product.db"),
-			checkpointDatabase: resolve(directory, "checkpoints.db"),
-			providerConfig: resolve(directory, "provider.json"),
+			agentDataDirectory: resolve(directory, "agent-data"),
 		},
 	};
 }
 
-function createDeferred(): { promise: Promise<void>; resolve(): void } {
-	let resolvePromise: (() => void) | undefined;
-	const promise = new Promise<void>((resolvePromiseValue) => {
-		resolvePromise = resolvePromiseValue;
-	});
-	return {
-		promise,
-		resolve() {
-			resolvePromise?.();
-		},
-	};
+async function withServerDirectory(run: (directory: string) => Promise<void>): Promise<void> {
+	const directory = resolve(
+		process.cwd(),
+		".test-artifacts",
+		`agents-startup-${crypto.randomUUID()}`,
+	);
+	mkdirSync(directory, { recursive: true });
+	try {
+		await run(directory);
+	} finally {
+		rmSync(directory, { force: true, recursive: true });
+	}
 }
 
 async function withDeadline<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
@@ -341,8 +222,6 @@ async function withDeadline<T>(promise: Promise<T>, timeoutMs: number, label: st
 			}),
 		]);
 	} finally {
-		if (timer !== undefined) {
-			clearTimeout(timer);
-		}
+		if (timer !== undefined) clearTimeout(timer);
 	}
 }

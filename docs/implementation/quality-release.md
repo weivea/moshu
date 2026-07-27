@@ -1,7 +1,7 @@
 # 质量与发布计划
 
 > 本文验证批准的三应用角色目标架构。
-> 当前单进程 Ask 测试是迁移输入，不能替代 client/agents-server/executor 的目标 gate。
+> 当前 Pi Ask、compiled companion 与三进程 smoke 已形成 A0/A1 gate；Tool/MCP/Skill gate 尚未实现。
 
 ## 1. 质量目标
 
@@ -39,7 +39,7 @@
 | Gate | 必须通过 |
 | --- | --- |
 | QG-A0 RPC/binary | 两 companion compile/package、dynamic loopback、registration、version、role allowlist、shutdown/restart cap |
-| QG-A1 server extraction | Ask parity、server 单写 DB/checkpoint、Provider/graph 不在 client、event replay |
+| QG-A1 server extraction | Pi Ask parity、server 单写产品 DB/Pi Session JSONL、Provider/runtime 不在 client、event replay |
 | QG-A2 registry | stable ID、instance/generation、Agent N:1、注册 full capability sync、syncing/offline Run gate |
 | QG-A3 execution | policy/approval/intent/grant 顺序、grant negative suite、Tool process tree、Action recovery |
 | QG-A4 MCP/Skills | executor-owned persistence、epoch/revision delta reconciliation、routed UI、stable resource ref、private secret store、逐 Tool grant、fail-closed restore |
@@ -118,16 +118,16 @@
 
 ### 6.1 agents server
 
-- 新业务 DB/checkpoint 建库、当前 schema、WAL、关闭重开和 backup。
+- 新产品 DB 建库、当前 schema、WAL、关闭重开和 backup；Pi Session JSONL restore。
 - SessionCatalog/RunJournal、Provider 设置、stream、cancel 和 error parity。
-- `BunSqliteSaver` 的 `getTuple/list/put/putWrites/deleteThread` contract。
-- event 先落库再发布；checkpoint/Event 偏差可识别。
+- public `SessionManager.create`、稳定 ID、restore、dispose 和 app-owned path contract。
+- event 先落库再发布；RunJournal 与 Pi conversation context 的职责清晰。
 - server 不导入 client UI 或 executor implementation。
 - 当前开发期不兼容 schema 进入明确 reset，不运行伪迁移。
 
 ### 6.2 executor
 
-- 不打开业务 DB/checkpoint，不持有 Provider adapter。
+- 不打开产品 DB/Pi Session JSONL，不持有 Provider adapter。
 - 文件路径、软链接、TOCTOU、hash CAS、原子替换和撤销。
 - 命令 cwd、最小 env、timeout、输出截断、进程组和取消。
 - executor shutdown 清理所有受管进程树。
@@ -138,7 +138,7 @@
 - companion 启动顺序、健康状态和 cooperative shutdown。
 - 两个角色各自独立 restart budget 与 capped backoff。
 - 达到 cap 后停止重启并展示 recovery UX。
-- client 不打开业务 DB/checkpoint，不调用 Provider/Deep Agents。
+- client 不打开产品 DB/Pi Session JSONL，不调用 Provider/Pi。
 - WebView 只通过 client adapter 访问 server。
 
 ## 7. Action Broker 与 Tool Bridge
@@ -186,7 +186,8 @@
 - executor DB 是 config/lifecycle/inventory 的 source of truth；restart 后从自身数据恢复，不依赖 server snapshot。
 - client command 经 server identity/auth 校验并路由；offline、expected-version conflict、disk failure 不返回 success，成功带 redacted result 与 inventory epoch/revision。
 - mutation result 触发 server 立即拉取到该 revision；失败时 cache 明确 stale，不伪造 read-own-write descriptor。
-- server 产品 DB、checkpoint、backup 和 inventory snapshot 不含 recoverable config、credential/OAuth state 或 executor secret locator。
+- server 产品 DB、Pi Session JSONL、backup 和 inventory snapshot 不含 recoverable config、credential/OAuth
+  state 或 executor secret locator。
 - stdio start/stop/restart cap、进程树和最小 env；credential 只注入目标 MCP child，不进入 executor 全局环境或无关 child。
 - HTTP/SSE disconnect、Schema hash 变化和 typed error。
 - Tool invocation 必须持有效 grant；MCP ready 不等于预授权。
@@ -199,7 +200,8 @@
 
 - executor 安装、immutable version、压缩包穿越、frontmatter、内容 hash、atomic publish 和卸载。
 - Agent resource ref 必须属于 assigned executor；server 只能按 stable ID/version/hash 获取 metadata/`SKILL.md`，不能直接读 Skill 目录。
-- server inventory snapshot 不能恢复 Skill；产品 DB/checkpoint/Run snapshot/backup/event/diagnostic/export 不含 fetched `SKILL.md` 或其他 Skill content。
+- server inventory snapshot 不能恢复 Skill；产品 DB/Pi Session JSONL/Run snapshot/backup/event/diagnostic/export
+  不含 fetched `SKILL.md` 或其他 Skill content。
 - descriptor missing/hash mismatch/wrong owner 使 Agent build/restore fail closed。
 - references/assets/scripts 通过 executor；script 必须重新经过 Policy/grant。
 - executor offline 或 Skill 缺失时 Agent start 明确失败，不静默省略 Skill。
@@ -228,7 +230,7 @@
 
 - WebView/client state 和 client-server RPC。
 - server-executor RPC、grant、invocation result、inventory hint/snapshot/change page。
-- server business DB、checkpoint、reset backup 和 inventory cache。
+- server 产品 DB、Pi Session JSONL、reset backup 和 inventory cache。
 - client/server/executor 日志、崩溃报告和诊断包。
 - server command/audit/event payload、client state 和命令环境快照。
 - Session/Agent/Canvas 导出。
@@ -278,7 +280,7 @@ Provider/model canary 只允许存在于测试 server `SecretVault`，进入 exe
 | WebView reload | 只重建订阅；Run 不丢失 |
 | client connection drop | server Run 继续；重连按 cursor 补齐 |
 | client process exit | supervisor 执行 cooperative shutdown；超时升级 |
-| agents server kill | client capped restart；DB/checkpoint 恢复；executor 重注册并 full inventory sync |
+| agents server kill | client capped restart；产品 DB/Pi Session JSONL 恢复；executor 重注册并 full inventory sync |
 | executor kill | cache stale；新 Run 被拒绝；活动 invocation 对账；重连 full sync 前不 runnable |
 | MCP process kill | executor inventory 更新；按 executor-owned config 受限重启 |
 | hint 丢失/change log compact | 48–72 秒 poll 发现 revision；gap/compaction 改用 full snapshot，不误删 |
@@ -317,12 +319,17 @@ Provider/model canary 只允许存在于测试 server `SecretVault`，进入 exe
 - stable package 扫描确认无 test method、固定 token、调试 listener。
 - release smoke 优先使用正式入口和公开诊断，不依赖测试后门。
 
-## 13. Provider、Checkpoint 与产品回归
+## 13. Provider、Pi Session 与产品回归
 
-- 每个 Provider adapter 继续覆盖认证、stream、Tool call、usage、error、capability 和 redaction。
+- public Pi compatibility gate 覆盖 imports、headless no-tools Session、offline fake stream、restore、abort 和
+  compiled binary。
+- Provider 覆盖动态 builtin 枚举、四种 custom API、选中 Provider 刷新、auth attempt 全部 prompt/event、
+  credential redaction、logout 和 invalid `ThinkingLevel`。
 - Provider 调用只在 server 测试进程中发生；client/executor 测试中出现 Provider Key 即失败。
-- checkpoint contract、thread 删除、interrupt 和 transcript 查询继续由 server integration 覆盖。
-- 现有 Provider/Chat/Session/WebView 测试在 A1 迁移期间保持；完成后删除永久旧 transport 路径。
+- Pi Ask integration 覆盖 unexpected Tool fail-closed、stream/usage、cancel classification、same-session fence、
+  different-session concurrency、restore、dispose 和 deletion containment。
+- 产品测试继续覆盖 orphan finalization、event replay、cleanup outbox retry/backoff、Session restart/read/delete
+  和 secret-free Run snapshot。
 
 ## 14. 性能预算
 
@@ -398,7 +405,7 @@ clean tagged commit
 
 当前重构阶段：
 
-- 不要求旧单进程业务 DB/checkpoint/Provider 开发配置迁移。
+- 不要求旧 runtime 数据或 Provider 开发配置迁移。
 - 测试只要求“不兼容时明确 reset、旧数据不被误读、当前 schema 可 backup/restore”。
 - 文案必须告诉开发用户 reset 会删除哪些本地数据。
 
@@ -424,7 +431,7 @@ clean tagged commit
 - 旧 instance/generation 的 event/result/grant 被接受。
 - executor offline 时仍能启动绑定 Agent 的 Run。
 - executor 未验证 grant 即执行，或重复/篡改 grant 成功。
-- executor 写业务 DB/checkpoint，或 client 持有 Provider/Agent runtime。
+- executor 写产品 DB/Pi Session JSONL，或 client 持有 Provider/Agent runtime。
 - non-idempotent Action 在 unknown outcome 后自动重放。
 - Provider/model credential 进入 executor，或 MCP credential 出现在 server copy、普通 DB 字段、query/UI/prompt/log/diagnostic/export、全局环境或无关 child/Agent。
 - server 保存 recoverable MCP/Skill config/content，或 executor offline/持久化失败时配置 command 返回成功。
@@ -461,4 +468,4 @@ clean tagged commit
 ### 数据
 
 - [ ] 当前开发期 reset 行为明确且已测试；没有迁移旧数据的错误承诺。
-- [ ] 当前 schema backup/restore、DB integrity 和 checkpoint contract 通过。
+- [ ] 当前 schema backup/restore、DB integrity 和 Pi Session contract 通过。

@@ -29,7 +29,7 @@ import {
 	chatRunEventsTable,
 	chatRunsTable,
 	chatSessionsTable,
-	checkpointDeletionOutboxTable,
+	agentSessionCleanupOutboxTable,
 	retiredChatSessionsTable,
 } from "./schema";
 import { ChatSessionNotFoundError } from "./session-repository";
@@ -104,8 +104,8 @@ export interface ListRunEventsInput {
 
 export const maxRunEventPageSize = 1_000;
 export const maxRetiredSessionTombstones = 10_000;
-export const maxCheckpointDeletionBatchSize = 100;
-export const maxCheckpointDeletionJobs = 10_000;
+export const maxAgentSessionCleanupBatchSize = 100;
+export const maxAgentSessionCleanupJobs = 10_000;
 
 export interface ReplayCursorSupport {
 	serverTimeMs: number;
@@ -113,7 +113,7 @@ export interface ReplayCursorSupport {
 	tombstoneTtlMs: typeof retiredSessionTombstoneTtlMs;
 }
 
-export interface CheckpointDeletionJob {
+export interface AgentSessionCleanupJob {
 	sessionId: string;
 	createdAtMs: number;
 	attemptCount: number;
@@ -188,9 +188,12 @@ export interface RunJournalRepository {
 	};
 	isSessionRetired(sessionId: string): boolean;
 	getReplayCursorSupport(): ReplayCursorSupport;
-	listPendingCheckpointDeletions(limit: number, includeDeferred?: boolean): CheckpointDeletionJob[];
-	recordCheckpointDeletionFailure(sessionId: string, error: string, nextAttemptAtMs: number): void;
-	ackCheckpointDeletion(sessionId: string): void;
+	listPendingAgentSessionCleanups(
+		limit: number,
+		includeDeferred?: boolean,
+	): AgentSessionCleanupJob[];
+	recordAgentSessionCleanupFailure(sessionId: string, error: string, nextAttemptAtMs: number): void;
+	ackAgentSessionCleanup(sessionId: string): void;
 }
 
 export class ChatRunNotFoundError extends Error {
@@ -226,18 +229,15 @@ function parseJsonValue(raw: string, description: string): unknown {
 	}
 }
 
-/** Strips the API key and every custom header value before a run is journalled. */
 function toSafeProviderState(provider: RunProviderConfigInput): RunProviderState {
 	return runProviderStateSchema.parse({
 		schemaVersion: 1,
 		providerId: provider.providerId,
 		name: provider.name,
-		type: provider.type,
-		baseUrl: provider.baseUrl,
+		source: provider.source,
+		api: provider.api,
 		model: provider.model,
-		organization: provider.organization,
-		reasoningEffort: provider.reasoningEffort,
-		reasoningBudgetTokens: provider.reasoningBudgetTokens,
+		thinkingLevel: provider.thinkingLevel,
 		status: "ready",
 	});
 }
@@ -255,17 +255,7 @@ function parseError(raw: string | null): AppError | undefined {
 
 function parseRunProviderState(raw: string): RunProviderState {
 	const value = parseJsonValue(raw, "provider state");
-	if (typeof value !== "object" || value === null || Array.isArray(value)) {
-		return runProviderStateSchema.parse(value);
-	}
-	const storedType = "type" in value ? value.type : undefined;
-	const type =
-		storedType === "openai-chat-completions" || storedType === "openai-responses"
-			? "openai-compatible"
-			: storedType === "anthropic-messages"
-				? "anthropic-compatible"
-				: storedType;
-	return runProviderStateSchema.parse({ ...value, type });
+	return runProviderStateSchema.parse(value);
 }
 
 function serializeError(error: AppError): string {
@@ -888,6 +878,14 @@ export class SqliteRunJournalRepository implements RunJournalRepository {
 				};
 			}
 			this.assertSessionExists(parsedSessionId);
+			const agentSessionId = this.orm
+				.select({ id: chatSessionsTable.piSessionId })
+				.from(chatSessionsTable)
+				.where(eq(chatSessionsTable.id, parsedSessionId))
+				.get()?.id;
+			if (agentSessionId === undefined) {
+				throw new Error("Chat session is missing its agent session mapping.");
+			}
 			const retainedCount =
 				this.orm.select({ count: sql<number>`count(*)` }).from(retiredChatSessionsTable).get()
 					?.count ?? 0;
@@ -900,18 +898,18 @@ export class SqliteRunJournalRepository implements RunJournalRepository {
 				.insert(retiredChatSessionsTable)
 				.values({ sessionId: parsedSessionId, retiredAtMs })
 				.run();
-			const checkpointDeletionCount =
-				this.orm.select({ count: sql<number>`count(*)` }).from(checkpointDeletionOutboxTable).get()
+			const agentSessionCleanupCount =
+				this.orm.select({ count: sql<number>`count(*)` }).from(agentSessionCleanupOutboxTable).get()
 					?.count ?? 0;
-			if (checkpointDeletionCount >= maxCheckpointDeletionJobs) {
+			if (agentSessionCleanupCount >= maxAgentSessionCleanupJobs) {
 				throw new Error(
-					`Checkpoint deletion recovery capacity is full (${maxCheckpointDeletionJobs}); Session deletion is temporarily unavailable.`,
+					`Agent session cleanup recovery capacity is full (${maxAgentSessionCleanupJobs}); Session deletion is temporarily unavailable.`,
 				);
 			}
 			this.orm
-				.insert(checkpointDeletionOutboxTable)
+				.insert(agentSessionCleanupOutboxTable)
 				.values({
-					sessionId: parsedSessionId,
+					sessionId: agentSessionId,
 					createdAtMs: retiredAtMs,
 					nextAttemptAtMs: retiredAtMs,
 				})
@@ -949,25 +947,28 @@ export class SqliteRunJournalRepository implements RunJournalRepository {
 		};
 	}
 
-	listPendingCheckpointDeletions(limit: number, includeDeferred = false): CheckpointDeletionJob[] {
-		if (!Number.isSafeInteger(limit) || limit < 1 || limit > maxCheckpointDeletionBatchSize) {
+	listPendingAgentSessionCleanups(
+		limit: number,
+		includeDeferred = false,
+	): AgentSessionCleanupJob[] {
+		if (!Number.isSafeInteger(limit) || limit < 1 || limit > maxAgentSessionCleanupBatchSize) {
 			throw new Error(
-				`Checkpoint deletion batch limit must be between 1 and ${maxCheckpointDeletionBatchSize}.`,
+				`Agent session cleanup batch limit must be between 1 and ${maxAgentSessionCleanupBatchSize}.`,
 			);
 		}
 		const nowMs = this.clock.now();
 		return this.orm
 			.select()
-			.from(checkpointDeletionOutboxTable)
+			.from(agentSessionCleanupOutboxTable)
 			.where(
 				includeDeferred
 					? undefined
-					: sql`${checkpointDeletionOutboxTable.nextAttemptAtMs} <= ${nowMs}`,
+					: sql`${agentSessionCleanupOutboxTable.nextAttemptAtMs} <= ${nowMs}`,
 			)
 			.orderBy(
-				asc(checkpointDeletionOutboxTable.nextAttemptAtMs),
-				asc(checkpointDeletionOutboxTable.createdAtMs),
-				asc(checkpointDeletionOutboxTable.sessionId),
+				asc(agentSessionCleanupOutboxTable.nextAttemptAtMs),
+				asc(agentSessionCleanupOutboxTable.createdAtMs),
+				asc(agentSessionCleanupOutboxTable.sessionId),
 			)
 			.limit(limit)
 			.all()
@@ -981,26 +982,30 @@ export class SqliteRunJournalRepository implements RunJournalRepository {
 			}));
 	}
 
-	recordCheckpointDeletionFailure(sessionId: string, error: string, nextAttemptAtMs: number): void {
+	recordAgentSessionCleanupFailure(
+		sessionId: string,
+		error: string,
+		nextAttemptAtMs: number,
+	): void {
 		if (!Number.isSafeInteger(nextAttemptAtMs) || nextAttemptAtMs < 0) {
-			throw new TypeError("Checkpoint deletion retry time must be a non-negative safe integer.");
+			throw new TypeError("Agent session cleanup retry time must be a non-negative safe integer.");
 		}
 		this.orm
-			.update(checkpointDeletionOutboxTable)
+			.update(agentSessionCleanupOutboxTable)
 			.set({
-				attemptCount: sql`${checkpointDeletionOutboxTable.attemptCount} + 1`,
+				attemptCount: sql`${agentSessionCleanupOutboxTable.attemptCount} + 1`,
 				lastAttemptAtMs: this.clock.now(),
 				lastError: error.slice(0, 2_000),
 				nextAttemptAtMs,
 			})
-			.where(eq(checkpointDeletionOutboxTable.sessionId, uuidV7Schema.parse(sessionId)))
+			.where(eq(agentSessionCleanupOutboxTable.sessionId, uuidV7Schema.parse(sessionId)))
 			.run();
 	}
 
-	ackCheckpointDeletion(sessionId: string): void {
+	ackAgentSessionCleanup(sessionId: string): void {
 		this.orm
-			.delete(checkpointDeletionOutboxTable)
-			.where(eq(checkpointDeletionOutboxTable.sessionId, uuidV7Schema.parse(sessionId)))
+			.delete(agentSessionCleanupOutboxTable)
+			.where(eq(agentSessionCleanupOutboxTable.sessionId, uuidV7Schema.parse(sessionId)))
 			.run();
 	}
 

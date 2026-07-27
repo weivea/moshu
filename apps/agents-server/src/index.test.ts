@@ -1,7 +1,7 @@
 import Database from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { spawn } from "node:child_process";
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, rmSync } from "node:fs";
 import { resolve } from "node:path";
 
 import { type AgentsServerBootstrapRecord, agentsServerReadyRecordSchema } from "@moshu/contracts";
@@ -12,7 +12,7 @@ const entrypoint = resolve(import.meta.dir, "index.ts");
 describe("agents-server stdout control channel", () => {
 	test.each([
 		["normal startup", false],
-		["coordinated old-schema reset", true],
+		["old product-schema reset", true],
 	] as const)("emits exactly one READY line during %s", async (_name, legacySchema) => {
 		const directory = resolve(process.cwd(), `.agents-control-${crypto.randomUUID()}`);
 		mkdirSync(directory, { recursive: true });
@@ -21,7 +21,6 @@ describe("agents-server stdout control channel", () => {
 			const database = new Database(bootstrap.paths.productDatabase);
 			database.exec("CREATE TABLE legacy_product (value TEXT); PRAGMA user_version = 6;");
 			database.close();
-			writeFileSync(bootstrap.paths.checkpointDatabase, "legacy checkpoint bytes");
 		}
 
 		try {
@@ -37,7 +36,7 @@ describe("agents-server stdout control channel", () => {
 			);
 			expect(output.stdout).not.toContain("Reset local product");
 			if (legacySchema) {
-				expect(output.stderr).toContain("Reset local product and checkpoint stores");
+				expect(output.stderr).toContain("Reset the local product store");
 				expect(output.stderr).not.toContain(directory);
 				expect(output.stderr).not.toContain(bootstrap.peerBindings[0]?.credential ?? "");
 			} else {
@@ -100,7 +99,7 @@ async function runEntrypoint(
 function createBootstrap(directory: string): AgentsServerBootstrapRecord {
 	return {
 		channel: "moshu-companion-bootstrap",
-		controlVersion: 1,
+		controlVersion: 2,
 		type: "START",
 		role: "agents-server",
 		nonce: crypto.randomUUID(),
@@ -132,8 +131,7 @@ function createBootstrap(directory: string): AgentsServerBootstrapRecord {
 		],
 		paths: {
 			productDatabase: resolve(directory, "product.db"),
-			checkpointDatabase: resolve(directory, "checkpoints.db"),
-			providerConfig: resolve(directory, "provider.json"),
+			agentDataDirectory: resolve(directory, "agent-data"),
 		},
 	};
 }

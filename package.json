@@ -24,7 +24,7 @@
 		"format": "biome format --write .",
 		"format:check": "biome format .",
 		"lint": "biome lint .",
-		"typecheck": "bun run --cwd packages/deepagents build:types && bun run --filter '@moshu/*' typecheck",
+		"typecheck": "bun run --filter '@moshu/*' typecheck",
 		"test:packages": "bun test packages",
 		"test:companions": "bun test apps/agents-server apps/executor",
 		"test:web": "bun run --cwd apps/desktop test",

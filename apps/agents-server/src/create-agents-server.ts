@@ -1,10 +1,12 @@
 import { mkdirSync } from "node:fs";
-import { dirname, isAbsolute } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import {
 	type AskChatRuntime,
-	BunSqliteSaver,
-	createAskChatRuntime,
+	HeadlessAuthController,
+	ModelRuntime,
+	PiAskChatRuntime,
 	type ProviderRegistry,
+	SecretVaultCredentialStore,
 } from "@moshu/agent-runtime";
 import type { AgentsServerBootstrapRecord } from "@moshu/contracts";
 import { productRpcMaxBufferedOutboundBytes, productRpcMaxFrameBytes } from "@moshu/contracts";
@@ -14,6 +16,7 @@ import { createRpcBearerAuthenticator, createRpcServer, type RpcServer } from "@
 import { ChatApplicationService } from "./chat-application-service";
 import { ExecutorReadiness } from "./executor-readiness";
 import { FileProviderRegistryStore } from "./file-provider-registry-store";
+import { createProviderAuthDiagnosticLog } from "./provider-auth-diagnostic-log";
 import {
 	agentsServerMethodAllowlist,
 	createProductRpcHandlers,
@@ -30,17 +33,14 @@ export interface AgentsServerInstance {
 export interface CreateAgentsServerOptions {
 	bootstrap: AgentsServerBootstrapRecord;
 	serverVersion: string;
-	createRuntime?: (providers: ProviderRegistry, checkpointer: BunSqliteSaver) => AskChatRuntime;
-	testProviderConnection?: ConstructorParameters<
-		typeof ChatApplicationService
-	>[0]["testProviderConnection"];
+	createRuntime?: (providers: ProviderRegistry, modelRuntime: ModelRuntime) => AskChatRuntime;
 	fetchProviderModels?: ConstructorParameters<
 		typeof ChatApplicationService
 	>[0]["fetchProviderModels"];
-	checkpointDeletionAttemptTimeoutMs?: number;
-	checkpointDeletionMaxInFlightAttempts?: number;
-	checkpointDeletionStartupTimeoutMs?: number;
-	checkpointDeletionStartupMaxAttempts?: number;
+	agentSessionCleanupAttemptTimeoutMs?: number;
+	agentSessionCleanupMaxInFlightAttempts?: number;
+	agentSessionCleanupStartupTimeoutMs?: number;
+	agentSessionCleanupStartupMaxAttempts?: number;
 	shutdownTimeoutMs?: number;
 	reportDiagnostic?: (message: string) => void;
 }
@@ -54,12 +54,10 @@ export async function createAgentsServer(
 			console.error(message);
 		});
 	assertAbsoluteDataPaths(options.bootstrap);
-	for (const filename of Object.values(options.bootstrap.paths)) {
-		mkdirSync(dirname(filename), { recursive: true, mode: 0o700 });
-	}
+	mkdirSync(dirname(options.bootstrap.paths.productDatabase), { recursive: true, mode: 0o700 });
+	mkdirSync(options.bootstrap.paths.agentDataDirectory, { recursive: true, mode: 0o700 });
 	const reset = prepareCoordinatedDatabaseReset({
 		productDatabase: options.bootstrap.paths.productDatabase,
-		checkpointDatabase: options.bootstrap.paths.checkpointDatabase,
 	});
 	if (reset.reset) {
 		const previousSchema =
@@ -67,21 +65,44 @@ export async function createAgentsServer(
 				? "unavailable after interrupted reset"
 				: String(reset.previousProductVersion);
 		reportDiagnostic(
-			`Reset local product and checkpoint stores (${reset.reason}, previous product schema ${previousSchema}).`,
+			`Reset the local product store (${reset.reason}, previous product schema ${previousSchema}).`,
 		);
 	}
 
 	const database = openAppDatabase(options.bootstrap.paths.productDatabase);
-	let checkpointSaver: BunSqliteSaver | undefined;
 	let chatService: ChatApplicationService | undefined;
 	let rpcServer: RpcServer | undefined;
 	let unsubscribe: (() => void) | undefined;
+	let authController: HeadlessAuthController | undefined;
 	try {
-		checkpointSaver = new BunSqliteSaver(options.bootstrap.paths.checkpointDatabase);
-		const providers = new FileProviderRegistryStore(options.bootstrap.paths.providerConfig);
+		const agentDataDirectory = options.bootstrap.paths.agentDataDirectory;
+		const credentials = new SecretVaultCredentialStore(
+			join(agentDataDirectory, "credentials", "vault.json"),
+		);
+		const modelRuntime = await ModelRuntime.create({
+			credentials,
+			modelsPath: null,
+			allowModelNetwork: false,
+		});
+		const providers = new FileProviderRegistryStore(
+			join(agentDataDirectory, "providers.json"),
+			modelRuntime,
+			credentials,
+		);
+		await providers.initialize();
 		const runtime =
-			options.createRuntime?.(providers, checkpointSaver) ??
-			createAskChatRuntime({ checkpointer: checkpointSaver });
+			options.createRuntime?.(providers, modelRuntime) ??
+			new PiAskChatRuntime({ agentDataDirectory, modelRuntime });
+		const writeAuthDiagnostic = createProviderAuthDiagnosticLog(
+			join(agentDataDirectory, "diagnostics", "provider-auth.jsonl"),
+		);
+		authController = new HeadlessAuthController(modelRuntime, {
+			onCredentialChanged: (providerId) => providers.onCredentialChanged(providerId),
+			reportDiagnostic(event) {
+				writeAuthDiagnostic(event);
+				console.error(`[provider-auth] ${JSON.stringify(event)}`);
+			},
+		});
 		const executorReadiness = new ExecutorReadiness();
 		const eventRouter = new ProductEventRouter();
 		chatService = new ChatApplicationService({
@@ -89,6 +110,9 @@ export async function createAgentsServer(
 			runs: database.runs,
 			providers,
 			runtime,
+			...(options.fetchProviderModels === undefined
+				? {}
+				: { fetchProviderModels: options.fetchProviderModels }),
 			isRuntimeReady: () => executorReadiness.isReady(),
 			logger: {
 				error(message, error) {
@@ -98,37 +122,31 @@ export async function createAgentsServer(
 					reportDiagnostic(message);
 				},
 			},
-			...(options.checkpointDeletionAttemptTimeoutMs === undefined
+			...(options.agentSessionCleanupAttemptTimeoutMs === undefined
 				? {}
 				: {
-						checkpointDeletionAttemptTimeoutMs: options.checkpointDeletionAttemptTimeoutMs,
+						agentSessionCleanupAttemptTimeoutMs: options.agentSessionCleanupAttemptTimeoutMs,
 					}),
-			...(options.checkpointDeletionMaxInFlightAttempts === undefined
+			...(options.agentSessionCleanupMaxInFlightAttempts === undefined
 				? {}
 				: {
-						checkpointDeletionMaxInFlightAttempts: options.checkpointDeletionMaxInFlightAttempts,
+						agentSessionCleanupMaxInFlightAttempts: options.agentSessionCleanupMaxInFlightAttempts,
 					}),
-			...(options.checkpointDeletionStartupTimeoutMs === undefined
+			...(options.agentSessionCleanupStartupTimeoutMs === undefined
 				? {}
 				: {
-						checkpointDeletionStartupTimeoutMs: options.checkpointDeletionStartupTimeoutMs,
+						agentSessionCleanupStartupTimeoutMs: options.agentSessionCleanupStartupTimeoutMs,
 					}),
-			...(options.checkpointDeletionStartupMaxAttempts === undefined
+			...(options.agentSessionCleanupStartupMaxAttempts === undefined
 				? {}
 				: {
-						checkpointDeletionStartupMaxAttempts: options.checkpointDeletionStartupMaxAttempts,
+						agentSessionCleanupStartupMaxAttempts: options.agentSessionCleanupStartupMaxAttempts,
 					}),
-			...(options.testProviderConnection === undefined
-				? {}
-				: { testProviderConnection: options.testProviderConnection }),
-			...(options.fetchProviderModels === undefined
-				? {}
-				: { fetchProviderModels: options.fetchProviderModels }),
 			...(options.shutdownTimeoutMs === undefined
 				? {}
 				: { shutdownTimeoutMs: options.shutdownTimeoutMs }),
 		});
-		const ready = chatService.drainPendingCheckpointDeletions({ batchSize: 64 });
+		const ready = chatService.drainPendingAgentSessionCleanups({ batchSize: 64 });
 
 		rpcServer = createRpcServer({
 			identity: options.bootstrap.serverIdentity,
@@ -139,6 +157,7 @@ export async function createAgentsServer(
 				executorReadiness,
 				eventRouter,
 				serverVersion: options.serverVersion,
+				authController,
 			}),
 			methodAllowlist: agentsServerMethodAllowlist,
 			limits: {
@@ -173,8 +192,8 @@ export async function createAgentsServer(
 				shutdownPromise = (async () => {
 					unsubscribe?.();
 					rpcServer?.stop();
+					await authController?.dispose();
 					await chatService?.shutdown();
-					checkpointSaver?.close();
 					database.close();
 				})();
 				return shutdownPromise;
@@ -183,8 +202,8 @@ export async function createAgentsServer(
 	} catch (error) {
 		unsubscribe?.();
 		rpcServer?.stop();
+		await authController?.dispose();
 		await chatService?.shutdown();
-		checkpointSaver?.close();
 		database.close();
 		throw error;
 	}

@@ -2,33 +2,46 @@ import { z } from "zod";
 
 import { appErrorSchema } from "./app-error";
 
-export const providerContractSchemaVersion = 1 as const;
-
-export const providerTypeValues = ["openai-compatible", "anthropic-compatible"] as const;
-
-export const providerTypeSchema = z.enum(providerTypeValues);
-
-export const maxProviderCount = 64;
-export const maxProviderModelCount = 1_024;
+export const providerContractSchemaVersion = 2 as const;
+export const maxProviderCount = 128;
+export const maxProviderModelCount = 2_048;
 export const maxCustomHeaderCount = 32;
 export const maxCustomHeaderNameCharacters = 128;
 export const maxCustomHeaderValueCharacters = 4_096;
-export const minAnthropicThinkingBudgetTokens = 1_024;
-/** Anthropic needs `max_tokens` to leave room for the answer after the thinking budget. */
-export const minOutputTokensAboveThinkingBudget = 1_024;
 
-const uuidV7Pattern = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+export const providerSourceValues = ["builtin", "custom"] as const;
+export const providerSourceSchema = z.enum(providerSourceValues);
+export const customProviderApiValues = [
+	"openai-completions",
+	"openai-responses",
+	"anthropic-messages",
+	"google-generative-ai",
+] as const;
+export const customProviderApiSchema = z.enum(customProviderApiValues);
+export const thinkingLevelValues = [
+	"off",
+	"minimal",
+	"low",
+	"medium",
+	"high",
+	"xhigh",
+	"max",
+] as const;
+export const thinkingLevelSchema = z.enum(thinkingLevelValues);
+export const providerAuthTypeValues = ["api_key", "oauth"] as const;
+export const providerAuthTypeSchema = z.enum(providerAuthTypeValues);
 
-const providerIdSchema = z.string().regex(uuidV7Pattern, "Expected UUIDv7.");
+export const providerIdSchema = z
+	.string()
+	.trim()
+	.min(1)
+	.max(200)
+	.regex(/^[A-Za-z0-9][A-Za-z0-9._:-]*$/, "Expected a stable Provider ID.");
 const providerDisplayNameSchema = z.string().trim().min(1).max(120);
 const providerBaseUrlSchema = z.string().trim().url().max(2048);
 const providerApiKeySchema = z.string().trim().min(1).max(4096);
-const providerApiKeyMaskSchema = z.string().trim().min(1).max(64);
 const modelIdSchema = z.string().trim().min(1).max(200);
-const modelDisplayNameSchema = z.string().trim().min(1).max(200);
-const reasoningEffortSchema = z.string().trim().min(1).max(32);
 const tokenCountSchema = z.int().min(0).max(100_000_000);
-
 const customHeaderNameSchema = z
 	.string()
 	.trim()
@@ -43,68 +56,28 @@ export const customHeadersSchema = z
 		`At most ${maxCustomHeaderCount} custom headers are supported.`,
 	);
 
-export const modelThinkingBudgetSchema = z
+export const providerCredentialStatusSchema = z
 	.object({
-		adaptive: z.boolean().optional(),
-		minBudgetTokens: tokenCountSchema.optional(),
-		maxBudgetTokens: tokenCountSchema.optional(),
+		configured: z.boolean(),
+		type: providerAuthTypeSchema.optional(),
+		label: z.string().trim().min(1).max(200).optional(),
 	})
-	.strict()
-	.refine(
-		(value) =>
-			value.minBudgetTokens === undefined ||
-			value.maxBudgetTokens === undefined ||
-			value.minBudgetTokens <= value.maxBudgetTokens,
-		"Thinking budget minimum cannot exceed its maximum.",
-	);
+	.strict();
 
 export const providerModelSchema = z
 	.object({
 		id: modelIdSchema,
 		enabled: z.boolean(),
-		displayName: modelDisplayNameSchema.optional(),
-		vendor: z.string().trim().min(1).max(120).optional(),
-		kind: z.string().trim().min(1).max(64).optional(),
-		preview: z.boolean().optional(),
-		contextWindowTokens: tokenCountSchema.optional(),
-		maxOutputTokens: tokenCountSchema.optional(),
-		supportedEndpoints: z.array(z.string().trim().min(1).max(200)).max(16).optional(),
-		reasoningEfforts: z.array(reasoningEffortSchema).max(16).optional(),
-		thinking: modelThinkingBudgetSchema.optional(),
-	})
-	.strict();
-
-export const reasoningCapabilitySchema = z.discriminatedUnion("kind", [
-	z.object({ kind: z.literal("none") }).strict(),
-	z
-		.object({
-			kind: z.literal("effort"),
-			levels: z.array(reasoningEffortSchema).min(1).max(16),
-		})
-		.strict(),
-	z
-		.object({
-			kind: z.literal("budget"),
-			adaptive: z.boolean().optional(),
-			minBudgetTokens: tokenCountSchema,
-			maxBudgetTokens: tokenCountSchema.optional(),
-		})
-		.strict(),
-	z
-		.object({
-			kind: z.literal("both"),
-			levels: z.array(reasoningEffortSchema).min(1).max(16),
-			adaptive: z.boolean().optional(),
-			minBudgetTokens: tokenCountSchema,
-			maxBudgetTokens: tokenCountSchema.optional(),
-		})
-		.strict(),
-]);
-
-export const reasoningSelectionSchema = z
-	.object({
-		effort: reasoningEffortSchema.optional(),
-		budgetTokens: tokenCountSchema.optional(),
+		displayName: z.string().trim().min(1).max(200),
+		api: z.string().trim().min(1).max(100),
+		input: z
+			.array(z.enum(["text", "image"]))
+			.min(1)
+			.max(2),
+		reasoning: z.boolean(),
+		contextWindowTokens: tokenCountSchema,
+		maxOutputTokens: tokenCountSchema,
+		thinkingLevels: z.array(thinkingLevelSchema).max(thinkingLevelValues.length),
 	})
 	.strict();
 
@@ -113,10 +86,12 @@ export const providerSummarySchema = z
 		schemaVersion: z.literal(providerContractSchemaVersion),
 		id: providerIdSchema,
 		displayName: providerDisplayNameSchema,
-		type: providerTypeSchema,
-		baseUrl: providerBaseUrlSchema,
+		source: providerSourceSchema,
 		enabled: z.boolean(),
-		apiKeyMask: providerApiKeyMaskSchema.optional(),
+		api: customProviderApiSchema.optional(),
+		baseUrl: providerBaseUrlSchema.optional(),
+		authMethods: z.array(providerAuthTypeSchema).max(2),
+		credential: providerCredentialStatusSchema,
 		customHeaderNames: z.array(customHeaderNameSchema).max(maxCustomHeaderCount),
 		models: z.array(providerModelSchema).max(maxProviderModelCount),
 		modelsFetchedAt: z.string().datetime({ offset: true }).optional(),
@@ -127,9 +102,8 @@ export const availableModelSchema = z
 	.object({
 		providerId: providerIdSchema,
 		providerDisplayName: providerDisplayNameSchema,
-		providerType: providerTypeSchema,
+		providerSource: providerSourceSchema,
 		model: providerModelSchema,
-		reasoning: reasoningCapabilitySchema,
 	})
 	.strict();
 
@@ -137,10 +111,9 @@ export const defaultModelSelectionSchema = z
 	.object({
 		providerId: providerIdSchema,
 		modelId: modelIdSchema,
-		reasoning: reasoningSelectionSchema.optional(),
+		thinkingLevel: thinkingLevelSchema.optional(),
 	})
 	.strict();
-
 export const sessionModelSelectionSchema = defaultModelSelectionSchema;
 
 export const listProvidersOutputSchema = z
@@ -154,9 +127,9 @@ export const createProviderInputSchema = z
 	.object({
 		schemaVersion: z.literal(providerContractSchemaVersion),
 		displayName: providerDisplayNameSchema,
-		type: providerTypeSchema,
+		api: customProviderApiSchema,
 		baseUrl: providerBaseUrlSchema,
-		apiKey: providerApiKeySchema,
+		apiKey: providerApiKeySchema.optional(),
 		customHeaders: customHeadersSchema.optional(),
 	})
 	.strict();
@@ -173,7 +146,7 @@ export const updateProviderInputSchema = z
 		schemaVersion: z.literal(providerContractSchemaVersion),
 		providerId: providerIdSchema,
 		displayName: providerDisplayNameSchema.optional(),
-		type: providerTypeSchema.optional(),
+		api: customProviderApiSchema.optional(),
 		baseUrl: providerBaseUrlSchema.optional(),
 		apiKey: providerApiKeySchema.optional(),
 		customHeaders: customHeadersSchema.optional(),
@@ -187,7 +160,6 @@ export const deleteProviderInputSchema = z
 		providerId: providerIdSchema,
 	})
 	.strict();
-
 export const deleteProviderOutputSchema = z
 	.object({
 		schemaVersion: z.literal(providerContractSchemaVersion),
@@ -195,16 +167,7 @@ export const deleteProviderOutputSchema = z
 	})
 	.strict();
 
-export const providerDraftSchema = z
-	.object({
-		displayName: providerDisplayNameSchema,
-		type: providerTypeSchema,
-		baseUrl: providerBaseUrlSchema,
-		apiKey: providerApiKeySchema.optional(),
-		customHeaders: customHeadersSchema.optional(),
-	})
-	.strict();
-
+export const providerDraftSchema = createProviderInputSchema.omit({ schemaVersion: true });
 export const testProviderInputSchema = z
 	.object({
 		schemaVersion: z.literal(providerContractSchemaVersion),
@@ -216,7 +179,6 @@ export const testProviderInputSchema = z
 		(value) => (value.providerId === undefined) !== (value.draft === undefined),
 		"Provide exactly one of providerId or draft.",
 	);
-
 export const testProviderOutputSchema = z
 	.object({
 		schemaVersion: z.literal(providerContractSchemaVersion),
@@ -224,27 +186,10 @@ export const testProviderOutputSchema = z
 		latencyMs: z.int().min(0),
 		error: appErrorSchema.optional(),
 	})
-	.strict()
-	.superRefine((value, context) => {
-		if (value.ok && value.error !== undefined) {
-			context.addIssue({
-				code: "custom",
-				message: "Successful provider tests cannot include an error.",
-				path: ["error"],
-			});
-		}
-		if (!value.ok && value.error === undefined) {
-			context.addIssue({
-				code: "custom",
-				message: "Failed provider tests require an error.",
-				path: ["error"],
-			});
-		}
-	});
+	.strict();
 
 export const fetchProviderModelsInputSchema = deleteProviderInputSchema;
 export const fetchProviderModelsOutputSchema = providerMutationOutputSchema;
-
 export const setProviderModelsEnabledInputSchema = z
 	.object({
 		schemaVersion: z.literal(providerContractSchemaVersion),
@@ -252,7 +197,6 @@ export const setProviderModelsEnabledInputSchema = z
 		enabledModelIds: z.array(modelIdSchema).max(maxProviderModelCount),
 	})
 	.strict();
-
 export const setProviderModelsEnabledOutputSchema = providerMutationOutputSchema;
 
 export const listAvailableModelsOutputSchema = z
@@ -262,29 +206,26 @@ export const listAvailableModelsOutputSchema = z
 		defaultModel: defaultModelSelectionSchema.optional(),
 	})
 	.strict();
-
 export const getDefaultModelOutputSchema = z
 	.object({
 		schemaVersion: z.literal(providerContractSchemaVersion),
 		defaultModel: defaultModelSelectionSchema.optional(),
 	})
 	.strict();
-
 export const setDefaultModelInputSchema = z
 	.object({
 		schemaVersion: z.literal(providerContractSchemaVersion),
 		defaultModel: defaultModelSelectionSchema.nullable(),
 	})
 	.strict();
-
 export const setDefaultModelOutputSchema = getDefaultModelOutputSchema;
 
-export type ProviderType = z.infer<typeof providerTypeSchema>;
+export type ProviderSource = z.infer<typeof providerSourceSchema>;
+export type CustomProviderApi = z.infer<typeof customProviderApiSchema>;
+export type ThinkingLevel = z.infer<typeof thinkingLevelSchema>;
+export type ProviderAuthType = z.infer<typeof providerAuthTypeSchema>;
 export type CustomHeaders = z.infer<typeof customHeadersSchema>;
-export type ModelThinkingBudget = z.infer<typeof modelThinkingBudgetSchema>;
 export type ProviderModel = z.infer<typeof providerModelSchema>;
-export type ReasoningCapability = z.infer<typeof reasoningCapabilitySchema>;
-export type ReasoningSelection = z.infer<typeof reasoningSelectionSchema>;
 export type ProviderSummary = z.infer<typeof providerSummarySchema>;
 export type AvailableModel = z.infer<typeof availableModelSchema>;
 export type DefaultModelSelection = z.infer<typeof defaultModelSelectionSchema>;

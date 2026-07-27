@@ -30,7 +30,7 @@ export interface RunAccepted {
 
 export type ShutdownReason = "app_quit" | "restart" | "fatal_error";
 
-export interface DeepAgentService {
+export interface AgentRuntimeService {
 	start(input: StartRunInput): Promise<RunAccepted>;
 	resume(input: ResumeRunInput): Promise<RunAccepted>;
 	cancel(input: CancelRunInput): Promise<void>;

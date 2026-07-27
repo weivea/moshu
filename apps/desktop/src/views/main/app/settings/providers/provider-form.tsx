@@ -1,5 +1,5 @@
 import { Button } from "@heroui/react";
-import type { ProviderSummary, ProviderType, UpdateProviderInput } from "@moshu/contracts";
+import type { CustomProviderApi, ProviderSummary, UpdateProviderInput } from "@moshu/contracts";
 import { type FormEvent, useEffect, useId, useState } from "react";
 
 import { ConfirmationDialog } from "../../confirmation-dialog";
@@ -32,23 +32,24 @@ export function ProviderForm({
 	const { t } = useI18n();
 	const fieldId = useId();
 	const [displayName, setDisplayName] = useState(provider.displayName);
-	const [type, setType] = useState<ProviderType>(provider.type);
-	const [baseUrl, setBaseUrl] = useState(provider.baseUrl);
-	const [apiKey, setApiKey] = useState("");
+	const [api, setApi] = useState<CustomProviderApi>(provider.api ?? "openai-completions");
+	const [baseUrl, setBaseUrl] = useState(provider.baseUrl ?? "");
 	const [customHeaders, setCustomHeaders] = useState("");
 	const [isDeleteConfirmationOpen, setIsDeleteConfirmationOpen] = useState(false);
 	const isDisabled = pendingAction !== undefined;
 
 	useEffect(() => {
 		setDisplayName(provider.displayName);
-		setType(provider.type);
-		setBaseUrl(provider.baseUrl);
-		setApiKey("");
+		setApi(provider.api ?? "openai-completions");
+		setBaseUrl(provider.baseUrl ?? "");
 		setCustomHeaders("");
 	}, [provider]);
 
 	const submit = (event: FormEvent<HTMLFormElement>) => {
 		event.preventDefault();
+		if (provider.source === "builtin") {
+			return;
+		}
 		if (displayName.trim().length === 0 || baseUrl.trim().length === 0) {
 			onInvalid("providers.error.required");
 			return;
@@ -66,15 +67,15 @@ export function ProviderForm({
 			return;
 		}
 
-		const trimmedApiKey = apiKey.trim();
+		const customHeadersInput = customHeaders.trim().length === 0 ? undefined : (headers ?? {});
+		setCustomHeaders("");
 		onSave({
-			schemaVersion: 1,
+			schemaVersion: 2,
 			providerId: provider.id,
 			displayName: displayName.trim(),
-			type,
+			api,
 			baseUrl: baseUrl.trim(),
-			...(trimmedApiKey.length === 0 ? {} : { apiKey: trimmedApiKey }),
-			...(customHeaders.trim().length === 0 ? {} : { customHeaders: headers ?? {} }),
+			...(customHeadersInput === undefined ? {} : { customHeaders: customHeadersInput }),
 		});
 	};
 
@@ -96,7 +97,7 @@ export function ProviderForm({
 						disabled={isDisabled}
 						onChange={(event) =>
 							onSave({
-								schemaVersion: 1,
+								schemaVersion: 2,
 								providerId: provider.id,
 								enabled: event.currentTarget.checked,
 							})
@@ -106,104 +107,121 @@ export function ProviderForm({
 				</label>
 			</div>
 
-			<label className="chat-field" htmlFor={`${fieldId}-name`}>
-				<span>{t("providers.displayName")}</span>
-				<input
-					id={`${fieldId}-name`}
-					required
-					maxLength={120}
-					value={displayName}
-					disabled={isDisabled}
-					onChange={(event) => setDisplayName(event.currentTarget.value)}
-				/>
-			</label>
+			{provider.source === "builtin" ? (
+				<dl className="provider-form__metadata">
+					<div>
+						<dt>{t("providers.source")}</dt>
+						<dd>{t("providers.source.builtin")}</dd>
+					</div>
+					<div>
+						<dt>{t("providers.identifier")}</dt>
+						<dd>
+							<code>{provider.id}</code>
+						</dd>
+					</div>
+					<div>
+						<dt>{t("providers.type")}</dt>
+						<dd>{[...new Set(provider.models.map((model) => model.api))].join(", ") || "—"}</dd>
+					</div>
+				</dl>
+			) : (
+				<>
+					<label className="chat-field" htmlFor={`${fieldId}-name`}>
+						<span>{t("providers.displayName")}</span>
+						<input
+							id={`${fieldId}-name`}
+							required
+							maxLength={120}
+							value={displayName}
+							disabled={isDisabled}
+							onChange={(event) => setDisplayName(event.currentTarget.value)}
+						/>
+					</label>
 
-			<label className="chat-field" htmlFor={`${fieldId}-type`}>
-				<span>{t("providers.type")}</span>
-				<select
-					id={`${fieldId}-type`}
-					value={type}
-					disabled={isDisabled}
-					onChange={(event) => setType(event.currentTarget.value as ProviderType)}
-				>
-					{providerTypeOptions.map((option) => (
-						<option key={option.value} value={option.value}>
-							{t(option.label)}
-						</option>
-					))}
-				</select>
-			</label>
+					<label className="chat-field" htmlFor={`${fieldId}-type`}>
+						<span>{t("providers.type")}</span>
+						<select
+							id={`${fieldId}-type`}
+							value={api}
+							disabled={isDisabled}
+							onChange={(event) => setApi(event.currentTarget.value as CustomProviderApi)}
+						>
+							{providerTypeOptions.map((option) => (
+								<option key={option.value} value={option.value}>
+									{t(option.label)}
+								</option>
+							))}
+						</select>
+					</label>
 
-			<label className="chat-field" htmlFor={`${fieldId}-base-url`}>
-				<span>{t("providers.baseUrl")}</span>
-				<input
-					id={`${fieldId}-base-url`}
-					type="url"
-					required
-					value={baseUrl}
-					disabled={isDisabled}
-					onChange={(event) => setBaseUrl(event.currentTarget.value)}
-				/>
-				<small className="chat-field__hint">{t("providers.baseUrlHint")}</small>
-			</label>
+					<label className="chat-field" htmlFor={`${fieldId}-base-url`}>
+						<span>{t("providers.baseUrl")}</span>
+						<input
+							id={`${fieldId}-base-url`}
+							type="url"
+							required
+							value={baseUrl}
+							disabled={isDisabled}
+							onChange={(event) => setBaseUrl(event.currentTarget.value)}
+						/>
+						<small className="chat-field__hint">{t("providers.baseUrlHint")}</small>
+					</label>
 
-			<label className="chat-field" htmlFor={`${fieldId}-api-key`}>
-				<span>{t("providers.apiKey")}</span>
-				<input
-					id={`${fieldId}-api-key`}
-					type="password"
-					autoComplete="off"
-					value={apiKey}
-					disabled={isDisabled}
-					placeholder={t("providers.apiKeyConfigured", provider.apiKeyMask ?? "")}
-					onChange={(event) => setApiKey(event.currentTarget.value)}
-				/>
-				<small className="chat-field__hint">{t("providers.apiKeyKeepHint")}</small>
-			</label>
-
-			<label className="chat-field" htmlFor={`${fieldId}-headers`}>
-				<span>{t("providers.customHeaders")}</span>
-				<textarea
-					id={`${fieldId}-headers`}
-					rows={2}
-					value={customHeaders}
-					placeholder="{}"
-					disabled={isDisabled}
-					onChange={(event) => setCustomHeaders(event.currentTarget.value)}
-				/>
-				<small className="chat-field__hint">
-					{provider.customHeaderNames.length === 0
-						? t("providers.customHeadersHint")
-						: t("providers.customHeadersStored", provider.customHeaderNames.join(", "))}
-				</small>
-			</label>
-
-			<p className="provider-form__danger-hint">{t("providers.delete.description")}</p>
+					<label className="chat-field" htmlFor={`${fieldId}-headers`}>
+						<span>{t("providers.customHeaders")}</span>
+						<textarea
+							id={`${fieldId}-headers`}
+							rows={2}
+							value={customHeaders}
+							placeholder="{}"
+							disabled={isDisabled}
+							onChange={(event) => setCustomHeaders(event.currentTarget.value)}
+						/>
+						<small className="chat-field__hint">
+							{provider.customHeaderNames.length === 0
+								? t("providers.customHeadersHint")
+								: t("providers.customHeadersStored", provider.customHeaderNames.join(", "))}
+						</small>
+					</label>
+				</>
+			)}
 
 			<div className="provider-form__actions">
-				<ConfirmationDialog
-					isOpen={isDeleteConfirmationOpen}
-					isPending={pendingAction === "delete"}
-					isTriggerDisabled={isDisabled}
-					triggerLabel={t("providers.delete.action")}
-					triggerClassName="confirmation-dialog-trigger confirmation-dialog-trigger--danger"
-					title={t("providers.delete.title")}
-					description={t("providers.delete.confirm", provider.displayName)}
-					cancelLabel={t("action.cancel")}
-					confirmLabel={t("providers.delete.action")}
-					pendingLabel={t("providers.deleting")}
-					onOpenChange={setIsDeleteConfirmationOpen}
-					onConfirm={async () => {
-						onDelete();
-						setIsDeleteConfirmationOpen(false);
-					}}
-				/>
-				<Button className="chat-button" isDisabled={isDisabled} onPress={onTest}>
+				{provider.source === "custom" ? (
+					<ConfirmationDialog
+						isOpen={isDeleteConfirmationOpen}
+						isPending={pendingAction === "delete"}
+						isTriggerDisabled={isDisabled}
+						triggerLabel={t("providers.delete.action")}
+						triggerClassName="confirmation-dialog-trigger confirmation-dialog-trigger--danger"
+						title={t("providers.delete.title")}
+						description={t("providers.delete.confirm", provider.displayName)}
+						cancelLabel={t("action.cancel")}
+						confirmLabel={t("providers.delete.action")}
+						pendingLabel={t("providers.deleting")}
+						onOpenChange={setIsDeleteConfirmationOpen}
+						onConfirm={async () => {
+							onDelete();
+							setIsDeleteConfirmationOpen(false);
+						}}
+					/>
+				) : null}
+				<Button
+					className="chat-button"
+					isDisabled={isDisabled || !provider.enabled || !provider.credential.configured}
+					onPress={onTest}
+				>
 					{pendingAction === "test" ? t("providers.testing") : t("providers.test")}
 				</Button>
-				<Button type="submit" className="chat-button chat-button--primary" isDisabled={isDisabled}>
-					{pendingAction === "save" ? t("providers.saving") : t("providers.save")}
-				</Button>
+				{provider.source === "custom" ? (
+					<Button
+						type="submit"
+						className="chat-button chat-button--primary"
+						isDisabled={isDisabled}
+					>
+						{pendingAction === "save" ? t("providers.saving") : t("providers.save")}
+					</Button>
+				) : null}
 			</div>
 		</form>
 	);

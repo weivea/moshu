@@ -1,13 +1,15 @@
-import type { ProviderType } from "@moshu/contracts";
+import type { CustomProviderApi } from "@moshu/contracts";
 
 import type { MessageKey } from "../i18n";
 
 export const providerTypeOptions = [
-	{ value: "openai-compatible", label: "providers.type.openaiCompatible" },
-	{ value: "anthropic-compatible", label: "providers.type.anthropicCompatible" },
-] as const satisfies readonly { value: ProviderType; label: MessageKey }[];
+	{ value: "openai-completions", label: "providers.type.openaiCompatible" },
+	{ value: "openai-responses", label: "providers.type.openaiCompatible" },
+	{ value: "anthropic-messages", label: "providers.type.anthropicCompatible" },
+	{ value: "google-generative-ai", label: "providers.type.openaiCompatible" },
+] as const satisfies readonly { value: CustomProviderApi; label: MessageKey }[];
 
-export function providerTypeLabelKey(type: ProviderType): MessageKey {
+export function providerTypeLabelKey(type: CustomProviderApi): MessageKey {
 	return (
 		providerTypeOptions.find((option) => option.value === type)?.label ??
 		"providers.type.openaiCompatible"

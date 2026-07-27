@@ -18,6 +18,8 @@ import {
 describe("product process RPC contracts", () => {
 	test("keeps client and executor request allowlists disjoint", () => {
 		expect(clientProductRequestMethods).toContain(productRpcMethods.chatSend);
+		expect(clientProductRequestMethods).toContain(productRpcMethods.providerAuthStart);
+		expect(clientProductRequestMethods).toContain(productRpcMethods.providerAuthRespond);
 		expect(clientProductRequestMethods).not.toContain(productRpcMethods.executorRegister);
 		expect(executorProductRequestMethods).toEqual([productRpcMethods.executorRegister]);
 		expect(productRpcInternalHandlerErrorCode).toBe("INTERNAL_HANDLER_ERROR");
@@ -77,7 +79,7 @@ describe("product process RPC contracts", () => {
 	test("requires canonical credentials and redacts bootstrap secrets", () => {
 		const record = {
 			channel: "moshu-companion-bootstrap",
-			controlVersion: 1,
+			controlVersion: 2,
 			type: "START",
 			role: "agents-server",
 			nonce: "bootstrap-1",
@@ -108,15 +110,16 @@ describe("product process RPC contracts", () => {
 				},
 			],
 			paths: {
-				productDatabase: "/tmp/moshu.db",
-				checkpointDatabase: "/tmp/moshu-checkpoints.db",
-				providerConfig: "/tmp/provider.json",
+				productDatabase: "/Users/example/moshu.db",
+				agentDataDirectory: "/Users/example/agent-data",
 			},
 		};
 		expect(agentsServerBootstrapRecordSchema.parse(record)).toBeDefined();
 		expect(JSON.stringify(redactCompanionControlRecord(record))).not.toContain(
 			record.peerBindings[0]?.credential ?? "",
 		);
-		expect(JSON.stringify(redactCompanionControlRecord(record))).not.toContain("/tmp/moshu.db");
+		expect(JSON.stringify(redactCompanionControlRecord(record))).not.toContain(
+			"/Users/example/moshu.db",
+		);
 	});
 });

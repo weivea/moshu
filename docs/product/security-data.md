@@ -20,7 +20,7 @@
 | Provider/Embedding | 内容发送到错误 Endpoint 或不符合用户预期的数据区域 |
 | WebView | XSS 后调用高权限 RPC |
 | 本机 RPC | 其他本机进程扫描动态端口、伪造 client/executor、重放注册材料或旧 generation 消息 |
-| agents server | Prompt/Tool 输入绕过 Policy、错误签发 grant、业务状态或 checkpoint 损坏 |
+| agents server | Prompt/Tool 输入绕过 Policy、错误签发 grant、产品 DB 或 Pi Session JSONL 损坏 |
 | executor | 伪造/重放 grant、越权路径/命令、临时凭证泄漏、进程树或扩展资源泄漏 |
 | 崩溃恢复 | 不确定的工具调用被重复执行 |
 
@@ -31,7 +31,8 @@
 - 应用协议只有 `client <-> agents server <-> executor`。client 不直连 executor，executor 不提供 DB、Provider、Policy 或 approval API。
 - desktop agents server 只绑定动态 loopback，但 loopback 本身不可信；连接仍需一次性 bootstrap、角色认证、版本和 method allowlist。
 - `clientId`/`executorId` 是稳定身份；每次启动/注册使用新的 `instanceId` 和 `generation`。旧实例的消息、result 和 grant 必须被拒绝。
-- agents server 独占业务 DB/checkpoint、Provider、Agent runtime、Policy/approval 和 Action intent/result。
+- agents server 独占产品 DB/Pi Session JSONL、Provider、Agent runtime；未来也独占 Policy/approval 和
+  Action intent/result。
 - executor 独占实际 Tool、MCP/Skill、取消和进程树；它不能打开业务 DB 或自行授予权限。
 - WebSocket/RPC 的传输保护不代替身份、Schema、capability、参数摘要、状态和授权校验。
 - Canvas 使用 `sandbox: true` 的独立 `BrowserView`/partition，不注册应用 RPC；sandbox 只减少应用桥接面，不保证子资源断网。
@@ -107,9 +108,11 @@ executor 在实际执行前验证 grant。Allow all 只改变 server 的审批�
 - 大文件、二进制和不可逆格式修改要求额外确认。
 - 删除优先进入可恢复区；无法恢复时明确提示。
 
-### 6.3 Deep Agents 权限边界
+### 6.3 Pi runtime 边界
 
-Deep Agents 的 filesystem permissions 可约束内建文件工具，但不能约束任意 Shell 命令。产品不能把文件 permission rules 当作完整沙箱。
+当前 Pi `AgentSession` 使用 `noTools: "all"`，extensions、Skills、prompt templates、themes、context files、
+default tools 和 TUI 全部禁用；意外 Tool activity 直接失败。未来文件/Shell 能力不会直接开放 Pi 默认 Tool，
+而是通过 Moshu-owned Policy、Action、grant 和 executor 强制执行。
 
 ## 7. 命令执行
 
@@ -169,7 +172,8 @@ Deep Agents 的 filesystem permissions 可约束内建文件工具，但不能�
 - 安装前扫描脚本和可执行文件清单。
 - executor 独占 Skill installation、immutable versions/content/hash、metadata、resources 和 scripts；server 只保存 assigned executor stable resource ref。
 - server 构建/恢复 Agent 时按 ref 获取 metadata/`SKILL.md` 并验证 owner/version/hash；offline、missing 或 mismatch 时 fail closed。
-- fetched Skill content 只用于内存 prompt assembly，不进入 server DB/checkpoint/Run snapshot/event/backup/diagnostic/export。
+- fetched Skill content 只用于内存 prompt assembly，不进入 server DB/Pi Session JSONL/Run snapshot/event/
+  backup/diagnostic/export。
 - Skill install/update/delete 只以 redacted descriptor/change/tombstone 同步；inventory 不复制 Skill body。
 - 依赖、网络和工具要求可见。
 - Skill 的 `allowed-tools` 不构成应用授权。
@@ -179,7 +183,8 @@ Deep Agents 的 filesystem permissions 可约束内建文件工具，但不能�
 
 ## 9. 密钥与凭证
 
-- agents server 的 `SecretVault` 只保存 Provider/model credential；首发 macOS adapter 通过经审查的 Bun FFI/native bridge 调用 Keychain。
+- agents server 的 `SecretVaultCredentialStore` 只保存 Provider/model credential；当前 app-owned file adapter
+  使用 parent `0700`、file `0600`、跨进程 lock、fresh read/apply、atomic rename 和 fsync。
 - Provider/model credential 只在 agents server 按 Run scope 读取，永不发送 executor。
 - MCP credential/token/OAuth state 只由 owning executor 的 `ExecutorSecretStore` 保存和读取；server 无 MCP Secret Ref 或 recoverable copy。
 - local desktop 首个 `ExecutorSecretStore` 可使用 executor-private files；future executor 可使用 Keychain、Docker Secret 或 cloud secret manager。
@@ -191,7 +196,8 @@ Deep Agents 的 filesystem permissions 可约束内建文件工具，但不能�
 - 剪贴板复制凭证需要用户主动操作并提示清理风险。
 - 日志、错误、崩溃报告和导出统一经过脱敏。
 - 删除 Provider/MCP 时提示是否同时删除关联凭证。
-- 所选 Secret adapter 不可用时连接进入 blocked 并显示明确错误，不静默迁移到较弱后端。
+- 当前 file adapter 不防同账户 malware、root 或 disk backup；Keychain adapter 是外部分发前工作，切换时
+  必须显式 migration/gate，不能静默降低保护。
 
 ## 10. 本地数据
 
@@ -199,13 +205,13 @@ Deep Agents 的 filesystem permissions 可约束内建文件工具，但不能�
 
 | 数据 | 默认位置/策略 |
 | --- | --- |
-| Session、消息、事件 | agents server 本地业务数据库 |
-| Run checkpoint | agents server 本地持久化 checkpointer |
+| Session、Run、消息投影、事件 | agents server 产品数据库 |
+| Conversation context | `agentDataDirectory/sessions` 下的 Pi `SessionManager` JSONL |
 | Provider/model config、Agent definitions/versions、resource refs | agents server 本地业务数据；resource ref 不含 executor config/content |
 | redacted executor inventory cache | agents server disposable projection；offline 时标 stale，可删除后从 executor 重建 |
 | MCP config/inventory、Skill metadata/versions | executor-owned DB |
 | Skill immutable content/resources/scripts | executor-private Skills 目录 |
-| 密钥与 Token | Provider/model credential 在 server `SecretVault`；MCP credential/OAuth 在 executor `ExecutorSecretStore` |
+| 密钥与 Token | Provider/model credential 在 server `SecretVaultCredentialStore`；未来 MCP credential/OAuth 在 executor `ExecutorSecretStore` |
 | Canvas 与版本 | 本地应用数据目录 |
 | 知识原文元数据、切分和向量 | 本地索引目录 |
 | Project 文件 | 保持在原目录，不自动复制 |
@@ -245,7 +251,8 @@ local desktop executor data root 使用 `0700`，credential file 使用 `0600`�
 ## 12. 发布安全
 
 - macOS 包必须签名、公证并验证更新签名。
-- Electrobun client、agents-server binary、executor binary、Deep Agents bundle、Keychain bridge 和更新 metadata 必须来自同一受信 release；未知版本/protocol 组合时 fail closed。
+- Electrobun client、agents-server binary、executor binary、public Pi `0.82.1` bundle 和更新 metadata 必须来自
+  同一受信 release；未知版本/protocol 组合时 fail closed。
 - 更新必须整体切换三个角色，不能留下新 client 配旧 companion 的部分更新。
 - 自动更新失败不能阻止用户访问本地数据。
 - 依赖锁文件、SBOM 和漏洞扫描纳入发布流程。

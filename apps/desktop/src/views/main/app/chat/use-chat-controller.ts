@@ -1,4 +1,4 @@
-import type { AvailableModel, DefaultModelSelection, ReasoningSelection } from "@moshu/contracts";
+import type { AvailableModel, DefaultModelSelection, ThinkingLevel } from "@moshu/contracts";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { type MessageKey, useI18n } from "../i18n";
 import { useChatSessionRecovery } from "./session-recovery-coordinator";
@@ -757,7 +757,7 @@ export function useChatController({
 
 function resolveSelectedModel(
 	models: readonly AvailableModel[],
-	selection: { providerId: string; modelId: string; reasoning?: ReasoningSelection } | undefined,
+	selection: { providerId: string; modelId: string; thinkingLevel?: ThinkingLevel } | undefined,
 ): AvailableModel | undefined {
 	if (selection === undefined) {
 		return undefined;

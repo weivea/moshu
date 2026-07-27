@@ -11,7 +11,7 @@
 | --- | --- |
 | [实施进度](./progress.md) | 已实现能力、目标架构迁移状态和下一里程碑 |
 | [技术架构](./architecture.md) | 三应用角色、RPC 拓扑、生命周期、职责和安全边界 |
-| [数据与接口契约](./data-contracts.md) | 身份、注册、RPC、Run、Action grant、checkpoint 和数据所有权 |
+| [数据与接口契约](./data-contracts.md) | 身份、注册、RPC、Run、Action grant、Agent Session 和数据所有权 |
 | [工程交付计划](./delivery-plan.md) | 迁移顺序、工作包、依赖和阶段出口 |
 | [质量与发布计划](./quality-release.md) | 跨进程测试、故障恢复、安全、打包和发布门槛 |
 
@@ -30,7 +30,9 @@ Electrobun client  <->  agents server  <->  executor
                       WebSocket + versioned JSON RPC
 ```
 
-目标架构已经批准，但**当前仓库仍是单 Electrobun Application Host 内的 Ask Chat 切片**：现有 `ChatService`、Deep Agents Ask runtime、Provider adapter 和 SQLite/checkpoint 尚未提取到两个 companion。本文描述目标；[实施进度](./progress.md)只记录代码已经证明的事实。
+三应用角色基础架构和 agents-server extraction 已落地：desktop 监管两个 compiled companion，Provider、公开
+Pi Ask runtime、产品数据库和 Agent Session 均由 agents server 持有。executor 当前只完成认证注册与
+readiness；Tool、MCP 和 Skill 仍是后续目标。[实施进度](./progress.md)只记录代码已经证明的事实。
 
 ## 3. 实施目标
 
@@ -58,7 +60,7 @@ RPC / companion binary POC
 | DEC-014 | 目标运行时固定为 Electrobun client、agents server、executor 三个应用角色；两个 companion 均为 TypeScript + Bun 编译二进制并随桌面应用打包 |
 | DEC-015 | 应用 RPC 固定为 `client <-> agents server <-> executor`，使用 WebSocket 和版本化 JSON RPC；client 不直接调用 executor |
 | DEC-016 | `clientId`、`executorId` 为可持久稳定身份；每次进程启动/连接注册使用新的 `instanceId` 和递增 `generation`，迟到连接不得覆盖新实例 |
-| DEC-017 | agents server 独占产品 DB/checkpoint、Provider/model credential、Agent definitions/versions、Session/Run/event、Policy/approval 和 Action intent/result；MCP/Skill 只保存 Agent resource reference 与可替换、非权威、可丢弃 inventory cache |
+| DEC-017 | agents server 独占产品 DB、Pi Session JSONL、Provider/model credential、Agent definitions/versions、Session/Run/event、Policy/approval 和 Action intent/result；MCP/Skill 只保存 Agent resource reference 与可替换、非权威、可丢弃 inventory cache |
 | DEC-018 | 每个 executor 独占其 MCP config/credential/OAuth/lifecycle、Skill installation/immutable version/content/hash/resource、Tool execution、取消、进程树和 executor-private local data |
 | DEC-019 | server 先决定并持久化策略/审批，再签发一次性 execution grant；executor 验证 grant 后才执行 |
 | DEC-022 | Provider/model credential 永不发送 executor；MCP credential 由 executor 自己的 `ExecutorSecretStore` 持久化和加载，连接已认证仍不代表后续 Tool 已获授权 |
@@ -67,12 +69,12 @@ RPC / companion binary POC
 | DEC-020 | 当前开发阶段允许重置现有本地数据，不为本次架构重构实现旧数据迁移 |
 | DEC-021 | 远程 client/executor、Docker、云 VM 和 remote-server transport 是协议扩展缝，不属于当前桌面实现范围 |
 | DEC-005 | 不向模型暴露裸 `LocalShellBackend.execute`；文件、命令、Git 和扩展副作用全部经 Tool Bridge / Action Broker |
-| DEC-006 | 业务数据库使用 `bun:sqlite` + Drizzle；conversation state 使用项目维护的 `BunSqliteSaver`，两者均由 agents server 单写 |
-| DEC-007 | UI 只读取规范化持久事件，不依赖 Deep Agents 内部事件结构 |
+| DEC-006 | 产品数据库使用 `bun:sqlite`；conversation context 使用公开 Pi `SessionManager` JSONL，两者均由 agents server 管理 |
+| DEC-007 | UI 只读取规范化持久事件，不依赖 Pi SDK 内部事件结构 |
 | DEC-008 | Ask、Plan、Agent 通过有效工具集和 Policy Engine 强制区分，不只靠系统提示词 |
 | DEC-010 | Web Canvas 使用无应用 RPC 的独立 sandbox BrowserView/partition，并通过专项 POC 验证隔离 |
 | DEC-011 | Provider、MCP、Skill 和知识库通过稳定 Port 接入，SDK 类型不得穿透角色边界 |
-| DEC-012 | Electrobun、Bun、Deep Agents/LangChain、Provider SDK 和 RPC protocol 精确锁版本并成组验证 |
+| DEC-012 | Electrobun、Bun、公开 Pi SDK 和 RPC protocol 精确锁版本并成组验证 |
 | DEC-013 | server Provider/model `SecretVault` 使用稳定 Port；首发 macOS 使用经审查的 Keychain adapter，不提供明文或弱加密回退 |
 
 ## 5. 角色所有权摘要
@@ -80,7 +82,7 @@ RPC / companion binary POC
 | 领域 | 唯一所有者 | 其他角色如何访问 |
 | --- | --- | --- |
 | UI、窗口、菜单、更新、companion 监管 | client | client 内部 Electrobun RPC；业务通过 agents server |
-| 产品 DB、checkpoint、Provider、Agent、Session/Run、Policy/Action | agents server | 版本化 RPC；executor 不直连产品数据库 |
+| 产品 DB、Pi Session JSONL、Provider、Agent、Session/Run、Policy/Action | agents server | 版本化 RPC；executor 不直连产品数据 |
 | Provider 访问和 Agent runtime | agents server | client 发起 Run；server 调度到已注册 executor |
 | Policy、approval、Action intent/result | agents server | client 展示/提交审批；executor 接收一次性 grant |
 | Tool、命令、文件、Git 实际执行 | executor | 仅接受 server 授权的 invocation |
@@ -91,7 +93,7 @@ RPC / companion binary POC
 
 当前桌面部署只有一个由主机环境支持的本地 executor，多个 Agent 绑定到该 executor，关系为 **Agent N:1 Executor**。executor 离线时，其 Agent 仍可查看配置和历史，但不能启动新 Run。
 
-Agent version 只能引用其绑定 executor 拥有的 MCP/Skill，引用形态为 `executorId + stableResourceId + version/hash`。server 构建或恢复 Agent 时按引用从 executor 获取 Skill metadata/`SKILL.md`；只在内存中组装 prompt，不把内容写入产品 DB/checkpoint/snapshot/backup。缺失、hash/version 不匹配或 executor offline 都 fail closed。
+Agent version 只能引用其绑定 executor 拥有的 MCP/Skill，引用形态为 `executorId + stableResourceId + version/hash`。server 构建或恢复 Agent 时按引用从 executor 获取 Skill metadata/`SKILL.md`；只在内存中组装 prompt，不把内容写入产品 DB、Pi Session JSONL、snapshot 或 backup。缺失、hash/version 不匹配或 executor offline 都 fail closed。
 
 每次 executor connection/registration/reconnect 后，server 必须先 full sync redacted inventory，成功前状态为 syncing、Agent 不 runnable。之后 executor 用 revision/category-only hint 提醒，server 去抖增量拉取，并每 60 秒 ±20% jitter 主动对账；gap、compaction、epoch reset 或 invalid cursor 回退 full snapshot。cache 离线时只标 stale，失败 poll 不代表删除，Run 仍 live 验证 resource/version/hash。
 
@@ -114,9 +116,9 @@ Agent version 只能引用其绑定 executor 拥有的 MCP/Skill，引用形态�
 | Client | Electrobun `1.18.1`、React 19、React Router、HeroUI、Tailwind CSS v4 |
 | Companions | TypeScript strict + Bun，编译为 `agents-server`、`executor` 二进制并随应用签名打包 |
 | Application RPC | WebSocket + versioned JSON RPC + Zod；动态 loopback endpoint；注册握手和连接身份 |
-| Agent | 仓内 `@moshu/deepagents`、LangChain、LangGraph；只在 agents server 运行 |
+| Agent | `@earendil-works/pi-ai`、`pi-agent-core`、`pi-coding-agent` `0.82.1` 公开 API；只在 agents server 运行 |
 | App DB | `bun:sqlite` + Drizzle，仅 agents server 写入 |
-| Checkpoint | `BunSqliteSaver`，独立 SQLite，仅 agents server 写入 |
+| Agent Session | Pi `SessionManager` JSONL，位于 app-owned `agentDataDirectory/sessions` |
 | Secret | server `SecretVault` 只保存 Provider/model credential；executor `ExecutorSecretStore` 保存 MCP credential |
 | Execution | executor Tool Bridge、MCP/Skill manager、executor-private DB/data root、进程树和取消 |
 | Test | `bun test`/Vitest、RPC contract、三角色 integration、packaged desktop E2E |
@@ -140,7 +142,7 @@ Agent version 只能引用其绑定 executor 拥有的 MCP/Skill，引用形态�
 | 阶段 | 工程出口 |
 | --- | --- |
 | A0 RPC / binary POC | 两个编译 companion 可由 client 启停；动态 loopback、版本握手、注册、request/response/event、取消可验证 |
-| A1 agents-server extraction | Provider、Ask runtime、业务 DB/checkpoint 和现有 Chat contract 迁入 server；client 仅保留 UI/桌面职责 |
+| A1 agents-server extraction | Provider、Pi Ask runtime、产品 DB/Session JSONL 和现有 Chat contract 迁入 server；client 仅保留 UI/桌面职责（已完成） |
 | A2 Executor / Agent registry | 稳定身份、instance/generation、注册 full capability sync、Agent N:1 绑定、syncing/offline Run gate 和列表 UX |
 | A3 Tool Bridge / Action Broker | server policy/approval/intent/result、一次性 grant、executor 实际 Tool/进程树、幂等恢复 |
 | A4 MCP / Skills | executor-owned config/credential/lifecycle/Skill store，epoch/revision inventory reconciliation，routed UI、resource refs 与 fail-closed prompt fetch |
@@ -150,7 +152,9 @@ Agent version 只能引用其绑定 executor 拥有的 MCP/Skill，引用形态�
 
 ## 10. 当前数据处理
 
-本次架构迁移发生在开发阶段。现有 `app.db`、checkpoint、Provider 开发配置和本地 fixture **不要求迁移**；实现可升级 schema 版本并在不兼容时明确重置开发数据。不得因此弱化未来正式发布后的 migration/backup 纪律。
+本次架构迁移发生在开发阶段。旧 runtime 数据、Provider 开发配置和本地 fixture **不要求迁移**；当前实现使用
+产品 DB 与 Pi Session JSONL，可升级 schema 并在不兼容时明确重置开发数据。不得因此弱化未来正式发布后的
+migration/backup 纪律。
 
 ## 11. 参考资料
 
@@ -158,5 +162,5 @@ Agent version 只能引用其绑定 executor 拥有的 MCP/Skill，引用形态�
 - [Electrobun 1.18.1 Architecture](https://github.com/blackboardsh/electrobun/blob/v1.18.1/docs/src/content/docs/electrobun/guides/architecture/overview.mdx)
 - [Bun Compile](https://bun.sh/docs/bundler/executables)
 - [Bun SQLite](https://bun.com/docs/runtime/sqlite)
-- [Deep Agents JavaScript](https://docs.langchain.com/oss/javascript/deepagents/overview)
+- [Pi mono repository](https://github.com/badlogic/pi-mono)
 - [Agent Skills Specification](https://agentskills.io/specification)

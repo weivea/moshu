@@ -12,9 +12,18 @@ function availableModel(providerId: string, name: string, modelId: string): Avai
 	return {
 		providerId,
 		providerDisplayName: name,
-		providerType: "openai-compatible",
-		model: { id: modelId, enabled: true, displayName: modelId },
-		reasoning: { kind: "none" },
+		providerSource: "builtin",
+		model: {
+			id: modelId,
+			enabled: true,
+			displayName: modelId,
+			api: "openai-responses",
+			input: ["text"],
+			reasoning: false,
+			contextWindowTokens: 128_000,
+			maxOutputTokens: 8_192,
+			thinkingLevels: [],
+		},
 	};
 }
 

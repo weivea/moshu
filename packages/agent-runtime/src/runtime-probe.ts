@@ -1,15 +1,27 @@
-import { createDeepAgent } from "@moshu/deepagents/browser";
+import { ModelRuntime } from "@earendil-works/pi-coding-agent";
 
-export const DEEP_AGENTS_VERSION = "1.12.0-rc.0-moshu.0+1225a7f";
+export const PI_AI_VERSION = "0.82.1";
+export const PI_AGENT_CORE_VERSION = "0.82.1";
+export const PI_CODING_AGENT_VERSION = "0.82.1";
 
 export interface AgentRuntimeProbe {
 	loaded: boolean;
-	version: string;
+	foundation: "pi-agent";
+	versions: {
+		piAi: string;
+		piAgentCore: string;
+		piCodingAgent: string;
+	};
 }
 
 export function probeAgentRuntime(): AgentRuntimeProbe {
 	return {
-		loaded: typeof createDeepAgent === "function",
-		version: DEEP_AGENTS_VERSION,
+		loaded: typeof ModelRuntime.create === "function",
+		foundation: "pi-agent",
+		versions: {
+			piAi: PI_AI_VERSION,
+			piAgentCore: PI_AGENT_CORE_VERSION,
+			piCodingAgent: PI_CODING_AGENT_VERSION,
+		},
 	};
 }

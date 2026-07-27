@@ -50,7 +50,10 @@ export function RuntimeStatus() {
 				<dl>
 					<RuntimeRow label={t("runtime.electrobun")} value={state.info.electrobunVersion} />
 					<RuntimeRow label={t("runtime.bun")} value={state.info.bunVersion} />
-					<RuntimeRow label={t("runtime.deepAgents")} value={state.info.deepAgents.version} />
+					<RuntimeRow
+						label={t("runtime.agentRuntime")}
+						value={state.info.agentRuntime.versions.piCodingAgent}
+					/>
 					<RuntimeRow label={t("runtime.channel")} value={state.info.channel} />
 				</dl>
 			) : null}

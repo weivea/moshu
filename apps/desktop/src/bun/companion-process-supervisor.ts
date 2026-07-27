@@ -458,7 +458,7 @@ export class CompanionProcessSupervisor {
 		const executorCredential = this.dependencies.createCredential();
 		const agentsBootstrap: AgentsServerBootstrapRecord = {
 			channel: "moshu-companion-bootstrap",
-			controlVersion: 1,
+			controlVersion: 2,
 			type: "START",
 			role: "agents-server",
 			nonce: this.dependencies.createNonce(),
@@ -506,7 +506,7 @@ export class CompanionProcessSupervisor {
 		this.status = "waiting-executor";
 		const executorBootstrap: ExecutorBootstrapRecord = {
 			channel: "moshu-companion-bootstrap",
-			controlVersion: 1,
+			controlVersion: 2,
 			type: "START",
 			role: "executor",
 			nonce: this.dependencies.createNonce(),
@@ -1041,8 +1041,7 @@ function createDefaultDataPaths(): AgentsServerDataPaths {
 	const directory = join(tmpdir(), `moshu-companion-${process.pid}`);
 	return {
 		productDatabase: join(directory, "moshu.db"),
-		checkpointDatabase: join(directory, "moshu-checkpoints.db"),
-		providerConfig: join(directory, "provider.json"),
+		agentDataDirectory: join(directory, "agent-data"),
 	};
 }
 

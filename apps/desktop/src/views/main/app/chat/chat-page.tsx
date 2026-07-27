@@ -194,9 +194,9 @@ export function ChatPage({
 								{...(controller.selectedModel === undefined
 									? {}
 									: { selectedModel: controller.selectedModel })}
-								{...(controller.modelSelection?.reasoning === undefined
+								{...(controller.modelSelection?.thinkingLevel === undefined
 									? {}
-									: { reasoning: controller.modelSelection.reasoning })}
+									: { thinkingLevel: controller.modelSelection.thinkingLevel })}
 								onDraftChange={controller.setDraft}
 								onModelChange={(selection) => void controller.changeSessionModel(selection)}
 								onSend={() => void controller.sendMessage()}
