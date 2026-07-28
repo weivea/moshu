@@ -362,6 +362,9 @@ export class RpcServer {
 			...(this.#options.methodAllowlist === undefined
 				? {}
 				: { methodAllowlist: this.#options.methodAllowlist }),
+			...(this.#options.requestTimeoutLimits === undefined
+				? {}
+				: { requestTimeoutLimits: this.#options.requestTimeoutLimits }),
 			...(this.#options.onProtocolError === undefined
 				? {}
 				: { onProtocolError: this.#options.onProtocolError }),

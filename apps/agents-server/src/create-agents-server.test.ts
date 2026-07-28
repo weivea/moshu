@@ -24,6 +24,7 @@ describe("createAgentsServer", () => {
 			const deletionStarted = Promise.withResolvers<void>();
 			const allowDeletion = Promise.withResolvers<void>();
 			const deleted: string[] = [];
+			let receivedExecutorGateway: unknown;
 			const runtime = fakeRuntime(async (id) => {
 				deleted.push(id);
 				deletionStarted.resolve();
@@ -32,9 +33,13 @@ describe("createAgentsServer", () => {
 			const instance = await createAgentsServer({
 				bootstrap,
 				serverVersion: "test",
-				createRuntime: () => runtime,
+				createRuntime: (_providers, _modelRuntime, executorGateway) => {
+					receivedExecutorGateway = executorGateway;
+					return runtime;
+				},
 			});
 			try {
+				expect(receivedExecutorGateway).toBe(instance.executorReadiness);
 				let ready = false;
 				void instance.ready.then(() => {
 					ready = true;

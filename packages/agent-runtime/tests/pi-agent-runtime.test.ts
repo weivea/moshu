@@ -8,13 +8,24 @@ import {
 	type Provider,
 } from "@earendil-works/pi-ai";
 import { ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
+import type { ExecutorToolInvokeInput } from "@moshu/contracts";
 
-import { AskChatCancelledError, AskChatRuntimeError, PiAskChatRuntime } from "../src";
+import {
+	AskChatCancelledError,
+	AskChatRuntimeError,
+	type ExecutorToolGateway,
+	PiAgentRuntime,
+} from "../src";
 
 const sessionId = "0198a20c-6f76-7e18-92da-353e2fc25b3e";
+const unavailableExecutorGateway: ExecutorToolGateway = {
+	async invoke() {
+		throw new Error("Executor must not be called in this test");
+	},
+};
 
-describe("Pi Ask runtime", () => {
-	test("streams, persists, restores, and deletes a no-tools Ask session", async () => {
+describe("Pi Agent runtime", () => {
+	test("streams, persists, restores, and deletes an Agent session", async () => {
 		await withAppData(async (agentDataDirectory) => {
 			const faux = fauxProvider({
 				provider: "moshu-runtime-test",
@@ -36,7 +47,11 @@ describe("Pi Ask runtime", () => {
 				api: model.api,
 				model: model.id,
 			};
-			const first = new PiAskChatRuntime({ agentDataDirectory, modelRuntime });
+			const first = new PiAgentRuntime({
+				agentDataDirectory,
+				modelRuntime,
+				executorGateway: unavailableExecutorGateway,
+			});
 			const deltas: string[] = [];
 			const stream = first.stream({
 				runId: "run-1",
@@ -55,7 +70,11 @@ describe("Pi Ask runtime", () => {
 			expect((await stream.result).usage?.totalTokens).toBeGreaterThan(0);
 			await first.shutdown();
 
-			const restored = new PiAskChatRuntime({ agentDataDirectory, modelRuntime });
+			const restored = new PiAgentRuntime({
+				agentDataDirectory,
+				modelRuntime,
+				executorGateway: unavailableExecutorGateway,
+			});
 			await expect(restored.getThreadMessages("../outside")).rejects.toThrow("Pi session IDs");
 			expect(await restored.getThreadMessages(sessionId)).toEqual([
 				{ role: "user", content: "Answer deterministically." },
@@ -67,27 +86,45 @@ describe("Pi Ask runtime", () => {
 		});
 	});
 
-	test("fails closed when a provider emits tool activity", async () => {
+	test("continues the standard tool loop through an executor-only proxy", async () => {
 		await withAppData(async (agentDataDirectory) => {
 			const faux = fauxProvider({
 				provider: "moshu-tool-test",
 				models: [{ id: "tool-model" }],
 			});
 			faux.setResponses([
-				fauxAssistantMessage([fauxToolCall("forbidden", { value: "secret-free" })], {
+				fauxAssistantMessage([fauxToolCall("read", { path: "README.md" })], {
 					stopReason: "toolUse",
 				}),
+				fauxAssistantMessage("The executor returned the file."),
 			]);
-			const { runtime, provider } = await createRuntime(agentDataDirectory, faux);
+			const calls: ExecutorToolInvokeInput[] = [];
+			const gateway: ExecutorToolGateway = {
+				async invoke(input) {
+					calls.push(input);
+					return {
+						schemaVersion: 1,
+						invocationId: input.invocationId,
+						tool: "read",
+						content: [{ type: "text", text: "executor file contents" }],
+					};
+				},
+			};
+			const { runtime, provider } = await createRuntime(agentDataDirectory, faux, gateway);
 			try {
-				await expect(
-					runtime.run({
-						runId: "tool-run",
-						threadId: "tool-thread",
-						provider,
-						messages: [{ role: "user", content: "Do not call tools." }],
-					}),
-				).rejects.toMatchObject({ kind: "unexpected_tool_activity" });
+				const result = await runtime.run({
+					runId: "018f47a2-9bcd-7def-8abc-1234567890ab",
+					threadId: "tool-thread",
+					provider,
+					messages: [{ role: "user", content: "Read the file." }],
+				});
+				expect(result.text).toBe("The executor returned the file.");
+				expect(calls).toHaveLength(1);
+				expect(calls[0]).toMatchObject({
+					runId: "018f47a2-9bcd-7def-8abc-1234567890ab",
+					cwd: join(agentDataDirectory, "workspace"),
+					call: { tool: "read", arguments: { path: "README.md" } },
+				});
 			} finally {
 				await runtime.shutdown();
 			}
@@ -137,6 +174,60 @@ describe("Pi Ask runtime", () => {
 				).rejects.toMatchObject({ kind: "cancelled" });
 				expect(faux.state.callCount).toBe(callsBefore);
 			} finally {
+				await runtime.shutdown();
+			}
+		});
+	});
+
+	test("does not start the provider or executor after cancellation during model preflight", async () => {
+		await withAppData(async (agentDataDirectory) => {
+			const faux = fauxProvider({
+				provider: "moshu-preflight-cancel-test",
+				models: [{ id: "preflight-model" }],
+			});
+			faux.setResponses([
+				fauxAssistantMessage([fauxToolCall("bash", { command: "printf unsafe" })], {
+					stopReason: "toolUse",
+				}),
+			]);
+			let executorCalls = 0;
+			const gateway: ExecutorToolGateway = {
+				async invoke() {
+					executorCalls += 1;
+					throw new Error("Executor must not be called after preflight cancellation");
+				},
+			};
+			const { runtime, provider, modelRuntime } = await createRuntime(
+				agentDataDirectory,
+				faux,
+				gateway,
+			);
+			const originalCheckAuth = modelRuntime.checkAuth.bind(modelRuntime);
+			const checkStarted = Promise.withResolvers<void>();
+			const releaseCheck = Promise.withResolvers<void>();
+			modelRuntime.checkAuth = async (providerId: string) => {
+				checkStarted.resolve();
+				await releaseCheck.promise;
+				return originalCheckAuth(providerId);
+			};
+			try {
+				const run = runtime.run({
+					runId: "preflight-cancel-run",
+					threadId: "preflight-cancel-thread",
+					provider,
+					messages: [{ role: "user", content: "Do not execute." }],
+				});
+				await checkStarted.promise;
+				expect(runtime.cancel("preflight-cancel-run", "Cancelled during preflight.")).toBe(true);
+				releaseCheck.resolve();
+				await expect(run).rejects.toMatchObject({
+					kind: "cancelled",
+					reason: "Cancelled during preflight.",
+				});
+				expect(faux.state.callCount).toBe(0);
+				expect(executorCalls).toBe(0);
+			} finally {
+				releaseCheck.resolve();
 				await runtime.shutdown();
 			}
 		});
@@ -262,7 +353,11 @@ describe("Pi Ask runtime", () => {
 			renameSync(info.path, escaped);
 			symlinkSync(escaped, info.path);
 
-			const restarted = new PiAskChatRuntime({ agentDataDirectory, modelRuntime });
+			const restarted = new PiAgentRuntime({
+				agentDataDirectory,
+				modelRuntime,
+				executorGateway: unavailableExecutorGateway,
+			});
 			try {
 				await expect(restarted.deleteThread("containment-thread")).rejects.toThrow(
 					"outside the app-owned session directory",
@@ -274,12 +369,16 @@ describe("Pi Ask runtime", () => {
 	});
 });
 
-async function createRuntime(agentDataDirectory: string, faux: ReturnType<typeof fauxProvider>) {
+async function createRuntime(
+	agentDataDirectory: string,
+	faux: ReturnType<typeof fauxProvider>,
+	executorGateway: ExecutorToolGateway = unavailableExecutorGateway,
+) {
 	const modelRuntime = await createModelRuntime(agentDataDirectory, faux.provider);
 	const fauxModel = faux.getModel();
 	return {
 		modelRuntime,
-		runtime: new PiAskChatRuntime({ agentDataDirectory, modelRuntime }),
+		runtime: new PiAgentRuntime({ agentDataDirectory, modelRuntime, executorGateway }),
 		provider: {
 			providerId: faux.provider.id,
 			providerName: faux.provider.name,

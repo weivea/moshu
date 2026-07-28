@@ -199,12 +199,11 @@ export function calculateRestartDelayMs(attempt: number, policy: RestartPolicy):
 	return Math.min(policy.baseDelayMs * 2 ** (attempt - 1), policy.maxDelayMs);
 }
 
-export function createMinimalCompanionEnvironment(
+export function createCompanionEnvironment(
 	source: Readonly<Record<string, string | undefined>> = process.env,
 ): Record<string, string> {
 	const environment: Record<string, string> = {};
-	for (const name of ["HOME", "TMPDIR", "TEMP", "TMP", "SystemRoot", "WINDIR"]) {
-		const value = source[name];
+	for (const [name, value] of Object.entries(source)) {
 		if (value !== undefined) {
 			environment[name] = value;
 		}
@@ -281,7 +280,7 @@ export class CompanionProcessSupervisor {
 		this.dataPaths = options.dataPaths ?? createDefaultDataPaths();
 		this.connectClient = options.connectClient ?? createNoopDesktopConnection;
 		this.additionalPeerBindings = options.additionalPeerBindings ?? [];
-		this.environment = options.environment ?? createMinimalCompanionEnvironment();
+		this.environment = options.environment ?? createCompanionEnvironment();
 		this.startupTimeoutMs = assertPositiveTimeout(
 			options.startupTimeoutMs ?? 10_000,
 			"Startup timeout",

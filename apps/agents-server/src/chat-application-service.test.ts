@@ -49,6 +49,7 @@ describe("ChatApplicationService", () => {
 
 		try {
 			const { session } = service.createSession();
+			expect(session.defaultMode).toBe("agent");
 			service.subscribe((event) => {
 				const persistedIds = database.runs
 					.listEvents({ runId: event.runId })
@@ -63,6 +64,7 @@ describe("ChatApplicationService", () => {
 			});
 
 			expect(accepted.run.status).toBe("queued");
+			expect(accepted.run.mode).toBe("agent");
 			expect(accepted.assistantMessage.status).toBe("streaming");
 			scheduler.runAll();
 			await service.waitForIdle();

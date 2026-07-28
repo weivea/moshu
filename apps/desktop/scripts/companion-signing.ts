@@ -85,6 +85,15 @@ export function createCompanionCodesignCommand(options: {
 	return command;
 }
 
+export function createBundledToolCodesignCommand(executable: string, identity: string): string[] {
+	const command = ["codesign", "--force", "--sign", identity];
+	if (identity !== "-") {
+		command.push("--options", "runtime", "--timestamp");
+	}
+	command.push(executable);
+	return command;
+}
+
 export function createOuterAppCodesignCommand(appBundle: string, identity: string): string[] {
 	const command = ["codesign", "--force", "--sign", identity];
 	if (identity !== "-") {

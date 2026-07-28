@@ -55,8 +55,10 @@
       "name": "@moshu/executor",
       "version": "0.0.1",
       "dependencies": {
+        "@silvia-odwyer/photon-node": "0.3.4",
         "@moshu/contracts": "workspace:*",
         "@moshu/process-rpc": "workspace:*",
+        "diff": "8.0.4",
       },
     },
     "packages/action-broker": {

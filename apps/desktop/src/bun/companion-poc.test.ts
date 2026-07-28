@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { posix, resolve, win32 } from "node:path";
 
 import {
+	assertCompanionResourceFilenames,
 	createElectrobunCompanionCopyEntries,
 	getCompanionExecutableFilename,
 	resolveCurrentHostCompanionPlatform,
@@ -24,6 +25,9 @@ describe("companion executable platform naming", () => {
 		expect(createElectrobunCompanionCopyEntries("win32")).toEqual({
 			"../agents-server/dist/moshu-agents-server.exe": "companions/moshu-agents-server.exe",
 			"../executor/dist/moshu-executor.exe": "companions/moshu-executor.exe",
+			"../executor/dist/rg.exe": "companions/rg.exe",
+			"../executor/dist/fd.exe": "companions/fd.exe",
+			"../executor/dist/photon_rs_bg.wasm": "companions/photon_rs_bg.wasm",
 		});
 	});
 
@@ -32,6 +36,21 @@ describe("companion executable platform naming", () => {
 		expect(() => resolveCurrentHostCompanionPlatform("win", "darwin")).toThrow(
 			"only supports Electrobun's current build host",
 		);
+	});
+
+	test("allows only the two companions, rg, fd, and Photon runtime asset", () => {
+		expect(() =>
+			assertCompanionResourceFilenames(
+				["moshu-executor", "fd", "photon_rs_bg.wasm", "moshu-agents-server", "rg"],
+				"darwin",
+			),
+		).not.toThrow();
+		expect(() =>
+			assertCompanionResourceFilenames(
+				["moshu-executor", "fd", "photon_rs_bg.wasm", "moshu-agents-server", "rg", "extra"],
+				"darwin",
+			),
+		).toThrow("Unexpected Moshu companion resource layout");
 	});
 });
 

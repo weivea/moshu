@@ -1,8 +1,9 @@
-import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { mkdtemp } from "node:fs/promises";
 import { resolve } from "node:path";
 import {
 	CompanionProcessSupervisor,
+	createCompanionEnvironment,
 	type DesktopAgentsConnectOptions,
 } from "../apps/desktop/src/bun/companion-process-supervisor";
 import { DesktopAgentsClient } from "../apps/desktop/src/bun/desktop-agents-client";
@@ -44,6 +45,15 @@ mkdirSync(smokeRoot, { recursive: true });
 const directory = await mkdtemp(resolve(smokeRoot, "moshu-three-process-"));
 const productDatabase = resolve(directory, "moshu.db");
 const agentDataDirectory = resolve(directory, "agent-data");
+const executorSmokeCwd = resolve(directory, "executor-workspace");
+mkdirSync(executorSmokeCwd, { recursive: true });
+writeFileSync(
+	resolve(executorSmokeCwd, "pixel.png"),
+	Buffer.from(
+		"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
+		"base64",
+	),
+);
 const staleCredential = Buffer.alloc(32, 91).toString("base64url");
 const agentsClient = new DesktopAgentsClient();
 let connectionOptions: DesktopAgentsConnectOptions | undefined;
@@ -66,6 +76,11 @@ const supervisor = new CompanionProcessSupervisor({
 		),
 	},
 	dataPaths: { productDatabase, agentDataDirectory },
+	environment: {
+		...createCompanionEnvironment(),
+		MOSHU_EXECUTOR_SMOKE_CWD: executorSmokeCwd,
+		MOSHU_EXECUTOR_SMOKE_VALUE: "inherited-by-executor",
+	},
 	additionalPeerBindings: [
 		{
 			credential: staleCredential,
@@ -192,6 +207,9 @@ try {
 	const events: ChatRunEvent[] = [];
 	const unsubscribe = agentsClient.subscribeChatEvents((event) => events.push(event));
 	const created = await agentsClient.createSession();
+	if (created.session.defaultMode !== "agent") {
+		throw new Error("New Chat Session did not default to Agent mode.");
+	}
 	const sendRequestId = crypto.randomUUID();
 	const accepted = await agentsClient.request(
 		productRpcMethods.chatSend,
@@ -208,6 +226,9 @@ try {
 	if (retried.run.id !== accepted.run.id) {
 		throw new Error("Ambiguous Chat send retry created a duplicate Run.");
 	}
+	if (accepted.run.mode !== "agent") {
+		throw new Error("New Chat Run did not use Agent mode.");
+	}
 	await waitForEvent(events, accepted.run.id, "message.completed");
 	const session = await agentsClient.request(
 		productRpcMethods.sessionGet,
@@ -220,6 +241,28 @@ try {
 		(session.eventCursors.find((cursor) => cursor.runId === accepted.run.id)?.lastSeq ?? 0) < 1
 	) {
 		throw new Error("Chat snapshot did not reconcile streamed events.");
+	}
+
+	const toolSession = await agentsClient.createSession();
+	const toolAccepted = await agentsClient.request(
+		productRpcMethods.chatSend,
+		{
+			requestId: crypto.randomUUID(),
+			sessionId: toolSession.session.id,
+			content: "tool-smoke",
+		},
+		sendAskChatMessageInputSchema,
+		chatSendAcceptedOutputSchema,
+	);
+	await waitForEvent(events, toolAccepted.run.id, "message.completed");
+	const toolPage = await agentsClient.request(
+		productRpcMethods.sessionGet,
+		{ sessionId: toolSession.session.id, limit: 2 },
+		getChatSessionPageInputSchema,
+		getChatSessionPageOutputSchema,
+	);
+	if (toolPage.messages.at(-1)?.content !== "executor tools ok") {
+		throw new Error("Three-process executor tool smoke did not complete.");
 	}
 
 	const errorSession = await agentsClient.createSession();
@@ -344,6 +387,7 @@ try {
 			authRejected: true,
 			staleGenerationRejected: true,
 			restartReconciled: true,
+			executorTools: true,
 			dataFilesOwnedByServer: true,
 			noOrphans: true,
 		}),

@@ -1,6 +1,6 @@
 # 技术架构
 
-> 状态：三应用角色与 agents-server extraction 已实现；Tool/MCP/Skill 边界仍是目标
+> 状态：三应用角色、agents-server extraction 与七个 executor-only Tool 已实现；Policy/grant、MCP/Skill 仍是目标
 > 当前实现证据见[实施进度](./progress.md)
 
 ## 1. 架构目标
@@ -24,8 +24,9 @@
 
 Electrobun 可另有 launcher、application worker 和 WebView 等框架进程，因此不能用 PID 数量判断架构是否正确。
 
-当前 desktop 已监管 agents-server 和 executor 两个 compiled companion。Ask、Provider、产品 DB 和 Pi Session
-在 agents server；executor 目前只有认证注册/readiness。下图中的 Policy、Tool、MCP 和 Skill 仍是目标能力。
+当前 desktop 已监管 agents-server 和 executor 两个 compiled companion。Agent、Provider、产品 DB 和 Pi Session
+在 agents server；`read`、`bash`、`edit`、`write`、`grep`、`find`、`ls` 只在 executor 执行。下图中的
+Policy、Action Broker、execution grant、MCP 和 Skill 仍是目标能力；当前七工具使用第 9 节记录的临时可信本机桥接。
 
 ## 3. 总体架构
 
@@ -71,6 +72,7 @@ flowchart LR
     AGENT --> CP
     PROVIDER --> VAULT
     BROKER -->|one-time execution grant| TOOLS
+    AGENT -.->|当前临时可信本机桥接| TOOLS
     TOOLS --> MCP
     TOOLS --> SKILLS
     TOOLS --> PROC
@@ -138,12 +140,15 @@ credential 或 Policy/approval。未来它拥有自身 MCP credential 并可在 
 
 ### 5.1 当前批准的 desktop 模式
 
-当前 desktop 模式已经实现 companion 生命周期和认证连接；Agent N:1 binding 与执行能力尚未实现：
+当前 desktop 模式已经实现 companion 生命周期、认证连接和唯一 local executor 的七工具执行；持久
+Agent N:1 binding 与 inventory 尚未实现：
 
 - client 启动并监管一个本地 agents server。
 - client 启动并监管一个由当前 host environment 支持的本地 executor。
 - agents server 只绑定 loopback 动态端口。
 - client 与 executor 都作为 WebSocket client 连接并注册到 agents server。
+- agents server 只向当前已认证且已注册的唯一 executor peer 路由 Tool invocation；断线或连接替换会取消旧 peer
+  上的活动调用，迟到 progress/result 不会路由到新连接。
 - client 可通过 agents server 列出已注册 executor；desktop 首版通常只有一个。
 - 多个 Agent 绑定同一 executor，关系为 **Agent N:1 Executor**。
 
@@ -276,12 +281,16 @@ interface RpcEnvelope<T> {
 公开 Pi runtime 只运行在 agents server：
 
 - `ModelRuntime` 动态提供 builtin/custom Provider 与模型能力；公共合同不暴露 SDK 类型。
-- 当前 Ask 通过 `createAgentSession` 构造 headless Session，固定 `noTools: "all"`，禁用 extensions、Skills、
-  prompt templates、themes、context files、default tools 和 TUI。
+- 默认 Chat 通过 `PiAgentRuntime` 和 `createAgentSession` 构造 headless Agent Session。固定
+  `noTools: "builtin"`，并禁用 extensions、Skills、prompt templates、themes、context files 和 TUI。
+- runtime 只注册七个 SDK custom proxy：`read`、`bash`、`edit`、`write`、`grep`、`find`、`ls`；启动时验证
+  active/configured Tool 恰好是这七个且来源为 SDK。缺失、额外或 built-in Tool 均 fail closed。
+- custom proxy 不读取文件或启动进程，只把严格参数、`runId`、`toolCallId`、`invocationId`、cwd、progress 和
+  cancellation 交给 agents-server executor gateway。
 - 产品 Session 保存稳定 `piSessionId`；`SessionManager` 在 `agentDataDirectory/sessions` 保存和恢复 JSONL context。
 - server 的 active registry 只保存当前 runtime、abort 与 lease；产品 DB 保存 Run/event projection，Pi JSONL
   保存 conversation context。进程崩溃后的非终态 Run会被终结，不宣称中点续跑。
-- Pi stream 转换为稳定 `AppRunEvent`，先持久化再推送 client；任何意外 Tool activity 都 fail closed。
+- Pi stream 转换为稳定 `AppRunEvent`，先持久化再推送 client；Tool 过程当前不扩展公开 UI event。
 
 ### 8.2 Provider
 
@@ -317,6 +326,33 @@ agentDataDirectory/
 - 本次开发期重构无需迁移旧 runtime 数据；不兼容时明确重置，不能静默误读。
 
 ## 9. Tool Bridge、Action Broker 与授权
+
+### 9.0 当前临时可信本机桥接
+
+当前七工具先完成了 executor-only 执行不变量，但**尚未**实现下述最终 Policy/approval/Action
+intent/execution grant 流程：
+
+- agents-server 将 Pi custom Tool call 直接路由到当前已认证 executor peer；executor 只接受已认证
+  `agents` role 的严格版本化 RPC。
+- 请求和结果由七工具 discriminated union 校验；同一连接拒绝重复 `invocationId`，progress 必须从 0
+  连续递增并绑定同一 peer、Tool 和 invocation。
+- executor 断线、连接替换、RPC cancel、Run cancel、shutdown 和 timeout 都会取消调用；`bash` 清理完整进程树。
+- `write`/`edit` 按稳定 canonical pathname 串行化；该 key 不依赖会被 atomic rename 替换的 inode，并解析
+  dangling final symlink 而不替换 link 本身。`edit` 在读取前拒绝超过 16 MiB 的目标，在提交前生成并验证有界
+  结果；两者都通过同目录临时文件 atomic rename，避免失败时截断目标文件。
+- 文本 `read` 流式读取有界范围；图片压缩输入限制为 32 MiB，并在 Photon 解码前从 JPEG/PNG/GIF/WebP/BMP
+  header 校验 32,768 单维和 25,000,000 像素上限，再压缩到 RPC 上限。`grep` 直接消费 bundled ripgrep
+  的有界行/上下文输出，不整文件载入匹配文件。
+- `bash` 使用流式 UTF-8 decoder 和输出 backpressure；展示保留最后 2,000 行或 50 KiB，完整输出最多保留
+  64 MiB 到 owner-only `0700` 目录和 `0600` 文件，目录总配额为 256 MiB，超过任一上限立即终止命令。
+  成功、timeout、非零退出和输出上限错误保留可诊断路径；取消或无法返回路径的失败删除文件并释放配额。
+- Unix 命令运行在独立 process group；Windows 命令分配到启用 `KILL_ON_JOB_CLOSE` 的 Job Object。正常退出、
+  取消、timeout 和 executor shutdown 都终止残留后代。
+- 相对路径基于 `agentDataDirectory/workspace`；为保持 Pi 兼容，当前允许绝对路径和 `..`，没有路径沙箱。
+- desktop 启动 executor 时完整继承 `process.env`；`bash` 因而可读取 desktop 环境中的 credential。bundled
+  `rg`/`fd` 使用绝对路径，不依赖该 `PATH`。
+- 这是有意接受的开发期高权限边界，不是 approval 或授权实现。A3 Policy、durable intent、single-use grant、
+  outcome recovery 和审计完成后，必须替换这条直接桥接，不能在其旁边再保留绕过路径。
 
 ### 9.1 请求流程
 
@@ -402,6 +438,10 @@ executor 必须拒绝过期、重复、目标不匹配、参数摘要变化、�
 
 - `agents-server` 和 `executor` 都使用 TypeScript strict + Bun，编译为目标架构二进制。
 - 两个 companion 与 Electrobun client 来自同一 release，随应用打包、签名、校验和更新。
+- `ripgrep` 15.2.0 与 `fd` 10.3.0 按 OS/arch manifest、固定 URL 和 SHA-256 准备并随 executor 打包；
+  Photon 0.3.4 WASM 与第三方许可也进入 package。
+- packaged `rg`/`fd` 必须是独立可执行文件；macOS 对它们分别 codesign，最终 app 的 nested-code/resource
+  allowlist 和 package verification 同时验证 companion、工具和 Photon WASM。
 - 启动注册必须比较 client/server/executor build 与 protocol compatibility；未知组合 fail closed。
 - stable 产物不得依赖用户安装 Bun/Node，也不得运行时下载 companion。
 - package smoke 必须证明 companion 可执行权限、路径、签名、动态库、loopback 和协作退出均正常。
@@ -410,6 +450,8 @@ executor 必须拒绝过期、重复、目标不匹配、参数摘要变化、�
 
 - 三角色均为受信任应用代码；拆进程提供故障和职责隔离，不等于完整 OS sandbox。
 - WebView 仍按不可信处理，只能通过 client 的领域 RPC。
+- 当前七工具桥接尚无 Policy/approval/grant，且 executor 完整继承 desktop 环境、允许绝对路径和 `..`；
+  因此当前 Agent 拥有该 OS 用户上下文下的高权限本机执行能力。这是第 9.0 节的显式临时风险。
 - agents server 的 Policy/approval 是授权事实来源；executor 的 grant validation 是执行前最后一道强制门。
 - executor-owned MCP credential/config 与 execution grant 是正交状态：前者维持连接认证，后者逐次授权 Tool execution。
 - executor 的文件根、命令解析、环境、网络、输出和进程树约束不能仅依赖 grant 字符串。
@@ -434,7 +476,7 @@ executor 必须拒绝过期、重复、目标不匹配、参数摘要变化、�
 | ARC-010 | client 协作关闭两个 companion；异常退出使用 capped backoff，达到上限后进入 recovery UX |
 | ARC-012 | server/executor 分别被 kill 后，Run/Action 能进入确定的 completed/interrupted/outcome_unknown 状态，不盲目重复副作用 |
 | ARC-013 | 两个 TypeScript + Bun companion 在签名产物中可执行、可握手、可更新，终端用户无需安装 runtime |
-| ARC-014 | 当前实现与目标差距始终在 progress 文档中明确，不用当前 no-tools Ask 测试替代未来 Tool/MCP 架构验收 |
+| ARC-014 | 当前实现与目标差距始终在 progress 文档中明确，不用当前可信直连七工具测试替代未来 Policy/grant/MCP 架构验收 |
 | ARC-015 | Provider/model credential 从不进入 executor；MCP credential 只在 executor private store/目标 process memory 中使用，永不经 query/UI/prompt/log/diagnostic/export 暴露 |
 | ARC-016 | client MCP/Skill command 经 server 校验后路由；executor offline 或持久化失败时不返回成功，server snapshot 不能恢复 executor config |
 | ARC-017 | 每次 executor 注册/重连先 full inventory sync；epoch/revision、hint、60 秒 ±20% poll、delta/tombstone 和 snapshot fallback 可收敛且 cache 可丢弃 |

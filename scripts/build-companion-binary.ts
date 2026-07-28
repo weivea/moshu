@@ -1,4 +1,4 @@
-import { mkdirSync } from "node:fs";
+import { copyFileSync, mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 
 import {
@@ -6,6 +6,8 @@ import {
 	type CompanionExecutableRole,
 	getCompanionExecutableFilename,
 } from "../apps/desktop/src/shared/companion-executable-names";
+import { executorImageProcessorWasmFilename } from "../packages/contracts/src/executor-tool-assets";
+import { copyPreparedExecutorTools, prepareExecutorToolAssets } from "./executor-tool-assets";
 
 const role = parseRole(process.argv[2]);
 const smoke = process.argv[3] === "smoke";
@@ -22,6 +24,20 @@ const outputPath = resolve(
 		: getCompanionExecutableFilename(role, process.platform),
 );
 mkdirSync(dirname(outputPath), { recursive: true });
+if (role === "executor") {
+	const prepared = await prepareExecutorToolAssets();
+	copyPreparedExecutorTools(prepared, dirname(outputPath));
+	copyFileSync(
+		resolve(
+			appDirectory,
+			"node_modules",
+			"@silvia-odwyer",
+			"photon-node",
+			executorImageProcessorWasmFilename,
+		),
+		resolve(dirname(outputPath), executorImageProcessorWasmFilename),
+	);
+}
 
 const child = Bun.spawn({
 	cmd: [

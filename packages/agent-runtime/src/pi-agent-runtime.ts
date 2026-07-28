@@ -7,11 +7,16 @@ import {
 	SessionManager,
 	SettingsManager,
 } from "@earendil-works/pi-coding-agent";
-import type { ThinkingLevel } from "@moshu/contracts";
+import { executorToolNames, type ThinkingLevel } from "@moshu/contracts";
 import { lstatSync, mkdirSync, realpathSync, unlinkSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
 
 import type { ResolvedProviderConfiguration } from "./provider-registry";
+import {
+	assertExecutorToolDefinitions,
+	createExecutorToolDefinitions,
+	type ExecutorToolGateway,
+} from "./executor-tools";
 
 export interface AskChatMessage {
 	role: "user" | "assistant";
@@ -64,6 +69,7 @@ export interface AskChatRuntime {
 export interface AskChatRuntimeOptions {
 	agentDataDirectory: string;
 	modelRuntime: ModelRuntime;
+	executorGateway: ExecutorToolGateway;
 	workspaceDirectory?: string;
 }
 
@@ -124,18 +130,21 @@ interface ActiveRun {
 	reason: string | undefined;
 }
 
-export class PiAskChatRuntime implements AskChatRuntime {
+export class PiAgentRuntime implements AskChatRuntime {
 	readonly #modelRuntime: ModelRuntime;
+	readonly #executorGateway: ExecutorToolGateway;
 	readonly #agentDirectory: string;
 	readonly #sessionDirectory: string;
 	readonly #workspaceDirectory: string;
 	readonly #activeRuns = new Map<string, ActiveRun>();
 	readonly #activeThreads = new Set<string>();
+	readonly #runIdByThread = new Map<string, string>();
 	readonly #sessions = new Map<string, AgentSession>();
 	#shuttingDown = false;
 
 	constructor(options: AskChatRuntimeOptions) {
 		this.#modelRuntime = options.modelRuntime;
+		this.#executorGateway = options.executorGateway;
 		this.#agentDirectory = resolve(options.agentDataDirectory);
 		this.#sessionDirectory = join(this.#agentDirectory, "sessions");
 		this.#workspaceDirectory = resolve(
@@ -194,6 +203,14 @@ export class PiAskChatRuntime implements AskChatRuntime {
 			}
 			const content =
 				typeof message.content === "string" ? message.content : contentText(message.content);
+			if (
+				message.role === "assistant" &&
+				content.length === 0 &&
+				Array.isArray(message.content) &&
+				message.content.some((block) => block.type === "toolCall")
+			) {
+				return [];
+			}
 			return [{ role: message.role, content }];
 		});
 	}
@@ -260,7 +277,7 @@ export class PiAskChatRuntime implements AskChatRuntime {
 		}
 		const prompt = input.messages.findLast((message) => message.role === "user")?.content;
 		if (prompt === undefined) {
-			throw new TypeError("An Ask run requires a user message.");
+			throw new TypeError("An Agent run requires a user message.");
 		}
 		const model = this.#modelRuntime.getModel(input.provider.providerId, input.provider.model);
 		if (model === undefined) {
@@ -269,38 +286,29 @@ export class PiAskChatRuntime implements AskChatRuntime {
 		const active: ActiveRun = { controller: new AbortController(), reason: undefined };
 		this.#activeRuns.set(input.runId, active);
 		this.#activeThreads.add(threadId);
+		this.#runIdByThread.set(threadId, input.runId);
 		const externalAbort = () => this.cancel(input.runId, "Request aborted.");
 		input.signal?.addEventListener("abort", externalAbort, { once: true });
 		if (input.signal?.aborted) {
 			externalAbort();
 		}
-		try {
-			const session = await this.#getOrCreateSession(threadId, model, input.provider.thinkingLevel);
-			active.session = session;
+		const throwIfCancelled = (): void => {
 			if (active.controller.signal.aborted) {
 				throw new AskChatCancelledError(input.runId, active.reason);
 			}
+		};
+		try {
+			const session = await this.#getOrCreateSession(threadId, model, input.provider.thinkingLevel);
+			active.session = session;
+			throwIfCancelled();
 			await session.setModel(model);
+			throwIfCancelled();
 			if (input.provider.thinkingLevel !== undefined) {
 				session.setThinkingLevel(input.provider.thinkingLevel);
 			}
 			const before = session.messages.length;
 			let callbackTail = Promise.resolve();
-			let unexpectedTool = false;
 			const unsubscribe = session.subscribe((event) => {
-				if (event.type === "tool_execution_start") {
-					unexpectedTool = true;
-					void session.abort();
-					return;
-				}
-				if (
-					event.type === "message_update" &&
-					event.assistantMessageEvent.type === "toolcall_start"
-				) {
-					unexpectedTool = true;
-					void session.abort();
-					return;
-				}
 				if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
 					const delta = event.assistantMessageEvent.delta;
 					callbackTail = callbackTail.then(() =>
@@ -309,18 +317,13 @@ export class PiAskChatRuntime implements AskChatRuntime {
 				}
 			});
 			try {
-				await session.prompt(prompt, { expandPromptTemplates: false });
+				await session.prompt(prompt, {
+					expandPromptTemplates: false,
+					preflightResult: throwIfCancelled,
+				});
 				await callbackTail;
 			} finally {
 				unsubscribe();
-			}
-			if (unexpectedTool) {
-				throw runtimeError(
-					"unexpected_tool_activity",
-					"The provider attempted tool activity in a no-tools Ask session.",
-					false,
-					input.runId,
-				);
 			}
 			if (active.controller.signal.aborted) {
 				throw new AskChatCancelledError(input.runId, active.reason);
@@ -355,6 +358,9 @@ export class PiAskChatRuntime implements AskChatRuntime {
 			input.signal?.removeEventListener("abort", externalAbort);
 			this.#activeRuns.delete(input.runId);
 			this.#activeThreads.delete(threadId);
+			if (this.#runIdByThread.get(threadId) === input.runId) {
+				this.#runIdByThread.delete(threadId);
+			}
 		}
 	}
 
@@ -392,28 +398,46 @@ export class PiAskChatRuntime implements AskChatRuntime {
 			noThemes: true,
 			noContextFiles: true,
 			systemPrompt:
-				"You are Moshu Ask. Answer the user's request directly and accurately. Do not use tools.",
+				`You are Moshu Agent. Complete the user's request directly and accurately. ` +
+				`You have exactly seven tools: ${executorToolNames.join(", ")}. ` +
+				`All tool execution happens in the trusted local executor. Relative paths resolve from ${this.#workspaceDirectory}. ` +
+				"Do not assume any other tools, skills, extensions, or execution capabilities exist.",
 		});
 		await resources.reload();
+		const customTools = createExecutorToolDefinitions({
+			gateway: this.#executorGateway,
+			cwd: this.#workspaceDirectory,
+			getRunId: () => this.#runIdByThread.get(threadId),
+		});
+		assertExecutorToolDefinitions(customTools);
 		const created = await createAgentSession({
 			agentDir: this.#agentDirectory,
 			cwd: this.#workspaceDirectory,
 			modelRuntime: this.#modelRuntime,
 			model,
 			...(thinkingLevel === undefined ? {} : { thinkingLevel }),
-			noTools: "all",
+			noTools: "builtin",
+			customTools,
 			resourceLoader: resources,
 			sessionManager: manager,
 			settingsManager: settings,
 		});
-		if (created.session.getActiveToolNames().length !== 0) {
+		const activeToolNames = created.session.getActiveToolNames();
+		const configuredTools = created.session.getAllTools();
+		if (
+			activeToolNames.length !== executorToolNames.length ||
+			executorToolNames.some((name) => !activeToolNames.includes(name)) ||
+			configuredTools.length !== executorToolNames.length ||
+			configuredTools.some((tool) => tool.sourceInfo.source !== "sdk")
+		) {
 			created.session.dispose();
 			throw runtimeError(
 				"unexpected_tool_activity",
-				"Ask session unexpectedly loaded tools.",
+				"Agent session did not load exactly the executor-backed tool set.",
 				false,
 			);
 		}
+
 		this.#sessions.set(threadId, created.session);
 		return created.session;
 	}
@@ -427,6 +451,8 @@ export class PiAskChatRuntime implements AskChatRuntime {
 			: SessionManager.open(info.path, this.#sessionDirectory, this.#workspaceDirectory);
 	}
 }
+
+export { PiAgentRuntime as PiAskChatRuntime };
 
 const piSessionIdPattern = /^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$/;
 

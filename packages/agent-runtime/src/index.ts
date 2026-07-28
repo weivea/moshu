@@ -1,7 +1,8 @@
 export { ModelRuntime } from "@earendil-works/pi-coding-agent";
 export { InMemoryModelsStore } from "@earendil-works/pi-ai";
 export type { CredentialStore } from "@earendil-works/pi-ai";
-export * from "./ask-chat-runtime";
+export * from "./pi-agent-runtime";
+export * from "./executor-tools";
 export * from "./bun-runtime";
 export * from "./headless-auth-controller";
 export * from "./provider-registry";

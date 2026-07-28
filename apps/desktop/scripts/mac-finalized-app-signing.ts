@@ -15,10 +15,14 @@ import { basename, dirname, join, resolve } from "node:path";
 import {
 	COMPANION_EXECUTABLE_ROLES,
 	type CompanionExecutableRole,
+	assertCompanionResourceFilenames,
+	getCompanionResourceFilenames,
 	getCompanionExecutableFilename,
+	getExecutorToolExecutableFilenames,
 } from "../src/shared/companion-executable-names";
 import {
 	assertEmbeddedCompanionEntitlements,
+	createBundledToolCodesignCommand,
 	createCompanionCodesignCommand,
 	createCompanionEntitlementsInspectionCommand,
 	createMacAppVerificationCommand,
@@ -51,6 +55,16 @@ function companionExecutable(appPath: string, role: CompanionExecutableRole): st
 	);
 }
 
+function companionResourceDirectory(appPath: string): string {
+	return join(appPath, "Contents", "Resources", "app", "companions");
+}
+
+function executorToolExecutables(appPath: string): string[] {
+	return getExecutorToolExecutableFilenames("darwin").map((filename) =>
+		join(companionResourceDirectory(appPath), filename),
+	);
+}
+
 function createNestedCodesignCommand(
 	executablePath: string,
 	identity: string,
@@ -74,6 +88,7 @@ export function createFinalizedMacCodesignPlan(
 	entitlementsPath: string,
 ): FinalizedMacCodesignPlan {
 	const companions = COMPANION_EXECUTABLE_ROLES.map((role) => companionExecutable(appPath, role));
+	const tools = executorToolExecutables(appPath);
 	return {
 		nested: [
 			...companions.map((executable) =>
@@ -83,6 +98,7 @@ export function createFinalizedMacCodesignPlan(
 					entitlementsPath,
 				}),
 			),
+			...tools.map((executable) => createBundledToolCodesignCommand(executable, identity)),
 			...lockedElectrobunMacCode.map(({ name, entitlements }) =>
 				createNestedCodesignCommand(
 					join(appPath, "Contents", "MacOS", name),
@@ -98,6 +114,7 @@ export function createFinalizedMacCodesignPlan(
 				["codesign", "--verify", "--strict", executable],
 				createCompanionEntitlementsInspectionCommand(executable),
 			]),
+			...tools.map((executable) => ["codesign", "--verify", "--strict", executable]),
 		],
 	};
 }
@@ -113,6 +130,13 @@ function assertExecutable(path: string): void {
 	const stats = lstatSync(path);
 	if (!stats.isFile() || stats.isSymbolicLink() || (stats.mode & 0o111) === 0) {
 		throw new Error(`Expected a regular executable, not a symlink: ${path}`);
+	}
+}
+
+function assertRegularFile(path: string): void {
+	const stats = lstatSync(path);
+	if (!stats.isFile() || stats.isSymbolicLink()) {
+		throw new Error(`Expected a regular file, not a symlink: ${path}`);
 	}
 }
 
@@ -150,6 +174,14 @@ export function signAndVerifyFinalizedMacApp(
 		throw new Error(
 			`Unexpected Electrobun macOS code layout: ${actualMacCode.join(", ") || "empty"}.`,
 		);
+	}
+	const resourcesDirectory = companionResourceDirectory(appPath);
+	assertDirectory(resourcesDirectory, "Moshu companion resource directory");
+	const actualCompanionResources = readdirSync(resourcesDirectory);
+	assertCompanionResourceFilenames(actualCompanionResources, "darwin");
+	const expectedCompanionResources = getCompanionResourceFilenames("darwin");
+	for (const filename of expectedCompanionResources) {
+		assertRegularFile(join(resourcesDirectory, filename));
 	}
 	const plan = createFinalizedMacCodesignPlan(appPath, identity, entitlementsPath);
 	for (const command of plan.nested) {

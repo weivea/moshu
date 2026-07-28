@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import {
 	assertEmbeddedCompanionEntitlements,
+	createBundledToolCodesignCommand,
 	createCompanionCodesignCommand,
 	createCompanionEntitlementsInspectionCommand,
 	createElectrobunCodesignEnvironment,
@@ -27,6 +28,22 @@ describe("companion signing contract", () => {
 			expect(command.includes("runtime")).toBe(identity !== "-");
 		},
 	);
+
+	test("signs bundled executor tools independently without Bun entitlements", () => {
+		expect(createBundledToolCodesignCommand("/tmp/rg", "-")).toEqual([
+			"codesign",
+			"--force",
+			"--sign",
+			"-",
+			"/tmp/rg",
+		]);
+		expect(
+			createBundledToolCodesignCommand("/tmp/fd", "Developer ID Application: Moshu"),
+		).toContain("--timestamp");
+		expect(
+			createBundledToolCodesignCommand("/tmp/fd", "Developer ID Application: Moshu"),
+		).not.toContain("--entitlements");
+	});
 
 	test("requires both Bun JIT entitlements in embedded codesign output", () => {
 		const output = `<?xml version="1.0"?><plist><dict>${requiredCompanionEntitlements

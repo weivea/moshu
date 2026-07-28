@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { companionSourceWatchPaths, createElectrobunConfig } from "../electrobun.config";
+import {
+	companionSourceWatchPaths,
+	createElectrobunConfig,
+	electrobunWatchIgnorePatterns,
+} from "../electrobun.config";
 
 describe("Electrobun config", () => {
 	test("disables Electrobun's timestamped signer for default ad-hoc packages", () => {
@@ -24,6 +28,24 @@ describe("Electrobun config", () => {
 			"../../packages/database/src",
 			"../../packages/process-rpc/src",
 		]);
+	});
+
+	test("ignores repository metadata and generated directories outside the desktop root", () => {
+		const config = createElectrobunConfig({}, "darwin");
+		expect(config.build.watchIgnore).toEqual(electrobunWatchIgnorePatterns);
+		const ignores = electrobunWatchIgnorePatterns.map((pattern) => new Bun.Glob(pattern));
+		for (const path of [
+			"/repo/.git/fsmonitor--daemon/cookies/38344-74",
+			"/repo/node_modules/.cache/dependency",
+			"/repo/.cache/executor-tools/rg",
+			"/repo/apps/agents-server/dist/moshu-agents-server",
+			"/repo/apps/desktop/build/dev-macos-arm64/Moshu-dev.app",
+			"/repo/apps/desktop/artifacts/update.json",
+			"/repo/packages/contracts/coverage/report.json",
+		]) {
+			expect(ignores.some((glob) => glob.match(path))).toBe(true);
+		}
+		expect(ignores.some((glob) => glob.match("/repo/packages/contracts/src/index.ts"))).toBe(false);
 	});
 
 	test("uses the companion Developer ID for Electrobun's hardened outer signing", () => {

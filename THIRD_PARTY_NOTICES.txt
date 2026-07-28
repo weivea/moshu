@@ -1,0 +1,22 @@
+Moshu includes or adapts the following third-party software:
+
+Pi coding agent v0.82.1
+Source: https://github.com/earendil-works/pi/tree/v0.82.1
+License: MIT
+Moshu's executor tool behavior is adapted from Pi source code. The Agent runtime
+continues to use the published @earendil-works Pi packages.
+
+ripgrep 15.2.0
+Source: https://github.com/BurntSushi/ripgrep/tree/15.2.0
+License: MIT OR Unlicense (Moshu distributes it under the MIT terms)
+
+fd 10.3.0
+Source: https://github.com/sharkdp/fd/tree/v10.3.0
+License: MIT OR Apache-2.0 (Moshu distributes it under the MIT terms)
+
+Photon 0.3.4
+Source: https://github.com/silvia-odwyer/photon/tree/v0.3.4
+License: Apache-2.0
+
+The applicable license texts are included in third_party/licenses or copied
+from the pinned dependency package into the packaged application's licenses.

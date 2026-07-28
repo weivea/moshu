@@ -10,7 +10,7 @@ import {
 	RpcTimeoutError,
 } from "./errors";
 import { hasSafeRpcJsonStructure } from "./json-structure";
-import type { ResolvedRpcLimits, RpcLimits } from "./limits";
+import { MAX_RPC_TIMER_MS, type ResolvedRpcLimits, type RpcLimits } from "./limits";
 import {
 	hasUnsupportedRpcSchemaVersion,
 	type JsonValue,
@@ -83,6 +83,10 @@ export interface RpcCloseInfo {
 export interface RpcEndpointOptions {
 	readonly handlers?: RpcHandlers;
 	readonly methodAllowlist?: RpcMethodAllowlist;
+	/**
+	 * Per-method maximum request deadlines. Unlisted methods retain `maxRequestTimeoutMs`.
+	 */
+	readonly requestTimeoutLimits?: Readonly<Record<string, number>>;
 	readonly limits?: RpcLimits;
 	readonly onProtocolError?: (error: RpcProtocolErrorEnvelope, peer: RpcPeer) => void;
 	readonly onError?: (error: unknown, peer: RpcPeer) => void;
@@ -156,6 +160,7 @@ export class RpcPeer {
 	readonly #eventHandlers: Readonly<Record<string, RpcEventHandler>>;
 	readonly #allowedRequests: ReadonlySet<string>;
 	readonly #allowedEvents: ReadonlySet<string>;
+	readonly #requestTimeoutLimits: ReadonlyMap<string, number>;
 	readonly #onProtocolError: ((error: RpcProtocolErrorEnvelope, peer: RpcPeer) => void) | undefined;
 	readonly #onError: ((error: unknown, peer: RpcPeer) => void) | undefined;
 	readonly #onClose: ((info: RpcCloseInfo, peer: RpcPeer) => void) | undefined;
@@ -180,6 +185,7 @@ export class RpcPeer {
 		const rolePolicy = options.methodAllowlist?.[options.remoteIdentity.role];
 		this.#allowedRequests = new Set(rolePolicy?.requests ?? []);
 		this.#allowedEvents = new Set(rolePolicy?.events ?? []);
+		this.#requestTimeoutLimits = resolveRequestTimeoutLimits(options.requestTimeoutLimits);
 		this.#onProtocolError = options.onProtocolError;
 		this.#onError = options.onError;
 		this.#onClose = options.onClose;
@@ -225,13 +231,10 @@ export class RpcPeer {
 		}
 
 		const timeoutMs = options.timeoutMs ?? this.limits.requestTimeoutMs;
-		if (
-			!Number.isSafeInteger(timeoutMs) ||
-			timeoutMs <= 0 ||
-			timeoutMs > this.limits.maxRequestTimeoutMs
-		) {
+		const maxRequestTimeoutMs = this.#getMaxRequestTimeoutMs(method);
+		if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > maxRequestTimeoutMs) {
 			throw new RangeError(
-				`timeoutMs must be a positive safe integer no greater than ${this.limits.maxRequestTimeoutMs}.`,
+				`timeoutMs for "${method}" must be a positive safe integer no greater than ${maxRequestTimeoutMs}.`,
 			);
 		}
 
@@ -568,10 +571,11 @@ export class RpcPeer {
 			});
 			return;
 		}
-		if (remainingMs > this.limits.maxRequestTimeoutMs) {
+		const maxRequestTimeoutMs = this.#getMaxRequestTimeoutMs(envelope.method);
+		if (remainingMs > maxRequestTimeoutMs) {
 			this.#sendRequestError(envelope, {
 				code: "INVALID_DEADLINE",
-				message: `The request deadline exceeds the ${this.limits.maxRequestTimeoutMs}ms limit.`,
+				message: `The request deadline exceeds the ${maxRequestTimeoutMs}ms limit for "${envelope.method}".`,
 			});
 			return;
 		}
@@ -596,6 +600,10 @@ export class RpcPeer {
 		}, remainingMs);
 
 		void this.#runRequestHandler(envelope, inbound, handler);
+	}
+
+	#getMaxRequestTimeoutMs(method: string): number {
+		return this.#requestTimeoutLimits.get(method) ?? this.limits.maxRequestTimeoutMs;
 	}
 
 	async #runRequestHandler(
@@ -1037,6 +1045,26 @@ export class RpcPeer {
 
 function getOwnHandler<T>(handlers: Readonly<Record<string, T>>, method: string): T | undefined {
 	return Object.hasOwn(handlers, method) ? handlers[method] : undefined;
+}
+
+function resolveRequestTimeoutLimits(
+	input: Readonly<Record<string, number>> | undefined,
+): ReadonlyMap<string, number> {
+	const resolved = new Map<string, number>();
+	for (const [method, timeoutMs] of Object.entries(input ?? {})) {
+		if (method.length === 0 || method.length > 256 || /\s/.test(method)) {
+			throw new TypeError(
+				"Request timeout limit methods must be non-empty, whitespace-free identifiers.",
+			);
+		}
+		if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0 || timeoutMs > MAX_RPC_TIMER_MS) {
+			throw new RangeError(
+				`Request timeout limit for "${method}" must be a positive safe integer no greater than ${MAX_RPC_TIMER_MS}.`,
+			);
+		}
+		resolved.set(method, timeoutMs);
+	}
+	return resolved;
 }
 
 function getAbortReason(reason: unknown): string {

@@ -10,7 +10,7 @@ import {
 	CompanionProcessSupervisor,
 	type CompanionRole,
 	type CompanionSignal,
-	createMinimalCompanionEnvironment,
+	createCompanionEnvironment,
 	type DesktopAgentsConnection,
 	RestartBudget,
 	type RestartPolicy,
@@ -692,18 +692,21 @@ describe("RestartBudget", () => {
 	});
 });
 
-describe("createMinimalCompanionEnvironment", () => {
-	test("does not inherit PATH or unrelated desktop secrets", () => {
+describe("createCompanionEnvironment", () => {
+	test("inherits the complete desktop environment and drops undefined values", () => {
 		expect(
-			createMinimalCompanionEnvironment({
+			createCompanionEnvironment({
 				HOME: "/Users/test",
 				TMPDIR: "/tmp/test",
 				PATH: "/usr/local/bin",
-				SECRET_TOKEN: "do-not-copy",
+				SECRET_TOKEN: "copy-by-design",
+				UNDEFINED_VALUE: undefined,
 			}),
 		).toEqual({
 			HOME: "/Users/test",
 			TMPDIR: "/tmp/test",
+			PATH: "/usr/local/bin",
+			SECRET_TOKEN: "copy-by-design",
 		});
 	});
 });
@@ -922,7 +925,7 @@ function createSupervisor(
 	const { dependencies, ...options } = overrides;
 	return new CompanionProcessSupervisor({
 		executables: EXECUTABLES,
-		environment: createMinimalCompanionEnvironment({
+		environment: createCompanionEnvironment({
 			HOME: "/Users/test",
 			TMPDIR: "/tmp/test",
 			PATH: "/usr/bin",

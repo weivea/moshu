@@ -85,6 +85,9 @@ function resolveClientOptions(options: ConnectRpcClientOptions): ResolvedClientO
 	const endpoint: RpcEndpointOptions = {
 		...(options.handlers === undefined ? {} : { handlers: options.handlers }),
 		...(options.methodAllowlist === undefined ? {} : { methodAllowlist: options.methodAllowlist }),
+		...(options.requestTimeoutLimits === undefined
+			? {}
+			: { requestTimeoutLimits: options.requestTimeoutLimits }),
 		...(options.onClose === undefined ? {} : { onClose: options.onClose }),
 		...(options.onError === undefined ? {} : { onError: options.onError }),
 		...(options.onProtocolError === undefined ? {} : { onProtocolError: options.onProtocolError }),

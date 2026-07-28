@@ -2,7 +2,10 @@ import { lstatSync, mkdirSync, mkdtempSync, readdirSync, rmSync } from "node:fs"
 import { join, resolve } from "node:path";
 import {
 	COMPANION_EXECUTABLE_ROLES,
+	assertCompanionResourceFilenames,
+	getCompanionResourceFilenames,
 	getCompanionExecutableFilename,
+	getExecutorToolExecutableFilenames,
 } from "../src/shared/companion-executable-names";
 import {
 	assertEmbeddedCompanionEntitlements,
@@ -134,9 +137,21 @@ function verifyOuterApp(appBundle: string): void {
 
 async function verifyCompanionsInApp(appBundle: string, scratchParent: string): Promise<void> {
 	const companionDirectory = join(appBundle, "Contents", "Resources", "app", "companions");
+	const actualResources = readRealDirectory(
+		companionDirectory,
+		"packaged companion resource directory",
+	);
+	assertCompanionResourceFilenames(actualResources, "darwin");
+	const expectedResources = getCompanionResourceFilenames("darwin");
+	for (const filename of expectedResources) {
+		assertRegularFile(join(companionDirectory, filename), "packaged companion resource");
+	}
 	const executables = COMPANION_EXECUTABLE_ROLES.map((role) =>
 		join(companionDirectory, getCompanionExecutableFilename(role, "darwin")),
 	) as [string, string];
+	const toolExecutables = getExecutorToolExecutableFilenames("darwin").map((filename) =>
+		join(companionDirectory, filename),
+	);
 
 	for (const executable of executables) {
 		assertExecutable(executable, "packaged companion executable");
@@ -149,6 +164,13 @@ async function verifyCompanionsInApp(appBundle: string, scratchParent: string): 
 			`Failed to inspect companion entitlements for ${executable}`,
 		);
 		assertEmbeddedCompanionEntitlements(entitlements, executable);
+	}
+	for (const executable of toolExecutables) {
+		assertExecutable(executable, "packaged executor tool");
+		runCommand(
+			["codesign", "--verify", "--strict", "--verbose=2", executable],
+			`Executor tool signature verification failed for ${executable}`,
+		);
 	}
 	await verifyPackagedCompanionLaunch(executables, scratchParent);
 }

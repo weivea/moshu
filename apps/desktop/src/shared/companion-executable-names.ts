@@ -1,3 +1,9 @@
+import {
+	executorImageProcessorWasmFilename,
+	executorToolBinaryNames,
+	getExecutorToolBinaryFilename,
+} from "../../../../packages/contracts/src/executor-tool-assets";
+
 export const COMPANION_EXECUTABLE_ROLES = ["agents-server", "executor"] as const;
 
 export type CompanionExecutableRole = (typeof COMPANION_EXECUTABLE_ROLES)[number];
@@ -15,15 +21,60 @@ export function getCompanionExecutableFilename(
 	return `${COMPANION_EXECUTABLE_BASE_NAMES[role]}${extension}`;
 }
 
+export function getCompanionExecutableFilenames(
+	platform: NodeJS.Platform = process.platform,
+): string[] {
+	return COMPANION_EXECUTABLE_ROLES.map((role) => getCompanionExecutableFilename(role, platform));
+}
+
+export function getExecutorToolExecutableFilenames(
+	platform: NodeJS.Platform = process.platform,
+): string[] {
+	return executorToolBinaryNames.map((tool) => getExecutorToolBinaryFilename(tool, platform));
+}
+
+export function getCompanionResourceFilenames(
+	platform: NodeJS.Platform = process.platform,
+): string[] {
+	return [
+		...getCompanionExecutableFilenames(platform),
+		...getExecutorToolExecutableFilenames(platform),
+		executorImageProcessorWasmFilename,
+	];
+}
+
+export function assertCompanionResourceFilenames(
+	entries: readonly string[],
+	platform: NodeJS.Platform = process.platform,
+): void {
+	const actual = [...entries].sort();
+	const expected = getCompanionResourceFilenames(platform).sort();
+	if (
+		actual.length !== expected.length ||
+		actual.some((entry, index) => entry !== expected[index])
+	) {
+		throw new Error(`Unexpected Moshu companion resource layout: ${actual.join(", ") || "empty"}.`);
+	}
+}
+
 export function createElectrobunCompanionCopyEntries(
 	platform: NodeJS.Platform = process.platform,
 ): Record<string, string> {
-	return Object.fromEntries(
+	const companions = Object.fromEntries(
 		COMPANION_EXECUTABLE_ROLES.map((role) => {
 			const filename = getCompanionExecutableFilename(role, platform);
 			return [`../${role}/dist/${filename}`, `companions/${filename}`];
 		}),
 	);
+	const tools = Object.fromEntries(
+		getExecutorToolExecutableFilenames(platform).map((filename) => {
+			return [`../executor/dist/${filename}`, `companions/${filename}`];
+		}),
+	);
+	const imageProcessor = {
+		[`../executor/dist/${executorImageProcessorWasmFilename}`]: `companions/${executorImageProcessorWasmFilename}`,
+	};
+	return { ...companions, ...tools, ...imageProcessor };
 }
 
 export function resolveCurrentHostCompanionPlatform(

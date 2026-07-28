@@ -4,10 +4,12 @@ import { join, resolve } from "node:path";
 import {
 	COMPANION_EXECUTABLE_ROLES,
 	getCompanionExecutableFilename,
+	getExecutorToolExecutableFilenames,
 	resolveCurrentHostCompanionPlatform,
 } from "../src/shared/companion-executable-names";
 import {
 	assertEmbeddedCompanionEntitlements,
+	createBundledToolCodesignCommand,
 	createCompanionCodesignCommand,
 	createCompanionEntitlementsInspectionCommand,
 	resolveCompanionCodesignIdentity,
@@ -23,8 +25,11 @@ const companionEntitlementsPath = resolve(import.meta.dir, "..", "companion-enti
 const executables = COMPANION_EXECUTABLE_ROLES.map((role) =>
 	join(companionDirectory, getCompanionExecutableFilename(role, targetPlatform)),
 );
+const toolExecutables = getExecutorToolExecutableFilenames(targetPlatform).map((filename) =>
+	join(companionDirectory, filename),
+);
 
-for (const executable of executables) {
+for (const executable of [...executables, ...toolExecutables]) {
 	if (targetPlatform !== "win32") {
 		chmodSync(executable, 0o755);
 	}
@@ -33,10 +38,16 @@ for (const executable of executables) {
 		throw new Error(`Bundled companion is not a regular file: ${executable}`);
 	}
 	if (targetPlatform === "darwin") {
-		await access(companionEntitlementsPath, constants.R_OK);
-		signMacExecutable(executable, signingIdentity, companionEntitlementsPath);
+		if (toolExecutables.includes(executable)) {
+			signMacToolExecutable(executable, signingIdentity);
+		} else {
+			await access(companionEntitlementsPath, constants.R_OK);
+			signMacExecutable(executable, signingIdentity, companionEntitlementsPath);
+		}
 		verifyMacExecutable(executable);
-		verifyMacEntitlements(executable);
+		if (!toolExecutables.includes(executable)) {
+			verifyMacEntitlements(executable);
+		}
 	}
 }
 if (targetPlatform !== "darwin") {
@@ -44,7 +55,7 @@ if (targetPlatform !== "darwin") {
 }
 
 console.info(
-	`Prepared ${executables.length} companion executables in ${companionDirectory}` +
+	`Prepared ${executables.length} companion and ${toolExecutables.length} tool executables in ${companionDirectory}` +
 		(targetPlatform === "darwin"
 			? ` with ${signingIdentity === "-" ? "ad-hoc" : "configured identity"} signatures.`
 			: "."),
@@ -89,6 +100,13 @@ function signMacExecutable(executable: string, identity: string, entitlementsPat
 	runCommand(
 		createCompanionCodesignCommand({ executable, identity, entitlementsPath }),
 		`Failed to sign companion executable ${executable}`,
+	);
+}
+
+function signMacToolExecutable(executable: string, identity: string): void {
+	runCommand(
+		createBundledToolCodesignCommand(executable, identity),
+		`Failed to sign bundled executor tool ${executable}`,
 	);
 }
 

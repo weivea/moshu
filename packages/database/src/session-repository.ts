@@ -146,7 +146,7 @@ export class SqliteSessionRepository implements SessionRepository {
 			id,
 			piSessionId: id,
 			title: parsedInput.title,
-			defaultMode: parsedInput.defaultMode ?? "ask",
+			defaultMode: parsedInput.defaultMode ?? "agent",
 			...toModelColumns(parsedInput.model ?? null),
 			createdAtMs: nowMs,
 			updatedAtMs: nowMs,

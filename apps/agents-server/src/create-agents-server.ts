@@ -4,12 +4,17 @@ import {
 	type AskChatRuntime,
 	HeadlessAuthController,
 	ModelRuntime,
-	PiAskChatRuntime,
+	PiAgentRuntime,
 	type ProviderRegistry,
 	SecretVaultCredentialStore,
 } from "@moshu/agent-runtime";
 import type { AgentsServerBootstrapRecord } from "@moshu/contracts";
-import { productRpcMaxBufferedOutboundBytes, productRpcMaxFrameBytes } from "@moshu/contracts";
+import {
+	executorToolRpcTimeoutMs,
+	productRpcMaxBufferedOutboundBytes,
+	productRpcMaxFrameBytes,
+	productRpcMethods,
+} from "@moshu/contracts";
 import { openAppDatabase, prepareCoordinatedDatabaseReset } from "@moshu/database";
 import { createRpcBearerAuthenticator, createRpcServer, type RpcServer } from "@moshu/process-rpc";
 
@@ -33,7 +38,11 @@ export interface AgentsServerInstance {
 export interface CreateAgentsServerOptions {
 	bootstrap: AgentsServerBootstrapRecord;
 	serverVersion: string;
-	createRuntime?: (providers: ProviderRegistry, modelRuntime: ModelRuntime) => AskChatRuntime;
+	createRuntime?: (
+		providers: ProviderRegistry,
+		modelRuntime: ModelRuntime,
+		executorGateway: ExecutorReadiness,
+	) => AskChatRuntime;
 	fetchProviderModels?: ConstructorParameters<
 		typeof ChatApplicationService
 	>[0]["fetchProviderModels"];
@@ -90,9 +99,14 @@ export async function createAgentsServer(
 			credentials,
 		);
 		await providers.initialize();
+		const executorReadiness = new ExecutorReadiness();
 		const runtime =
-			options.createRuntime?.(providers, modelRuntime) ??
-			new PiAskChatRuntime({ agentDataDirectory, modelRuntime });
+			options.createRuntime?.(providers, modelRuntime, executorReadiness) ??
+			new PiAgentRuntime({
+				agentDataDirectory,
+				modelRuntime,
+				executorGateway: executorReadiness,
+			});
 		const writeAuthDiagnostic = createProviderAuthDiagnosticLog(
 			join(agentDataDirectory, "diagnostics", "provider-auth.jsonl"),
 		);
@@ -103,7 +117,6 @@ export async function createAgentsServer(
 				console.error(`[provider-auth] ${JSON.stringify(event)}`);
 			},
 		});
-		const executorReadiness = new ExecutorReadiness();
 		const eventRouter = new ProductEventRouter();
 		chatService = new ChatApplicationService({
 			sessions: database.sessions,
@@ -163,6 +176,9 @@ export async function createAgentsServer(
 			limits: {
 				maxFrameBytes: productRpcMaxFrameBytes,
 				maxBufferedOutboundBytes: productRpcMaxBufferedOutboundBytes,
+			},
+			requestTimeoutLimits: {
+				[productRpcMethods.executorToolInvoke]: executorToolRpcTimeoutMs,
 			},
 			onClose(_info, peer) {
 				executorReadiness.clear(peer);

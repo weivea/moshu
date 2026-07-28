@@ -1,9 +1,11 @@
 import {
+	agentsExecutorRequestMethods,
 	companionBootstrapChannel,
 	companionControlVersion,
 	type ExecutorReadyRecord,
 	executorRegisterInputSchema,
 	executorRegisterOutputSchema,
+	executorToolRpcTimeoutMs,
 	productRpcMaxBufferedOutboundBytes,
 	productRpcMaxFrameBytes,
 	productRpcMethods,
@@ -16,6 +18,8 @@ import {
 	type RpcPeer,
 	rpcJsonValueSchema,
 } from "@moshu/process-rpc";
+import { createExecutorToolRequestHandler } from "./tool-handler";
+import { createExecutorToolRuntime, type ExecutorToolRuntime } from "./tools/index";
 
 import {
 	type BootstrapControlChannel,
@@ -54,6 +58,7 @@ export interface RunExecutorProcessOptions {
 	readonly readyWriter?: ExecutorReadyWriter;
 	readonly signalSource?: ExecutorSignalSource;
 	readonly cleanupTimeoutMs?: number;
+	readonly toolRuntime?: ExecutorToolRuntime;
 }
 
 const processSignalSource: ExecutorSignalSource = {
@@ -72,6 +77,9 @@ export async function runExecutorProcess(options: RunExecutorProcessOptions = {}
 	const connectPeer = options.connectPeer ?? connectRpcClient;
 	const readyWriter = options.readyWriter ?? processReadyWriter;
 	const cleanupTimeoutMs = options.cleanupTimeoutMs ?? 250;
+	const toolRequestHandler = options.toolRuntime
+		? createExecutorToolRequestHandler(options.toolRuntime)
+		: undefined;
 	if (!Number.isSafeInteger(cleanupTimeoutMs) || cleanupTimeoutMs <= 0) {
 		throw new TypeError("cleanupTimeoutMs must be a positive safe integer.");
 	}
@@ -115,7 +123,21 @@ export async function runExecutorProcess(options: RunExecutorProcessOptions = {}
 				expectedServerIdentity: bootstrap.agentsServer.identity,
 				signal: lifecycle.signal,
 				getHandshakeHeaders: createRpcBearerHandshakeHeaders(bootstrap.credential),
-				methodAllowlist: { agents: {} },
+				methodAllowlist: options.toolRuntime
+					? { agents: { requests: agentsExecutorRequestMethods } }
+					: { agents: {} },
+				...(toolRequestHandler
+					? {
+							handlers: {
+								requests: {
+									[productRpcMethods.executorToolInvoke]: toolRequestHandler,
+								},
+							},
+							requestTimeoutLimits: {
+								[productRpcMethods.executorToolInvoke]: executorToolRpcTimeoutMs,
+							},
+						}
+					: {}),
 				limits: {
 					maxFrameBytes: productRpcMaxFrameBytes,
 					maxBufferedOutboundBytes: productRpcMaxBufferedOutboundBytes,
@@ -341,7 +363,13 @@ class ExecutorLifecycleStop extends Error {
 }
 
 if (import.meta.main) {
-	await runExecutorProcess().catch((error: unknown) => {
+	const toolRuntime = await createExecutorToolRuntime().catch((error: unknown) => {
+		console.error(
+			error instanceof Error ? error.message : "executor tool runtime initialization failed.",
+		);
+		process.exit(1);
+	});
+	await runExecutorProcess({ toolRuntime }).catch((error: unknown) => {
 		console.error(error instanceof Error ? error.message : "executor bootstrap failed.");
 		process.exit(1);
 	});

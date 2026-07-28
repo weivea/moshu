@@ -50,6 +50,11 @@ import {
 	startProviderAuthInputSchema,
 } from "./provider-auth";
 import { agentsRuntimeInfoSchema, emptyParamsSchema } from "./runtime";
+import {
+	executorToolInvokeInputSchema,
+	executorToolInvokeOutputSchema,
+	executorToolProgressEventSchema,
+} from "./executor-tools";
 
 export const productRpcMethods = {
 	runtimeGet: "moshu.v1.runtime.get",
@@ -79,10 +84,12 @@ export const productRpcMethods = {
 	chatCancel: "moshu.v1.chat.cancel",
 	chatReplay: "moshu.v1.chat.replay",
 	executorRegister: "moshu.v1.executor.register",
+	executorToolInvoke: "moshu.v1.executor.tool.invoke",
 } as const;
 
 export const productRpcEvents = {
 	chatEvent: "moshu.v1.chat.event",
+	executorToolProgress: "moshu.v1.executor.tool.progress",
 } as const;
 
 export const productRpcMaxFrameBytes = 4 * 1024 * 1024;
@@ -286,10 +293,15 @@ export const productRpcRequestSchemas = {
 		input: executorRegisterInputSchema,
 		output: executorRegisterOutputSchema,
 	},
+	[productRpcMethods.executorToolInvoke]: {
+		input: executorToolInvokeInputSchema,
+		output: executorToolInvokeOutputSchema,
+	},
 } as const;
 
 export const productRpcEventSchemas = {
 	[productRpcEvents.chatEvent]: chatEventDeliverySchema,
+	[productRpcEvents.executorToolProgress]: executorToolProgressEventSchema,
 } as const;
 
 export const clientProductRequestMethods = [
@@ -323,6 +335,8 @@ export const clientProductRequestMethods = [
 
 export const executorProductRequestMethods = [productRpcMethods.executorRegister] as const;
 export const agentsProductEventMethods = [productRpcEvents.chatEvent] as const;
+export const agentsExecutorRequestMethods = [productRpcMethods.executorToolInvoke] as const;
+export const executorProductEventMethods = [productRpcEvents.executorToolProgress] as const;
 
 export type SendAskChatMessageInput = z.infer<typeof sendAskChatMessageInputSchema>;
 export type CreateProcessChatSessionInput = z.infer<typeof createProcessChatSessionInputSchema>;

@@ -619,7 +619,7 @@ export class DesktopAgentsClient {
 			schemaVersion: 1,
 			createKey: selectedKey,
 			title: "New chat",
-			defaultMode: "ask",
+			defaultMode: "agent",
 			...(model === undefined ? {} : { model }),
 		});
 		const existing = this.#pendingSessionCreates.get(parsedInput.createKey);

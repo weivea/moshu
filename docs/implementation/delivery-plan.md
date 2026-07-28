@@ -41,7 +41,7 @@ flowchart LR
 - 在 client 保留新的 Agent/Provider/DB 业务实现。
 - 增加 client 直连 executor 的临时通道。
 - 让 executor 写产品 DB/Pi Session JSONL 或自行批准 Action。
-- 用当前 no-tools Ask 测试替代尚未实现的 Tool/MCP/Skill 验收。
+- 用当前可信直连七工具测试替代尚未实现的 Policy/grant/MCP/Skill 验收。
 
 ## 3. A0：RPC / Companion Binary POC
 
@@ -133,6 +133,10 @@ flowchart LR
 ## 6. A3：Tool Bridge / Action Broker
 
 **目标：** 完成 server 决策、executor 执行的可审计副作用闭环。
+
+当前已先交付 executor-only 的 `read`、`bash`、`edit`、`write`、`grep`、`find`、`ls` 和严格 RPC
+gateway，作为开发期可信本机桥接。它没有 Policy、approval、durable intent 或 execution grant，因此不满足
+A3 出口；后续必须把它接入同一强制授权链并移除直接旁路。
 
 ### 6.1 工作包
 

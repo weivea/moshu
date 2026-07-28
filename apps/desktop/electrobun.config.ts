@@ -12,6 +12,16 @@ export const companionSourceWatchPaths = [
 	"../../packages/process-rpc/src",
 ];
 
+export const electrobunWatchIgnorePatterns = [
+	"**/.git/**",
+	"**/node_modules/**",
+	"**/.cache/**",
+	"**/build/**",
+	"**/dist/**",
+	"**/artifacts/**",
+	"**/coverage/**",
+];
+
 export function createElectrobunConfig(
 	environment: NodeJS.ProcessEnv = process.env,
 	platform: NodeJS.Platform = process.platform,
@@ -32,13 +42,18 @@ export function createElectrobunConfig(
 				"dist/mainview/index.html": "views/mainview/index.html",
 				"dist/mainview/assets": "views/mainview/assets",
 				"src/views/canvas/index.html": "views/canvas/index.html",
+				"../../THIRD_PARTY_NOTICES.txt": "licenses/THIRD_PARTY_NOTICES.txt",
+				"../../third_party/licenses": "licenses/third_party",
+				"../executor/node_modules/@silvia-odwyer/photon-node/LICENSE.md":
+					"licenses/third_party/photon-node-LICENSE.md",
 				...createElectrobunCompanionCopyEntries(platform),
 			},
 			// Companion binaries are compiled for the build host, so cross-target packaging is unsupported.
 			targets: "current",
 			useAsar: false,
 			watch: companionSourceWatchPaths,
-			watchIgnore: ["dist/**"],
+			// Root-level copy sources make Electrobun watch the repository root.
+			watchIgnore: electrobunWatchIgnorePatterns,
 			mac: {
 				bundleCEF: false,
 				// Electrobun 1.18.1 always timestamps this path; ad-hoc signing runs pre-archive instead.

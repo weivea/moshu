@@ -150,6 +150,7 @@ describe("process RPC protocol", () => {
 			heartbeatIntervalMs: MAX_RPC_TIMER_MS - 1,
 			heartbeatTimeoutMs: MAX_RPC_TIMER_MS,
 		});
+
 		expect(() =>
 			resolveRpcLimits({
 				maxFrameBytes: MIN_RPC_FRAME_BYTES,
@@ -174,6 +175,48 @@ describe("process RPC protocol", () => {
 		expect(() => resolveRpcLimits({ maxConcurrentEvents: 0 })).toThrow(
 			"maxConcurrentEvents must be a positive safe integer",
 		);
+	});
+
+	test("raises request deadlines only for explicitly configured methods", async () => {
+		const sent: string[] = [];
+		const peer = new RpcPeer({
+			localIdentity: agentsIdentity,
+			remoteIdentity: clientIdentity,
+			protocol: CURRENT_PROCESS_RPC_PROTOCOL,
+			resolvedLimits: resolveRpcLimits({
+				heartbeatIntervalMs: 0,
+				requestTimeoutMs: 1_000,
+				maxRequestTimeoutMs: 5_000,
+			}),
+			requestTimeoutLimits: { "fixture.long": 10_000 },
+			transport: {
+				send: (text) => sent.push(text),
+				close: () => undefined,
+				terminate: () => undefined,
+				isOpen: () => true,
+			},
+		});
+
+		const pending = peer.request("fixture.long", {}, { timeoutMs: 6_000 });
+		expect(() => peer.request("fixture.short", {}, { timeoutMs: 6_000 })).toThrow(
+			"no greater than 5000",
+		);
+		const request = rpcEnvelopeSchema.parse(JSON.parse(sent[0] ?? ""));
+		if (request.type !== "request") {
+			throw new Error("Expected an RPC request envelope.");
+		}
+		peer.handleTextFrame(
+			JSON.stringify({
+				schemaVersion: PROCESS_RPC_SCHEMA_VERSION,
+				protocol: CURRENT_PROCESS_RPC_PROTOCOL,
+				type: "response",
+				requestId: request.requestId,
+				traceId: request.traceId,
+				result: { ok: true, payload: { accepted: true } },
+			}),
+		);
+		await expect(pending).resolves.toEqual({ accepted: true });
+		peer.close();
 	});
 
 	test("fits maximally escaped bounded handshake envelopes within the frame minimum", () => {

@@ -13,9 +13,12 @@ import {
 	chatEventDeliverySchema,
 	chatRunEventSchema,
 	clientProductRequestMethods,
+	executorProductEventMethods,
 	executorProductRequestMethods,
 	executorRegisterOutputSchema,
+	executorToolProgressEventSchema,
 	productRpcInternalHandlerErrorCode,
+	productRpcEvents,
 	productRpcMethods,
 	productRpcRequestSchemas,
 } from "@moshu/contracts";
@@ -154,7 +157,10 @@ function createRouteBinding(peer: RpcPeer): ProductEventRouteBinding {
 
 export const agentsServerMethodAllowlist: RpcMethodAllowlist = {
 	client: { requests: clientProductRequestMethods },
-	executor: { requests: executorProductRequestMethods },
+	executor: {
+		requests: executorProductRequestMethods,
+		events: executorProductEventMethods,
+	},
 };
 
 export function createProductRpcHandlers(dependencies: ProductRpcDependencies): RpcHandlers {
@@ -299,6 +305,23 @@ export function createProductRpcHandlers(dependencies: ProductRpcDependencies): 
 					return executorRegisterOutputSchema.parse({ schemaVersion: 1, accepted: true });
 				},
 			),
+		},
+		events: {
+			[productRpcEvents.executorToolProgress]: (payload, context) => {
+				let event: z.infer<typeof executorToolProgressEventSchema>;
+				try {
+					event = executorToolProgressEventSchema.parse(payload);
+				} catch (error) {
+					if (error instanceof ZodError) {
+						throw new RpcHandlerError(
+							"INVALID_EXECUTOR_TOOL_PROGRESS",
+							"The executor tool progress payload is invalid.",
+						);
+					}
+					throw error;
+				}
+				executorReadiness.handleProgress(context.peer, event);
+			},
 		},
 	};
 }

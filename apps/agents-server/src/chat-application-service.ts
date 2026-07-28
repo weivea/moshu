@@ -473,7 +473,7 @@ export class ChatApplicationService {
 		this.#assertDataPlaneAvailable();
 		return this.#sessions.create({
 			title: "New chat",
-			defaultMode: "ask",
+			defaultMode: "agent",
 		});
 	}
 
@@ -669,7 +669,7 @@ export class ChatApplicationService {
 			const created = this.#runs.create({
 				clientRequestId,
 				sessionId: input.sessionId,
-				mode: "ask",
+				mode: "agent",
 				provider: {
 					schemaVersion: 1,
 					providerId: provider.providerId,

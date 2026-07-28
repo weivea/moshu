@@ -6,13 +6,20 @@ import {
 	type AskChatRunStream,
 	type AskChatRuntime,
 	AskChatRuntimeError,
+	type ExecutorToolGateway,
 } from "@moshu/agent-runtime";
+import type { ExecutorToolCall, ExecutorToolInvokeOutput } from "@moshu/contracts";
 
 import { runAgentsServerProcess } from "./index";
 
-class SmokeAskChatRuntime implements AskChatRuntime {
+class SmokeAgentRuntime implements AskChatRuntime {
 	readonly #messages = new Map<string, AskChatMessage[]>();
 	readonly #pending = new Map<string, (error: AskChatCancelledError) => void>();
+
+	constructor(
+		private readonly executorGateway: ExecutorToolGateway,
+		private readonly executorCwd: string,
+	) {}
 
 	async run(input: AskChatRunInput): Promise<AskChatRunResult> {
 		const threadId = input.threadId ?? input.runId;
@@ -35,16 +42,79 @@ class SmokeAskChatRuntime implements AskChatRuntime {
 			});
 		}
 
-		for (const delta of ["hello", " world"]) {
+		const text =
+			userMessage.content === "tool-smoke"
+				? await this.#runExecutorToolSmoke(input.runId)
+				: "hello world";
+		for (const delta of text === "hello world" ? ["hello", " world"] : [text]) {
 			await input.onEvent?.({ type: "message.delta", runId: input.runId, delta });
 		}
-		const text = "hello world";
 		this.#messages.set(threadId, [
 			...(this.#messages.get(threadId) ?? []),
 			{ ...userMessage },
 			{ role: "assistant", content: text },
 		]);
 		return { runId: input.runId, text };
+	}
+
+	async #runExecutorToolSmoke(runId: string): Promise<string> {
+		let sequence = 0;
+		const invoke = (call: ExecutorToolCall): Promise<ExecutorToolInvokeOutput> => {
+			sequence += 1;
+			return this.executorGateway.invoke({
+				schemaVersion: 1,
+				invocationId: crypto.randomUUID(),
+				runId,
+				toolCallId: `three-process-tool-${sequence}`,
+				cwd: this.executorCwd,
+				call,
+			});
+		};
+		const write = await invoke({
+			tool: "write",
+			arguments: { path: "notes.txt", content: "alpha from executor\n" },
+		});
+		const read = await invoke({ tool: "read", arguments: { path: "notes.txt" } });
+		const grep = await invoke({
+			tool: "grep",
+			arguments: { pattern: "alpha from executor", path: ".", literal: true },
+		});
+		const find = await invoke({ tool: "find", arguments: { pattern: "notes.txt" } });
+		const ls = await invoke({ tool: "ls", arguments: { path: "." } });
+		const environmentCommand =
+			process.platform === "win32"
+				? "echo %MOSHU_EXECUTOR_SMOKE_VALUE%"
+				: 'printf "%s" "$MOSHU_EXECUTOR_SMOKE_VALUE"';
+		const bash = await invoke({
+			tool: "bash",
+			arguments: { command: environmentCommand },
+		});
+		const edit = await invoke({
+			tool: "edit",
+			arguments: {
+				path: "notes.txt",
+				edits: [{ oldText: "alpha from executor", newText: "beta from executor" }],
+			},
+		});
+		const image = await invoke({
+			tool: "read",
+			arguments: { path: "pixel.png" },
+		});
+
+		if (
+			write.tool !== "write" ||
+			!toolText(read).includes("alpha from executor") ||
+			!toolText(grep).includes("notes.txt") ||
+			!toolText(find).includes("notes.txt") ||
+			!toolText(ls).includes("notes.txt") ||
+			!toolText(bash).includes("inherited-by-executor") ||
+			!toolText(edit).includes("beta from executor") ||
+			image.tool !== "read" ||
+			!image.content.some((block) => block.type === "image")
+		) {
+			throw new Error("Three-process executor tool smoke returned unexpected output.");
+		}
+		return "executor tools ok";
 	}
 
 	stream(_input: AskChatRunInput): AskChatRunStream {
@@ -78,8 +148,13 @@ class SmokeAskChatRuntime implements AskChatRuntime {
 }
 
 if (import.meta.main) {
+	const executorCwd = process.env.MOSHU_EXECUTOR_SMOKE_CWD;
+	if (executorCwd === undefined) {
+		throw new Error("MOSHU_EXECUTOR_SMOKE_CWD is required by the smoke Agent runtime.");
+	}
 	await runAgentsServerProcess({
-		createRuntime: () => new SmokeAskChatRuntime(),
+		createRuntime: (_providers, _modelRuntime, executorGateway) =>
+			new SmokeAgentRuntime(executorGateway, executorCwd),
 		fetchProviderModels: async () => [
 			{
 				id: "smoke-model",
@@ -97,4 +172,8 @@ if (import.meta.main) {
 		console.error(error instanceof Error ? error.message : "smoke agents-server failed.");
 		process.exit(1);
 	});
+}
+
+function toolText(output: ExecutorToolInvokeOutput): string {
+	return output.content.flatMap((block) => (block.type === "text" ? [block.text] : [])).join("\n");
 }

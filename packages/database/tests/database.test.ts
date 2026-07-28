@@ -237,6 +237,7 @@ describe("application database", () => {
 			try {
 				const first = database.sessions.create({ title: "Alpha notes" }).session;
 				const second = database.sessions.create({ title: "Beta notes" }).session;
+				expect(first.defaultMode).toBe("agent");
 				expect(
 					database.sessions.update({ sessionId: first.id, title: "Alpha architecture" }).session
 						.title,

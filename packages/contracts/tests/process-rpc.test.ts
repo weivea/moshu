@@ -1,10 +1,15 @@
 import { describe, expect, test } from "bun:test";
 
 import {
+	agentsExecutorRequestMethods,
 	agentsServerBootstrapRecordSchema,
 	clientProductRequestMethods,
 	createProcessChatSessionInputSchema,
+	executorProductEventMethods,
 	executorProductRequestMethods,
+	executorToolInvokeInputSchema,
+	executorToolInvokeOutputSchema,
+	executorToolProgressEventSchema,
 	maxRetainedSessionRetirements,
 	productRpcInternalHandlerErrorCode,
 	productRpcMethods,
@@ -22,8 +27,58 @@ describe("product process RPC contracts", () => {
 		expect(clientProductRequestMethods).toContain(productRpcMethods.providerAuthRespond);
 		expect(clientProductRequestMethods).not.toContain(productRpcMethods.executorRegister);
 		expect(executorProductRequestMethods).toEqual([productRpcMethods.executorRegister]);
+		expect(agentsExecutorRequestMethods).toEqual([productRpcMethods.executorToolInvoke]);
+		expect(executorProductEventMethods).toHaveLength(1);
 		expect(productRpcInternalHandlerErrorCode).toBe("INTERNAL_HANDLER_ERROR");
 		expect(maxRetainedSessionRetirements).toBe(256);
+	});
+
+	test("strictly discriminates executor tool calls, results, and progress", () => {
+		const invocationId = crypto.randomUUID();
+		const runId = "018f0f2c-7b19-7abc-8def-1234567890ab";
+		const request = {
+			schemaVersion: 1 as const,
+			invocationId,
+			runId,
+			toolCallId: "tool-call-1",
+			cwd: "/tmp/workspace",
+			call: {
+				tool: "read" as const,
+				arguments: { path: "README.md", offset: 1, limit: 20 },
+			},
+		};
+		expect(executorToolInvokeInputSchema.parse(request)).toEqual(request);
+		expect(() =>
+			executorToolInvokeInputSchema.parse({
+				...request,
+				call: { tool: "read", arguments: { path: "README.md", command: "pwd" } },
+			}),
+		).toThrow();
+
+		const output = {
+			schemaVersion: 1 as const,
+			invocationId,
+			tool: "read" as const,
+			content: [{ type: "text" as const, text: "hello" }],
+		};
+		expect(executorToolInvokeOutputSchema.parse(output)).toEqual(output);
+		expect(() =>
+			executorToolInvokeOutputSchema.parse({
+				...output,
+				tool: "write",
+				details: { truncation: {} },
+			}),
+		).toThrow();
+
+		const progress = {
+			schemaVersion: 1 as const,
+			invocationId,
+			tool: "bash" as const,
+			sequence: 0,
+			content: [],
+		};
+		expect(executorToolProgressEventSchema.parse(progress)).toEqual(progress);
+		expect(() => executorToolProgressEventSchema.parse({ ...progress, tool: "read" })).toThrow();
 	});
 
 	test("accepts only the current Ask send projection", () => {
