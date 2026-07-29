@@ -1,33 +1,61 @@
 # 墨枢
 
-墨枢是一款 Local-first 桌面 Agent 应用，当前三应用角色基础架构已经落地，尚未面向外部分发。
+墨枢是一款 Local-first 桌面 Agent 应用。当前仓库处于首次外部分发前的 POC 阶段，三应用角色架构和 Local/Remote Runtime Box 平台已经落地。
 
-当前仓库已经实现：
+## 当前能力
 
-- Electrobun client 启动并监管两个 Bun compiled companion。
-- agents server 独立承载 Provider、基于公开 Pi 0.82.1 API 的 Ask runtime、产品数据库和 Agent Session。
-- executor 完成独立进程、认证注册和生命周期基线；Tool、MCP 和 Skill 执行能力仍在后续阶段。
-- client、agents server 和 executor 通过动态 loopback endpoint 上的版本化 JSON RPC 通信。
+- **Desktop Client**：Electrobun + React 桌面界面，负责窗口、设置、Runtime Box 切换和本地 companion 监管。
+- **Agent Server**：独占 Provider、Agent runtime、Session、Project、Run/event、Policy/Action、产品数据库和 Pi Session JSONL。
+- **Runtime Box**：在本机或远程设备执行 `read`、`bash`、`edit`、`write`、`grep`、`find`、`ls`，并拥有自己的 MCP、Skills、credential、journal 和 workspace。
+- **Remote Runtime Box**：通过 Agent Server 管理的 Anonymous Microsoft Dev Tunnel 主动连接，使用一次性配对码、Ed25519 双向身份、generation fence 和版本协商。
+- **多 Box 路由**：切换 Runtime Box 后，界面切换到该 Box 对应的 Session、Project、MCP 和 Skills；既有 Session/Run 永远按持久归属路由，不随全局选择迁移。
+- **MCP 与 Skills**：支持 MCP stdio、Streamable HTTP、兼容 SSE、Box 私有 SecretStore、immutable Skills、Runtime Profile 和 inventory full/delta reconciliation。
+- **恢复与发布门**：durable Action intent、单次 grant、fsync journal、未知结果对账、进程树清理、协议升级状态、脱敏诊断、流量估算及签名 package/update gate。
+
+## 架构
 
 ```text
 React WebView
-    <-> typed Electrobun RPC
-Electrobun Application Host
-    <-> authenticated WebSocket JSON RPC
-agents server
-    <-> authenticated WebSocket JSON RPC
-executor
+  <-> typed Electrobun RPC
+Electrobun Client
+  <-> authenticated WebSocket JSON RPC
+Agent Server
+  <-> authenticated Runtime RPC
+Local Runtime Box
+
+Remote Runtime Box
+  -> HTTPS / WebSocket
+  -> Anonymous Dev Tunnel
+  -> Agent Server Runtime ingress
 ```
 
-这里的“三角色”描述应用职责和可执行程序。Electrobun 还会创建 launcher、application worker、WebView
-等框架进程，因此操作系统中不一定刚好只有三个 PID。
+“三角色”描述应用职责，不表示操作系统中永远只有三个 PID。Electrobun 仍会创建 launcher、application worker 和 WebView 等框架进程。
+
+数据所有权：
+
+| 领域 | 所有者 |
+| --- | --- |
+| Provider、Agent、Session、Project、Run/event、Policy/Action | Agent Server |
+| MCP config/credential/lifecycle、Skills、Tool 执行、workspace | owning Runtime Box |
+| UI、窗口、Updater、本地 companion supervisor | Desktop Client |
+
+Remote Tunnel 只公开 Runtime ingress，不公开 Product RPC、Provider 或数据库接口。
+
+## POC 安全边界
+
+当前版本中，完成设备认证并绑定的 Remote Runtime Box 完全信任其 Agent Server，包括执行 `bash`。用户级命令审批和 shell sandbox 后置；现有 grant 用于 durable dispatch、单次消费、generation fencing 和恢复，而不是交互审批。
+
+Remote path tools 仍执行 canonical workspace containment；Remote `bash` 按当前信任决策不受该限制。
 
 ## 环境
 
+仓库开发环境：
+
 - macOS 14+
-- Bun 1.3.14（仓库固定版本）
+- Bun 1.3.14
 - Electrobun 1.18.1
-- Electrobun 内置 application runtime：Bun 1.3.13
+
+Remote Runtime Box 二进制可在 macOS、Linux 和 Windows 对应主机上构建；当前不支持交叉平台编译。终端用户运行 compiled binary 时不需要安装 Bun 或 Node。
 
 安装依赖：
 
@@ -35,29 +63,30 @@ executor
 bun install --frozen-lockfile
 ```
 
-Remote Runtime Box 的安装、配对和后台服务操作见[连接 Remote Runtime Box](./docs/guides/remote-runtime-box.md)。
+## 快速开始
 
-## 开发
-
-推荐使用带 WebView 热更新的开发入口：
+推荐使用带 React WebView 热更新的开发入口：
 
 ```bash
 bun run dev:hmr
 ```
 
-该命令会：
+该命令会并行启动 Vite HMR 和 Electrobun 开发流程。Desktop 会编译并监管：
 
-1. 并行启动 Vite HMR server 和 desktop 开发流程。
-2. 构建一次 React WebView，作为 Vite 不可用时的回退资源。
-3. Electrobun `preBuild` 依次将 agents server 和 executor 编译成独立可执行文件。
-4. `electrobun dev --watch` 构建并启动 desktop，由 supervisor 启动两个 companion 并等待认证注册和 readiness。
+```text
+apps/agents-server/dist/moshu-agents-server
+apps/runtime-box/dist/moshu-runtime-box
+```
 
-React WebView 使用 Vite HMR，通常不重开窗口。agents server 和 executor 使用完整自动重载：修改它们或当前引用的
-共享包源码后，Electrobun 会进行 300ms 防抖、停止当前应用、重新编译两个 companion，再构建并启动 desktop。
-该过程会重开桌面窗口，不保留 WebView 内存状态；产品数据库和 Pi SessionManager JSONL 不受影响。构建失败时应用保持停止，
-修复源码并再次保存后会重新尝试。
+不需要 Vite HMR 时运行：
 
-当前 companion 自动重载覆盖：
+```bash
+bun run dev
+```
+
+修改 Agent Server、Runtime Box 或其共享包后，Electrobun watch 会停止当前应用、重新编译 companion 并重启 Desktop；产品 DB 和 Pi Session JSONL 保持持久。
+
+自动重载覆盖：
 
 ```text
 apps/agents-server/src/
@@ -68,41 +97,72 @@ packages/database/src/
 packages/process-rpc/src/
 ```
 
-修改 desktop Application Host 时同样由 Electrobun watch 重建并重启应用。
+## 连接 Remote Runtime Box
 
-不需要 Vite HMR 时可以运行：
+完整操作手册见[连接 Remote Runtime Box](./docs/guides/remote-runtime-box.md)，包括：
+
+1. Microsoft Dev Tunnels 登录和 Remote Access 启用；
+2. 一次性配对码和设备指纹确认；
+3. macOS、Linux、Windows 用户服务安装；
+4. Runtime Box 切换、状态验证、排障、卸载和解除绑定。
+
+POC 源码构建：
 
 ```bash
-bun run dev
+bun run --cwd apps/runtime-box build:binary
 ```
 
-此模式使用预构建的 WebView 资源并启动 Electrobun watch。
-它不提供 React HMR，但 companion 和 Application Host 的完整自动重载仍然有效。
+然后在远程设备上使用匹配平台的 `moshu-runtime-box` 或 `moshu-runtime-box.exe`。
+
+## 目录
+
+```text
+apps/
+  desktop/          Electrobun Client 与 React WebView
+  agents-server/    Agent Server、Product RPC、Runtime ingress、Dev Tunnel
+  runtime-box/      Local/Remote Runtime Box、Tools、MCP、Skills、用户服务
+
+packages/
+  contracts/        跨角色 Zod contract 与 RPC allowlist
+  process-rpc/      认证 WebSocket JSON RPC
+  database/         Agent Server 产品数据库 repository
+  agent-runtime/    Pi Agent runtime 与 Tool/MCP proxy
+  action-broker/    Action/grant contract
+```
 
 ## 构建与打包
 
 | 命令 | 作用 |
 | --- | --- |
-| `bun run build:companions` | 依次编译 agents server 和 executor standalone binary |
+| `bun run build:companions` | 编译 Agent Server 和 Runtime Box standalone binary |
 | `bun run build:web` | 使用 Vite 构建 React WebView |
-| `bun run build` | 构建两个 companion 和 WebView；不生成桌面安装包 |
-| `bun run package:canary` | 重建全部输入并执行 `electrobun build --env=canary` |
+| `bun run build` | 构建两个 companion 和 WebView，不生成桌面安装包 |
+| `bun run package:canary` | 为当前主机生成并验证 ad-hoc canary package |
+| `bun run package:release` | 执行 stable package gate，需要正式标识、更新签名和平台签名凭据 |
 
-主要中间产物：
+主要产物：
 
 ```text
-apps/agents-server/dist/moshu-agents-server
-apps/runtime-box/dist/moshu-runtime-box
+apps/agents-server/dist/
+apps/runtime-box/dist/
 apps/desktop/dist/mainview/
 apps/desktop/build/
 apps/desktop/artifacts/
 ```
 
-开发运行时，desktop 直接使用 workspace 中的 companion binary。打包时，Electrobun 将它们复制到应用的
-`Resources/app/companions` 目录，并检查执行权限、签名、entitlement 和实际启动能力。
+Desktop package 将两个 companion 复制到 `Resources/app/companions`，并验证：
 
-Companion binary 按当前构建主机编译，因此暂不支持交叉平台打包。当前 canary 配置也仍使用开发 Bundle ID、
-关闭 notarization 和增量 patch，不能视为正式发布配置。
+- 同一 release version 和 protocol matrix；
+- companion SHA-256 manifest；
+- 可执行权限和平台签名；
+- 无系统 Bun/Node 时的实际启动与协作关闭。
+
+Canary 使用开发 Bundle ID 和 ad-hoc 签名，不能视为正式发布。Stable release 还要求：
+
+- macOS Developer ID、notarization、staple 和 Gatekeeper；
+- Windows Authenticode SHA-256、RFC 3161 timestamp 和已签名 `Setup.exe`；
+- Ed25519 签名的整体 update artifact manifest；
+- 对应平台 runner 和外部发布凭据。
 
 ## 质量检查
 
@@ -111,34 +171,56 @@ Companion binary 按当前构建主机编译，因此暂不支持交叉平台打
 | `bun run format` | 使用 Biome 写入格式化结果 |
 | `bun run lint` | 运行 Biome lint |
 | `bun run typecheck` | 检查所有 `@moshu/*` workspace |
-| `bun run test:packages` | 运行 `packages/*` 测试 |
-| `bun run test:companions` | 运行 agents server 和 executor 测试 |
-| `bun run test:web` | 运行 desktop Bun/Vitest 测试 |
-| `bun run test` | 运行上述全部测试 |
-| `bun run check` | 运行格式检查、lint、类型检查和测试 |
+| `bun run test:packages` | 运行共享 package 测试 |
+| `bun run test:companions` | 运行 Agent Server 和 Runtime Box 测试 |
+| `bun run test:tooling` | 运行构建与发布脚本测试 |
+| `bun run test:web` | 运行 Desktop Bun/Vitest 测试 |
+| `bun run test` | 运行全部测试 |
+| `bun run check` | 运行格式检查、lint、类型检查和全部测试 |
 | `bun run smoke:companions` | 验证两个 compiled companion 可启动并正常退出 |
-| `bun run smoke:three-process` | 验证三角色认证、Chat、恢复、取消和数据所有权 |
-| `bun run smoke:parent-death` | 验证 desktop parent 异常退出后 companion 不残留 |
+| `bun run smoke:three-process` | 验证三角色认证、Chat、Tool、恢复、取消和所有权 |
+| `bun run smoke:parent-death` | 验证 Desktop parent 异常退出后 companion 不残留 |
+| `bun run smoke:runtime-box-single` | 验证 Remote Runtime Box 单二进制和内嵌资源 |
+| `bun run smoke:live-tunnel` | 对真实 Dev Tunnel 执行 opt-in ingress 隔离探针 |
 
-`bun run check` 不包含 smoke test 或桌面打包；发布流水线需要单独执行相应命令。
+真实 Tunnel 探针需要显式提供 URL：
+
+```bash
+MOSHU_LIVE_RUNTIME_BASE_URL='https://example.devtunnels.ms' \
+  bun run smoke:live-tunnel
+```
+
+`bun run check` 不包含 compiled smoke、真实 Tunnel 或桌面打包；发布流水线必须单独执行对应门。
 
 ## Agent runtime
 
-Ask 使用固定版本 `@earendil-works/pi-ai`、`pi-agent-core` 和 `pi-coding-agent` 的公开 API。
-agents server 通过 `ModelRuntime` 动态枚举内置 Provider，并支持四类公开 API 的自定义 Provider。
-凭据由 app-owned `SecretVaultCredentialStore` 保存；交互式登录使用异步 auth attempt，secret 回答只作为输入传递。
+墨枢固定使用 `@earendil-works/pi-ai`、`pi-agent-core` 和 `pi-coding-agent` 0.82.1 的公开 API。
 
-每个 Chat Session 映射到显式 `agentDataDirectory/sessions` 下的 Pi `SessionManager` JSONL。产品数据库只保存
-Session/Run/event UI 投影和通用 agent-session cleanup outbox。当前 Ask 创建 headless、`noTools: "all"` 的
-`AgentSession`；Tool、MCP、Skill 和 subagent 尚未实现，后续只能通过墨枢自有 Policy、grant 和 executor 边界接入。
+- `ModelRuntime` 动态枚举 builtin Provider，并支持批准的 custom API family。
+- Provider credential 只保存在 Agent Server `SecretVaultCredentialStore`。
+- 每个 Chat Session 映射到 `agentDataDirectory/sessions` 下的 Pi `SessionManager` JSONL。
+- Pi builtin tools、extensions 和动态资源被禁用；七个 Tool 和 live MCP tools 只能经 Moshu Runtime Box gateway、Policy/grant 和 journal 执行。
+- Skill prompt 经过 owner/version/hash live validation 后只加载到 Agent 内存，不写入 Product DB、事件或 Pi Session JSONL。
+
+## 当前未实现
+
+- 用户级命令审批与 shell sandbox；
+- 独立 Git Tool、Diff journal 和 revert；
+- Plan、自定义 Agent、subagent、任务中心和桌面通知；
+- MCP OAuth 2.1 浏览器授权/DCR、Git URL Skill 更新和完整包导入；
+- Mobile Client、团队共享、Docker/cloud、多租户和云端 Agent Server；
+- 正式外部分发所需的真实 Tunnel、三平台签名 runner 和 macOS Keychain release gate。
+
+当前仍处于首次外部分发前，不兼容的旧开发数据可以明确 reset；首次发布冻结 schema 后必须使用正式 migration/rollback gate。
 
 ## 文档
 
+- [实施进度](./docs/implementation/progress.md)
 - [技术架构](./docs/implementation/architecture.md)
+- [Runtime Box 技术与实施方案](./docs/implementation/runtime-box.md)
+- [Remote Runtime Box 使用文档](./docs/guides/remote-runtime-box.md)
 - [数据与接口契约](./docs/implementation/data-contracts.md)
-- [工程交付计划](./docs/implementation/delivery-plan.md)
 - [质量与发布计划](./docs/implementation/quality-release.md)
 - [产品需求](./docs/product/README.md)
 
-“墨枢”为正式产品名称，项目采用 [MIT License](./LICENSE)。当前 Bundle ID `dev.moshu.app` 仅用于开发，
-正式发布前必须替换为发布方的永久标识。
+“墨枢”为正式产品名称，项目采用 [MIT License](./LICENSE)。当前 Bundle ID `dev.moshu.app` 仅用于开发，正式发布前必须替换为发布方的永久标识。
