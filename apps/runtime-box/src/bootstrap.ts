@@ -1,10 +1,10 @@
 import {
 	companionBootstrapChannel,
 	companionControlVersion,
-	type ExecutorBootstrapRecord,
-	type ExecutorReadyRecord,
-	executorBootstrapRecordSchema,
-	executorReadyRecordSchema,
+	type RuntimeBoxBootstrapRecord,
+	type RuntimeBoxReadyRecord,
+	runtimeBoxBootstrapRecordSchema,
+	runtimeBoxReadyRecordSchema,
 	maxCompanionControlRecordBytes,
 	parseCompanionControlRecord,
 	serializeCompanionControlRecord,
@@ -13,7 +13,7 @@ import {
 export const BOOTSTRAP_CHANNEL = companionBootstrapChannel;
 export const BOOTSTRAP_CONTROL_VERSION = companionControlVersion;
 export const MAX_CONTROL_RECORD_BYTES = maxCompanionControlRecordBytes;
-export type { ExecutorBootstrapRecord, ExecutorReadyRecord };
+export type { RuntimeBoxBootstrapRecord, RuntimeBoxReadyRecord };
 
 export interface BootstrapControlChannel {
 	input: string;
@@ -34,12 +34,12 @@ export async function openBootstrapControlChannel(
 	const reader = stream.getReader();
 	const bytes: number[] = [];
 	const onAbort = (): void => {
-		void reader.cancel("Executor bootstrap was cancelled.").catch(() => undefined);
+		void reader.cancel("Runtime Box bootstrap was cancelled.").catch(() => undefined);
 	};
 	signal?.addEventListener("abort", onAbort, { once: true });
 	try {
 		if (isSignalAborted(signal)) {
-			await reader.cancel("Executor bootstrap was cancelled.").catch(() => undefined);
+			await reader.cancel("Runtime Box bootstrap was cancelled.").catch(() => undefined);
 			throw getBootstrapAbortError(signal?.reason);
 		}
 		while (true) {
@@ -84,20 +84,20 @@ export async function openBootstrapControlChannel(
 }
 
 function getBootstrapAbortError(reason: unknown): Error {
-	return reason instanceof Error ? reason : new Error("Executor bootstrap was cancelled.");
+	return reason instanceof Error ? reason : new Error("Runtime Box bootstrap was cancelled.");
 }
 
 function isSignalAborted(signal: AbortSignal | undefined): boolean {
 	return signal?.aborted === true;
 }
 
-export function parseExecutorBootstrapRecord(input: string): ExecutorBootstrapRecord {
-	return parseCompanionControlRecord(input, executorBootstrapRecordSchema, "bootstrap");
+export function parseRuntimeBoxBootstrapRecord(input: string): RuntimeBoxBootstrapRecord {
+	return parseCompanionControlRecord(input, runtimeBoxBootstrapRecordSchema, "bootstrap");
 }
 
-export function serializeReadyRecord(record: ExecutorReadyRecord): string {
+export function serializeReadyRecord(record: RuntimeBoxReadyRecord): string {
 	return new TextDecoder().decode(
-		serializeCompanionControlRecord(record, executorReadyRecordSchema),
+		serializeCompanionControlRecord(record, runtimeBoxReadyRecordSchema),
 	);
 }
 
@@ -134,7 +134,7 @@ function createParentClosureMonitor(reader: ByteStreamReader): {
 			}
 			cancelled = true;
 			cancelPromise = reader
-				.cancel("Executor bootstrap monitor cancelled.")
+				.cancel("RuntimeBox bootstrap monitor cancelled.")
 				.catch(() => undefined)
 				.then(() => closed);
 			return cancelPromise;

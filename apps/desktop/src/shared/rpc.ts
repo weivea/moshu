@@ -5,6 +5,10 @@ import {
 	type ChatSendAcceptedOutput,
 	type CreateChatSessionOutput,
 	type CreateProviderInput,
+	type CreateProjectInput,
+	type CreateProjectOutput,
+	type DeleteProjectInput,
+	type DeleteProjectOutput,
 	type DeleteChatSessionInput,
 	type DeleteChatSessionOutput,
 	type DeleteProviderInput,
@@ -15,10 +19,26 @@ import {
 	type GetChatSessionInput,
 	type GetChatSessionSnapshotOutput,
 	type GetDefaultModelOutput,
+	type GetProjectInput,
+	type GetProjectOutput,
 	type ListAvailableModelsOutput,
 	type ListChatSessionsInput,
 	type ListChatSessionsOutput,
 	type ListProvidersOutput,
+	type ListProjectsInput,
+	type ListProjectsOutput,
+	type ListRuntimeBoxPairingClaimsOutput,
+	type ListRuntimeBoxesOutput,
+	type CreateRuntimeBoxPairingOutput,
+	type ApproveRuntimeBoxPairingInput,
+	type ApproveRuntimeBoxPairingOutput,
+	type RejectRuntimeBoxPairingInput,
+	type RejectRuntimeBoxPairingOutput,
+	type RevokeRuntimeBoxDeviceInput,
+	type RevokeRuntimeBoxDeviceOutput,
+	type RemoteAccessAuthAttempt,
+	type RemoteAccessMutationOutput,
+	type RemoteAccessStatusOutput,
 	type ProviderMutationOutput,
 	type ProviderAuthAttemptOutput,
 	type RespondProviderAuthInput,
@@ -33,11 +53,17 @@ import {
 	type SetDefaultModelOutput,
 	type SetProviderModelsEnabledInput,
 	type SetProviderModelsEnabledOutput,
+	type SetProjectArchivedInput,
+	type SetProjectArchivedOutput,
 	type TestProviderInput,
 	type TestProviderOutput,
+	type SwitchRuntimeBoxInput,
+	type SwitchRuntimeBoxOutput,
 	type UpdateChatSessionInput,
 	type UpdateChatSessionOutput,
 	type UpdateProviderInput,
+	type UpdateProjectInput,
+	type UpdateProjectOutput,
 	uuidV7Schema,
 } from "@moshu/contracts";
 import type { RPCSchema } from "electrobun/bun";
@@ -90,6 +116,82 @@ export type DesktopRpc = {
 			getRuntimeInfo: {
 				params: EmptyParams;
 				response: RuntimeInfo;
+			};
+			listRuntimeBoxes: {
+				params: EmptyParams;
+				response: ListRuntimeBoxesOutput;
+			};
+			switchRuntimeBox: {
+				params: SwitchRuntimeBoxInput;
+				response: SwitchRuntimeBoxOutput;
+			};
+			createRuntimeBoxPairing: {
+				params: EmptyParams;
+				response: CreateRuntimeBoxPairingOutput;
+			};
+			listRuntimeBoxPairingClaims: {
+				params: EmptyParams;
+				response: ListRuntimeBoxPairingClaimsOutput;
+			};
+			approveRuntimeBoxPairing: {
+				params: ApproveRuntimeBoxPairingInput;
+				response: ApproveRuntimeBoxPairingOutput;
+			};
+			rejectRuntimeBoxPairing: {
+				params: RejectRuntimeBoxPairingInput;
+				response: RejectRuntimeBoxPairingOutput;
+			};
+			revokeRuntimeBoxDevice: {
+				params: RevokeRuntimeBoxDeviceInput;
+				response: RevokeRuntimeBoxDeviceOutput;
+			};
+			getRemoteAccessStatus: {
+				params: EmptyParams;
+				response: RemoteAccessStatusOutput;
+			};
+			startRemoteAccessAuthentication: {
+				params: EmptyParams;
+				response: RemoteAccessAuthAttempt;
+			};
+			getRemoteAccessAuthentication: {
+				params: { attemptId: string };
+				response: RemoteAccessAuthAttempt;
+			};
+			enableRemoteAccess: {
+				params: EmptyParams;
+				response: RemoteAccessMutationOutput;
+			};
+			disableRemoteAccess: {
+				params: EmptyParams;
+				response: RemoteAccessMutationOutput;
+			};
+			recreateRemoteAccess: {
+				params: EmptyParams;
+				response: RemoteAccessMutationOutput;
+			};
+			createProject: {
+				params: CreateProjectInput;
+				response: CreateProjectOutput;
+			};
+			listProjects: {
+				params: ListProjectsInput;
+				response: ListProjectsOutput;
+			};
+			getProject: {
+				params: GetProjectInput;
+				response: GetProjectOutput;
+			};
+			updateProject: {
+				params: UpdateProjectInput;
+				response: UpdateProjectOutput;
+			};
+			setProjectArchived: {
+				params: SetProjectArchivedInput;
+				response: SetProjectArchivedOutput;
+			};
+			deleteProject: {
+				params: DeleteProjectInput;
+				response: DeleteProjectOutput;
 			};
 			listProviders: {
 				params: EmptyParams;
@@ -204,6 +306,7 @@ export type DesktopRpc = {
 			agentsReady: EmptyParams;
 			chatEvent: ChatRunEvent;
 			chatSessionInvalidated: ChatSessionInvalidation;
+			runtimeBoxesChanged: ListRuntimeBoxesOutput;
 		};
 	}>;
 };

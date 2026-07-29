@@ -4,7 +4,6 @@ import { join, resolve } from "node:path";
 import {
 	COMPANION_EXECUTABLE_ROLES,
 	getCompanionExecutableFilename,
-	getExecutorToolExecutableFilenames,
 	resolveCurrentHostCompanionPlatform,
 } from "../src/shared/companion-executable-names";
 import {
@@ -25,9 +24,7 @@ const companionEntitlementsPath = resolve(import.meta.dir, "..", "companion-enti
 const executables = COMPANION_EXECUTABLE_ROLES.map((role) =>
 	join(companionDirectory, getCompanionExecutableFilename(role, targetPlatform)),
 );
-const toolExecutables = getExecutorToolExecutableFilenames(targetPlatform).map((filename) =>
-	join(companionDirectory, filename),
-);
+const toolExecutables: string[] = [];
 
 for (const executable of [...executables, ...toolExecutables]) {
 	if (targetPlatform !== "win32") {
@@ -106,7 +103,7 @@ function signMacExecutable(executable: string, identity: string, entitlementsPat
 function signMacToolExecutable(executable: string, identity: string): void {
 	runCommand(
 		createBundledToolCodesignCommand(executable, identity),
-		`Failed to sign bundled executor tool ${executable}`,
+		`Failed to sign bundled Runtime Box tool ${executable}`,
 	);
 }
 

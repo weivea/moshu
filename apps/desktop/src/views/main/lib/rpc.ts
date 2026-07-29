@@ -16,6 +16,41 @@ import {
 	getChatSessionInputSchema,
 	getChatSessionSnapshotOutputSchema,
 	getDefaultModelOutputSchema,
+	type ApproveRuntimeBoxPairingInput,
+	approveRuntimeBoxPairingInputSchema,
+	approveRuntimeBoxPairingOutputSchema,
+	createRuntimeBoxPairingOutputSchema,
+	listRuntimeBoxPairingClaimsOutputSchema,
+	listRuntimeBoxesOutputSchema,
+	type RejectRuntimeBoxPairingInput,
+	rejectRuntimeBoxPairingInputSchema,
+	rejectRuntimeBoxPairingOutputSchema,
+	remoteAccessAuthAttemptInputSchema,
+	remoteAccessAuthAttemptSchema,
+	remoteAccessMutationOutputSchema,
+	remoteAccessStatusOutputSchema,
+	type CreateProjectInput,
+	createProjectInputSchema,
+	createProjectOutputSchema,
+	type ListProjectsInput,
+	listProjectsInputSchema,
+	listProjectsOutputSchema,
+	getProjectInputSchema,
+	getProjectOutputSchema,
+	type UpdateProjectInput,
+	updateProjectInputSchema,
+	updateProjectOutputSchema,
+	type SetProjectArchivedInput,
+	setProjectArchivedInputSchema,
+	setProjectArchivedOutputSchema,
+	deleteProjectInputSchema,
+	deleteProjectOutputSchema,
+	type RevokeRuntimeBoxDeviceInput,
+	revokeRuntimeBoxDeviceInputSchema,
+	revokeRuntimeBoxDeviceOutputSchema,
+	type SwitchRuntimeBoxInput,
+	switchRuntimeBoxInputSchema,
+	switchRuntimeBoxOutputSchema,
 	listAvailableModelsOutputSchema,
 	listChatSessionsInputSchema,
 	listChatSessionsOutputSchema,
@@ -67,12 +102,15 @@ const invalidationListenerTimeoutMs = 10_000;
 const maxPendingChatSessionInvalidations = 256;
 const chatEventListeners = new Set<(event: ChatRunEvent) => void>();
 const agentsReadyListeners = new Set<() => void>();
+const runtimeBoxesChangedListeners = new Set<
+	(snapshot: ReturnType<typeof listRuntimeBoxesOutputSchema.parse>) => void
+>();
 const chatSessionInvalidationBridge = new ChatSessionInvalidationBridge({
 	timeoutMs: invalidationListenerTimeoutMs,
 	maxPending: maxPendingChatSessionInvalidations,
 });
 const rpc = Electroview.defineRPC<DesktopRpc>({
-	maxRequestTime: 15_000,
+	maxRequestTime: 125_000,
 	handlers: {
 		requests: {},
 		messages: {
@@ -92,6 +130,12 @@ const rpc = Electroview.defineRPC<DesktopRpc>({
 			chatSessionInvalidated: (payload) => {
 				const invalidation = chatSessionInvalidationSchema.parse(payload);
 				void acknowledgeChatSessionInvalidation(invalidation);
+			},
+			runtimeBoxesChanged: (payload) => {
+				const snapshot = listRuntimeBoxesOutputSchema.parse(payload);
+				for (const listener of runtimeBoxesChangedListeners) {
+					listener(snapshot);
+				}
 			},
 		},
 	},
@@ -119,6 +163,116 @@ export const desktopClient = {
 	},
 	async getRuntimeInfo() {
 		return runtimeInfoSchema.parse(await requestDesktop(() => getRequest().getRuntimeInfo({})));
+	},
+	subscribeRuntimeBoxesChanged(
+		listener: (snapshot: ReturnType<typeof listRuntimeBoxesOutputSchema.parse>) => void,
+	) {
+		runtimeBoxesChangedListeners.add(listener);
+		return () => runtimeBoxesChangedListeners.delete(listener);
+	},
+	async listRuntimeBoxes() {
+		return listRuntimeBoxesOutputSchema.parse(
+			await requestDesktop(() => getRequest().listRuntimeBoxes({})),
+		);
+	},
+	async switchRuntimeBox(input: SwitchRuntimeBoxInput) {
+		const parsedInput = switchRuntimeBoxInputSchema.parse(input);
+		return switchRuntimeBoxOutputSchema.parse(
+			await requestDesktop(() => getRequest().switchRuntimeBox(parsedInput)),
+		);
+	},
+	async createRuntimeBoxPairing() {
+		return createRuntimeBoxPairingOutputSchema.parse(
+			await requestDesktop(() => getRequest().createRuntimeBoxPairing({})),
+		);
+	},
+	async listRuntimeBoxPairingClaims() {
+		return listRuntimeBoxPairingClaimsOutputSchema.parse(
+			await requestDesktop(() => getRequest().listRuntimeBoxPairingClaims({})),
+		);
+	},
+	async approveRuntimeBoxPairing(input: ApproveRuntimeBoxPairingInput) {
+		const parsedInput = approveRuntimeBoxPairingInputSchema.parse(input);
+		return approveRuntimeBoxPairingOutputSchema.parse(
+			await requestDesktop(() => getRequest().approveRuntimeBoxPairing(parsedInput)),
+		);
+	},
+	async rejectRuntimeBoxPairing(input: RejectRuntimeBoxPairingInput) {
+		const parsedInput = rejectRuntimeBoxPairingInputSchema.parse(input);
+		return rejectRuntimeBoxPairingOutputSchema.parse(
+			await requestDesktop(() => getRequest().rejectRuntimeBoxPairing(parsedInput)),
+		);
+	},
+	async revokeRuntimeBoxDevice(input: RevokeRuntimeBoxDeviceInput) {
+		const parsedInput = revokeRuntimeBoxDeviceInputSchema.parse(input);
+		return revokeRuntimeBoxDeviceOutputSchema.parse(
+			await requestDesktop(() => getRequest().revokeRuntimeBoxDevice(parsedInput)),
+		);
+	},
+	async getRemoteAccessStatus() {
+		return remoteAccessStatusOutputSchema.parse(
+			await requestDesktop(() => getRequest().getRemoteAccessStatus({})),
+		);
+	},
+	async startRemoteAccessAuthentication() {
+		return remoteAccessAuthAttemptSchema.parse(
+			await requestDesktop(() => getRequest().startRemoteAccessAuthentication({})),
+		);
+	},
+	async getRemoteAccessAuthentication(attemptId: string) {
+		const input = remoteAccessAuthAttemptInputSchema.parse({ attemptId });
+		return remoteAccessAuthAttemptSchema.parse(
+			await requestDesktop(() => getRequest().getRemoteAccessAuthentication(input)),
+		);
+	},
+	async enableRemoteAccess() {
+		return remoteAccessMutationOutputSchema.parse(
+			await requestDesktop(() => getRequest().enableRemoteAccess({})),
+		);
+	},
+	async disableRemoteAccess() {
+		return remoteAccessMutationOutputSchema.parse(
+			await requestDesktop(() => getRequest().disableRemoteAccess({})),
+		);
+	},
+	async recreateRemoteAccess() {
+		return remoteAccessMutationOutputSchema.parse(
+			await requestDesktop(() => getRequest().recreateRemoteAccess({})),
+		);
+	},
+	async createProject(input: CreateProjectInput) {
+		const parsedInput = createProjectInputSchema.parse(input);
+		return createProjectOutputSchema.parse(
+			await requestDesktop(() => getRequest().createProject(parsedInput)),
+		);
+	},
+	async listProjects(input: ListProjectsInput = {}) {
+		const parsedInput = listProjectsInputSchema.parse(input);
+		return listProjectsOutputSchema.parse(
+			await requestDesktop(() => getRequest().listProjects(parsedInput)),
+		);
+	},
+	async getProject(projectId: string) {
+		const input = getProjectInputSchema.parse({ projectId });
+		return getProjectOutputSchema.parse(await requestDesktop(() => getRequest().getProject(input)));
+	},
+	async updateProject(input: UpdateProjectInput) {
+		const parsedInput = updateProjectInputSchema.parse(input);
+		return updateProjectOutputSchema.parse(
+			await requestDesktop(() => getRequest().updateProject(parsedInput)),
+		);
+	},
+	async setProjectArchived(input: SetProjectArchivedInput) {
+		const parsedInput = setProjectArchivedInputSchema.parse(input);
+		return setProjectArchivedOutputSchema.parse(
+			await requestDesktop(() => getRequest().setProjectArchived(parsedInput)),
+		);
+	},
+	async deleteProject(projectId: string) {
+		const input = deleteProjectInputSchema.parse({ projectId });
+		return deleteProjectOutputSchema.parse(
+			await requestDesktop(() => getRequest().deleteProject(input)),
+		);
 	},
 	async listProviders() {
 		return listProvidersOutputSchema.parse(

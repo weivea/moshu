@@ -1,4 +1,5 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { defaultLocalRuntimeBoxId } from "@moshu/contracts";
 import { beforeEach, describe, expect, test, vi } from "vitest";
 
 import { ChatSessionNotFoundError } from "../../../../shared/rpc-errors";
@@ -254,12 +255,14 @@ class FakeSessionTransport extends ProviderModelTransportDefaults implements Cha
 	readonly #sessions: ChatSessionSummary[] = [
 		{
 			id: "session-1",
+			runtimeBoxId: defaultLocalRuntimeBoxId,
 			title: "Architecture notes",
 			createdAt: "2026-01-01T00:00:00.000Z",
 			updatedAt: "2026-01-02T00:00:00.000Z",
 		},
 		{
 			id: "session-2",
+			runtimeBoxId: defaultLocalRuntimeBoxId,
 			title: "Launch plan",
 			createdAt: "2026-01-01T00:00:00.000Z",
 			updatedAt: "2026-01-03T00:00:00.000Z",

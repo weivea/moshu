@@ -4,7 +4,11 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSy
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { type AppError, retiredSessionTombstoneTtlMs } from "@moshu/contracts";
+import {
+	type AppError,
+	defaultLocalRuntimeBoxId,
+	retiredSessionTombstoneTtlMs,
+} from "@moshu/contracts";
 
 import {
 	applyAppMigrations,
@@ -104,6 +108,366 @@ function getAssistantMessageId(run: ReturnType<typeof createRun>["run"]): string
 }
 
 describe("application database", () => {
+	test("persists active Runtime Box selection and binds Sessions and Runs to their Box", () => {
+		const database = openAppDatabase(":memory:");
+		try {
+			const initial = database.runtimeBoxes.getActive();
+			expect(initial).toEqual({ runtimeBoxId: defaultLocalRuntimeBoxId, revision: 1 });
+			const localSession = database.sessions.create({ title: "Local" }).session;
+			expect(localSession.runtimeBoxId).toBe(defaultLocalRuntimeBoxId);
+
+			database.runtimeBoxes.upsertRegistration({
+				schemaVersion: 1,
+				runtimeBoxId: "remote-linux",
+				kind: "remote",
+				displayName: "Remote Linux",
+				runtimeBoxVersion: "0.0.1",
+				platform: "linux",
+				arch: "x64",
+				capabilities: ["tool.read"],
+			});
+			const switched = database.runtimeBoxes.switchActive({
+				runtimeBoxId: "remote-linux",
+				expectedRevision: initial.revision,
+			});
+			expect(switched).toEqual({ runtimeBoxId: "remote-linux", revision: 2 });
+			expect(() =>
+				database.runtimeBoxes.switchActive({
+					runtimeBoxId: defaultLocalRuntimeBoxId,
+					expectedRevision: 1,
+				}),
+			).toThrow("revision conflict");
+
+			const remoteSession = database.sessions.create({ title: "Remote" }).session;
+			expect(remoteSession.runtimeBoxId).toBe("remote-linux");
+			expect(database.sessions.list().items.map((session) => session.id)).toEqual([
+				remoteSession.id,
+			]);
+			expect(
+				database.sessions
+					.list({ runtimeBoxId: defaultLocalRuntimeBoxId })
+					.items.map((session) => session.id),
+			).toEqual([localSession.id]);
+
+			expect(createRun(database, localSession.id).run.runtimeBoxId).toBe(defaultLocalRuntimeBoxId);
+			expect(createRun(database, remoteSession.id).run.runtimeBoxId).toBe("remote-linux");
+		} finally {
+			database.close();
+		}
+	});
+
+	test("persists Runtime Box generation high-water marks", () => {
+		withTempDatabase((databasePath) => {
+			const database = openAppDatabase(databasePath);
+			database.runtimeBoxes.upsertRegistration({
+				schemaVersion: 1,
+				runtimeBoxId: "remote-generation-box",
+				kind: "remote",
+				displayName: "Remote Generation Box",
+				runtimeBoxVersion: "0.0.1",
+				platform: "linux",
+				arch: "x64",
+				capabilities: [],
+			});
+
+			expect(
+				database.runtimeBoxes.acceptGeneration("remote-generation-box", "local-instance-2", 2),
+			).toEqual({ accepted: true });
+			expect(
+				database.runtimeBoxes.acceptGeneration("remote-generation-box", "local-instance-1", 1),
+			).toEqual({
+				accepted: false,
+				code: "STALE_GENERATION",
+				currentGeneration: 2,
+			});
+			database.close();
+
+			const reopened = openAppDatabase(databasePath);
+			try {
+				expect(
+					reopened.runtimeBoxes.acceptGeneration(
+						"remote-generation-box",
+						"different-instance-2",
+						2,
+					),
+				).toEqual({
+					accepted: false,
+					code: "GENERATION_CONFLICT",
+					currentGeneration: 2,
+				});
+				expect(
+					reopened.runtimeBoxes.acceptGeneration("remote-generation-box", "local-instance-3", 3),
+				).toEqual({ accepted: true });
+			} finally {
+				reopened.close();
+			}
+		});
+	});
+
+	test("lists active device keys independently of Runtime Box connectivity", () => {
+		const database = openAppDatabase(":memory:");
+		try {
+			const pairingId = crypto.randomUUID();
+			database.runtimeBoxPairings.create({
+				id: pairingId,
+				codeHash: "pairing-code-hash",
+				expiresAtMs: Date.now() + 60_000,
+			});
+			database.runtimeBoxPairings.claim({
+				codeHash: "pairing-code-hash",
+				claimTokenHash: "claim-token-hash",
+				deviceKeyId: "offline-device-key",
+				publicKey: "public-key",
+				publicKeyFingerprint: "fingerprint-123456",
+				displayName: "Offline Remote Box",
+				platform: "linux",
+				arch: "x64",
+			});
+			const runtimeBox = database.runtimeBoxPairings.approve(pairingId, "fingerprint-123456");
+			expect(
+				database.runtimeBoxPairings
+					.listActiveDeviceKeys(runtimeBox.runtimeBoxId)
+					.map((key) => key.keyId),
+			).toEqual(["offline-device-key"]);
+			database.runtimeBoxPairings.revokeDeviceKey(runtimeBox.runtimeBoxId, "offline-device-key");
+			expect(database.runtimeBoxPairings.listActiveDeviceKeys(runtimeBox.runtimeBoxId)).toEqual([]);
+		} finally {
+			database.close();
+		}
+	});
+
+	test("persists Projects per Runtime Box and enforces normalized path uniqueness", () => {
+		const database = openAppDatabase(":memory:");
+		try {
+			const local = database.projects.create({
+				runtimeBoxId: defaultLocalRuntimeBoxId,
+				name: "Local project",
+				path: "/workspace/local",
+				gitRootPath: "/workspace/local",
+				gitBranch: "main",
+			}).project;
+			database.runtimeBoxes.upsertRegistration({
+				schemaVersion: 1,
+				runtimeBoxId: "remote-project-box",
+				kind: "remote",
+				displayName: "Remote Project Box",
+				runtimeBoxVersion: "0.0.1",
+				platform: "linux",
+				arch: "x64",
+				capabilities: ["projects.validate-path"],
+			});
+
+			const active = database.runtimeBoxes.getActive();
+			database.runtimeBoxes.switchActive({
+				runtimeBoxId: "remote-project-box",
+				expectedRevision: active.revision,
+			});
+			const remote = database.projects.create({
+				runtimeBoxId: "remote-project-box",
+				name: "Remote project",
+				path: "/srv/project",
+			}).project;
+			expect(database.projects.list().items.map((project) => project.id)).toEqual([remote.id]);
+			expect(
+				database.projects
+					.list({ runtimeBoxId: defaultLocalRuntimeBoxId })
+					.items.map((project) => project.id),
+			).toEqual([local.id]);
+			expect(() =>
+				database.projects.create({
+					runtimeBoxId: "remote-project-box",
+					name: "Duplicate",
+					path: "/srv/project",
+				}),
+			).toThrow("already registered");
+			expect(database.projects.update({ projectId: remote.id, name: "Renamed" }).project.name).toBe(
+				"Renamed",
+			);
+			expect(
+				database.projects.setArchived({ projectId: remote.id, archived: true }).project.archivedAt,
+			).toBeDefined();
+			expect(database.projects.list().items).toEqual([]);
+			expect(database.projects.list({ archived: true }).items).toHaveLength(1);
+			expect(database.projects.delete({ projectId: remote.id })).toEqual({
+				deletedProjectId: remote.id,
+			});
+			expect(() => database.projects.get({ projectId: remote.id })).toThrow("not found");
+		} finally {
+			database.close();
+		}
+	});
+
+	test("consumes execution grants once and reconciles durable Action evidence", () => {
+		const database = openAppDatabase(":memory:");
+		try {
+			const session = database.sessions.create({ title: "Action Session" }).session;
+			const run = createRun(database, session.id).run;
+			const actionId = crypto.randomUUID();
+			const grantId = crypto.randomUUID();
+			const invocationId = crypto.randomUUID();
+			const digest = "a".repeat(64);
+			const tokenHash = "b".repeat(64);
+			database.actions.createGrant({
+				actionId,
+				grantId,
+				grantTokenHash: tokenHash,
+				invocationId,
+				runtimeBoxId: defaultLocalRuntimeBoxId,
+				runId: run.id,
+				toolCallId: "tool-call",
+				tool: "read",
+				parameterDigest: digest,
+				riskClass: "low",
+				sideEffectClass: "none",
+				idempotencyClass: "read",
+				policyRule: "builtin-read-only",
+				originInstanceId: "agents-instance",
+				originGeneration: 2,
+				targetInstanceId: "runtime-instance",
+				targetGeneration: 3,
+				executionScope: "request-cwd",
+				expiresAtMs: Date.now() + 60_000,
+			});
+			database.actions.consumeGrant(actionId, grantId, tokenHash);
+			expect(() => database.actions.consumeGrant(actionId, grantId, tokenHash)).toThrow(
+				"already used",
+			);
+			const result = {
+				schemaVersion: 1 as const,
+				invocationId,
+				tool: "read" as const,
+				content: [{ type: "text" as const, text: "contents" }],
+			};
+			const evidence = {
+				invocationId,
+				actionId,
+				grantId,
+				parameterDigest: digest,
+				originInstanceId: "agents-instance",
+				originGeneration: 2,
+				targetRuntimeBoxId: defaultLocalRuntimeBoxId,
+				targetInstanceId: "runtime-instance",
+				targetGeneration: 3,
+				state: "succeeded" as const,
+				result,
+				completedAt: new Date().toISOString(),
+			};
+			database.actions.complete(defaultLocalRuntimeBoxId, evidence);
+			database.actions.complete(defaultLocalRuntimeBoxId, evidence);
+			expect(database.actions.hasUnacknowledgedForSession(session.id)).toBe(true);
+			database.actions.markServerAcked([invocationId]);
+			expect(database.actions.hasUnacknowledgedForSession(session.id)).toBe(true);
+			database.actions.markReceiptConfirmed([invocationId]);
+			expect(database.actions.hasUnacknowledgedForSession(session.id)).toBe(false);
+			expect(database.actions.get(invocationId)).toMatchObject({
+				actionId,
+				grantId,
+				state: "succeeded",
+				result,
+				grantConsumedAtMs: expect.any(Number),
+				serverAckedAtMs: expect.any(Number),
+				boxReceiptConfirmedAtMs: expect.any(Number),
+			});
+			expect(() =>
+				database.actions.complete(defaultLocalRuntimeBoxId, {
+					...evidence,
+					state: "failed",
+					result: undefined,
+					safeError: "conflict",
+				}),
+			).toThrow("conflicts");
+			expect(() =>
+				database.actions.complete(defaultLocalRuntimeBoxId, {
+					...evidence,
+					result: { ...result, invocationId: crypto.randomUUID() },
+				}),
+			).toThrow("did not match");
+		} finally {
+			database.close();
+		}
+	});
+
+	test("recovers undispatched and ambiguous Actions on Agent Server startup", () => {
+		const database = openAppDatabase(":memory:");
+		try {
+			const session = database.sessions.create({ title: "Recovery" }).session;
+			const run = createRun(database, session.id).run;
+			const createAction = (consumed: boolean) => {
+				const actionId = crypto.randomUUID();
+				const grantId = crypto.randomUUID();
+				const invocationId = crypto.randomUUID();
+				const tokenHash = Buffer.alloc(32, consumed ? 1 : 2).toString("hex");
+				database.actions.createGrant({
+					actionId,
+					grantId,
+					grantTokenHash: tokenHash,
+					invocationId,
+					runtimeBoxId: defaultLocalRuntimeBoxId,
+					runId: run.id,
+					toolCallId: crypto.randomUUID(),
+					tool: "bash",
+					parameterDigest: "c".repeat(64),
+					riskClass: "high",
+					sideEffectClass: "local",
+					idempotencyClass: "non_idempotent",
+					policyRule: "test",
+					originInstanceId: "agents",
+					originGeneration: 1,
+					targetInstanceId: "runtime",
+					targetGeneration: 1,
+					executionScope: "request-cwd",
+					expiresAtMs: Date.now() + 60_000,
+				});
+				if (consumed) {
+					database.actions.consumeGrant(actionId, grantId, tokenHash);
+				}
+				return invocationId;
+			};
+			const undispatched = createAction(false);
+			const ambiguous = createAction(true);
+			expect(database.actions.recoverOnStartup()).toEqual({
+				cancelled: 1,
+				outcomeUnknown: 1,
+			});
+			expect(database.actions.get(undispatched).state).toBe("cancelled");
+			expect(database.actions.get(ambiguous).state).toBe("outcome_unknown");
+		} finally {
+			database.close();
+		}
+	});
+
+	test("does not overwrite the last registered Local Runtime Box descriptor on reopen", () => {
+		withTempDatabase((databasePath) => {
+			const platform = process.platform;
+			if (platform !== "darwin" && platform !== "win32" && platform !== "linux") {
+				throw new Error(`Unsupported test platform: ${platform}`);
+			}
+			const database = openAppDatabase(databasePath);
+			database.runtimeBoxes.upsertRegistration({
+				schemaVersion: 1,
+				runtimeBoxId: defaultLocalRuntimeBoxId,
+				kind: "local",
+				displayName: "My Local Box",
+				runtimeBoxVersion: "1.2.3",
+				platform,
+				arch: process.arch,
+				capabilities: ["tool.read"],
+			});
+			database.close();
+
+			const reopened = openAppDatabase(databasePath);
+			try {
+				expect(reopened.runtimeBoxes.get(defaultLocalRuntimeBoxId)).toMatchObject({
+					displayName: "My Local Box",
+					runtimeBoxVersion: "1.2.3",
+					capabilities: ["tool.read"],
+				});
+			} finally {
+				reopened.close();
+			}
+		});
+	});
+
 	test("applies the current schema without a duplicate message table", () => {
 		withTempDatabase((databasePath) => {
 			const database = openAppDatabase(databasePath);
@@ -209,6 +573,7 @@ describe("application database", () => {
 						.insert(chatRunsTable)
 						.values({
 							id: createUuidV7(),
+							runtimeBoxId: defaultLocalRuntimeBoxId,
 							clientRequestId: crypto.randomUUID(),
 							sessionId: createUuidV7(),
 							mode: "ask",
@@ -315,11 +680,12 @@ describe("application database", () => {
 						SELECT value + 1 FROM fixture WHERE value < $count
 					)
 					INSERT INTO chat_sessions (
-						id, pi_session_id, title, default_mode, created_at_ms, updated_at_ms,
+						id, runtime_box_id, pi_session_id, title, default_mode, created_at_ms, updated_at_ms,
 						last_message_at_ms, archived_at_ms
 					)
 					SELECT
 						printf('00000000-0000-7000-8000-%012x', value),
+						$runtimeBoxId,
 						printf('00000000-0000-7000-8000-%012x', value),
 						'capacity fixture',
 						'ask',
@@ -329,7 +695,10 @@ describe("application database", () => {
 						NULL
 					FROM fixture`,
 				)
-				.run({ count: maxSessionCreateIdempotencyRecords });
+				.run({
+					count: maxSessionCreateIdempotencyRecords,
+					runtimeBoxId: defaultLocalRuntimeBoxId,
+				});
 			database.client
 				.query(
 					`WITH RECURSIVE fixture(value) AS (
@@ -338,11 +707,12 @@ describe("application database", () => {
 						SELECT value + 1 FROM fixture WHERE value < $count
 					)
 					INSERT INTO chat_session_create_requests (
-						create_key, origin_role, origin_peer_id, origin_instance_id,
+						create_key, runtime_box_id, origin_role, origin_peer_id, origin_instance_id,
 						origin_generation, title, default_mode, session_id, created_at_ms
 					)
 					SELECT
 						printf('capacity-key-%d', value),
+						$runtimeBoxId,
 						'client',
 						'capacity-client',
 						'capacity-instance',
@@ -353,7 +723,10 @@ describe("application database", () => {
 						value
 					FROM fixture`,
 				)
-				.run({ count: maxSessionCreateIdempotencyRecords });
+				.run({
+					count: maxSessionCreateIdempotencyRecords,
+					runtimeBoxId: defaultLocalRuntimeBoxId,
+				});
 
 			expect(() =>
 				database.sessions.createIdempotently({
@@ -822,12 +1195,13 @@ describe("application database", () => {
 						SELECT value + 1 FROM fixture WHERE value < 10001
 					)
 					INSERT INTO chat_runs (
-						id, client_request_id, session_id, mode, status, provider_json,
+						id, runtime_box_id, client_request_id, session_id, mode, status, provider_json,
 						user_message_id, user_content, assistant_message_id, assistant_content,
 						last_error_json, created_at_ms, updated_at_ms, completed_at_ms
 					)
 					SELECT
 						printf('00000000-0000-7000-8000-%012x', value),
+						$runtimeBoxId,
 						printf('request-%d', value),
 						$sessionId,
 						'ask',
@@ -843,7 +1217,10 @@ describe("application database", () => {
 						value
 					FROM fixture`,
 				)
-				.run({ sessionId: session.id });
+				.run({
+					runtimeBoxId: defaultLocalRuntimeBoxId,
+					sessionId: session.id,
+				});
 
 			expect(database.runs.deleteSessionAndRetireRuns(session.id)).toEqual({
 				sessionId: session.id,

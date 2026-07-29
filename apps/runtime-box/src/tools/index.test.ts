@@ -540,7 +540,10 @@ describe("executor bash tool", () => {
 			import { mkdir, open, rm } from "node:fs/promises";
 			import { tmpdir } from "node:os";
 			import { join } from "node:path";
-			const outputDirectory = join(tmpdir(), "moshu-executor-tool-output");
+			const outputDirectory = join(
+				tmpdir(),
+				"moshu-executor-tool-output-" + (process.getuid?.() ?? "user"),
+			);
 			await mkdir(outputDirectory, { recursive: true, mode: 0o700 });
 			const seedPath = join(outputDirectory, "quota-seed-" + crypto.randomUUID());
 			const seed = await open(seedPath, "w", 0o600);
@@ -605,7 +608,10 @@ describe("executor bash tool", () => {
 		"cancellation terminates the complete Unix process group",
 		async () => {
 			const cwd = await createWorkspace();
-			const outputDirectory = join(tmpdir(), "moshu-executor-tool-output");
+			const outputDirectory = join(
+				tmpdir(),
+				`moshu-executor-tool-output-${process.getuid?.() ?? "user"}`,
+			);
 			const outputsBefore = new Set(await readdir(outputDirectory));
 			const controller = new AbortController();
 			const run = invoke(

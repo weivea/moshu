@@ -10,20 +10,184 @@ import {
 	type ChatRunEvent,
 	clientProductRequestMethods,
 	createChatSessionOutputSchema,
-	executorProductRequestMethods,
+	defaultLocalRuntimeBoxId,
 	productRpcInternalHandlerErrorCode,
 	productRpcMethods,
+	runtimeBoxProductRequestMethods,
 } from "@moshu/contracts";
-import { ChatSessionNotFoundError, openAppDatabase } from "@moshu/database";
-import { RpcHandlerError, type RpcPeer } from "@moshu/process-rpc";
+import {
+	ChatSessionNotFoundError,
+	openAppDatabase,
+	type RuntimeBoxRepository,
+} from "@moshu/database";
+import { RpcHandlerError, type RpcPeer, rpcJsonValueSchema } from "@moshu/process-rpc";
 import { z } from "zod";
 
 import type { ChatApplicationService } from "./chat-application-service";
-import type { ExecutorReadiness } from "./executor-readiness";
 import { createProductRpcHandlers, ProductEventRouter, publishChatEvent } from "./product-rpc";
 import { ProviderCatalogError } from "./provider-catalog";
+import { type RuntimeBoxGatewayPeer, RuntimeBoxRegistry } from "./runtime-box-registry";
+import type { RuntimeIngressAuth } from "./runtime-ingress-auth";
+import type { DevTunnelService } from "./dev-tunnel-service";
 
 const authController = {} as HeadlessAuthController;
+const runtimeBoxes = {} as RuntimeBoxRepository;
+const runtimeIngressAuth = {} as RuntimeIngressAuth;
+const devTunnelService = {} as DevTunnelService;
+
+describe("Runtime Box product RPC", () => {
+	test("lists and switches the persisted active Runtime Box with CAS", async () => {
+		const database = openAppDatabase(":memory:");
+		try {
+			database.runtimeBoxes.upsertRegistration({
+				schemaVersion: 1,
+				runtimeBoxId: "remote-linux",
+				kind: "remote",
+				displayName: "Remote Linux",
+				runtimeBoxVersion: "0.0.1",
+				platform: "linux",
+				arch: "x64",
+				capabilities: [],
+			});
+
+			const active = database.runtimeBoxes.getActive();
+			const registry = new RuntimeBoxRegistry({
+				descriptors: database.runtimeBoxes.list(),
+				activeRuntimeBoxId: active.runtimeBoxId,
+			});
+			const handlers = createProductRpcHandlers({
+				authController,
+				chatService: {} as ChatApplicationService,
+				runtimeBoxRegistry: registry,
+				runtimeBoxes: database.runtimeBoxes,
+				runtimeIngressAuth,
+				getDevTunnelService: () => devTunnelService,
+				eventRouter: new ProductEventRouter(),
+				serverVersion: "test",
+			}).requests;
+			const peer = createPeer({ emitEvent: () => "event", close() {} });
+			const list = handlers?.[productRpcMethods.runtimeBoxesList];
+			const switchRuntime = handlers?.[productRpcMethods.runtimeBoxesSwitch];
+			if (list === undefined || switchRuntime === undefined) {
+				throw new Error("Runtime Box handlers are missing.");
+			}
+
+			await expect(
+				list({}, createRequestContext(peer, productRpcMethods.runtimeBoxesList)),
+			).resolves.toMatchObject({
+				active,
+				items: [
+					{ runtimeBox: { runtimeBoxId: "moshu-local-runtime-box" } },
+					{ runtimeBox: { runtimeBoxId: "remote-linux" } },
+				],
+			});
+			await expect(
+				switchRuntime(
+					{ runtimeBoxId: "remote-linux", expectedRevision: active.revision },
+					createRequestContext(peer, productRpcMethods.runtimeBoxesSwitch),
+				),
+			).resolves.toEqual({
+				active: { runtimeBoxId: "remote-linux", revision: active.revision + 1 },
+			});
+			expect(registry.getActiveRuntimeBoxId()).toBe("remote-linux");
+			await expect(
+				switchRuntime(
+					{ runtimeBoxId: "moshu-local-runtime-box", expectedRevision: active.revision },
+					createRequestContext(peer, productRpcMethods.runtimeBoxesSwitch),
+				),
+			).rejects.toMatchObject({ code: "ACTIVE_RUNTIME_REVISION_CONFLICT" });
+		} finally {
+			database.close();
+		}
+	});
+
+	test("creates Projects only after the owning Runtime Box validates their path", async () => {
+		const database = openAppDatabase(":memory:");
+		try {
+			const registry = new RuntimeBoxRegistry({
+				descriptors: database.runtimeBoxes.list(),
+				activeRuntimeBoxId: database.runtimeBoxes.getActive().runtimeBoxId,
+			});
+			const runtimePeer: RuntimeBoxGatewayPeer = {
+				isClosed: false,
+				remoteIdentity: {
+					role: "runtime-box",
+					peerId: defaultLocalRuntimeBoxId,
+					instanceId: crypto.randomUUID(),
+					generation: 1,
+				},
+				close() {},
+				request(method, payload) {
+					expect(method).toBe(productRpcMethods.runtimeBoxProjectValidatePath);
+					expect(payload).toEqual({ path: "/workspace/moshu" });
+					return Promise.resolve(
+						rpcJsonValueSchema.parse({
+							normalizedPath: "/workspace/moshu",
+							displayName: "moshu",
+							gitRootPath: "/workspace/moshu",
+							gitBranch: "main",
+						}),
+					);
+				},
+			};
+			registry.register(runtimePeer, database.runtimeBoxes.get(defaultLocalRuntimeBoxId));
+			registry.markReady(runtimePeer);
+			const handlers = createProductRpcHandlers({
+				authController,
+				chatService: {} as ChatApplicationService,
+				runtimeBoxRegistry: registry,
+				runtimeBoxes: database.runtimeBoxes,
+				projects: database.projects,
+				runtimeIngressAuth,
+				getDevTunnelService: () => devTunnelService,
+				eventRouter: new ProductEventRouter(),
+				serverVersion: "test",
+			}).requests;
+			const peer = createPeer({ emitEvent: () => "event", close() {} });
+			const create = handlers?.[productRpcMethods.projectsCreate];
+			const list = handlers?.[productRpcMethods.projectsList];
+			const archive = handlers?.[productRpcMethods.projectsArchive];
+			if (create === undefined || list === undefined || archive === undefined) {
+				throw new Error("Project handlers are missing.");
+			}
+			const created = await create(
+				{ path: "/workspace/moshu" },
+				createRequestContext(peer, productRpcMethods.projectsCreate),
+			);
+			expect(created).toMatchObject({
+				project: {
+					runtimeBoxId: defaultLocalRuntimeBoxId,
+					name: "moshu",
+					path: "/workspace/moshu",
+					gitBranch: "main",
+				},
+			});
+			const projectId = z.object({ project: z.object({ id: z.string() }) }).parse(created)
+				.project.id;
+			await expect(
+				list({}, createRequestContext(peer, productRpcMethods.projectsList)),
+			).resolves.toMatchObject({ items: [{ id: projectId }] });
+			registry.clear(runtimePeer);
+			await expect(
+				archive(
+					{ projectId, archived: true },
+					createRequestContext(peer, productRpcMethods.projectsArchive),
+				),
+			).rejects.toMatchObject({ code: "RUNTIME_BOX_NOT_READY" });
+			registry.register(runtimePeer, database.runtimeBoxes.get(defaultLocalRuntimeBoxId));
+			registry.markReady(runtimePeer);
+			await archive(
+				{ projectId, archived: true },
+				createRequestContext(peer, productRpcMethods.projectsArchive),
+			);
+			await expect(
+				list({}, createRequestContext(peer, productRpcMethods.projectsList)),
+			).resolves.toEqual({ items: [] });
+		} finally {
+			database.close();
+		}
+	});
+});
 
 describe("product RPC event broadcast", () => {
 	test("isolates a failed client peer and continues broadcasting", () => {
@@ -37,6 +201,7 @@ describe("product RPC event broadcast", () => {
 				failedCloseCalls += 1;
 			},
 		});
+
 		const healthyPeer = createPeer({
 			emitEvent() {
 				healthyDeliveries += 1;
@@ -303,7 +468,10 @@ describe("product RPC event broadcast", () => {
 					throw new Error("must not dispatch");
 				},
 			} as unknown as ChatApplicationService,
-			executorReadiness: {} as ExecutorReadiness,
+			runtimeBoxRegistry: {} as RuntimeBoxRegistry,
+			runtimeBoxes,
+			runtimeIngressAuth,
+			getDevTunnelService: () => devTunnelService,
 			eventRouter: new ProductEventRouter(),
 			serverVersion: "test",
 		}).requests?.[productRpcMethods.sessionGet];
@@ -314,7 +482,10 @@ describe("product RPC event broadcast", () => {
 					return { privateOutput: "private-output-secret" };
 				},
 			} as unknown as ChatApplicationService,
-			executorReadiness: {} as ExecutorReadiness,
+			runtimeBoxRegistry: {} as RuntimeBoxRegistry,
+			runtimeBoxes,
+			runtimeIngressAuth,
+			getDevTunnelService: () => devTunnelService,
 			eventRouter: new ProductEventRouter(),
 			serverVersion: "test",
 		}).requests?.[productRpcMethods.sessionGet];
@@ -325,7 +496,10 @@ describe("product RPC event broadcast", () => {
 					return z.string().parse({ privateValue: "private-zod-secret" });
 				},
 			} as unknown as ChatApplicationService,
-			executorReadiness: {} as ExecutorReadiness,
+			runtimeBoxRegistry: {} as RuntimeBoxRegistry,
+			runtimeBoxes,
+			runtimeIngressAuth,
+			getDevTunnelService: () => devTunnelService,
 			eventRouter: new ProductEventRouter(),
 			serverVersion: "test",
 		}).requests?.[productRpcMethods.sessionGet];
@@ -387,7 +561,10 @@ describe("product RPC event broadcast", () => {
 					return { run: { status: "queued" } };
 				},
 			} as unknown as ChatApplicationService,
-			executorReadiness: {} as ExecutorReadiness,
+			runtimeBoxRegistry: {} as RuntimeBoxRegistry,
+			runtimeBoxes,
+			runtimeIngressAuth,
+			getDevTunnelService: () => devTunnelService,
 			eventRouter: new ProductEventRouter(),
 			serverVersion: "test",
 		}).requests;
@@ -434,7 +611,10 @@ describe("product RPC event broadcast", () => {
 					throw new ChatSessionNotFoundError("01984df0-cf17-7e6e-9a7d-4d98c1f0d5ce");
 				},
 			} as unknown as ChatApplicationService,
-			executorReadiness: {} as ExecutorReadiness,
+			runtimeBoxRegistry: {} as RuntimeBoxRegistry,
+			runtimeBoxes,
+			runtimeIngressAuth,
+			getDevTunnelService: () => devTunnelService,
 			eventRouter: new ProductEventRouter(),
 			serverVersion: "test",
 		}).requests?.[productRpcMethods.sessionGet];
@@ -476,7 +656,10 @@ describe("product RPC event broadcast", () => {
 					return Promise.resolve(database.runs.deleteSessionAndRetireRuns(input.sessionId));
 				},
 			} as ChatApplicationService,
-			executorReadiness: {} as ExecutorReadiness,
+			runtimeBoxRegistry: {} as RuntimeBoxRegistry,
+			runtimeBoxes,
+			runtimeIngressAuth,
+			getDevTunnelService: () => devTunnelService,
 			eventRouter: new ProductEventRouter(),
 			serverVersion: "test",
 		}).requests?.[productRpcMethods.sessionDelete];
@@ -520,7 +703,10 @@ describe("product RPC event broadcast", () => {
 					return Promise.resolve(database.runs.deleteSessionAndRetireRuns(input.sessionId));
 				},
 			} as ChatApplicationService,
-			executorReadiness: {} as ExecutorReadiness,
+			runtimeBoxRegistry: {} as RuntimeBoxRegistry,
+			runtimeBoxes,
+			runtimeIngressAuth,
+			getDevTunnelService: () => devTunnelService,
 			eventRouter: new ProductEventRouter(),
 			serverVersion: "test",
 		}).requests?.[productRpcMethods.sessionDelete];
@@ -567,7 +753,10 @@ describe("product RPC event broadcast", () => {
 					});
 				},
 			} as ChatApplicationService,
-			executorReadiness: {} as ExecutorReadiness,
+			runtimeBoxRegistry: {} as RuntimeBoxRegistry,
+			runtimeBoxes,
+			runtimeIngressAuth,
+			getDevTunnelService: () => devTunnelService,
 			eventRouter: new ProductEventRouter(),
 			serverVersion: "test",
 		}).requests?.[productRpcMethods.sessionCreate];
@@ -702,6 +891,7 @@ describe("product RPC provider and model handlers", () => {
 		schemaVersion: 1,
 		id: sessionId,
 		agentSessionId: sessionId,
+		runtimeBoxId: defaultLocalRuntimeBoxId,
 		title: "New chat",
 		defaultMode: "ask",
 		model: { providerId, modelId: "gpt-5.4" },
@@ -742,7 +932,10 @@ describe("product RPC provider and model handlers", () => {
 		const handlers = createProductRpcHandlers({
 			authController,
 			chatService,
-			executorReadiness: {} as ExecutorReadiness,
+			runtimeBoxRegistry: {} as RuntimeBoxRegistry,
+			runtimeBoxes,
+			runtimeIngressAuth,
+			getDevTunnelService: () => devTunnelService,
 			eventRouter: new ProductEventRouter(),
 			serverVersion: "test",
 		}).requests;
@@ -884,7 +1077,10 @@ describe("product RPC provider and model handlers", () => {
 			const handler = createProductRpcHandlers({
 				authController,
 				chatService,
-				executorReadiness: {} as ExecutorReadiness,
+				runtimeBoxRegistry: {} as RuntimeBoxRegistry,
+				runtimeBoxes,
+				runtimeIngressAuth,
+				getDevTunnelService: () => devTunnelService,
 				eventRouter: new ProductEventRouter(),
 				serverVersion: "test",
 			}).requests?.[testCase.method];
@@ -939,7 +1135,10 @@ describe("product RPC provider and model handlers", () => {
 		const handlers = createProductRpcHandlers({
 			authController: fakeAuthController,
 			chatService: {} as ChatApplicationService,
-			executorReadiness: {} as ExecutorReadiness,
+			runtimeBoxRegistry: {} as RuntimeBoxRegistry,
+			runtimeBoxes,
+			runtimeIngressAuth,
+			getDevTunnelService: () => devTunnelService,
 			eventRouter: new ProductEventRouter(),
 			serverVersion: "test",
 		}).requests;
@@ -976,11 +1175,14 @@ describe("product RPC provider and model handlers", () => {
 		expect(JSON.stringify(outputs)).not.toContain(secret);
 	});
 
-	test("registers a handler for every client and executor product request method", () => {
+	test("registers a handler for every client and Runtime Box product request method", () => {
 		const handlers = createProductRpcHandlers({
 			authController,
 			chatService: {} as unknown as ChatApplicationService,
-			executorReadiness: {} as ExecutorReadiness,
+			runtimeBoxRegistry: {} as RuntimeBoxRegistry,
+			runtimeBoxes,
+			runtimeIngressAuth,
+			getDevTunnelService: () => devTunnelService,
 			eventRouter: new ProductEventRouter(),
 			serverVersion: "test",
 		}).requests;
@@ -988,7 +1190,7 @@ describe("product RPC provider and model handlers", () => {
 		for (const method of clientProductRequestMethods) {
 			expect(typeof handlers?.[method]).toBe("function");
 		}
-		for (const method of executorProductRequestMethods) {
+		for (const method of runtimeBoxProductRequestMethods) {
 			expect(typeof handlers?.[method]).toBe("function");
 		}
 	});

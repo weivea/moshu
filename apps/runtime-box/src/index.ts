@@ -1,14 +1,16 @@
+import { isAbsolute, join } from "node:path";
 import {
-	agentsExecutorRequestMethods,
+	agentsRuntimeBoxRequestMethods,
 	companionBootstrapChannel,
 	companionControlVersion,
-	type ExecutorReadyRecord,
-	executorRegisterInputSchema,
-	executorRegisterOutputSchema,
+	type RuntimeBoxReadyRecord,
+	executorToolNames,
 	executorToolRpcTimeoutMs,
 	productRpcMaxBufferedOutboundBytes,
 	productRpcMaxFrameBytes,
 	productRpcMethods,
+	runtimeBoxRegisterInputSchema,
+	runtimeBoxRegisterOutputSchema,
 } from "@moshu/contracts";
 import {
 	type ConnectRpcClientOptions,
@@ -18,50 +20,63 @@ import {
 	type RpcPeer,
 	rpcJsonValueSchema,
 } from "@moshu/process-rpc";
-import { createExecutorToolRequestHandler } from "./tool-handler";
+import {
+	createExecutorToolRequestHandler,
+	createInvocationAcknowledgementHandler,
+} from "./tool-handler";
+import {
+	reconcileInvocationJournal,
+	RuntimeBoxInvocationJournal,
+	watchInvocationReconciliation,
+} from "./invocation-journal";
+import { validateProjectPathRequestHandler } from "./project-path";
 import { createExecutorToolRuntime, type ExecutorToolRuntime } from "./tools/index";
+import { runRuntimeBoxCli } from "./cli";
+import { extractEmbeddedRuntimeBoxAssets, type EmbeddedRuntimeBoxAssets } from "./embedded-assets";
+import { configurePhotonWasmPath } from "./tools/photon";
 
 import {
 	type BootstrapControlChannel,
 	openBootstrapControlChannel,
-	parseExecutorBootstrapRecord,
+	parseRuntimeBoxBootstrapRecord,
 	serializeReadyRecord,
 } from "./bootstrap";
 
 const PROCESS_VERSION = "0.0.1";
 
-export type ExecutorRpcPeer = Pick<
+export type RuntimeBoxRpcPeer = Pick<
 	RpcPeer,
 	"close" | "closed" | "remoteIdentity" | "request" | "terminate"
 >;
 
-export interface ExecutorSignalSource {
+export interface RuntimeBoxSignalSource {
 	add(signal: "SIGINT" | "SIGTERM", listener: () => void): void;
 	remove(signal: "SIGINT" | "SIGTERM", listener: () => void): void;
 }
 
-export interface ExecutorReadyPublication {
+export interface RuntimeBoxReadyPublication {
 	readonly drained: Promise<void>;
 }
 
-export interface ExecutorReadyWriter {
-	enqueue(record: string, signal: AbortSignal): ExecutorReadyPublication;
+export interface RuntimeBoxReadyWriter {
+	enqueue(record: string, signal: AbortSignal): RuntimeBoxReadyPublication;
 }
 
-export interface RunExecutorProcessOptions {
+export interface RunRuntimeBoxProcessOptions {
 	readonly stdin?: ReadableStream<Uint8Array>;
 	readonly openControlChannel?: (
 		stream: ReadableStream<Uint8Array>,
 		signal: AbortSignal,
 	) => Promise<BootstrapControlChannel>;
-	readonly connectPeer?: (options: ConnectRpcClientOptions) => Promise<ExecutorRpcPeer>;
-	readonly readyWriter?: ExecutorReadyWriter;
-	readonly signalSource?: ExecutorSignalSource;
+	readonly connectPeer?: (options: ConnectRpcClientOptions) => Promise<RuntimeBoxRpcPeer>;
+	readonly readyWriter?: RuntimeBoxReadyWriter;
+	readonly signalSource?: RuntimeBoxSignalSource;
 	readonly cleanupTimeoutMs?: number;
 	readonly toolRuntime?: ExecutorToolRuntime;
+	readonly invocationJournal?: RuntimeBoxInvocationJournal;
 }
 
-const processSignalSource: ExecutorSignalSource = {
+const processSignalSource: RuntimeBoxSignalSource = {
 	add(signal, listener) {
 		process.once(signal, listener);
 	},
@@ -70,16 +85,15 @@ const processSignalSource: ExecutorSignalSource = {
 	},
 };
 
-export async function runExecutorProcess(options: RunExecutorProcessOptions = {}): Promise<void> {
+export async function runRuntimeBoxProcess(
+	options: RunRuntimeBoxProcessOptions = {},
+): Promise<void> {
 	const lifecycle = new AbortController();
 	const signalSource = options.signalSource ?? processSignalSource;
 	const openControlChannel = options.openControlChannel ?? openBootstrapControlChannel;
 	const connectPeer = options.connectPeer ?? connectRpcClient;
 	const readyWriter = options.readyWriter ?? processReadyWriter;
 	const cleanupTimeoutMs = options.cleanupTimeoutMs ?? 250;
-	const toolRequestHandler = options.toolRuntime
-		? createExecutorToolRequestHandler(options.toolRuntime)
-		: undefined;
 	if (!Number.isSafeInteger(cleanupTimeoutMs) || cleanupTimeoutMs <= 0) {
 		throw new TypeError("cleanupTimeoutMs must be a positive safe integer.");
 	}
@@ -87,15 +101,16 @@ export async function runExecutorProcess(options: RunExecutorProcessOptions = {}
 	let controlChannel: BootstrapControlChannel | undefined;
 	let parentObservation: Promise<void> = Promise.resolve();
 	let lateConnectionObservation: Promise<void> = Promise.resolve();
-	let peer: ExecutorRpcPeer | undefined;
+	let reconciliationObservation: Promise<void> = Promise.resolve();
+	let peer: RuntimeBoxRpcPeer | undefined;
 
-	const stop = (reason: ExecutorLifecycleStop): void => {
+	const stop = (reason: RuntimeBoxLifecycleStop): void => {
 		if (!lifecycle.signal.aborted) {
 			lifecycle.abort(reason);
 		}
 	};
-	const onSigint = (): void => stop(new ExecutorLifecycleStop("SIGINT", true));
-	const onSigterm = (): void => stop(new ExecutorLifecycleStop("SIGTERM", true));
+	const onSigint = (): void => stop(new RuntimeBoxLifecycleStop("SIGINT", true));
+	const onSigterm = (): void => stop(new RuntimeBoxLifecycleStop("SIGTERM", true));
 	signalSource.add("SIGINT", onSigint);
 	signalSource.add("SIGTERM", onSigterm);
 
@@ -105,16 +120,30 @@ export async function runExecutorProcess(options: RunExecutorProcessOptions = {}
 			lifecycle.signal,
 		);
 		parentObservation = controlChannel.parentClosed.then(
-			() => stop(new ExecutorLifecycleStop("Parent control channel closed.", true)),
+			() => stop(new RuntimeBoxLifecycleStop("Parent control channel closed.", true)),
 			(error: unknown) =>
 				stop(
-					new ExecutorLifecycleStop("Parent control channel failed.", false, {
+					new RuntimeBoxLifecycleStop("Parent control channel failed.", false, {
 						cause: error,
 					}),
 				),
 		);
 		throwIfLifecycleStopped(lifecycle.signal);
-		const bootstrap = parseExecutorBootstrapRecord(controlChannel.input);
+		const bootstrap = parseRuntimeBoxBootstrapRecord(controlChannel.input);
+		if (!isAbsolute(bootstrap.dataDirectory)) {
+			throw new Error("Runtime Box data directory must be absolute.");
+		}
+		const invocationJournal =
+			options.invocationJournal ??
+			new RuntimeBoxInvocationJournal(
+				join(bootstrap.dataDirectory, "journal", bootstrap.actionJournalEpoch),
+			);
+		const toolRequestHandler =
+			options.toolRuntime === undefined
+				? undefined
+				: createExecutorToolRequestHandler(options.toolRuntime, {
+						journal: invocationJournal,
+					});
 
 		const connection = Promise.resolve(
 			connectPeer({
@@ -123,27 +152,39 @@ export async function runExecutorProcess(options: RunExecutorProcessOptions = {}
 				expectedServerIdentity: bootstrap.agentsServer.identity,
 				signal: lifecycle.signal,
 				getHandshakeHeaders: createRpcBearerHandshakeHeaders(bootstrap.credential),
-				methodAllowlist: options.toolRuntime
-					? { agents: { requests: agentsExecutorRequestMethods } }
-					: { agents: {} },
-				...(toolRequestHandler
-					? {
-							handlers: {
-								requests: {
-									[productRpcMethods.executorToolInvoke]: toolRequestHandler,
-								},
-							},
+				methodAllowlist: {
+					agents: {
+						requests: options.toolRuntime
+							? agentsRuntimeBoxRequestMethods
+							: [
+									productRpcMethods.runtimeBoxProjectValidatePath,
+									productRpcMethods.runtimeBoxInvocationsAck,
+								],
+					},
+				},
+				handlers: {
+					requests: {
+						[productRpcMethods.runtimeBoxProjectValidatePath]: validateProjectPathRequestHandler,
+						[productRpcMethods.runtimeBoxInvocationsAck]:
+							createInvocationAcknowledgementHandler(invocationJournal),
+						...(toolRequestHandler === undefined
+							? {}
+							: { [productRpcMethods.runtimeBoxToolInvoke]: toolRequestHandler }),
+					},
+				},
+				...(toolRequestHandler === undefined
+					? {}
+					: {
 							requestTimeoutLimits: {
-								[productRpcMethods.executorToolInvoke]: executorToolRpcTimeoutMs,
+								[productRpcMethods.runtimeBoxToolInvoke]: executorToolRpcTimeoutMs,
 							},
-						}
-					: {}),
+						}),
 				limits: {
 					maxFrameBytes: productRpcMaxFrameBytes,
 					maxBufferedOutboundBytes: productRpcMaxBufferedOutboundBytes,
 				},
 				onClose() {
-					stop(new ExecutorLifecycleStop("Agents-server RPC connection closed.", false));
+					stop(new RuntimeBoxLifecycleStop("Agents-server RPC connection closed.", false));
 				},
 			}),
 		);
@@ -161,23 +202,55 @@ export async function runExecutorProcess(options: RunExecutorProcessOptions = {}
 
 		const registration = await raceWithLifecycle(
 			peer.request(
-				productRpcMethods.executorRegister,
+				productRpcMethods.runtimeBoxRegister,
 				rpcJsonValueSchema.parse(
-					executorRegisterInputSchema.parse({ schemaVersion: 1, status: "ready" }),
+					runtimeBoxRegisterInputSchema.parse({
+						schemaVersion: 1,
+						status: "ready",
+						runtimeBox: {
+							schemaVersion: 1,
+							runtimeBoxId: bootstrap.identity.peerId,
+							kind: "local",
+							displayName: "Local Runtime Box",
+							runtimeBoxVersion: PROCESS_VERSION,
+							platform: process.platform,
+							arch: process.arch,
+							capabilities: [
+								...executorToolNames.map((tool) => `tool.${tool}`),
+								"projects.validate-path",
+							],
+						},
+					}),
 				),
 				{ signal: lifecycle.signal },
 			),
 			lifecycle.signal,
 		);
-		executorRegisterOutputSchema.parse(registration);
+		const registrationOutput = runtimeBoxRegisterOutputSchema.parse(registration);
+		if (registrationOutput.runtimeBoxId !== bootstrap.identity.peerId) {
+			throw new Error("Agents-server registered a different Runtime Box identity.");
+		}
+		await reconcileInvocationJournal(peer, invocationJournal, lifecycle.signal);
+		await peer.request(productRpcMethods.runtimeBoxReady, {}, { signal: lifecycle.signal });
+		reconciliationObservation = watchInvocationReconciliation(
+			peer,
+			invocationJournal,
+			lifecycle.signal,
+			{
+				onError: (error) =>
+					console.error(
+						error instanceof Error ? error.message : "Runtime Box Action reconciliation failed.",
+					),
+			},
+		);
 		await Promise.resolve();
 		throwIfLifecycleStopped(lifecycle.signal);
 
-		const ready: ExecutorReadyRecord = {
+		const ready: RuntimeBoxReadyRecord = {
 			channel: companionBootstrapChannel,
 			controlVersion: companionControlVersion,
 			type: "READY",
-			role: "executor",
+			role: "runtime-box",
 			pid: process.pid,
 			processVersion: PROCESS_VERSION,
 			nonce: bootstrap.nonce,
@@ -199,7 +272,7 @@ export async function runExecutorProcess(options: RunExecutorProcessOptions = {}
 		signalSource.remove("SIGINT", onSigint);
 		signalSource.remove("SIGTERM", onSigterm);
 		if (!lifecycle.signal.aborted) {
-			lifecycle.abort(new ExecutorLifecycleStop("Executor startup cleanup.", true));
+			lifecycle.abort(new RuntimeBoxLifecycleStop("Runtime Box startup cleanup.", true));
 		}
 		const cleanupDeadline = Date.now() + cleanupTimeoutMs;
 		const cancelParentMonitor = Promise.resolve()
@@ -208,6 +281,7 @@ export async function runExecutorProcess(options: RunExecutorProcessOptions = {}
 		await settlesWithin(cancelParentMonitor, cleanupDeadline);
 		shutdownPeer(peer);
 		await settlesWithin(parentObservation, cleanupDeadline);
+		await settlesWithin(reconciliationObservation, cleanupDeadline);
 		void lateConnectionObservation;
 	}
 }
@@ -217,19 +291,19 @@ export function assertExpectedAgentsServerIdentity(
 	expected: Parameters<typeof isSameRpcPeerIdentity>[1],
 ): void {
 	if (!isSameRpcPeerIdentity(actual, expected)) {
-		throw new Error("Authenticated agents-server identity did not match executor bootstrap.");
+		throw new Error("Authenticated agents-server identity did not match Runtime Box bootstrap.");
 	}
 }
 
 function createAgentsServerUrl(endpoint: {
 	host: "127.0.0.1";
 	port: number;
-	path: "/rpc";
+	path: "/runtime";
 }): string {
 	return `ws://${endpoint.host}:${endpoint.port}${endpoint.path}`;
 }
 
-const processReadyWriter: ExecutorReadyWriter = {
+const processReadyWriter: RuntimeBoxReadyWriter = {
 	enqueue(record, signal) {
 		throwIfLifecycleStopped(signal);
 		let resolveDrain: (() => void) | undefined;
@@ -254,7 +328,7 @@ const processReadyWriter: ExecutorReadyWriter = {
 	},
 };
 
-function shutdownPeer(peer: ExecutorRpcPeer | undefined): void {
+function shutdownPeer(peer: RuntimeBoxRpcPeer | undefined): void {
 	if (peer === undefined) {
 		return;
 	}
@@ -263,9 +337,9 @@ function shutdownPeer(peer: ExecutorRpcPeer | undefined): void {
 		() => undefined,
 	);
 	try {
-		peer.close(1000, "Executor shutting down.");
+		peer.close(1000, "RuntimeBox shutting down.");
 	} finally {
-		peer.terminate(1001, "Executor transport shutdown deadline reached.");
+		peer.terminate(1001, "RuntimeBox transport shutdown deadline reached.");
 	}
 }
 
@@ -347,30 +421,51 @@ function throwIfLifecycleStopped(signal: AbortSignal): void {
 	}
 }
 
-function getLifecycleStop(reason: unknown): ExecutorLifecycleStop | undefined {
-	return reason instanceof ExecutorLifecycleStop ? reason : undefined;
+function getLifecycleStop(reason: unknown): RuntimeBoxLifecycleStop | undefined {
+	return reason instanceof RuntimeBoxLifecycleStop ? reason : undefined;
 }
 
-class ExecutorLifecycleStop extends Error {
+class RuntimeBoxLifecycleStop extends Error {
 	constructor(
 		message: string,
 		readonly normal: boolean,
 		options?: ErrorOptions,
 	) {
 		super(message, options);
-		this.name = "ExecutorLifecycleStop";
+		this.name = "RuntimeBoxLifecycleStop";
 	}
 }
 
+export async function runRuntimeBoxMain(
+	args: readonly string[],
+	embeddedAssets?: EmbeddedRuntimeBoxAssets,
+): Promise<number> {
+	let toolRuntime: Promise<ExecutorToolRuntime> | undefined;
+	const createToolRuntime = (): Promise<ExecutorToolRuntime> => {
+		if (toolRuntime !== undefined) {
+			return toolRuntime;
+		}
+		toolRuntime = (async () => {
+			if (embeddedAssets === undefined) {
+				return createExecutorToolRuntime();
+			}
+			const extracted = await extractEmbeddedRuntimeBoxAssets(embeddedAssets);
+			configurePhotonWasmPath(extracted.photonWasm);
+			return createExecutorToolRuntime({ rg: extracted.rg, fd: extracted.fd });
+		})();
+		return toolRuntime;
+	};
+	if (args.length === 0) {
+		await runRuntimeBoxProcess({ toolRuntime: await createToolRuntime() });
+		return 0;
+	}
+	return runRuntimeBoxCli(args, console.log, { createToolRuntime });
+}
+
 if (import.meta.main) {
-	const toolRuntime = await createExecutorToolRuntime().catch((error: unknown) => {
-		console.error(
-			error instanceof Error ? error.message : "executor tool runtime initialization failed.",
-		);
-		process.exit(1);
+	const exitCode = await runRuntimeBoxMain(process.argv.slice(2)).catch((error: unknown) => {
+		console.error(error instanceof Error ? error.message : "Runtime Box command failed.");
+		return 1;
 	});
-	await runExecutorProcess({ toolRuntime }).catch((error: unknown) => {
-		console.error(error instanceof Error ? error.message : "executor bootstrap failed.");
-		process.exit(1);
-	});
+	process.exit(exitCode);
 }

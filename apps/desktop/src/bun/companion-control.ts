@@ -6,10 +6,10 @@ import {
 	type CompanionReadyRecord,
 	companionBootstrapChannel,
 	companionControlVersion,
-	type ExecutorBootstrapRecord,
-	type ExecutorReadyRecord,
-	executorBootstrapRecordSchema,
-	executorReadyRecordSchema,
+	type RuntimeBoxBootstrapRecord,
+	type RuntimeBoxReadyRecord,
+	runtimeBoxBootstrapRecordSchema,
+	runtimeBoxReadyRecordSchema,
 	maxCompanionControlRecordBytes,
 	parseCompanionControlRecord,
 	serializeCompanionControlRecord,
@@ -18,13 +18,13 @@ import {
 export const COMPANION_BOOTSTRAP_CHANNEL = companionBootstrapChannel;
 export const COMPANION_CONTROL_VERSION = companionControlVersion;
 export const MAX_COMPANION_CONTROL_RECORD_BYTES = maxCompanionControlRecordBytes;
-export type CompanionRole = "agents-server" | "executor";
+export type CompanionRole = "agents-server" | "runtime-box";
 export type {
 	AgentsServerBootstrapRecord,
 	AgentsServerReadyRecord,
 	CompanionReadyRecord,
-	ExecutorBootstrapRecord,
-	ExecutorReadyRecord,
+	RuntimeBoxBootstrapRecord,
+	RuntimeBoxReadyRecord,
 };
 
 export type ReadyRecordExpectation =
@@ -35,10 +35,10 @@ export type ReadyRecordExpectation =
 			serverIdentity: AgentsServerReadyRecord["serverIdentity"];
 	  }
 	| {
-			role: "executor";
+			role: "runtime-box";
 			pid: number;
 			nonce: string;
-			identity: ExecutorReadyRecord["identity"];
+			identity: RuntimeBoxReadyRecord["identity"];
 			agentsServer: AgentsServerReadyRecord;
 	  };
 
@@ -92,17 +92,17 @@ export function parseCompanionReadyRecord(
 		}
 		return ready;
 	}
-	const ready = parseCompanionControlRecord(input, executorReadyRecordSchema, "READY");
+	const ready = parseCompanionControlRecord(input, runtimeBoxReadyRecordSchema, "READY");
 	if (
 		ready.pid !== expectation.pid ||
 		ready.nonce !== expectation.nonce ||
 		!sameIdentity(ready.identity, expectation.identity) ||
 		!sameIdentity(ready.agentsServer.identity, expectation.agentsServer.serverIdentity) ||
-		ready.agentsServer.endpoint.host !== expectation.agentsServer.endpoint.host ||
-		ready.agentsServer.endpoint.port !== expectation.agentsServer.endpoint.port ||
-		ready.agentsServer.endpoint.path !== expectation.agentsServer.endpoint.path
+		ready.agentsServer.endpoint.host !== expectation.agentsServer.runtimeEndpoint.host ||
+		ready.agentsServer.endpoint.port !== expectation.agentsServer.runtimeEndpoint.port ||
+		ready.agentsServer.endpoint.path !== expectation.agentsServer.runtimeEndpoint.path
 	) {
-		throw new Error("Invalid executor READY control record.");
+		throw new Error("Invalid Runtime Box READY control record.");
 	}
 	return ready;
 }
@@ -111,8 +111,8 @@ export function serializeAgentsServerBootstrap(record: AgentsServerBootstrapReco
 	return serializeCompanionControlRecord(record, agentsServerBootstrapRecordSchema);
 }
 
-export function serializeExecutorBootstrap(record: ExecutorBootstrapRecord): Uint8Array {
-	return serializeCompanionControlRecord(record, executorBootstrapRecordSchema);
+export function serializeRuntimeBoxBootstrap(record: RuntimeBoxBootstrapRecord): Uint8Array {
+	return serializeCompanionControlRecord(record, runtimeBoxBootstrapRecordSchema);
 }
 
 function sameIdentity(

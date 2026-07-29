@@ -22,6 +22,7 @@ import {
 	type ChatSendAcceptedOutput,
 	type CreateChatSessionOutput,
 	type CreateProcessChatSessionInput,
+	defaultLocalRuntimeBoxId,
 	type CreateProviderInput,
 	chatMessageSchema,
 	chatSendAcceptedOutputSchema,
@@ -104,6 +105,7 @@ import {
 	type RunJournalRepository,
 	type RunPageCursor,
 	type SessionRepository,
+	type ActionRepository,
 } from "@moshu/database";
 
 const STREAMED_DELTA_FLUSH_LATENCY_MS = 20;
@@ -150,7 +152,9 @@ export interface ChatApplicationServiceOptions {
 	fetchProviderModels?: ProviderModelCatalogFetcher;
 	schedule?: ChatTaskScheduler;
 	logger?: ChatServiceLogger;
-	isRuntimeReady?: () => boolean;
+	isRuntimeReady?: (runtimeBoxId: string) => boolean;
+	getActiveRuntimeBoxId?: () => string;
+	actions?: ActionRepository;
 	agentSessionCleanupRetryBaseMs?: number;
 	agentSessionCleanupRetryMaxMs?: number;
 	agentSessionCleanupAttemptTimeoutMs?: number;
@@ -170,6 +174,7 @@ interface ActiveChatRun {
 	runId: string;
 	sessionId: string;
 	agentSessionId: string;
+	runtimeBoxId: string;
 	assistantMessageId: string;
 	provider: ResolvedProviderConfiguration;
 	messages: AskChatMessage[];
@@ -192,7 +197,9 @@ export class ChatApplicationService {
 	readonly #runtime: AskChatRuntime;
 	readonly #schedule: ChatTaskScheduler;
 	readonly #logger: ChatServiceLogger;
-	readonly #isRuntimeReady: () => boolean;
+	readonly #isRuntimeReady: (runtimeBoxId: string) => boolean;
+	readonly #getActiveRuntimeBoxId: () => string;
+	readonly #actions: ActionRepository | undefined;
 	readonly #listeners = new Set<ChatEventListener>();
 	readonly #publicationQueue: ChatRunEvent[][] = [];
 	readonly #activeRuns = new Map<string, ActiveChatRun>();
@@ -236,6 +243,8 @@ export class ChatApplicationService {
 		this.#schedule = options.schedule ?? ((task) => setTimeout(task, 0));
 		this.#logger = options.logger ?? console;
 		this.#isRuntimeReady = options.isRuntimeReady ?? (() => true);
+		this.#getActiveRuntimeBoxId = options.getActiveRuntimeBoxId ?? (() => defaultLocalRuntimeBoxId);
+		this.#actions = options.actions;
 		this.#agentSessionCleanupRetryBaseMs = requirePositiveSafeInteger(
 			options.agentSessionCleanupRetryBaseMs ?? defaultAgentSessionCleanupRetryBaseMs,
 			"agentSessionCleanupRetryBaseMs",
@@ -459,6 +468,7 @@ export class ChatApplicationService {
 	setSessionModel(input: SetChatSessionModelInput): SetChatSessionModelOutput {
 		const parsedInput = setChatSessionModelInputSchema.parse(input);
 		this.#assertDataPlaneAvailable();
+		this.#assertSessionRuntimeReady(parsedInput.sessionId);
 		if (parsedInput.model !== null) {
 			this.#requireProviderModel(parsedInput.model.providerId, parsedInput.model.modelId);
 		}
@@ -471,6 +481,7 @@ export class ChatApplicationService {
 
 	createSession(): CreateChatSessionOutput {
 		this.#assertDataPlaneAvailable();
+		this.#assertRuntimeReady(this.#getActiveRuntimeBoxId());
 		return this.#sessions.create({
 			title: "New chat",
 			defaultMode: "agent",
@@ -482,6 +493,11 @@ export class ChatApplicationService {
 		origin: ProcessPeerIdentity,
 	): CreateChatSessionOutput {
 		this.#assertDataPlaneAvailable();
+		const existing = this.#sessions.findIdempotent({ request, origin });
+		if (existing !== undefined) {
+			return existing;
+		}
+		this.#assertRuntimeReady(request.runtimeBoxId ?? this.#getActiveRuntimeBoxId());
 		return this.#sessions.createIdempotently({ request, origin });
 	}
 
@@ -494,6 +510,7 @@ export class ChatApplicationService {
 		this.#assertDataPlaneAvailable();
 		const parsedInput = updateChatSessionInputSchema.parse(input);
 		this.#assertSessionNotDeleting(parsedInput.sessionId);
+		this.#assertSessionRuntimeReady(parsedInput.sessionId);
 		return this.#sessions.update(parsedInput);
 	}
 
@@ -501,6 +518,7 @@ export class ChatApplicationService {
 		this.#assertDataPlaneAvailable();
 		const parsedInput = setChatSessionArchivedInputSchema.parse(input);
 		this.#assertSessionNotDeleting(parsedInput.sessionId);
+		this.#assertSessionRuntimeReady(parsedInput.sessionId);
 		if (parsedInput.archived) {
 			this.#assertSessionCanBeRemovedFromActiveList(parsedInput.sessionId);
 		}
@@ -517,6 +535,14 @@ export class ChatApplicationService {
 		if (this.#runs.isSessionRetired(parsedInput.sessionId)) {
 			return Promise.resolve({ sessionId: parsedInput.sessionId });
 		}
+		if (this.#actions?.hasUnacknowledgedForSession(parsedInput.sessionId)) {
+			throw new AskChatRuntimeError({
+				kind: "duplicate_run_id",
+				message: "Reconcile pending Runtime Box Actions before deleting this Session.",
+				retryable: true,
+			});
+		}
+		this.#assertSessionRuntimeReady(parsedInput.sessionId);
 		this.#assertSessionCanBeRemovedFromActiveList(parsedInput.sessionId);
 		this.#deletingSessions.add(parsedInput.sessionId);
 		let deleted: { sessionId: string };
@@ -636,13 +662,12 @@ export class ChatApplicationService {
 				}
 			}
 		}
-		this.#assertRuntimeReady();
-		const provider = this.#resolveSessionProvider(input.sessionId);
-
 		const reservation = this.#reserveSessionStart(input.sessionId);
 		let convertedReservation = false;
 		try {
 			const currentSession = this.#sessions.get({ sessionId: input.sessionId });
+			this.#assertRuntimeReady(currentSession.runtimeBoxId);
+			const provider = this.#resolveSessionProvider(input.sessionId);
 			const existingRuns = this.#runs.listBySession(input.sessionId);
 			for (const run of existingRuns) {
 				if (isNonTerminalRun(run) && !this.#activeRuns.has(run.id)) {
@@ -689,6 +714,7 @@ export class ChatApplicationService {
 				runId: created.run.id,
 				sessionId: input.sessionId,
 				agentSessionId: currentSession.agentSessionId,
+				runtimeBoxId: currentSession.runtimeBoxId,
 				assistantMessageId,
 				messages: [{ role: "user", content: input.content, id: userMessageId }],
 				durableAssistantContent: "",
@@ -1340,7 +1366,7 @@ export class ChatApplicationService {
 
 	async #executeRun(activeRun: ActiveChatRun): Promise<void> {
 		try {
-			this.#assertRuntimeReady();
+			this.#assertRuntimeReady(activeRun.runtimeBoxId);
 			if (activeRun.cancelRequested) {
 				await this.#finishCancelledRun(activeRun);
 				return;
@@ -1362,6 +1388,7 @@ export class ChatApplicationService {
 			const result = await this.#runtime.run({
 				runId: activeRun.runId,
 				threadId: activeRun.agentSessionId,
+				runtimeBoxId: activeRun.runtimeBoxId,
 				provider: activeRun.provider,
 				messages: activeRun.messages,
 				signal: activeRun.abortController.signal,
@@ -2075,14 +2102,18 @@ export class ChatApplicationService {
 		}
 	}
 
-	#assertRuntimeReady(): void {
-		if (!this.#isRuntimeReady()) {
+	#assertRuntimeReady(runtimeBoxId: string): void {
+		if (!this.#isRuntimeReady(runtimeBoxId)) {
 			throw new AskChatRuntimeError({
-				kind: "provider_failure",
-				message: "The local executor is not authenticated and ready.",
+				kind: "runtime_box_unavailable",
+				message: "The active Runtime Box is not authenticated and ready.",
 				retryable: true,
 			});
 		}
+	}
+
+	#assertSessionRuntimeReady(sessionId: string): void {
+		this.#assertRuntimeReady(this.#sessions.get({ sessionId }).runtimeBoxId);
 	}
 
 	#assertDataPlaneAvailable(): void {
@@ -2328,6 +2359,11 @@ const runtimeErrorDetails: Record<
 		code: "PROVIDER_REQUEST_FAILED",
 		category: "provider",
 		messageKey: "errors.providerRequestFailed",
+	},
+	runtime_box_unavailable: {
+		code: "RUNTIME_BOX_UNAVAILABLE",
+		category: "runtime",
+		messageKey: "errors.runtimeBoxUnavailable",
 	},
 	thread_busy: {
 		code: "CHAT_THREAD_BUSY",

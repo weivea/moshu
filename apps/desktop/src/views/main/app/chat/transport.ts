@@ -41,6 +41,7 @@ export interface ChatMessage {
 
 export interface ChatSession {
 	id: string;
+	runtimeBoxId: string;
 	title: string;
 	updatedAt: string;
 	archivedAt?: string;
@@ -56,6 +57,7 @@ export interface ChatSession {
 
 export interface ChatSessionSummary {
 	id: string;
+	runtimeBoxId: string;
 	title: string;
 	createdAt: string;
 	updatedAt: string;

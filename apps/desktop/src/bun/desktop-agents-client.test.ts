@@ -9,6 +9,7 @@ import {
 	chatSendAcceptedOutputSchema,
 	createChatSessionOutputSchema,
 	createProcessChatSessionInputSchema,
+	defaultLocalRuntimeBoxId,
 	deleteChatSessionInputSchema,
 	deleteChatSessionOutputSchema,
 	emptyParamsSchema,
@@ -336,7 +337,12 @@ describe("DesktopAgentsClient", () => {
 		client.close();
 	});
 
-	test.each(["INVALID_ARGUMENT", "SESSION_CREATE_KEY_CONFLICT", "SESSION_CREATE_CAPACITY"])(
+	test.each([
+		"INVALID_ARGUMENT",
+		"RUNTIME_BOX_NOT_READY",
+		"SESSION_CREATE_KEY_CONFLICT",
+		"SESSION_CREATE_CAPACITY",
+	])(
 		"releases an ambiguous Session create after definitive %s reconciliation",
 		async (remoteCode) => {
 			const receivedKeys: string[] = [];
@@ -1319,7 +1325,7 @@ describe("DesktopAgentsClient", () => {
 						failedPeer as unknown as Parameters<NonNullable<typeof options.onClose>>[1],
 					);
 					throw new RpcRemoteError("remote-send", {
-						code: "AGENTS_NOT_READY",
+						code: "RUNTIME_BOX_NOT_READY",
 						message: "definitive rejection",
 					});
 				});
@@ -1498,7 +1504,7 @@ describe("DesktopAgentsClient", () => {
 		},
 	);
 
-	test.each(["INVALID_ARGUMENT", "AGENTS_NOT_READY"])(
+	test.each(["INVALID_ARGUMENT", "RUNTIME_BOX_NOT_READY"])(
 		"releases an unbound reservation after definitive %s reconciliation",
 		async (remoteCode) => {
 			let connectionIndex = 0;
@@ -1797,8 +1803,8 @@ describe("DesktopAgentsClient", () => {
 
 	test("maps transport closure before or after onClose without relabeling remote or schema errors", async () => {
 		const remoteError = new RpcRemoteError("remote-request", {
-			code: "AGENTS_NOT_READY",
-			message: "executor is not ready",
+			code: "RUNTIME_BOX_NOT_READY",
+			message: "Runtime Box is not ready",
 		});
 		const failures: Array<{
 			readonly error: Error;
@@ -3177,6 +3183,8 @@ function createConnectOptions(): DesktopAgentsConnectOptions {
 				generation: 1,
 			},
 			endpoint: { host: "127.0.0.1", port: 42_101, path: "/rpc" },
+			runtimeEndpoint: { host: "127.0.0.1", port: 42_102, path: "/runtime" },
+			actionJournalEpoch: "550e8400-e29b-41d4-a716-446655440099",
 		},
 		identity: {
 			role: "client",
@@ -3194,6 +3202,7 @@ function createSessionPayload(index: number): JsonValue {
 			schemaVersion: 1,
 			id: `01984df0-cf17-7e6e-9a7d-${index.toString(16).padStart(12, "0")}`,
 			agentSessionId: `01984df0-cf17-7e6e-9a7d-${index.toString(16).padStart(12, "0")}`,
+			runtimeBoxId: defaultLocalRuntimeBoxId,
 			title: "New chat",
 			defaultMode: "ask",
 			createdAt,
@@ -3213,6 +3222,7 @@ function createAcceptedPayload(
 			schemaVersion: 1,
 			id: acceptedRunId,
 			sessionId: acceptedSessionId,
+			runtimeBoxId: defaultLocalRuntimeBoxId,
 			mode: "ask",
 			status: "queued",
 			provider: {
@@ -3262,6 +3272,7 @@ function createSessionPagePayload(): JsonValue {
 			schemaVersion: 1,
 			id: sessionId,
 			agentSessionId: sessionId,
+			runtimeBoxId: defaultLocalRuntimeBoxId,
 			title: "Recovered Session",
 			defaultMode: "ask",
 			createdAt,

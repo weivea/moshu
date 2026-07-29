@@ -29,7 +29,11 @@ import type {
 	UpdateChatSessionOutput,
 	UpdateProviderInput,
 } from "@moshu/contracts";
-import { maxRetainedSessionRetirements, retiredSessionTombstoneTtlMs } from "@moshu/contracts";
+import {
+	defaultLocalRuntimeBoxId,
+	maxRetainedSessionRetirements,
+	retiredSessionTombstoneTtlMs,
+} from "@moshu/contracts";
 import { describe, expect, test } from "vitest";
 
 import { AgentsUnavailableError, ChatSessionNotFoundError } from "../../../../shared/rpc-errors";
@@ -214,6 +218,7 @@ describe("RPC Chat transport", () => {
 		expect(await transport.listSessions()).toEqual([
 			{
 				id: sessionId,
+				runtimeBoxId: defaultLocalRuntimeBoxId,
 				title: "New chat",
 				createdAt,
 				updatedAt: createdAt,
@@ -496,6 +501,7 @@ function createContractSession() {
 		schemaVersion: 1 as const,
 		id: sessionId,
 		agentSessionId: sessionId,
+		runtimeBoxId: defaultLocalRuntimeBoxId,
 		title: "New chat",
 		defaultMode: "ask" as const,
 		createdAt,
@@ -540,6 +546,7 @@ function createRun() {
 		schemaVersion: 1 as const,
 		id: runId,
 		sessionId,
+		runtimeBoxId: defaultLocalRuntimeBoxId,
 		mode: "ask" as const,
 		status: "running" as const,
 		provider: {

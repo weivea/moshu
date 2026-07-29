@@ -35,9 +35,9 @@ const validRecord: AgentsServerBootstrapRecord = {
 		{
 			credential: Buffer.alloc(32, 8).toString("base64url"),
 			identity: {
-				role: "executor",
-				peerId: "moshu-local-executor",
-				instanceId: "executor-1",
+				role: "runtime-box",
+				peerId: "moshu-local-runtime-box",
+				instanceId: "runtime-box-1",
 				generation: 1,
 			},
 		},
@@ -58,7 +58,7 @@ describe("agents-server bootstrap control", () => {
 	test.each([
 		["invalid JSON", "not-json\n"],
 		["multiple records", "{}\n{}\n"],
-		["wrong role", JSON.stringify({ ...validRecord, role: "executor" })],
+		["wrong role", JSON.stringify({ ...validRecord, role: "runtime-box" })],
 		["missing peer bindings", JSON.stringify({ ...validRecord, peerBindings: [] })],
 	])("rejects %s", (_name, input) => {
 		expect(() => parseAgentsServerBootstrapRecord(input)).toThrow();

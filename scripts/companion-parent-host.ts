@@ -13,12 +13,12 @@ const supervisor = new CompanionProcessSupervisor({
 			"dist",
 			getCompanionExecutableFilename("agents-server", process.platform),
 		),
-		executor: resolve(
+		"runtime-box": resolve(
 			repositoryRoot,
 			"apps",
-			"executor",
+			"runtime-box",
 			"dist",
-			getCompanionExecutableFilename("executor", process.platform),
+			getCompanionExecutableFilename("runtime-box", process.platform),
 		),
 	},
 	startupTimeoutMs: 5_000,
@@ -26,8 +26,8 @@ const supervisor = new CompanionProcessSupervisor({
 });
 const snapshot = await supervisor.start();
 const agentsServer = snapshot.processes["agents-server"];
-const executor = snapshot.processes.executor;
-if (agentsServer === undefined || executor === undefined) {
+const runtimeBox = snapshot.processes["runtime-box"];
+if (agentsServer === undefined || runtimeBox === undefined) {
 	throw new Error("Parent-death host did not start both companions.");
 }
 
@@ -35,7 +35,7 @@ console.info(
 	JSON.stringify({
 		type: "PARENT_READY",
 		agentsServerPid: agentsServer.identity.pid,
-		executorPid: executor.identity.pid,
+		runtimeBoxPid: runtimeBox.identity.pid,
 	}),
 );
 

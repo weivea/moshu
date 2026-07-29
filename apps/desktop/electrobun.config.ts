@@ -5,7 +5,7 @@ import { createElectrobunCompanionCopyEntries } from "./src/shared/companion-exe
 
 export const companionSourceWatchPaths = [
 	"../agents-server/src",
-	"../executor/src",
+	"../runtime-box/src",
 	"../../packages/agent-runtime/src",
 	"../../packages/contracts/src",
 	"../../packages/database/src",
@@ -44,7 +44,7 @@ export function createElectrobunConfig(
 				"src/views/canvas/index.html": "views/canvas/index.html",
 				"../../THIRD_PARTY_NOTICES.txt": "licenses/THIRD_PARTY_NOTICES.txt",
 				"../../third_party/licenses": "licenses/third_party",
-				"../executor/node_modules/@silvia-odwyer/photon-node/LICENSE.md":
+				"../runtime-box/node_modules/@silvia-odwyer/photon-node/LICENSE.md":
 					"licenses/third_party/photon-node-LICENSE.md",
 				...createElectrobunCompanionCopyEntries(platform),
 			},

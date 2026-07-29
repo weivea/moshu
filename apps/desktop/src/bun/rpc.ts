@@ -17,6 +17,33 @@ import {
 	getChatSessionPageOutputSchema,
 	getChatSessionSnapshotOutputSchema,
 	getDefaultModelOutputSchema,
+	listRuntimeBoxesOutputSchema,
+	switchRuntimeBoxInputSchema,
+	switchRuntimeBoxOutputSchema,
+	createRuntimeBoxPairingOutputSchema,
+	listRuntimeBoxPairingClaimsOutputSchema,
+	approveRuntimeBoxPairingInputSchema,
+	approveRuntimeBoxPairingOutputSchema,
+	rejectRuntimeBoxPairingInputSchema,
+	rejectRuntimeBoxPairingOutputSchema,
+	revokeRuntimeBoxDeviceInputSchema,
+	revokeRuntimeBoxDeviceOutputSchema,
+	remoteAccessStatusOutputSchema,
+	remoteAccessAuthAttemptInputSchema,
+	remoteAccessAuthAttemptSchema,
+	remoteAccessMutationOutputSchema,
+	createProjectInputSchema,
+	createProjectOutputSchema,
+	listProjectsInputSchema,
+	listProjectsOutputSchema,
+	getProjectInputSchema,
+	getProjectOutputSchema,
+	updateProjectInputSchema,
+	updateProjectOutputSchema,
+	setProjectArchivedInputSchema,
+	setProjectArchivedOutputSchema,
+	deleteProjectInputSchema,
+	deleteProjectOutputSchema,
 	listAvailableModelsOutputSchema,
 	listChatSessionsInputSchema,
 	listChatSessionsOutputSchema,
@@ -62,7 +89,7 @@ export interface DesktopRpcDependencies {
 
 export function createDesktopRpc({ agentsClient }: DesktopRpcDependencies) {
 	return BrowserView.defineRPC<DesktopRpc>({
-		maxRequestTime: 15_000,
+		maxRequestTime: 125_000,
 		handlers: {
 			requests: {
 				getRuntimeInfo: async (params) => {
@@ -84,6 +111,139 @@ export function createDesktopRpc({ agentsClient }: DesktopRpcDependencies) {
 						agentRuntime: server.agentRuntime,
 					});
 				},
+				listRuntimeBoxes: (params) =>
+					agentsClient.request(
+						productRpcMethods.runtimeBoxesList,
+						params,
+						emptyParamsSchema,
+						listRuntimeBoxesOutputSchema,
+					),
+				switchRuntimeBox: (params) =>
+					agentsClient.request(
+						productRpcMethods.runtimeBoxesSwitch,
+						params,
+						switchRuntimeBoxInputSchema,
+						switchRuntimeBoxOutputSchema,
+					),
+				createRuntimeBoxPairing: (params) =>
+					agentsClient.request(
+						productRpcMethods.runtimeBoxesPairingCreate,
+						params,
+						emptyParamsSchema,
+						createRuntimeBoxPairingOutputSchema,
+					),
+				listRuntimeBoxPairingClaims: (params) =>
+					agentsClient.request(
+						productRpcMethods.runtimeBoxesPairingListClaims,
+						params,
+						emptyParamsSchema,
+						listRuntimeBoxPairingClaimsOutputSchema,
+					),
+				approveRuntimeBoxPairing: (params) =>
+					agentsClient.request(
+						productRpcMethods.runtimeBoxesPairingApprove,
+						params,
+						approveRuntimeBoxPairingInputSchema,
+						approveRuntimeBoxPairingOutputSchema,
+					),
+				rejectRuntimeBoxPairing: (params) =>
+					agentsClient.request(
+						productRpcMethods.runtimeBoxesPairingReject,
+						params,
+						rejectRuntimeBoxPairingInputSchema,
+						rejectRuntimeBoxPairingOutputSchema,
+					),
+				revokeRuntimeBoxDevice: (params) =>
+					agentsClient.request(
+						productRpcMethods.runtimeBoxesDeviceRevoke,
+						params,
+						revokeRuntimeBoxDeviceInputSchema,
+						revokeRuntimeBoxDeviceOutputSchema,
+					),
+				getRemoteAccessStatus: (params) =>
+					agentsClient.request(
+						productRpcMethods.remoteAccessStatus,
+						params,
+						emptyParamsSchema,
+						remoteAccessStatusOutputSchema,
+					),
+				startRemoteAccessAuthentication: (params) =>
+					agentsClient.request(
+						productRpcMethods.remoteAccessAuthStart,
+						params,
+						emptyParamsSchema,
+						remoteAccessAuthAttemptSchema,
+					),
+				getRemoteAccessAuthentication: (params) =>
+					agentsClient.request(
+						productRpcMethods.remoteAccessAuthGet,
+						params,
+						remoteAccessAuthAttemptInputSchema,
+						remoteAccessAuthAttemptSchema,
+					),
+				enableRemoteAccess: (params) =>
+					agentsClient.request(
+						productRpcMethods.remoteAccessEnable,
+						params,
+						emptyParamsSchema,
+						remoteAccessMutationOutputSchema,
+					),
+				disableRemoteAccess: (params) =>
+					agentsClient.request(
+						productRpcMethods.remoteAccessDisable,
+						params,
+						emptyParamsSchema,
+						remoteAccessMutationOutputSchema,
+					),
+				recreateRemoteAccess: (params) =>
+					agentsClient.request(
+						productRpcMethods.remoteAccessRecreate,
+						params,
+						emptyParamsSchema,
+						remoteAccessMutationOutputSchema,
+					),
+				createProject: (params) =>
+					agentsClient.request(
+						productRpcMethods.projectsCreate,
+						params,
+						createProjectInputSchema,
+						createProjectOutputSchema,
+					),
+				listProjects: (params) =>
+					agentsClient.request(
+						productRpcMethods.projectsList,
+						params,
+						listProjectsInputSchema,
+						listProjectsOutputSchema,
+					),
+				getProject: (params) =>
+					agentsClient.request(
+						productRpcMethods.projectsGet,
+						params,
+						getProjectInputSchema,
+						getProjectOutputSchema,
+					),
+				updateProject: (params) =>
+					agentsClient.request(
+						productRpcMethods.projectsUpdate,
+						params,
+						updateProjectInputSchema,
+						updateProjectOutputSchema,
+					),
+				setProjectArchived: (params) =>
+					agentsClient.request(
+						productRpcMethods.projectsArchive,
+						params,
+						setProjectArchivedInputSchema,
+						setProjectArchivedOutputSchema,
+					),
+				deleteProject: (params) =>
+					agentsClient.request(
+						productRpcMethods.projectsDelete,
+						params,
+						deleteProjectInputSchema,
+						deleteProjectOutputSchema,
+					),
 				listProviders: (params) =>
 					agentsClient.request(
 						productRpcMethods.providersList,

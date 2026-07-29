@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { runtimeBoxConnectionInfoSchema, runtimeBoxIdSchema } from "./runtime-box";
 
 export const emptyParamsSchema = z.object({}).strict();
 
@@ -18,22 +19,14 @@ export const agentRuntimeInfoSchema = z
 
 export const agentsRuntimeInfoSchema = z
 	.object({
-		apiVersion: z.literal(2),
+		apiVersion: z.literal(3),
 		serverVersion: z.string().min(1),
 		bunVersion: z.string().min(1),
 		platform: z.enum(["darwin", "win32", "linux"]),
 		arch: z.string().min(1),
 		agentRuntime: agentRuntimeInfoSchema,
-		ready: z.boolean(),
-		executor: z
-			.object({
-				connected: z.boolean(),
-				registered: z.boolean(),
-				peerId: z.string().min(1).max(256).optional(),
-				instanceId: z.string().min(1).max(256).optional(),
-				generation: z.int().nonnegative().safe().optional(),
-			})
-			.strict(),
+		activeRuntimeBoxId: runtimeBoxIdSchema.optional(),
+		runtimeBoxes: z.array(runtimeBoxConnectionInfoSchema).max(128),
 	})
 	.strict();
 

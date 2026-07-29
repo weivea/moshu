@@ -3,6 +3,7 @@ import { useEffect, useRef } from "react";
 import { createPortal } from "react-dom";
 import { useI18n } from "../i18n";
 import { useAppShellContext } from "../shell-context";
+import { useRuntimeBoxes } from "../runtime-boxes";
 import { ChatComposer } from "./chat-composer";
 import { MessageList } from "./message-list";
 import { SessionSidebar } from "./session-sidebar";
@@ -42,6 +43,7 @@ export function ChatPage({
 }: ChatPageProps) {
 	const { t } = useI18n();
 	const shell = useAppShellContext();
+	const runtimeBoxes = useRuntimeBoxes();
 	const controller = useChatController({
 		transport,
 		sessionId,
@@ -58,6 +60,10 @@ export function ChatPage({
 	const isArchived = controller.session?.archivedAt !== undefined;
 	const title = controller.session?.title ?? t("chat.header.title");
 	const activeSessionId = controller.session?.id ?? sessionId;
+	const sessionRuntimeReady =
+		controller.session === null
+			? runtimeBoxes.isActiveReady
+			: runtimeBoxes.isRuntimeBoxReady(controller.session.runtimeBoxId);
 	const updateSessionSummaryRef = useRef(controller.updateSessionSummary);
 	updateSessionSummaryRef.current = controller.updateSessionSummary;
 
@@ -177,6 +183,11 @@ export function ChatPage({
 								<span>{t("chat.notice.archived")}</span>
 							</div>
 						) : null}
+						{!sessionRuntimeReady ? (
+							<div className="chat-notice chat-notice--info" role="status">
+								<span>{t("runtime.offlineReadOnly")}</span>
+							</div>
+						) : null}
 
 						<MessageList
 							compact={shell !== null}
@@ -186,7 +197,7 @@ export function ChatPage({
 						/>
 						{controller.hasConfiguredProvider ? (
 							<ChatComposer
-								canSend={controller.canSend && !isArchived}
+								canSend={controller.canSend && !isArchived && sessionRuntimeReady}
 								draft={controller.draft}
 								isResponding={controller.isResponding}
 								isStopping={controller.isStopping}

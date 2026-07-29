@@ -11,10 +11,10 @@ import {
 import type { BootstrapControlChannel } from "./bootstrap";
 import {
 	assertExpectedAgentsServerIdentity,
-	type ExecutorReadyWriter,
-	type ExecutorRpcPeer,
-	type ExecutorSignalSource,
-	runExecutorProcess,
+	type RuntimeBoxReadyWriter,
+	type RuntimeBoxRpcPeer,
+	type RuntimeBoxSignalSource,
+	runRuntimeBoxProcess,
 } from "./index";
 
 const expected = {
@@ -28,26 +28,28 @@ const bootstrapRecord = {
 	channel: "moshu-companion-bootstrap",
 	controlVersion: companionControlVersion,
 	type: "START",
-	role: "executor",
-	nonce: "executor-generation-2",
+	role: "runtime-box",
+	nonce: "runtime-box-generation-2",
 	identity: {
-		role: "executor",
-		peerId: "moshu-local-executor",
-		instanceId: "executor-2",
+		role: "runtime-box",
+		peerId: "moshu-local-runtime-box",
+		instanceId: "runtime-box-2",
 		generation: 2,
 	},
 	credential: Buffer.alloc(32, 8).toString("base64url"),
+	dataDirectory: "/tmp/moshu-runtime-box-index-test",
+	actionJournalEpoch: "550e8400-e29b-41d4-a716-446655440099",
 	agentsServer: {
 		identity: expected,
 		endpoint: {
 			host: "127.0.0.1",
 			port: 42_101,
-			path: "/rpc",
+			path: "/runtime",
 		},
 	},
 } as const;
 
-describe("executor agents-server identity", () => {
+describe("Runtime Box agents-server identity", () => {
 	test("accepts the exact authenticated generation", () => {
 		expect(() => assertExpectedAgentsServerIdentity(expected, expected)).not.toThrow();
 	});
@@ -58,25 +60,25 @@ describe("executor agents-server identity", () => {
 		["peer", { ...expected, peerId: "other-agents" }],
 	])("rejects a stale or mismatched %s", (_name, actual) => {
 		expect(() => assertExpectedAgentsServerIdentity(actual, expected)).toThrow(
-			"did not match executor bootstrap",
+			"did not match Runtime Box bootstrap",
 		);
 	});
 });
 
-describe("executor lifecycle", () => {
+describe("Runtime Box lifecycle", () => {
 	test("cancels a stalled connect when the parent closes without emitting READY", async () => {
 		const parent = createParentChannel();
 		const signals = new FakeSignalSource();
 		const connectStarted = deferred<void>();
 		let connectSignal: AbortSignal | undefined;
 		const readyRecords: string[] = [];
-		const run = runExecutorProcess({
+		const run = runRuntimeBoxProcess({
 			...createBaseOptions(parent, signals, readyRecords),
 			connectPeer: (options) => {
 				connectSignal = options.signal;
 				expect(options.expectedServerIdentity).toEqual(expected);
 				connectStarted.resolve();
-				return new Promise<ExecutorRpcPeer>(() => undefined);
+				return new Promise<RuntimeBoxRpcPeer>(() => undefined);
 			},
 		});
 		await connectStarted.promise;
@@ -94,13 +96,13 @@ describe("executor lifecycle", () => {
 		const signals = new FakeSignalSource();
 		const registrationStarted = deferred<void>();
 		let registrationSignal: AbortSignal | undefined;
-		const peer = new FakeExecutorPeer((_method, _payload, options) => {
+		const peer = new FakeRuntimeBoxPeer((_method, _payload, options) => {
 			registrationSignal = options?.signal;
 			registrationStarted.resolve();
 			return new Promise<JsonValue>(() => undefined);
 		});
 		const readyRecords: string[] = [];
-		const run = runExecutorProcess({
+		const run = runRuntimeBoxProcess({
 			...createBaseOptions(parent, signals, readyRecords),
 			connectPeer: async () => peer,
 		});
@@ -118,15 +120,19 @@ describe("executor lifecycle", () => {
 	test("does not emit READY when parent EOF lands immediately after registration", async () => {
 		const parent = createParentChannel();
 		const signals = new FakeSignalSource();
-		const peer = new FakeExecutorPeer((method) => {
-			expect(method).toBe(productRpcMethods.executorRegister);
+		const peer = new FakeRuntimeBoxPeer((method) => {
+			expect(method).toBe(productRpcMethods.runtimeBoxRegister);
 			parent.close();
-			return rpcJsonValueSchema.parse({ schemaVersion: 1, accepted: true });
+			return rpcJsonValueSchema.parse({
+				schemaVersion: 1,
+				accepted: true,
+				runtimeBoxId: bootstrapRecord.identity.peerId,
+			});
 		});
 		const readyRecords: string[] = [];
 
 		await within(
-			runExecutorProcess({
+			runRuntimeBoxProcess({
 				...createBaseOptions(parent, signals, readyRecords),
 				connectPeer: async () => peer,
 			}),
@@ -143,11 +149,11 @@ describe("executor lifecycle", () => {
 			const signals = new FakeSignalSource();
 			const connectStarted = deferred<void>();
 			const readyRecords: string[] = [];
-			const run = runExecutorProcess({
+			const run = runRuntimeBoxProcess({
 				...createBaseOptions(parent, signals, readyRecords),
 				connectPeer: () => {
 					connectStarted.resolve();
-					return new Promise<ExecutorRpcPeer>(() => undefined);
+					return new Promise<RuntimeBoxRpcPeer>(() => undefined);
 				},
 			});
 			await connectStarted.promise;
@@ -163,12 +169,16 @@ describe("executor lifecycle", () => {
 		const parent = createParentChannel();
 		const signals = new FakeSignalSource();
 		const readyRecords: string[] = [];
-		const peer = new FakeExecutorPeer(() =>
-			rpcJsonValueSchema.parse({ schemaVersion: 1, accepted: true }),
+		const peer = new FakeRuntimeBoxPeer(() =>
+			rpcJsonValueSchema.parse({
+				schemaVersion: 1,
+				accepted: true,
+				runtimeBoxId: bootstrapRecord.identity.peerId,
+			}),
 		);
 
 		await within(
-			runExecutorProcess({
+			runRuntimeBoxProcess({
 				...createBaseOptions(parent, signals, readyRecords),
 				connectPeer: async () => peer,
 				readyWriter: {
@@ -193,11 +203,16 @@ describe("executor lifecycle", () => {
 		const signals = new FakeSignalSource();
 		const readyWritten = deferred<void>();
 		const readyRecords: string[] = [];
-		const peer = new FakeExecutorPeer(
-			() => rpcJsonValueSchema.parse({ schemaVersion: 1, accepted: true }),
+		const peer = new FakeRuntimeBoxPeer(
+			() =>
+				rpcJsonValueSchema.parse({
+					schemaVersion: 1,
+					accepted: true,
+					runtimeBoxId: bootstrapRecord.identity.peerId,
+				}),
 			true,
 		);
-		const run = runExecutorProcess({
+		const run = runRuntimeBoxProcess({
 			...createBaseOptions(parent, signals, readyRecords),
 			connectPeer: async () => peer,
 			readyWriter: {
@@ -226,8 +241,12 @@ describe("executor lifecycle", () => {
 			const readyEnqueued = deferred<void>();
 			const drain = deferred<void>();
 			const readyRecords: string[] = [];
-			const peer = new FakeExecutorPeer(() =>
-				rpcJsonValueSchema.parse({ schemaVersion: 1, accepted: true }),
+			const peer = new FakeRuntimeBoxPeer(() =>
+				rpcJsonValueSchema.parse({
+					schemaVersion: 1,
+					accepted: true,
+					runtimeBoxId: bootstrapRecord.identity.peerId,
+				}),
 			);
 			const unhandled: unknown[] = [];
 			const onUnhandled = (error: unknown): void => {
@@ -235,7 +254,7 @@ describe("executor lifecycle", () => {
 			};
 			process.on("unhandledRejection", onUnhandled);
 			try {
-				const run = runExecutorProcess({
+				const run = runRuntimeBoxProcess({
 					...createBaseOptions(parent, signals, readyRecords),
 					connectPeer: async () => peer,
 					readyWriter: {
@@ -271,10 +290,14 @@ describe("executor lifecycle", () => {
 		const signals = new FakeSignalSource();
 		const readyEnqueued = deferred<void>();
 		const readyRecords: string[] = [];
-		const peer = new FakeExecutorPeer(() =>
-			rpcJsonValueSchema.parse({ schemaVersion: 1, accepted: true }),
+		const peer = new FakeRuntimeBoxPeer(() =>
+			rpcJsonValueSchema.parse({
+				schemaVersion: 1,
+				accepted: true,
+				runtimeBoxId: bootstrapRecord.identity.peerId,
+			}),
 		);
-		const run = runExecutorProcess({
+		const run = runRuntimeBoxProcess({
 			...createBaseOptions(parent, signals, readyRecords),
 			openControlChannel: async () => ({
 				...parent.channel,
@@ -309,11 +332,11 @@ describe("executor lifecycle", () => {
 			const parent = createParentChannel();
 			const signals = new FakeSignalSource();
 			const connectStarted = deferred<void>();
-			const run = runExecutorProcess({
+			const run = runRuntimeBoxProcess({
 				...createBaseOptions(parent, signals, []),
 				connectPeer: () => {
 					connectStarted.resolve();
-					return new Promise<ExecutorRpcPeer>((_resolve, reject) => {
+					return new Promise<RuntimeBoxRpcPeer>((_resolve, reject) => {
 						setTimeout(() => reject(new Error("late connect failure")), 10);
 					});
 				},
@@ -330,7 +353,7 @@ describe("executor lifecycle", () => {
 	});
 });
 
-class FakeExecutorPeer implements ExecutorRpcPeer {
+class FakeRuntimeBoxPeer implements RuntimeBoxRpcPeer {
 	readonly remoteIdentity = expected;
 	readonly #closed = deferred<RpcCloseInfo>();
 	readonly closed = this.#closed.promise;
@@ -367,7 +390,7 @@ class FakeExecutorPeer implements ExecutorRpcPeer {
 	}
 }
 
-class FakeSignalSource implements ExecutorSignalSource {
+class FakeSignalSource implements RuntimeBoxSignalSource {
 	readonly #listeners = new Map<"SIGINT" | "SIGTERM", Set<() => void>>([
 		["SIGINT", new Set()],
 		["SIGTERM", new Set()],
@@ -442,7 +465,7 @@ function createBaseOptions(
 		_signal: AbortSignal,
 	) => Promise<BootstrapControlChannel>;
 	readonly signalSource: FakeSignalSource;
-	readonly readyWriter: ExecutorReadyWriter;
+	readonly readyWriter: RuntimeBoxReadyWriter;
 } {
 	return {
 		stdin: new ReadableStream<Uint8Array>(),

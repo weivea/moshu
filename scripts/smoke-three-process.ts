@@ -11,6 +11,7 @@ import { getCompanionExecutableFilename } from "../apps/desktop/src/shared/compa
 import { isAgentsUnavailableError } from "../apps/desktop/src/shared/rpc-errors";
 import {
 	agentsRuntimeInfoSchema,
+	type AgentsRuntimeInfo,
 	type ChatRunEvent,
 	cancelChatRunInputSchema,
 	cancelChatRunOutputSchema,
@@ -31,7 +32,6 @@ import {
 	setProviderModelsEnabledInputSchema,
 	setProviderModelsEnabledOutputSchema,
 } from "../packages/contracts/src";
-import { createUuidV7 } from "../packages/database/src";
 import {
 	connectRpcClient,
 	createRpcBearerHandshakeHeaders,
@@ -45,10 +45,10 @@ mkdirSync(smokeRoot, { recursive: true });
 const directory = await mkdtemp(resolve(smokeRoot, "moshu-three-process-"));
 const productDatabase = resolve(directory, "moshu.db");
 const agentDataDirectory = resolve(directory, "agent-data");
-const executorSmokeCwd = resolve(directory, "executor-workspace");
-mkdirSync(executorSmokeCwd, { recursive: true });
+const runtimeBoxSmokeCwd = resolve(directory, "runtime-box-workspace");
+mkdirSync(runtimeBoxSmokeCwd, { recursive: true });
 writeFileSync(
-	resolve(executorSmokeCwd, "pixel.png"),
+	resolve(runtimeBoxSmokeCwd, "pixel.png"),
 	Buffer.from(
 		"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
 		"base64",
@@ -57,7 +57,7 @@ writeFileSync(
 const staleCredential = Buffer.alloc(32, 91).toString("base64url");
 const agentsClient = new DesktopAgentsClient();
 let connectionOptions: DesktopAgentsConnectOptions | undefined;
-let rejectedBeforeExecutor = false;
+let rejectedBeforeRuntimeBox = false;
 
 const agentsFilename = getCompanionExecutableFilename("agents-server");
 const smokeAgentsFilename =
@@ -67,19 +67,19 @@ const smokeAgentsFilename =
 const supervisor = new CompanionProcessSupervisor({
 	executables: {
 		"agents-server": resolve(repositoryRoot, "apps", "agents-server", "dist", smokeAgentsFilename),
-		executor: resolve(
+		"runtime-box": resolve(
 			repositoryRoot,
 			"apps",
-			"executor",
+			"runtime-box",
 			"dist",
-			getCompanionExecutableFilename("executor"),
+			getCompanionExecutableFilename("runtime-box"),
 		),
 	},
 	dataPaths: { productDatabase, agentDataDirectory },
 	environment: {
 		...createCompanionEnvironment(),
-		MOSHU_EXECUTOR_SMOKE_CWD: executorSmokeCwd,
-		MOSHU_EXECUTOR_SMOKE_VALUE: "inherited-by-executor",
+		MOSHU_RUNTIME_BOX_SMOKE_CWD: runtimeBoxSmokeCwd,
+		MOSHU_RUNTIME_BOX_SMOKE_VALUE: "inherited-by-runtime-box",
 	},
 	additionalPeerBindings: [
 		{
@@ -101,28 +101,19 @@ const supervisor = new CompanionProcessSupervisor({
 			emptyParamsSchema,
 			agentsRuntimeInfoSchema,
 		);
-		if (runtime.ready) {
-			throw new Error("Agents runtime became ready before executor registration.");
+		if (isActiveRuntimeBoxReady(runtime)) {
+			throw new Error("Agents runtime became ready before Runtime Box registration.");
 		}
 		try {
-			await agentsClient.request(
-				productRpcMethods.chatSend,
-				{
-					requestId: crypto.randomUUID(),
-					sessionId: createUuidV7(),
-					content: "must fail before executor",
-				},
-				sendAskChatMessageInputSchema,
-				chatSendAcceptedOutputSchema,
-			);
+			await agentsClient.createSession();
 		} catch (error) {
 			if (
 				!isAgentsUnavailableError(error) &&
-				!(error instanceof RpcRemoteError && error.code === "AGENTS_NOT_READY")
+				!(error instanceof RpcRemoteError && error.code === "RUNTIME_BOX_NOT_READY")
 			) {
 				throw error;
 			}
-			rejectedBeforeExecutor = true;
+			rejectedBeforeRuntimeBox = true;
 		}
 		return connection;
 	},
@@ -131,8 +122,8 @@ const supervisor = new CompanionProcessSupervisor({
 try {
 	const snapshot = await supervisor.start();
 	const capturedConnection = connectionOptions;
-	if (capturedConnection === undefined || !rejectedBeforeExecutor) {
-		throw new Error("Desktop client did not observe fail-closed pre-executor readiness.");
+	if (capturedConnection === undefined || !rejectedBeforeRuntimeBox) {
+		throw new Error("Desktop client did not observe fail-closed pre-Runtime Box readiness.");
 	}
 
 	const runtime = await agentsClient.request(
@@ -141,8 +132,8 @@ try {
 		emptyParamsSchema,
 		agentsRuntimeInfoSchema,
 	);
-	if (!runtime.ready || !runtime.executor.registered) {
-		throw new Error("Agents runtime did not report authenticated executor readiness.");
+	if (!isActiveRuntimeBoxReady(runtime)) {
+		throw new Error("Agents runtime did not report authenticated Runtime Box readiness.");
 	}
 
 	await expectHandshakeFailure(
@@ -153,7 +144,7 @@ try {
 	);
 	await expectHandshakeFailure("role spoof", capturedConnection, capturedConnection.credential, {
 		...capturedConnection.identity,
-		role: "executor",
+		role: "runtime-box",
 	});
 	await expectHandshakeFailure("stale generation", capturedConnection, staleCredential, {
 		role: "client",
@@ -261,8 +252,8 @@ try {
 		getChatSessionPageInputSchema,
 		getChatSessionPageOutputSchema,
 	);
-	if (toolPage.messages.at(-1)?.content !== "executor tools ok") {
-		throw new Error("Three-process executor tool smoke did not complete.");
+	if (toolPage.messages.at(-1)?.content !== "runtime-box tools ok") {
+		throw new Error("Three-process Runtime Box tool smoke did not complete.");
 	}
 
 	const errorSession = await agentsClient.createSession();
@@ -366,9 +357,9 @@ try {
 	const finalSnapshot = supervisor.getSnapshot();
 	const pids = [
 		snapshot.processes["agents-server"]?.identity.pid,
-		snapshot.processes.executor?.identity.pid,
+		snapshot.processes["runtime-box"]?.identity.pid,
 		finalSnapshot.processes["agents-server"]?.identity.pid,
-		finalSnapshot.processes.executor?.identity.pid,
+		finalSnapshot.processes["runtime-box"]?.identity.pid,
 	].filter((pid): pid is number => pid !== undefined);
 	agentsClient.close();
 	await supervisor.shutdown();
@@ -452,7 +443,7 @@ async function waitForRuntimeReady(): Promise<void> {
 				emptyParamsSchema,
 				agentsRuntimeInfoSchema,
 			);
-			if (runtime.ready) {
+			if (isActiveRuntimeBoxReady(runtime)) {
 				return;
 			}
 		} catch {
@@ -461,6 +452,16 @@ async function waitForRuntimeReady(): Promise<void> {
 		await Bun.sleep(10);
 	}
 	throw new Error("Timed out waiting for runtime readiness after restart.");
+}
+
+function isActiveRuntimeBoxReady(runtime: AgentsRuntimeInfo): boolean {
+	if (runtime.activeRuntimeBoxId === undefined) {
+		return false;
+	}
+	const active = runtime.runtimeBoxes.find(
+		(candidate) => candidate.runtimeBox.runtimeBoxId === runtime.activeRuntimeBoxId,
+	);
+	return active?.connected === true && active.registered;
 }
 
 function isProcessAlive(pid: number): boolean {

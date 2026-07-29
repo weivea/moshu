@@ -18,7 +18,7 @@ class SmokeAgentRuntime implements AskChatRuntime {
 
 	constructor(
 		private readonly executorGateway: ExecutorToolGateway,
-		private readonly executorCwd: string,
+		private readonly runtimeBoxCwd: string,
 	) {}
 
 	async run(input: AskChatRunInput): Promise<AskChatRunResult> {
@@ -66,25 +66,25 @@ class SmokeAgentRuntime implements AskChatRuntime {
 				invocationId: crypto.randomUUID(),
 				runId,
 				toolCallId: `three-process-tool-${sequence}`,
-				cwd: this.executorCwd,
+				cwd: this.runtimeBoxCwd,
 				call,
 			});
 		};
 		const write = await invoke({
 			tool: "write",
-			arguments: { path: "notes.txt", content: "alpha from executor\n" },
+			arguments: { path: "notes.txt", content: "alpha from runtime-box\n" },
 		});
 		const read = await invoke({ tool: "read", arguments: { path: "notes.txt" } });
 		const grep = await invoke({
 			tool: "grep",
-			arguments: { pattern: "alpha from executor", path: ".", literal: true },
+			arguments: { pattern: "alpha from runtime-box", path: ".", literal: true },
 		});
 		const find = await invoke({ tool: "find", arguments: { pattern: "notes.txt" } });
 		const ls = await invoke({ tool: "ls", arguments: { path: "." } });
 		const environmentCommand =
 			process.platform === "win32"
-				? "echo %MOSHU_EXECUTOR_SMOKE_VALUE%"
-				: 'printf "%s" "$MOSHU_EXECUTOR_SMOKE_VALUE"';
+				? "echo %MOSHU_RUNTIME_BOX_SMOKE_VALUE%"
+				: 'printf "%s" "$MOSHU_RUNTIME_BOX_SMOKE_VALUE"';
 		const bash = await invoke({
 			tool: "bash",
 			arguments: { command: environmentCommand },
@@ -93,7 +93,7 @@ class SmokeAgentRuntime implements AskChatRuntime {
 			tool: "edit",
 			arguments: {
 				path: "notes.txt",
-				edits: [{ oldText: "alpha from executor", newText: "beta from executor" }],
+				edits: [{ oldText: "alpha from runtime-box", newText: "beta from runtime-box" }],
 			},
 		});
 		const image = await invoke({
@@ -103,18 +103,18 @@ class SmokeAgentRuntime implements AskChatRuntime {
 
 		if (
 			write.tool !== "write" ||
-			!toolText(read).includes("alpha from executor") ||
+			!toolText(read).includes("alpha from runtime-box") ||
 			!toolText(grep).includes("notes.txt") ||
 			!toolText(find).includes("notes.txt") ||
 			!toolText(ls).includes("notes.txt") ||
-			!toolText(bash).includes("inherited-by-executor") ||
-			!toolText(edit).includes("beta from executor") ||
+			!toolText(bash).includes("inherited-by-runtime-box") ||
+			!toolText(edit).includes("beta from runtime-box") ||
 			image.tool !== "read" ||
 			!image.content.some((block) => block.type === "image")
 		) {
-			throw new Error("Three-process executor tool smoke returned unexpected output.");
+			throw new Error("Three-process Runtime Box tool smoke returned unexpected output.");
 		}
-		return "executor tools ok";
+		return "runtime-box tools ok";
 	}
 
 	stream(_input: AskChatRunInput): AskChatRunStream {
@@ -148,13 +148,13 @@ class SmokeAgentRuntime implements AskChatRuntime {
 }
 
 if (import.meta.main) {
-	const executorCwd = process.env.MOSHU_EXECUTOR_SMOKE_CWD;
-	if (executorCwd === undefined) {
-		throw new Error("MOSHU_EXECUTOR_SMOKE_CWD is required by the smoke Agent runtime.");
+	const runtimeBoxCwd = process.env.MOSHU_RUNTIME_BOX_SMOKE_CWD;
+	if (runtimeBoxCwd === undefined) {
+		throw new Error("MOSHU_RUNTIME_BOX_SMOKE_CWD is required by the smoke Agent runtime.");
 	}
 	await runAgentsServerProcess({
 		createRuntime: (_providers, _modelRuntime, executorGateway) =>
-			new SmokeAgentRuntime(executorGateway, executorCwd),
+			new SmokeAgentRuntime(executorGateway, runtimeBoxCwd),
 		fetchProviderModels: async () => [
 			{
 				id: "smoke-model",

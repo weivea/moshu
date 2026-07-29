@@ -222,7 +222,7 @@ describe("process RPC protocol", () => {
 	test("fits maximally escaped bounded handshake envelopes within the frame minimum", () => {
 		const maximalIdentifier = "\0".repeat(256);
 		const maximalIdentity: RpcPeerIdentity = {
-			role: "executor",
+			role: "runtime-box",
 			peerId: maximalIdentifier,
 			instanceId: maximalIdentifier,
 			generation: Number.MAX_SAFE_INTEGER,

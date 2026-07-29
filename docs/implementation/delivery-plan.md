@@ -2,6 +2,7 @@
 
 > 本文维护目标、依赖和阶段出口，不直接表示完成度。当前状态见[实施进度](./progress.md)。
 > 三应用角色及所有权以[技术架构](./architecture.md)和[数据契约](./data-contracts.md)为准。
+> Remote Runtime Box 的专项依赖和出口见[Runtime Box 技术与实施方案](./runtime-box.md)。
 
 ## 1. 计划口径
 
@@ -22,7 +23,7 @@
 flowchart LR
     A0[A0 RPC / Binary POC]
     A1[A1 Agents Server Extraction]
-    A2[A2 Executor / Agent Registry]
+    A2[A2 Runtime Box / Agent Registry]
     A3[A3 Tool Bridge / Action Broker]
     A4[A4 MCP / Skills]
     A5[A5 Recovery / Release Hardening]
@@ -39,8 +40,8 @@ flowchart LR
 功能流可以在不破坏所有权的前提下与迁移重叠，但不能：
 
 - 在 client 保留新的 Agent/Provider/DB 业务实现。
-- 增加 client 直连 executor 的临时通道。
-- 让 executor 写产品 DB/Pi Session JSONL 或自行批准 Action。
+- 增加 client 直连 Runtime Box 的临时通道。
+- 让 Runtime Box 写产品 DB/Pi Session JSONL 或自行批准 Action。
 - 用当前可信直连七工具测试替代尚未实现的 Policy/grant/MCP/Skill 验收。
 
 ## 3. A0：RPC / Companion Binary POC
@@ -51,7 +52,7 @@ flowchart LR
 
 | ID | 工作包 | 产出 | 尺寸 |
 | --- | --- | --- | --- |
-| A0-01 | Companion skeleton | `agents-server`、`executor` TypeScript entry、Bun compile、版本输出 | M |
+| A0-01 | Companion skeleton | `agents-server`、`Runtime Box` TypeScript entry、Bun compile、版本输出 | M |
 | A0-02 | Desktop bootstrap | client 启动 server、动态 loopback endpoint、一次性注册材料 | L |
 | A0-03 | Versioned JSON RPC | WebSocket request/response/notification、Zod、错误、deadline、背压 | L |
 | A0-04 | Role registration | stable ID、instance ID、generation、connection ID、method allowlist | L |
@@ -62,15 +63,15 @@ flowchart LR
 
 1. client 启动 server，读取受控 bootstrap，不解析普通业务日志发现端口。
 2. server 只监听动态 loopback；未持有注册材料的本机进程被拒绝。
-3. client/executor 各自注册，断线重连生成新 instance/generation。
+3. client/Runtime Box 各自注册，断线重连生成新 instance/generation。
 4. request/response、event、取消、超时、超限 frame 和慢消费者行为可重复测试。
-5. client 请求协作关闭；server/executor 均在有界时间退出。
+5. client 请求协作关闭；server/Runtime Box 均在有界时间退出。
 6. companion 连续崩溃时达到 restart cap 后停止循环并进入恢复状态。
 
 ### 3.3 A0 出口
 
 - [x] 开发构建和 packaged app 都能启动两个编译 companion。
-- [x] `client <-> server <-> executor` 是唯一应用 RPC 拓扑。
+- [x] `client <-> server <-> Runtime Box` 是唯一应用 RPC 拓扑。
 - [x] protocol/version/role/identity Schema 冻结到首个可迁移版本。
 - [x] 旧 generation 的连接和消息无法覆盖新实例。
 - [x] stable package 不包含固定 token、调试端口或通用 method forwarder。
@@ -94,7 +95,7 @@ flowchart LR
 
 迁移使用一次一个领域的 strangler adapter；过渡期允许 client 调用 server fake，但不允许 DB 双写。当前处于开发阶段，旧 app data 可明确重置，不为本阶段增加旧 schema migration。
 
-当前 A1 no-tools Ask 不依赖 executor Tool capability；A2 再建立持久 Executor/Agent binding 与完整 capability gate。
+当前 A1 no-tools Ask 不依赖 Runtime Box Tool capability；A2 再建立持久 Runtime Box/Agent binding 与完整 capability gate。
 
 ### 4.2 A1 出口
 
@@ -105,36 +106,36 @@ flowchart LR
 - [x] server restart 后识别并安全终结非终态 orphan Run，不伪装 runtime resume。
 - [x] Ask service/package/WebView 测试已迁移为跨角色 contract，没有永久旧 transport 路径。
 
-## 5. A2：Executor / Agent Registry
+## 5. A2：Runtime Box / Agent Registry
 
-**目标：** 建立可持久稳定身份和当前 desktop 的单 local executor / 多 Agent 模型。
+**目标：** 建立可持久稳定身份和当前 desktop 的单 local Runtime Box / 多 Agent 模型。
 
 ### 5.1 工作包
 
 | ID | 工作包 | 产出 | 依赖 | 尺寸 |
 | --- | --- | --- | --- | --- |
-| A2-01 | Executor identity | `executorId` 持久化、instance/generation、capability register | A0,A1 | L |
+| A2-01 | Runtime Box identity | `runtimeBoxId` 持久化、instance/generation、capability register | A0,A1 | L |
 | A2-02 | Client identity | `clientId` 持久化、重连注册、server registry projection | A0 | M |
-| A2-03 | Executor registry | syncing/online/offline、lease、注册后 capability full snapshot 和查询 API | A2-01 | L |
-| A2-04 | Agent binding | Agent version 绑定 executor、当前 local default、N:1 校验 | A2-03 | L |
+| A2-03 | Runtime Box registry | syncing/online/offline、lease、注册后 capability full snapshot 和查询 API | A2-01 | L |
+| A2-04 | Runtime Profile | `agentId + runtimeBoxId` profile、当前 Local default、资源 owner 校验 | A2-03 | L |
 | A2-05 | Availability UX | client 列表、离线状态、重试/诊断、Run start gate | A2-03,A2-04 | M |
-| A2-06 | Run dispatch identity | Run snapshot 记录 executor stable ID 和执行 generation | A2-04 | L |
+| A2-06 | Run dispatch identity | Run snapshot 记录 Runtime Box stable ID 和执行 generation | A2-04 | L |
 
 ### 5.2 A2 出口
 
-- [ ] client 与 executor stable ID 跨进程重启保留。
+- [ ] client 与 Runtime Box stable ID 跨进程重启保留。
 - [ ] 每次启动/注册使用新的 instance ID 和 generation；并发旧实例被拒绝。
-- [ ] 一个 local executor 下可配置多个 Agent。
-- [ ] client 能列出 server 已注册 executor，不直接探测 executor 进程。
-- [ ] 每次 executor 注册/重连先 full capability inventory sync；成功前保持 syncing，Agent 不 runnable。
-- [ ] executor offline 时相关 Agent 无法启动新 Run，并返回 `EXECUTOR_OFFLINE`。
-- [ ] 文档/API 允许未来独立注册，但当前没有 remote/Docker/cloud transport 实现或承诺。
+- [ ] 一个 local Runtime Box 下可配置多个 Agent。
+- [ ] client 能列出 server 已注册 Runtime Box，不直接探测 Runtime Box 进程。
+- [ ] 每次 Runtime Box 注册/重连先 full capability inventory sync；成功前保持 syncing，Agent 不 runnable。
+- [ ] Runtime Box offline 时相关 Agent 无法启动新 Run，并返回 `RUNTIME_BOX_OFFLINE`。
+- [ ] Local Runtime Box 通过 registry 验证；Remote ingress、配对和 Tunnel 按 RB-03–RB-05 独立交付。
 
 ## 6. A3：Tool Bridge / Action Broker
 
-**目标：** 完成 server 决策、executor 执行的可审计副作用闭环。
+**目标：** 完成 server 决策、Runtime Box 执行的可审计副作用闭环。
 
-当前已先交付 executor-only 的 `read`、`bash`、`edit`、`write`、`grep`、`find`、`ls` 和严格 RPC
+当前已先交付 Runtime Box-only 的 `read`、`bash`、`edit`、`write`、`grep`、`find`、`ls` 和严格 RPC
 gateway，作为开发期可信本机桥接。它没有 Policy、approval、durable intent 或 execution grant，因此不满足
 A3 出口；后续必须把它接入同一强制授权链并移除直接旁路。
 
@@ -145,19 +146,19 @@ A3 出口；后续必须把它接入同一强制授权链并移除直接旁路�
 | A3-01 | Tool contract | ActionRequest、Tool metadata、typed result、幂等分类 | A1,A2 | L |
 | A3-02 | Server Policy/Approval | 模式工具集、风险、审批、Allow all、durable interrupt | A3-01 | XL |
 | A3-03 | Action journal | intent/result、outcome unknown、recovery resolver | A3-02 | L |
-| A3-04 | Execution grant | 单次、短时、executor instance/args/scope 绑定、审计 | A3-03 | XL |
-| A3-05 | Executor Tool Bridge | 文件、命令、Git adapter；grant validation | A3-04 | XL |
+| A3-04 | Execution grant | 单次、短时、Runtime Box instance/args/scope 绑定、审计 | A3-03 | XL |
+| A3-05 | Runtime Box Tool Bridge | 文件、命令、Git adapter；grant validation | A3-04 | XL |
 | A3-06 | Cancellation/process tree | timeout、输出上限、进程组、协作/升级终止 | A3-05 | L |
 | A3-07 | Diff/revert integration | server change journal、client Diff、hash conflict | A3-05 | XL |
 
 ### 6.2 A3 出口
 
 - [ ] 未经 server Policy/approval/intent 的 Action 无法获得 grant。
-- [ ] executor 拒绝过期、重复、篡改、错误 executor 或旧 generation grant。
-- [ ] executor 不打开业务 DB；server 不直接执行 Tool。
-- [ ] 文件/命令/Git 的实际动作、取消和进程树只在 executor。
+- [ ] Runtime Box 拒绝过期、重复、篡改、错误 Runtime Box 或旧 generation grant。
+- [ ] Runtime Box 不打开业务 DB；server 不直接执行 Tool。
+- [ ] 文件/命令/Git 的实际动作、取消和进程树只在 Runtime Box。
 - [ ] non-idempotent Action 在结果不明时不会自动重放。
-- [ ] executor kill、server kill、网络断开覆盖 intent 前后和 result 前后 kill points。
+- [ ] Runtime Box kill、server kill、网络断开覆盖 intent 前后和 result 前后 kill points。
 - [ ] Ask/Plan/Agent 和 Allow all 不能绕过相同强制边界。
 
 ## 7. A4：MCP / Skills
@@ -170,31 +171,31 @@ A4 先交付 backend ownership、协议和安全 gate，默认保持 feature fla
 
 | ID | 工作包 | 产出 | 依赖 | 尺寸 |
 | --- | --- | --- | --- | --- |
-| A4-01 | Executor data root | executor DB、private Skill store、persisted inventory epoch/revision/change log、`0700`/`0600`/owner/no-follow/atomic replace | A2 | XL |
+| A4-01 | Runtime Box data root | Runtime Box DB、private Skill store、persisted inventory epoch/revision/change log、`0700`/`0600`/owner/no-follow/atomic replace | A2 | XL |
 | A4-02 | Inventory reconciliation | registration snapshot、delta/tombstone、hint debounce、60 秒 ±20% poll、snapshot fallback、stale cache | A4-01 | XL |
-| A4-03 | Routed MCP/Skill API | full client UI command -> server auth -> selected executor；mutation revision/read-own-write、offline failure | A4-02 | XL |
-| A4-04 | MCP lifecycle | executor-owned config、stdio/HTTP/SSE lifecycle、Tool schema/inventory | A4-01,A4-02 | XL |
-| A4-05 | MCP auth | executor-owned `ExecutorSecretStore`、OAuth/token、minimal child env、cleanup | A4-04 | XL |
+| A4-03 | Routed MCP/Skill API | full client UI command -> server auth -> selected Runtime Box；mutation revision/read-own-write、offline failure | A4-02 | XL |
+| A4-04 | MCP lifecycle | Runtime Box-owned config、stdio/HTTP/SSE lifecycle、Tool schema/inventory | A4-01,A4-02 | XL |
+| A4-05 | MCP auth | Runtime Box-owned `ExecutorSecretStore`、OAuth/token、minimal child env、cleanup | A4-04 | XL |
 | A4-06 | MCP Tool bridge | stable resource ref、live validation、ToolDefinition、grant、typed error | A4-04,A3 | L |
-| A4-07 | Immutable Skill store | executor install/validate/version/hash/content/resources/uninstall | A4-01 | XL |
-| A4-08 | Agent resource refs | server 只存 assigned executor resource refs；按 version/hash 获取 metadata/`SKILL.md` | A4-06,A4-07 | L |
-| A4-09 | Skill execution | resources/scripts 通过 executor grant 使用 | A4-07,A3 | L |
+| A4-07 | Immutable Skill store | Runtime Box install/validate/version/hash/content/resources/uninstall | A4-01 | XL |
+| A4-08 | Agent resource refs | server 只存 assigned Runtime Box resource refs；按 version/hash 获取 metadata/`SKILL.md` | A4-06,A4-07 | L |
+| A4-09 | Skill execution | resources/scripts 通过 Runtime Box grant 使用 | A4-07,A3 | L |
 
 ### 7.2 A4 出口
 
-- [ ] 每个 executor 是自身 MCP config/credential/OAuth/lifecycle 与 Skill immutable content/resources 的唯一 source of truth。
+- [ ] 每个 Runtime Box 是自身 MCP config/credential/OAuth/lifecycle 与 Skill immutable content/resources 的唯一 source of truth。
 - [ ] server 只保存 Agent resource refs 和 replaceable/non-authoritative/disposable redacted inventory cache；产品 DB/backup 不含 recoverable MCP/Skill config、content 或 credential。
-- [ ] executor 持久化 epoch/revision 与有界 change log/deletion tombstone；每次注册/重连 full sync 成功前 Agent 不 runnable。
+- [ ] Runtime Box 持久化 epoch/revision 与有界 change log/deletion tombstone；每次注册/重连 full sync 成功前 Agent 不 runnable。
 - [ ] `inventory.changed` 只含 revision/category；server 去抖增量拉取，并每 60 秒 ±20% jitter 独立 polling。
 - [ ] gap、compaction、epoch reset 或 invalid cursor 触发 full snapshot atomic replace；offline/failed poll 只标 stale，不解释为 deletion。
 - [ ] cache 只含 stable ID/version/hash、Tool schema、health/capability 和 credential-configured boolean，不含 recoverable config、secret、sensitive env 或 Skill body。
-- [ ] 完整 client MCP/Skill UI 所需的 command path 经 server 校验后路由；只有 executor 持久化成功才返回 success/epoch/revision，并立即 read-own-write；offline 不排队伪成功。
+- [ ] 完整 client MCP/Skill UI 所需的 command path 经 server 校验后路由；只有 Runtime Box 持久化成功才返回 success/epoch/revision，并立即 read-own-write；offline 不排队伪成功。
 - [ ] MCP Tool 与 Skill script 使用 A3 的 grant，不建立扩展专用旁路。
-- [ ] Agent 只能引用 assigned executor 的稳定 resource version/hash；Run start/restore live 验证，polling 不替代授权；server 按 ref 获取并校验 Skill metadata/`SKILL.md`。
-- [ ] executor offline、resource missing/hash mismatch 或 MCP Schema 变化会 fail closed。
-- [ ] Provider/model credential 不进入 executor；MCP credential 只在 executor private secret store 和目标 connection/process 可达，不进入 query/UI/prompt/log/diagnostic/export、全局环境或无关 child/Agent。
+- [ ] Agent 只能引用 assigned Runtime Box 的稳定 resource version/hash；Run start/restore live 验证，polling 不替代授权；server 按 ref 获取并校验 Skill metadata/`SKILL.md`。
+- [ ] Runtime Box offline、resource missing/hash mismatch 或 MCP Schema 变化会 fail closed。
+- [ ] Provider/model credential 不进入 Runtime Box；MCP credential 只在 Runtime Box private secret store 和目标 connection/process 可达，不进入 query/UI/prompt/log/diagnostic/export、全局环境或无关 child/Agent。
 - [ ] local root/credential file 权限、owner、atomic replacement、symlink/no-follow 通过测试，并明确不能防同账户 malware、root 或 disk snapshot/backup。
-- [ ] executor-owned MCP credential 不替代一次性 execution grant；保持认证的 connection 上每次 Tool 仍独立授权。
+- [ ] Runtime Box-owned MCP credential 不替代一次性 execution grant；保持认证的 connection 上每次 Tool 仍独立授权。
 
 ## 8. A5：Recovery / Release Hardening
 
@@ -205,19 +206,19 @@ A4 先交付 backend ownership、协议和安全 gate，默认保持 feature fla
 | ID | 工作包 | 产出 | 依赖 | 尺寸 |
 | --- | --- | --- | --- | --- |
 | A5-01 | Supervisor hardening | 独立 restart budget、capped backoff、crash-loop UX | A0-A4 | L |
-| A5-02 | Connection recovery | client event replay、executor invocation reconciliation、registration full inventory sync 和 periodic delta reconciliation | A2-A4 | XL |
+| A5-02 | Connection recovery | client event replay、Runtime Box invocation reconciliation、registration full inventory sync 和 periodic delta reconciliation | A2-A4 | XL |
 | A5-03 | Shutdown protocol | stop admission、Run interruption、进程树清理、DB flush | A3 | L |
-| A5-04 | Fault matrix | client/server/executor/WebView/Tool/MCP kill 与 sleep/network/disk | A5-02 | XL |
+| A5-04 | Fault matrix | client/server/Runtime Box/WebView/Tool/MCP kill 与 sleep/network/disk | A5-02 | XL |
 | A5-05 | Diagnostics | 三角色日志关联、版本/identity/registry/DB integrity 导出 | A5-01 | L |
 | A5-06 | Signed package | companion 签名、公证、Updater、安装/升级、无外部 Bun | A0,A5-03 | XL |
 | A5-07 | Packaged E2E | 正式入口驱动的启动、注册、Action、恢复和退出 | A5-04,A5-06 | XL |
 
 ### 8.2 A5 出口
 
-- [ ] server/executor 各自 crash 后按预算重启；达到 cap 后不无限循环。
+- [ ] server/Runtime Box 各自 crash 后按预算重启；达到 cap 后不无限循环。
 - [ ] client 正常退出协作关闭两个 companion，持久化完成且无遗留受管进程树。
-- [ ] client/WebView 重连不丢 durable event；executor 重连不重复 non-idempotent invocation。
-- [ ] executor reconnect 在 full inventory sync 前保持 syncing；missed hint、compacted log、epoch reset 和 poll failure 都按合同收敛。
+- [ ] client/WebView 重连不丢 durable event；Runtime Box 重连不重复 non-idempotent invocation。
+- [ ] Runtime Box reconnect 在 full inventory sync 前保持 syncing；missed hint、compacted log、epoch reset 和 poll failure 都按合同收敛。
 - [ ] signed/notarized package 包含兼容的两个 companion，版本握手和更新原子性通过。
 - [ ] release package 无测试后门、固定 token、调试 listener 或系统 runtime 依赖。
 - [ ] recovery UX 能区分可重试、需人工确认、数据 reset 和不可恢复状态。
@@ -230,10 +231,11 @@ A4 先交付 backend ownership、协议和安全 gate，默认保持 feature fla
 | Project/Agent registry 可见性 | A2 |
 | Ask 只读 Tool、Plan、Agent、审批、Diff/撤销 | A3 |
 | 后台任务、崩溃恢复、外部分发 | A5 |
-| 自定义 Agent 绑定 executor | A2 + 产品 Agent Editor |
+| 自定义 Agent Runtime Profile | A2 + 产品 Agent Editor |
 | MCP、Skills | A4 |
 | Canvas 触发本机能力 | A3；Preview 隔离另行验收 |
-| 未来 remote/Docker/cloud executor | A0–A5 后的新 ADR，不属于当前范围 |
+| Remote Runtime Box | RB-00–RB-09；复用 A2–A5 的 registry、grant、inventory 和 recovery 不变量 |
+| Docker/cloud Runtime Box | Remote Runtime Box 稳定后的独立 transport/packaging ADR |
 
 产品 Phase 1 可在 A1 完成后继续只读 UI/Provider 工作，但任何副作用能力必须等待 A3；外部 Alpha/Beta 必须等待 A5。产品 Phase 2 的 MCP/Skills 必须等待 A4；A4 backend 完成不等于对应产品功能已发布。
 
@@ -248,8 +250,8 @@ A4 先交付 backend ownership、协议和安全 gate，默认保持 feature fla
 | SessionCatalog / RunJournal | agents server | A1 |
 | Pi `SessionManager` JSONL | agents server | A1（已迁移） |
 | 当前无 Tool Ask guard | server effective Tool policy | A1 保持，A3 泛化 |
-| 文件/命令/Action Broker | executor + server Action Broker | A3 新增 |
-| MCP/Skills | executor-owned config/secret/content + server-routed UI/resource refs | A4 新增 |
+| 文件/命令/Action Broker | Runtime Box + server Action Broker | A3 新增 |
+| MCP/Skills | Runtime Box-owned config/secret/content + server-routed UI/resource refs | A4 新增 |
 
 该表同时记录已迁移组件与后续新增组件；完成度以[实施进度](./progress.md)为准。
 
@@ -266,7 +268,7 @@ A4 先交付 backend ownership、协议和安全 gate，默认保持 feature fla
 ### 11.2 Done
 
 - 实现、targeted test、跨角色 contract 和直接相关文档完成。
-- 没有双写、通用 RPC、直连 executor 或无 grant 执行。
+- 没有双写、通用 RPC、直连 Runtime Box 或无 grant 执行。
 - 错误保持失败语义，取消能传播并完成资源清理。
 - 当前实现状态更新到 progress，不把 POC 写成完整阶段完成。
 - 对应 packaged gate 在可发布阶段运行。
@@ -281,14 +283,16 @@ A4 先交付 backend ownership、协议和安全 gate，默认保持 feature fla
 | ADR-004 Stable identity / instance / generation | A0 |
 | ADR-005 Companion supervisor and shutdown | A0 |
 | ADR-006 Product DB / Pi Session JSONL single writer | A1（已完成） |
-| ADR-007 Executor / Agent registry | A2 |
+| ADR-007 Runtime Box / Agent registry | A2 |
 | ADR-008 Action Broker / execution grant | A3 |
 | ADR-009 Tool cancellation and process trees | A3 |
-| ADR-010 Executor-owned MCP config/credential/lifecycle、`ExecutorSecretStore` 与 routed command | A4 |
-| ADR-011 Executor-owned immutable Skill store、Agent resource ref 与 prompt fetch | A4 |
+| ADR-010 Runtime Box-owned MCP config/credential/lifecycle、`ExecutorSecretStore` 与 routed command | A4 |
+| ADR-011 Runtime Box-owned immutable Skill store、Agent resource ref 与 prompt fetch | A4 |
 | ADR-012 Recovery, restart budget and reconciliation | A5 |
 | ADR-013 Companion signing/update/diagnostics | A5 |
-| ADR-014 Future remote transport | 当前范围外，启动远程工作前 |
+| ADR-014 Runtime Box and remote transport | RB-00；见 `runtime-box.md` |
+| ADR-015 Anonymous Runtime ingress and device authentication | RB-03 |
+| ADR-016 Agent Server Dev Tunnel ownership | RB-05 |
 
 ## 13. 主要风险
 
@@ -297,12 +301,13 @@ A4 先交付 backend ownership、协议和安全 gate，默认保持 feature fla
 | 本机未授权连接 server | 其他进程可猜端口并注册 | 动态 loopback、一次性 bootstrap、角色认证、method allowlist |
 | 旧实例污染新状态 | restart 后迟到 result/event 被接受 | stable ID + instance/generation + invocation correlation |
 | 迁移期双写 | client/server DB 状态分叉 | 单领域切换、单 writer assertion、无长期 compatibility path |
-| grant 被重放/篡改 | executor 重复执行或参数变化 | 短 TTL、单次 nonce、args/scope digest、目标 generation |
-| executor 丢失结果 | Tool 已发生但 server 未落 result | intent-first、reconcile、`outcome_unknown`、非幂等不自动重放 |
+| grant 被重放/篡改 | Runtime Box 重复执行或参数变化 | 短 TTL、单次 nonce、args/scope digest、目标 generation |
+| Runtime Box 丢失结果 | Tool 已发生但 server 未落 result | intent-first、reconcile、`outcome_unknown`、非幂等不自动重放 |
 | companion crash loop | 启动后连续退出 | capped backoff、停机状态、诊断和用户控制重试 |
 | Bun compile/package 差异 | dev 可用、签名包不可执行 | A0 package smoke、目标架构 matrix、同 release 版本握手 |
-| MCP/Skill 形成旁路或双 owner | 扩展绕过 grant、server 留 recoverable copy、secret 泄露到全局环境 | routed command、统一 grant、executor-private store、server-copy scan 与 credential canary |
-| 过早远程化 | 当前 desktop 被 TLS/多租户复杂度拖慢 | 只保留接口 seam，remote ADR 延后 |
+| MCP/Skill 形成旁路或双 owner | 扩展绕过 grant、server 留 recoverable copy、secret 泄露到全局环境 | routed command、统一 grant、Runtime Box-private store、server-copy scan 与 credential canary |
+| Anonymous Runtime ingress 被滥用 | 公网握手/签名验证耗尽连接或 CPU | 独立入口、预认证上限、速率限制、短 timeout、统一失败响应 |
+| Dev Tunnels 预览服务不可用或超额 | Remote Box 大面积离线、每月 5 GB 配额接近上限 | 明确状态、流量告警、可恢复重连；不伪造在线或执行成功 |
 
 ## 14. 发布节奏
 

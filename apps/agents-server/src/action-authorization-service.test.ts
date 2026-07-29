@@ -1,0 +1,176 @@
+import { describe, expect, test } from "bun:test";
+import { defaultLocalRuntimeBoxId } from "@moshu/contracts";
+import { createUuidV7, openAppDatabase } from "@moshu/database";
+import {
+	ActionPolicyDeniedError,
+	DurableActionAuthorizationService,
+} from "./action-authorization-service";
+
+describe("DurableActionAuthorizationService", () => {
+	test("binds and consumes a grant before dispatch, then reconciles old-generation evidence", async () => {
+		const database = openAppDatabase(":memory:");
+		try {
+			const session = database.sessions.create({ title: "Action" }).session;
+			const run = database.runs.create({
+				clientRequestId: crypto.randomUUID(),
+				sessionId: session.id,
+				mode: "agent",
+				provider: {
+					schemaVersion: 1,
+					providerId: createUuidV7(),
+					name: "Provider",
+					source: "custom",
+					api: "openai-responses",
+					model: "model",
+					thinkingLevel: "medium",
+				},
+				userMessageId: createUuidV7(),
+				userContent: "run",
+				assistantMessageId: createUuidV7(),
+			}).run;
+			const service = new DurableActionAuthorizationService(database.actions, {
+				role: "agents",
+				peerId: "agents",
+				instanceId: "agents-generation-five",
+				generation: 5,
+			});
+			const invocation = {
+				schemaVersion: 1 as const,
+				invocationId: crypto.randomUUID(),
+				runId: run.id,
+				toolCallId: "tool-call",
+				cwd: "/workspace",
+				call: { tool: "write" as const, arguments: { path: "file.txt", content: "data" } },
+			};
+			const authorized = await service.authorize(
+				defaultLocalRuntimeBoxId,
+				invocation,
+				{
+					role: "runtime-box",
+					peerId: defaultLocalRuntimeBoxId,
+					instanceId: "runtime-instance",
+					generation: 3,
+				},
+				"request-cwd",
+			);
+			expect(authorized.authorization).toMatchObject({
+				originInstanceId: "agents-generation-five",
+				originGeneration: 5,
+			});
+			expect(database.actions.get(invocation.invocationId)).toMatchObject({
+				state: "running",
+				grantConsumedAtMs: expect.any(Number),
+			});
+
+			service.markOutcomeUnknown(authorized, "connection lost");
+			const authorization = authorized.authorization;
+			if (authorization === undefined) {
+				throw new Error("Expected authorization.");
+			}
+			expect(
+				service.reconcile(
+					defaultLocalRuntimeBoxId,
+					[
+						{
+							invocationId: invocation.invocationId,
+							actionId: authorization.actionId,
+							grantId: authorization.grantId,
+							parameterDigest: authorization.parameterDigest,
+							originInstanceId: authorization.originInstanceId,
+							originGeneration: authorization.originGeneration,
+							targetRuntimeBoxId: authorization.targetRuntimeBoxId,
+							targetInstanceId: authorization.targetInstanceId,
+							targetGeneration: authorization.targetGeneration,
+							state: "failed",
+							safeError: "write failed on device",
+							completedAt: new Date().toISOString(),
+						},
+					],
+					[],
+				),
+			).toEqual({
+				ackedInvocationIds: [invocation.invocationId],
+				confirmedAcknowledgementIds: [],
+			});
+			expect(database.actions.get(invocation.invocationId)).toMatchObject({
+				state: "failed",
+				safeError: "write failed on device",
+				serverAckedAtMs: expect.any(Number),
+			});
+			expect(service.reconcile(defaultLocalRuntimeBoxId, [], [invocation.invocationId])).toEqual({
+				ackedInvocationIds: [],
+				confirmedAcknowledgementIds: [invocation.invocationId],
+			});
+			expect(database.actions.get(invocation.invocationId)).toMatchObject({
+				boxReceiptConfirmedAtMs: expect.any(Number),
+			});
+			const undispatched = {
+				...invocation,
+				invocationId: crypto.randomUUID(),
+				toolCallId: "undispatched-tool-call",
+			};
+			const undispatchedAuthorized = await service.authorize(
+				defaultLocalRuntimeBoxId,
+				undispatched,
+				{
+					role: "runtime-box",
+					peerId: defaultLocalRuntimeBoxId,
+					instanceId: "runtime-instance",
+					generation: 3,
+				},
+				"request-cwd",
+			);
+			service.cancelUndispatched(undispatchedAuthorized, "readiness changed");
+			expect(database.actions.get(undispatched.invocationId)).toMatchObject({
+				state: "cancelled",
+				serverAckedAtMs: expect.any(Number),
+				boxReceiptConfirmedAtMs: expect.any(Number),
+			});
+			database.runs.deleteSessionAndRetireRuns(session.id);
+			expect(service.reconcile(defaultLocalRuntimeBoxId, [], [invocation.invocationId])).toEqual({
+				ackedInvocationIds: [],
+				confirmedAcknowledgementIds: [invocation.invocationId],
+			});
+		} finally {
+			database.close();
+		}
+	});
+
+	test("retains an approval boundary when side effects are not pre-authorized", async () => {
+		const database = openAppDatabase(":memory:");
+		try {
+			const service = new DurableActionAuthorizationService(
+				database.actions,
+				{
+					role: "agents",
+					peerId: "agents",
+					instanceId: "agents-instance",
+					generation: 1,
+				},
+				{ allowSideEffects: false },
+			);
+			await expect(
+				service.authorize(
+					defaultLocalRuntimeBoxId,
+					{
+						schemaVersion: 1,
+						invocationId: crypto.randomUUID(),
+						runId: "018f47a2-9bcd-7def-8abc-1234567890ab",
+						toolCallId: "tool-call",
+						cwd: "/workspace",
+						call: { tool: "bash", arguments: { command: "echo test" } },
+					},
+					{
+						role: "runtime-box",
+						peerId: defaultLocalRuntimeBoxId,
+						instanceId: "runtime-instance",
+						generation: 1,
+					},
+					"request-cwd",
+				),
+			).rejects.toBeInstanceOf(ActionPolicyDeniedError);
+		} finally {
+			database.close();
+		}
+	});
+});

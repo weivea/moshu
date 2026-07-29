@@ -5,7 +5,6 @@ import {
 	assertCompanionResourceFilenames,
 	getCompanionResourceFilenames,
 	getCompanionExecutableFilename,
-	getExecutorToolExecutableFilenames,
 } from "../src/shared/companion-executable-names";
 import {
 	assertEmbeddedCompanionEntitlements,
@@ -149,9 +148,7 @@ async function verifyCompanionsInApp(appBundle: string, scratchParent: string): 
 	const executables = COMPANION_EXECUTABLE_ROLES.map((role) =>
 		join(companionDirectory, getCompanionExecutableFilename(role, "darwin")),
 	) as [string, string];
-	const toolExecutables = getExecutorToolExecutableFilenames("darwin").map((filename) =>
-		join(companionDirectory, filename),
-	);
+	const toolExecutables: string[] = [];
 
 	for (const executable of executables) {
 		assertExecutable(executable, "packaged companion executable");
@@ -166,10 +163,10 @@ async function verifyCompanionsInApp(appBundle: string, scratchParent: string): 
 		assertEmbeddedCompanionEntitlements(entitlements, executable);
 	}
 	for (const executable of toolExecutables) {
-		assertExecutable(executable, "packaged executor tool");
+		assertExecutable(executable, "packaged Runtime Box tool");
 		runCommand(
 			["codesign", "--verify", "--strict", "--verbose=2", executable],
-			`Executor tool signature verification failed for ${executable}`,
+			`RuntimeBox tool signature verification failed for ${executable}`,
 		);
 	}
 	await verifyPackagedCompanionLaunch(executables, scratchParent);

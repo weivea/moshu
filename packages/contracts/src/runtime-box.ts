@@ -1,0 +1,346 @@
+import { z } from "zod";
+import { actionJournalEpochSchema, processPeerIdentitySchema } from "./companion-bootstrap";
+
+export const defaultLocalRuntimeBoxId = "moshu-local-runtime-box" as const;
+
+export const runtimeBoxIdSchema = z
+	.string()
+	.trim()
+	.min(1)
+	.max(128)
+	.regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/);
+
+export const runtimeBoxKindSchema = z.enum(["local", "remote"]);
+
+export const runtimeBoxDeviceKeyIdSchema = z
+	.string()
+	.min(1)
+	.max(128)
+	.regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/);
+
+export const runtimeBoxCapabilitySchema = z
+	.string()
+	.min(1)
+	.max(128)
+	.regex(/^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)*$/);
+
+export const runtimeBoxDescriptorSchema = z
+	.object({
+		schemaVersion: z.literal(1),
+		runtimeBoxId: runtimeBoxIdSchema,
+		kind: runtimeBoxKindSchema,
+		displayName: z.string().trim().min(1).max(128),
+		runtimeBoxVersion: z.string().min(1).max(64),
+		platform: z.enum(["darwin", "win32", "linux"]),
+		arch: z.string().min(1).max(64),
+		capabilities: z
+			.array(runtimeBoxCapabilitySchema)
+			.max(128)
+			.superRefine((capabilities, context) => {
+				const seen = new Set<string>();
+				for (const [index, capability] of capabilities.entries()) {
+					if (seen.has(capability)) {
+						context.addIssue({
+							code: "custom",
+							message: "Runtime Box capabilities must be unique.",
+							path: [index],
+						});
+					}
+					seen.add(capability);
+				}
+			}),
+	})
+	.strict();
+
+export const runtimeBoxConnectionInfoSchema = z
+	.object({
+		runtimeBox: runtimeBoxDescriptorSchema,
+		connected: z.boolean(),
+		registered: z.boolean(),
+		instanceId: z.string().min(1).max(256).optional(),
+		generation: z.int().nonnegative().safe().optional(),
+		deviceKeyIds: z.array(runtimeBoxDeviceKeyIdSchema).max(32),
+	})
+	.strict();
+
+export const activeRuntimeBoxSelectionSchema = z
+	.object({
+		runtimeBoxId: runtimeBoxIdSchema,
+		revision: z.int().positive().safe(),
+	})
+	.strict();
+
+export const listRuntimeBoxesOutputSchema = z
+	.object({
+		active: activeRuntimeBoxSelectionSchema,
+		items: z.array(runtimeBoxConnectionInfoSchema).max(128),
+	})
+	.strict();
+
+export const switchRuntimeBoxInputSchema = z
+	.object({
+		runtimeBoxId: runtimeBoxIdSchema,
+		expectedRevision: z.int().positive().safe(),
+	})
+	.strict();
+
+export const switchRuntimeBoxOutputSchema = z
+	.object({
+		active: activeRuntimeBoxSelectionSchema,
+	})
+	.strict();
+
+const pairingSecretSchema = z
+	.string()
+	.min(22)
+	.max(171)
+	.regex(/^[A-Za-z0-9_-]+$/);
+
+export const runtimeBoxPublicKeySchema = z
+	.string()
+	.min(32)
+	.max(2_048)
+	.regex(/^[A-Za-z0-9_-]+$/);
+
+export const createRuntimeBoxPairingOutputSchema = z
+	.object({
+		pairingId: z.string().uuid(),
+		code: pairingSecretSchema,
+		expiresAt: z.string().datetime({ offset: true }),
+		runtimeBaseUrl: z.string().url().optional(),
+	})
+	.strict();
+
+export const claimRuntimeBoxPairingInputSchema = z
+	.object({
+		code: pairingSecretSchema,
+		deviceKeyId: runtimeBoxDeviceKeyIdSchema,
+		publicKey: runtimeBoxPublicKeySchema,
+		displayName: z.string().trim().min(1).max(128),
+		platform: z.enum(["darwin", "win32", "linux"]),
+		arch: z.string().min(1).max(64),
+	})
+	.strict();
+
+export const claimRuntimeBoxPairingOutputSchema = z
+	.object({
+		pairingId: z.string().uuid(),
+		claimToken: pairingSecretSchema,
+		status: z.literal("pending_approval"),
+	})
+	.strict();
+
+export const runtimeBoxPairingClaimSchema = z
+	.object({
+		pairingId: z.string().uuid(),
+		deviceKeyId: runtimeBoxDeviceKeyIdSchema,
+		displayName: z.string().trim().min(1).max(128),
+		platform: z.enum(["darwin", "win32", "linux"]),
+		arch: z.string().min(1).max(64),
+		publicKeyFingerprint: z.string().min(16).max(128),
+		claimedAt: z.string().datetime({ offset: true }),
+		expiresAt: z.string().datetime({ offset: true }),
+	})
+	.strict();
+
+export const listRuntimeBoxPairingClaimsOutputSchema = z
+	.object({
+		items: z.array(runtimeBoxPairingClaimSchema).max(128),
+	})
+	.strict();
+
+export const approveRuntimeBoxPairingInputSchema = z
+	.object({
+		pairingId: z.string().uuid(),
+		expectedPublicKeyFingerprint: z.string().min(16).max(128),
+	})
+	.strict();
+
+export const approveRuntimeBoxPairingOutputSchema = z
+	.object({
+		runtimeBox: runtimeBoxDescriptorSchema,
+	})
+	.strict();
+
+export const rejectRuntimeBoxPairingInputSchema = z
+	.object({
+		pairingId: z.string().uuid(),
+	})
+	.strict();
+
+export const rejectRuntimeBoxPairingOutputSchema = z
+	.object({
+		rejected: z.literal(true),
+	})
+	.strict();
+
+export const revokeRuntimeBoxDeviceInputSchema = z
+	.object({
+		runtimeBoxId: runtimeBoxIdSchema,
+		deviceKeyId: runtimeBoxDeviceKeyIdSchema,
+	})
+	.strict();
+
+export const revokeRuntimeBoxDeviceOutputSchema = z
+	.object({
+		revoked: z.literal(true),
+	})
+	.strict();
+
+export const getRuntimeBoxPairingStatusInputSchema = z
+	.object({
+		pairingId: z.string().uuid(),
+		claimToken: pairingSecretSchema,
+	})
+	.strict();
+
+export const runtimeBoxPairingStatusOutputSchema = z.discriminatedUnion("status", [
+	z.object({ status: z.literal("pending_approval") }).strict(),
+	z.object({ status: z.literal("rejected") }).strict(),
+	z.object({ status: z.literal("expired") }).strict(),
+	z
+		.object({
+			status: z.literal("approved"),
+			runtimeBoxId: runtimeBoxIdSchema,
+			agentServerId: z.string().uuid(),
+			agentServerPublicKey: runtimeBoxPublicKeySchema,
+		})
+		.strict(),
+]);
+
+export const runtimeBoxChallengeInputSchema = z
+	.object({
+		runtimeBoxId: runtimeBoxIdSchema,
+		deviceKeyId: runtimeBoxDeviceKeyIdSchema,
+		instanceId: z.string().min(1).max(256),
+		generation: z.int().nonnegative().safe(),
+		protocolVersion: z.literal(1),
+	})
+	.strict();
+
+export const runtimeBoxChallengeOutputSchema = z
+	.object({
+		challengeId: z.string().uuid(),
+		nonce: pairingSecretSchema,
+		expiresAt: z.string().datetime({ offset: true }),
+		agentServerId: z.string().uuid(),
+		rpcIdentity: processPeerIdentitySchema.refine((identity) => identity.role === "agents"),
+		actionJournalEpoch: actionJournalEpochSchema,
+		signature: pairingSecretSchema,
+	})
+	.strict();
+
+export const remoteAccessStateSchema = z.enum([
+	"disabled",
+	"stopping",
+	"auth_required",
+	"starting",
+	"online",
+	"error",
+	"repair_required",
+]);
+
+export const remoteAccessStatusOutputSchema = z
+	.object({
+		enabled: z.boolean(),
+		state: remoteAccessStateSchema,
+		runtimeIngressPort: z.int().min(1).max(65_535),
+		tunnelId: z.string().min(3).max(60).optional(),
+		publicUrl: z.string().url().optional(),
+		lastError: z.string().min(1).max(1_024).optional(),
+	})
+	.strict();
+
+export const remoteAccessAuthAttemptSchema = z
+	.object({
+		attemptId: z.string().uuid(),
+		status: z.enum(["running", "succeeded", "failed"]),
+		message: z.string().max(4_096),
+	})
+	.strict();
+
+export const remoteAccessAuthAttemptInputSchema = z
+	.object({
+		attemptId: z.string().uuid(),
+	})
+	.strict();
+
+export const remoteAccessMutationOutputSchema = z
+	.object({
+		status: remoteAccessStatusOutputSchema,
+	})
+	.strict();
+
+export type RuntimeBoxId = z.infer<typeof runtimeBoxIdSchema>;
+export type RuntimeBoxKind = z.infer<typeof runtimeBoxKindSchema>;
+export type RuntimeBoxDescriptor = z.infer<typeof runtimeBoxDescriptorSchema>;
+export type RuntimeBoxConnectionInfo = z.infer<typeof runtimeBoxConnectionInfoSchema>;
+export type ActiveRuntimeBoxSelection = z.infer<typeof activeRuntimeBoxSelectionSchema>;
+export type ListRuntimeBoxesOutput = z.infer<typeof listRuntimeBoxesOutputSchema>;
+export type SwitchRuntimeBoxInput = z.infer<typeof switchRuntimeBoxInputSchema>;
+export type SwitchRuntimeBoxOutput = z.infer<typeof switchRuntimeBoxOutputSchema>;
+export type CreateRuntimeBoxPairingOutput = z.infer<typeof createRuntimeBoxPairingOutputSchema>;
+export type ClaimRuntimeBoxPairingInput = z.infer<typeof claimRuntimeBoxPairingInputSchema>;
+export type ClaimRuntimeBoxPairingOutput = z.infer<typeof claimRuntimeBoxPairingOutputSchema>;
+export type RuntimeBoxPairingClaim = z.infer<typeof runtimeBoxPairingClaimSchema>;
+export type ListRuntimeBoxPairingClaimsOutput = z.infer<
+	typeof listRuntimeBoxPairingClaimsOutputSchema
+>;
+export type ApproveRuntimeBoxPairingInput = z.infer<typeof approveRuntimeBoxPairingInputSchema>;
+export type ApproveRuntimeBoxPairingOutput = z.infer<typeof approveRuntimeBoxPairingOutputSchema>;
+export type RejectRuntimeBoxPairingInput = z.infer<typeof rejectRuntimeBoxPairingInputSchema>;
+export type RejectRuntimeBoxPairingOutput = z.infer<typeof rejectRuntimeBoxPairingOutputSchema>;
+export type RevokeRuntimeBoxDeviceInput = z.infer<typeof revokeRuntimeBoxDeviceInputSchema>;
+export type RevokeRuntimeBoxDeviceOutput = z.infer<typeof revokeRuntimeBoxDeviceOutputSchema>;
+export type RuntimeBoxPairingStatusOutput = z.infer<typeof runtimeBoxPairingStatusOutputSchema>;
+export type RuntimeBoxChallengeInput = z.infer<typeof runtimeBoxChallengeInputSchema>;
+export type RuntimeBoxChallengeOutput = z.infer<typeof runtimeBoxChallengeOutputSchema>;
+export type RemoteAccessStatusOutput = z.infer<typeof remoteAccessStatusOutputSchema>;
+export type RemoteAccessAuthAttempt = z.infer<typeof remoteAccessAuthAttemptSchema>;
+export type RemoteAccessMutationOutput = z.infer<typeof remoteAccessMutationOutputSchema>;
+
+export function createRuntimeBoxServerChallengePayload(
+	input: RuntimeBoxChallengeInput,
+	output: Omit<RuntimeBoxChallengeOutput, "signature">,
+): string {
+	return JSON.stringify([
+		"moshu-runtime-box-server-challenge-v1",
+		output.agentServerId,
+		output.rpcIdentity.role,
+		output.rpcIdentity.peerId,
+		output.rpcIdentity.instanceId,
+		output.rpcIdentity.generation,
+		output.actionJournalEpoch,
+		input.runtimeBoxId,
+		input.deviceKeyId,
+		input.instanceId,
+		input.generation,
+		input.protocolVersion,
+		output.challengeId,
+		output.nonce,
+		output.expiresAt,
+	]);
+}
+
+export function createRuntimeBoxAuthenticationPayload(
+	input: RuntimeBoxChallengeInput,
+	challenge: Omit<RuntimeBoxChallengeOutput, "signature">,
+): string {
+	return JSON.stringify([
+		"moshu-runtime-box-authentication-v1",
+		challenge.agentServerId,
+		challenge.rpcIdentity.role,
+		challenge.rpcIdentity.peerId,
+		challenge.rpcIdentity.instanceId,
+		challenge.rpcIdentity.generation,
+		challenge.actionJournalEpoch,
+		input.runtimeBoxId,
+		input.deviceKeyId,
+		input.instanceId,
+		input.generation,
+		input.protocolVersion,
+		challenge.challengeId,
+		challenge.nonce,
+		challenge.expiresAt,
+	]);
+}

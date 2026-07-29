@@ -19,30 +19,30 @@
 | Canvas | XSS、资源滥用、通过 Electrobun RPC 或 URL Scheme 访问本地能力 |
 | Provider/Embedding | 内容发送到错误 Endpoint 或不符合用户预期的数据区域 |
 | WebView | XSS 后调用高权限 RPC |
-| 本机 RPC | 其他本机进程扫描动态端口、伪造 client/executor、重放注册材料或旧 generation 消息 |
+| 本机 RPC | 其他本机进程扫描动态端口、伪造 client/Runtime Box、重放注册材料或旧 generation 消息 |
 | agents server | Prompt/Tool 输入绕过 Policy、错误签发 grant、产品 DB 或 Pi Session JSONL 损坏 |
-| executor | 伪造/重放 grant、越权路径/命令、临时凭证泄漏、进程树或扩展资源泄漏 |
+| Runtime Box | 伪造/重放 grant、越权路径/命令、临时凭证泄漏、进程树或扩展资源泄漏 |
 | 崩溃恢复 | 不确定的工具调用被重复执行 |
 
 ## 3. 三应用角色安全基线
 
-- Electrobun client、agents server、executor 都是受信应用代码；角色拆分提供职责和故障隔离，不等于完整 OS sandbox。
+- Electrobun client、agents server、Runtime Box 都是受信应用代码；角色拆分提供职责和故障隔离，不等于完整 OS sandbox。
 - 主 React WebView 只注册最小 Electrobun RPC；client 校验 View ID、窗口角色、origin、参数和 capability。
-- 应用协议只有 `client <-> agents server <-> executor`。client 不直连 executor，executor 不提供 DB、Provider、Policy 或 approval API。
+- 应用协议只有 `client <-> agents server <-> Runtime Box`。client 不直连 Runtime Box，Runtime Box 不提供 DB、Provider、Policy 或 approval API。
 - desktop agents server 只绑定动态 loopback，但 loopback 本身不可信；连接仍需一次性 bootstrap、角色认证、版本和 method allowlist。
-- `clientId`/`executorId` 是稳定身份；每次启动/注册使用新的 `instanceId` 和 `generation`。旧实例的消息、result 和 grant 必须被拒绝。
+- `clientId`/`runtimeBoxId` 是稳定身份；每次启动/注册使用新的 `instanceId` 和 `generation`。旧实例的消息、result 和 grant 必须被拒绝。
 - agents server 独占产品 DB/Pi Session JSONL、Provider、Agent runtime；未来也独占 Policy/approval 和
   Action intent/result。
-- executor 独占实际 Tool、MCP/Skill、取消和进程树；它不能打开业务 DB 或自行授予权限。
+- Runtime Box 独占实际 Tool、MCP/Skill、取消和进程树；它不能打开业务 DB 或自行授予权限。
 - WebSocket/RPC 的传输保护不代替身份、Schema、capability、参数摘要、状态和授权校验。
 - Canvas 使用 `sandbox: true` 的独立 `BrowserView`/partition，不注册应用 RPC；sandbox 只减少应用桥接面，不保证子资源断网。
 - 两个 TypeScript + Bun companion 必须随 desktop 同一 release 打包、签名和更新，不能运行时下载未知 binary。
 
 ## 4. 模式、授权与动作权限
 
-server 先根据 Agent mode、持久 Policy、Session grant 和 Action 参数做决定；需要时让 client 展示审批并持久化用户决定。随后 server 写入 Action intent，签发绑定 action、参数摘要、scope、目标 executor instance/generation、短 TTL 和 single-use nonce 的 execution grant。
+server 先根据 Agent mode、持久 Policy、Session grant 和 Action 参数做决定；需要时让 client 展示审批并持久化用户决定。随后 server 写入 Action intent，签发绑定 action、参数摘要、scope、目标 Runtime Box instance/generation、短 TTL 和 single-use nonce 的 execution grant。
 
-executor 在实际执行前验证 grant。Allow all 只改变 server 的审批决定，不能跳过 grant，也不能让 executor自行放宽路径、命令或网络约束。
+Runtime Box 在实际执行前验证 grant。Allow all 只改变 server 的审批决定，不能跳过 grant，也不能让 Runtime Box自行放宽路径、命令或网络约束。
 
 | 动作 | Ask | Plan（批准前） | Agent 默认 | Agent + Allow all |
 | --- | --- | --- | --- | --- |
@@ -94,8 +94,8 @@ executor 在实际执行前验证 grant。Allow all 只改变 server 的审批�
 
 ### 6.1 默认边界
 
-- Project Agent 的普通文件权限限制在 Project 根目录；server 在 grant 中绑定 scope，executor 在执行时重新校验。
-- executor 使用真实路径解析和符号链接检查，阻止通过 `..`、软链接或路径大小写绕过。
+- Project Agent 的普通文件权限限制在 Project 根目录；server 在 grant 中绑定 scope，Runtime Box 在执行时重新校验。
+- Runtime Box 使用真实路径解析和符号链接检查，阻止通过 `..`、软链接或路径大小写绕过。
 - 内部工作文件、会话附件、Memory 和 Skills 使用独立虚拟路径，不与项目内容混放。
 - 默认保护 `.env*`、密钥文件、凭证目录和应用自己的安全存储。
 - 文件权限规则采用明确的 allow/deny 顺序，并在 UI 中显示最终结果。
@@ -112,13 +112,13 @@ executor 在实际执行前验证 grant。Allow all 只改变 server 的审批�
 
 当前 Pi `AgentSession` 使用 `noTools: "all"`，extensions、Skills、prompt templates、themes、context files、
 default tools 和 TUI 全部禁用；意外 Tool activity 直接失败。未来文件/Shell 能力不会直接开放 Pi 默认 Tool，
-而是通过 Moshu-owned Policy、Action、grant 和 executor 强制执行。
+而是通过 Moshu-owned Policy、Action、grant 和 Runtime Box 强制执行。
 
 ## 7. 命令执行
 
 ### 7.1 强制策略层
 
-不得将原始 `LocalShellBackend.execute` 直接暴露给模型。命令由 agents server 形成 Action、完成审批并签发 grant，再由 executor 的命令执行器：
+不得将原始 `LocalShellBackend.execute` 直接暴露给模型。命令由 agents server 形成 Action、完成审批并签发 grant，再由 Runtime Box 的命令执行器：
 
 - 固定工作目录并记录规范化路径。
 - 使用最小环境变量，不继承 client/agents server 全量环境。
@@ -153,24 +153,24 @@ default tools 和 TUI 全部禁用；意外 Tool activity 直接失败。未来�
 ### 8.1 MCP
 
 - 安装/添加时展示 Server 来源、Transport、命令/域名和 Tool 清单。
-- selected executor 是 MCP config、credential/token/OAuth state、lifecycle 和 Tool inventory 的唯一 source of truth。
-- client 配置 command 经 agents server 做 client/executor identity 与授权检查后路由；只有 executor 持久化成功才返回 redacted result/inventory epoch/revision，offline 或失败不能伪装成功。
-- agents server 只可保存 Agent stable resource ref 与 replaceable、non-authoritative、disposable redacted inventory cache，不保存 recoverable config、credential、OAuth state 或 executor secret locator。
-- 每次 executor 注册/重连先 full snapshot，成功前保持 syncing；运行期由 revision/category-only hint 和 60 秒 ±20% jitter poll 触发增量拉取。
+- selected Runtime Box 是 MCP config、credential/token/OAuth state、lifecycle 和 Tool inventory 的唯一 source of truth。
+- client 配置 command 经 agents server 做 client/Runtime Box identity 与授权检查后路由；只有 Runtime Box 持久化成功才返回 redacted result/inventory epoch/revision，offline 或失败不能伪装成功。
+- agents server 只可保存 Agent stable resource ref 与 replaceable、non-authoritative、disposable redacted inventory cache，不保存 recoverable config、credential、OAuth state 或 Runtime Box secret locator。
+- 每次 Runtime Box 注册/重连先 full snapshot，成功前保持 syncing；运行期由 revision/category-only hint 和 60 秒 ±20% jitter poll 触发增量拉取。
 - gap、compaction、epoch reset 或 invalid cursor 回退 full snapshot。offline/failed poll 只把 cache 标 stale，不得解释为 resource deletion。
 - inventory allowlist 只有 stable ID、version/hash、MCP Tool schema、health/capability 和 `credentialConfigured` boolean；token、sensitive env、recoverable config、完整 `SKILL.md`/resources 一律禁止。
 - 每个 Tool 有只读、写入、外部副作用、未知四类风险标签。
 - 用户或应用可覆盖风险标签，但保留来源。
 - MCP 返回内容不能授予新 Tool 或改变权限。
 - OAuth Scope 在授权前展示；Token 按 Server 隔离。
-- MCP credential 可由 owning executor 从自己的 `ExecutorSecretStore` 加载，并在目标 connection/process 生命周期内保留 runtime reference；不进入全局环境或无关 child/Agent。
+- MCP credential 可由 owning Runtime Box 从自己的 `ExecutorSecretStore` 加载，并在目标 connection/process 生命周期内保留 runtime reference；不进入全局环境或无关 child/Agent。
 - revocation、expiry 或 MCP shutdown 必须关闭对应连接/进程并释放 runtime reference；不宣称 JavaScript 可可靠清零 string memory。
 - MCP Tool 仍使用普通 Action/execution grant；连接已建立不等于预授权。
 
 ### 8.2 Skills
 
 - 安装前扫描脚本和可执行文件清单。
-- executor 独占 Skill installation、immutable versions/content/hash、metadata、resources 和 scripts；server 只保存 assigned executor stable resource ref。
+- Runtime Box 独占 Skill installation、immutable versions/content/hash、metadata、resources 和 scripts；server 只保存 assigned Runtime Box stable resource ref。
 - server 构建/恢复 Agent 时按 ref 获取 metadata/`SKILL.md` 并验证 owner/version/hash；offline、missing 或 mismatch 时 fail closed。
 - fetched Skill content 只用于内存 prompt assembly，不进入 server DB/Pi Session JSONL/Run snapshot/event/
   backup/diagnostic/export。
@@ -179,19 +179,19 @@ default tools 和 TUI 全部禁用；意外 Tool activity 直接失败。未来�
 - Skill 的 `allowed-tools` 不构成应用授权。
 - 更新后内容哈希变化时重新提示权限与脚本差异。
 - 未签名或来源不明不等于禁止安装，但必须明确风险。
-- Skill resources/scripts 通过 executor grant 使用，不能形成服务器或 client 的本地执行旁路。
+- Skill resources/scripts 通过 Runtime Box grant 使用，不能形成服务器或 client 的本地执行旁路。
 
 ## 9. 密钥与凭证
 
 - agents server 的 `SecretVaultCredentialStore` 只保存 Provider/model credential；当前 app-owned file adapter
   使用 parent `0700`、file `0600`、跨进程 lock、fresh read/apply、atomic rename 和 fsync。
-- Provider/model credential 只在 agents server 按 Run scope 读取，永不发送 executor。
-- MCP credential/token/OAuth state 只由 owning executor 的 `ExecutorSecretStore` 保存和读取；server 无 MCP Secret Ref 或 recoverable copy。
-- local desktop 首个 `ExecutorSecretStore` 可使用 executor-private files；future executor 可使用 Keychain、Docker Secret 或 cloud secret manager。
-- stdio 只把 credential 注入目标 MCP child 的最小环境，不修改 executor 全局环境。
+- Provider/model credential 只在 agents server 按 Run scope 读取，永不发送 Runtime Box。
+- MCP credential/token/OAuth state 只由 owning Runtime Box 的 `ExecutorSecretStore` 保存和读取；server 无 MCP Secret Ref 或 recoverable copy。
+- local desktop 首个 `ExecutorSecretStore` 可使用 Runtime Box-private files；future Runtime Box 可使用 Keychain、Docker Secret 或 cloud secret manager。
+- stdio 只把 credential 注入目标 MCP child 的最小环境，不修改 Runtime Box 全局环境。
 - HTTP MCP 可在可行时按 request 注入 credential，但不是所有 transport 的统一要求。
 - credential 不通过 query RPC、UI、prompt、日志、诊断或 export 暴露，也不传给无关 child process 或 Agent。
-- `inventory.changed`、snapshot、delta、cache 和 mutation result 都不能携带 credential value、sensitive env 或 executor secret locator。
+- `inventory.changed`、snapshot、delta、cache 和 mutation result 都不能携带 credential value、sensitive env 或 Runtime Box secret locator。
 - UI 只显示掩码和最后更新时间，不支持读取回完整值。
 - 剪贴板复制凭证需要用户主动操作并提示清理风险。
 - 日志、错误、崩溃报告和导出统一经过脱敏。
@@ -207,17 +207,17 @@ default tools 和 TUI 全部禁用；意外 Tool activity 直接失败。未来�
 | --- | --- |
 | Session、Run、消息投影、事件 | agents server 产品数据库 |
 | Conversation context | `agentDataDirectory/sessions` 下的 Pi `SessionManager` JSONL |
-| Provider/model config、Agent definitions/versions、resource refs | agents server 本地业务数据；resource ref 不含 executor config/content |
-| redacted executor inventory cache | agents server disposable projection；offline 时标 stale，可删除后从 executor 重建 |
-| MCP config/inventory、Skill metadata/versions | executor-owned DB |
-| Skill immutable content/resources/scripts | executor-private Skills 目录 |
-| 密钥与 Token | Provider/model credential 在 server `SecretVaultCredentialStore`；未来 MCP credential/OAuth 在 executor `ExecutorSecretStore` |
+| Provider/model config、Agent definitions/versions、resource refs | agents server 本地业务数据；resource ref 不含 Runtime Box config/content |
+| redacted Runtime Box inventory cache | agents server disposable projection；offline 时标 stale，可删除后从 Runtime Box 重建 |
+| MCP config/inventory、Skill metadata/versions | Runtime Box-owned DB |
+| Skill immutable content/resources/scripts | Runtime Box-private Skills 目录 |
+| 密钥与 Token | Provider/model credential 在 server `SecretVaultCredentialStore`；未来 MCP credential/OAuth 在 Runtime Box `ExecutorSecretStore` |
 | Canvas 与版本 | 本地应用数据目录 |
 | 知识原文元数据、切分和向量 | 本地索引目录 |
 | Project 文件 | 保持在原目录，不自动复制 |
 | 日志 | 本地轮转、脱敏、有限保留 |
 
-local desktop executor data root 使用 `0700`，credential file 使用 `0600`；写入做 owner check、atomic replacement，拒绝 symlink，并在平台支持时 no-follow。它能防止其他普通本机用户读取，但不能防止同账户 malware、root、disk snapshot 或 backup。用户应把磁盘加密和备份保护作为独立控制。
+local desktop Runtime Box data root 使用 `0700`，credential file 使用 `0600`；写入做 owner check、atomic replacement，拒绝 symlink，并在平台支持时 no-follow。它能防止其他普通本机用户读取，但不能防止同账户 malware、root、disk snapshot 或 backup。用户应把磁盘加密和备份保护作为独立控制。
 
 ### 10.2 数据外发
 
@@ -237,7 +237,7 @@ local desktop executor data root 使用 `0700`，credential file 使用 `0600`�
 - 默认移除密钥、认证 Header、敏感变量值和内部绝对路径。
 - 用户可删除单个 Session、Project 记录、Canvas、知识库或全部应用数据。
 - 删除 Project 记录不删除 Project 目录。
-- 卸载应用前无法保证自动清除所有 server/executor secret backend 项，设置页提供按 executor 路由的“删除全部安全凭证”，并明确 offline executor 无法确认删除。
+- 卸载应用前无法保证自动清除所有 server/Runtime Box secret backend 项，设置页提供按 Runtime Box 路由的“删除全部安全凭证”，并明确 offline Runtime Box 无法确认删除。
 
 ## 11. 日志、审计与遥测
 
@@ -251,7 +251,7 @@ local desktop executor data root 使用 `0700`，credential file 使用 `0600`�
 ## 12. 发布安全
 
 - macOS 包必须签名、公证并验证更新签名。
-- Electrobun client、agents-server binary、executor binary、public Pi `0.82.1` bundle 和更新 metadata 必须来自
+- Electrobun client、agents-server binary、Runtime Box binary、public Pi `0.82.1` bundle 和更新 metadata 必须来自
   同一受信 release；未知版本/protocol 组合时 fail closed。
 - 更新必须整体切换三个角色，不能留下新 client 配旧 companion 的部分更新。
 - 自动更新失败不能阻止用户访问本地数据。
@@ -269,13 +269,13 @@ local desktop executor data root 使用 `0700`，credential file 使用 `0600`�
 | SEC-005 | Shell 使用独立策略层和最小环境 | P0 |
 | SEC-006 | 文件路径防穿越、符号链接绕过和并发覆盖 | P0 |
 | SEC-007 | 所有副作用关联 Run、审批和结果 | P0 |
-| SEC-008 | Provider credential 只在 server SecretVault；MCP credential 只在 executor `ExecutorSecretStore`，均不进入 WebView/query/log/export | P0 |
+| SEC-008 | Provider credential 只在 server SecretVault；MCP credential 只在 Runtime Box `ExecutorSecretStore`，均不进入 WebView/query/log/export | P0 |
 | SEC-009 | Canvas、MCP、Skill 和网页内容按不可信处理 | P0 |
 | SEC-010 | 遥测默认关闭，日志和导出默认脱敏 | P0 |
 | SEC-011 | stable ID、instance/generation、角色认证、取消、durable interrupt 和进程树清理可验证 | P0 |
 | SEC-012 | Canvas 默认子资源断网在真实网络测试中成立；否则不得执行任意 Web 内容 | P0 |
-| SEC-013 | server 先持久化 Policy/approval/intent，executor 只执行有效的一次性 grant | P0 |
-| SEC-014 | server 不保存 recoverable MCP/Skill config/content/credential；executor private root 的 mode/owner/atomic/no-follow 与诚实威胁边界可验证 | P0 |
+| SEC-013 | server 先持久化 Policy/approval/intent，Runtime Box 只执行有效的一次性 grant | P0 |
+| SEC-014 | server 不保存 recoverable MCP/Skill config/content/credential；Runtime Box private root 的 mode/owner/atomic/no-follow 与诚实威胁边界可验证 | P0 |
 | SEC-015 | client 对两个 companion 使用 cooperative shutdown、capped backoff 和明确 recovery UX | P0 |
-| SEC-016 | MCP/Skill command 只有 owning executor 持久化后成功；Agent resource missing/mismatch 时 fail closed | P0 |
+| SEC-016 | MCP/Skill command 只有 owning Runtime Box 持久化后成功；Agent resource missing/mismatch 时 fail closed | P0 |
 | SEC-017 | registration full sync、epoch/revision delta/tombstone、hint + jittered poll 和 snapshot fallback 不泄密、不误删；Run 仍 live 验证 | P0 |

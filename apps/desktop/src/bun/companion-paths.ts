@@ -5,7 +5,7 @@ import { getCompanionExecutableFilename } from "../shared/companion-executable-n
 
 export interface CompanionExecutables {
 	"agents-server": string;
-	executor: string;
+	"runtime-box": string;
 }
 
 export type CompanionExecutableSource = "bundled" | "workspace";
@@ -34,9 +34,9 @@ export function resolveBundledCompanionExecutables(
 			companionDirectory,
 			getCompanionExecutableFilename("agents-server", platform),
 		),
-		executor: path.resolve(
+		"runtime-box": path.resolve(
 			companionDirectory,
-			getCompanionExecutableFilename("executor", platform),
+			getCompanionExecutableFilename("runtime-box", platform),
 		),
 	};
 }
@@ -54,12 +54,12 @@ export function resolveWorkspaceCompanionExecutables(
 			"dist",
 			getCompanionExecutableFilename("agents-server", platform),
 		),
-		executor: path.resolve(
+		"runtime-box": path.resolve(
 			workspaceRoot,
 			"apps",
-			"executor",
+			"runtime-box",
 			"dist",
-			getCompanionExecutableFilename("executor", platform),
+			getCompanionExecutableFilename("runtime-box", platform),
 		),
 	};
 }

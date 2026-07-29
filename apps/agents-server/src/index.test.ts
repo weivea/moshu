@@ -46,6 +46,69 @@ describe("agents-server stdout control channel", () => {
 			rmSync(directory, { force: true, recursive: true });
 		}
 	});
+
+	test("Dev Tunnel watchdog terminates its child when the parent pipe closes", async () => {
+		const watched = [
+			"console.log(JSON.stringify({ pid: process.pid }));",
+			"setInterval(() => undefined, 1000);",
+		].join("");
+		const watchdog = spawn(
+			process.execPath,
+			[entrypoint, "--dev-tunnel-watchdog", "--", process.execPath, "-e", watched],
+			{
+				cwd: repositoryRoot,
+				env: { ...process.env },
+				stdio: ["pipe", "pipe", "pipe"],
+			},
+		);
+		watchdog.stdout.setEncoding("utf8");
+		let stdout = "";
+		let watchedPid: number | undefined;
+		const ready = new Promise<void>((resolveReady, rejectReady) => {
+			watchdog.stdout.on("data", (chunk: string) => {
+				stdout += chunk;
+				const line = stdout.split("\n")[0];
+				if (
+					stdout.includes("\n") &&
+					line !== undefined &&
+					line.length > 0 &&
+					watchedPid === undefined
+				) {
+					const parsed = JSON.parse(line) as { pid?: unknown };
+					if (typeof parsed.pid !== "number") {
+						rejectReady(new Error("Watchdog child did not publish its PID."));
+						return;
+					}
+					watchedPid = parsed.pid;
+					resolveReady();
+				}
+			});
+			watchdog.once("exit", (code) => {
+				if (watchedPid === undefined) {
+					rejectReady(new Error(`Watchdog exited before child readiness with code ${code}.`));
+				}
+			});
+		});
+		const closed = new Promise<number | null>((resolveClose) =>
+			watchdog.once("close", resolveClose),
+		);
+		try {
+			await within(ready, 5_000, "watchdog child readiness");
+			watchdog.stdin.end();
+			expect(await within(closed, 5_000, "watchdog parent-close shutdown")).toBe(0);
+			if (watchedPid === undefined) {
+				throw new Error("Watchdog child PID was not captured.");
+			}
+			expect(isProcessAlive(watchedPid)).toBe(false);
+		} finally {
+			if (watchdog.exitCode === null && watchdog.signalCode === null) {
+				watchdog.kill("SIGTERM");
+			}
+			if (watchedPid !== undefined && isProcessAlive(watchedPid)) {
+				process.kill(watchedPid, "SIGKILL");
+			}
+		}
+	});
 });
 
 async function runEntrypoint(
@@ -122,8 +185,8 @@ function createBootstrap(directory: string): AgentsServerBootstrapRecord {
 			{
 				credential: Buffer.alloc(32, 72).toString("base64url"),
 				identity: {
-					role: "executor",
-					peerId: "executor-control-test",
+					role: "runtime-box",
+					peerId: "runtime-box-control-test",
 					instanceId: crypto.randomUUID(),
 					generation: 1,
 				},
@@ -153,4 +216,13 @@ function within<T>(operation: Promise<T>, timeoutMs: number, label: string): Pro
 			},
 		);
 	});
+}
+
+function isProcessAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		return (error as NodeJS.ErrnoException).code === "EPERM";
+	}
 }

@@ -1,4 +1,4 @@
-import { retiredSessionTombstoneTtlMs } from "@moshu/contracts";
+import { defaultLocalRuntimeBoxId, retiredSessionTombstoneTtlMs } from "@moshu/contracts";
 import { beforeEach, describe, expect, test, vi } from "vitest";
 import { ChatSessionNotFoundError } from "../../../../shared/rpc-errors";
 import {
@@ -347,6 +347,7 @@ class RecoveryTransport {
 function makeSession(sessionId: string): ChatSession {
 	return {
 		id: sessionId,
+		runtimeBoxId: defaultLocalRuntimeBoxId,
 		title: sessionId,
 		updatedAt: "2026-01-01T00:00:00.000Z",
 		model: modelSelectionFor("gpt-5.4"),

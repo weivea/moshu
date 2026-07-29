@@ -850,18 +850,64 @@ describe("ChatApplicationService", () => {
 		}
 	});
 
-	test("rejects new Runs while the executor is not ready", () => {
+	test("rejects new Runs while the Runtime Box is not ready", () => {
 		const database = openAppDatabase(":memory:");
+		let ready = true;
 		const service = createService(database, new FakeAskChatRuntime({}), new ManualScheduler(), {
-			isRuntimeReady: () => false,
+			isRuntimeReady: () => ready,
 		});
 		const { session } = service.createSession();
+		ready = false;
 
 		expect(() => service.sendMessage({ sessionId: session.id, content: "blocked" })).toThrow(
-			"executor is not authenticated and ready",
+			"Runtime Box is not authenticated and ready",
+		);
+		expect(() => service.createSession()).toThrow("Runtime Box is not authenticated and ready");
+		expect(() => service.updateSession({ sessionId: session.id, title: "Blocked" })).toThrow(
+			"Runtime Box is not authenticated and ready",
+		);
+		expect(() => service.setSessionArchived({ sessionId: session.id, archived: true })).toThrow(
+			"Runtime Box is not authenticated and ready",
+		);
+		expect(() => service.setSessionModel({ sessionId: session.id, model: null })).toThrow(
+			"Runtime Box is not authenticated and ready",
+		);
+		expect(() => service.deleteSession({ sessionId: session.id })).toThrow(
+			"Runtime Box is not authenticated and ready",
 		);
 		expect(database.runs.listBySession(session.id)).toEqual([]);
 		database.close();
+	});
+
+	test("replays a committed Session create key while its Runtime Box is offline", async () => {
+		const database = openAppDatabase(":memory:");
+		let ready = true;
+		const service = createService(database, new FakeAskChatRuntime({}), new ManualScheduler(), {
+			isRuntimeReady: () => ready,
+		});
+		const request = {
+			schemaVersion: 1 as const,
+			createKey: crypto.randomUUID(),
+			title: "Recovered Session",
+			defaultMode: "agent" as const,
+		};
+		const origin = {
+			role: "client" as const,
+			peerId: "desktop-client",
+			instanceId: crypto.randomUUID(),
+			generation: 1,
+		};
+		try {
+			const created = service.createSessionIdempotently(request, origin);
+			ready = false;
+			expect(service.createSessionIdempotently(request, origin)).toEqual(created);
+			expect(() =>
+				service.createSessionIdempotently({ ...request, createKey: crypto.randomUUID() }, origin),
+			).toThrow("Runtime Box is not authenticated and ready");
+		} finally {
+			await service.shutdown();
+			database.close();
+		}
 	});
 
 	test("retains an accepted prompt when readiness is lost before execution", async () => {
@@ -958,6 +1004,7 @@ describe("ChatApplicationService", () => {
 
 		try {
 			const { session } = service.createSession();
+			const otherSession = service.createSession().session;
 			const requestId = crypto.randomUUID();
 			const first = service.sendMessage({
 				requestId,
@@ -979,7 +1026,6 @@ describe("ChatApplicationService", () => {
 					content: "conflicting replay",
 				}),
 			).toThrow("already used for different content");
-			const otherSession = service.createSession().session;
 			expect(() =>
 				service.sendMessage({
 					requestId,
@@ -993,7 +1039,7 @@ describe("ChatApplicationService", () => {
 					sessionId: session.id,
 					content: "new while unavailable",
 				}),
-			).toThrow("executor is not authenticated and ready");
+			).toThrow("already has an active response");
 
 			ready = true;
 			scheduler.runAll();
@@ -2832,6 +2878,7 @@ function createService(
 	return new ChatApplicationService({
 		sessions: options.sessions ?? database.sessions,
 		runs: options.runs ?? database.runs,
+		actions: database.actions,
 		providers: options.providers ?? createTestProviderRegistry(),
 		runtime,
 		schedule: scheduler.schedule,

@@ -12,7 +12,10 @@ import { join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncateTail } from "./truncate.ts";
 
-const outputDirectory = join(tmpdir(), "moshu-executor-tool-output");
+const outputDirectory = join(
+	tmpdir(),
+	`moshu-executor-tool-output-${process.getuid?.() ?? "user"}`,
+);
 const retainedOutputAgeMs = 24 * 60 * 60 * 1_000;
 export const MAX_RETAINED_OUTPUT_BYTES = 64 * 1024 * 1024;
 export const MAX_TOTAL_RETAINED_OUTPUT_BYTES = 256 * 1024 * 1024;

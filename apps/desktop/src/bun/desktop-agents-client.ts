@@ -12,11 +12,16 @@ import {
 	deleteChatSessionInputSchema,
 	getChatSessionPageInputSchema,
 	getChatSessionPageOutputSchema,
+	type ListRuntimeBoxesOutput,
+	listRuntimeBoxesOutputSchema,
 	maxReplayRunCursors,
 	productRpcMaxBufferedOutboundBytes,
 	productRpcMaxFrameBytes,
 	productRpcMethods,
+	productRpcEvents,
 	type productRpcRequestSchemas,
+	remoteAccessMutationMethods,
+	remoteAccessMutationRpcTimeoutMs,
 	type ReplayCursorSupport,
 	replayChatEventsInputSchema,
 	replayChatEventsOutputSchema,
@@ -66,7 +71,9 @@ import type {
 type ChatEventListener = (event: ChatRunEvent) => void | PromiseLike<void>;
 type ChatSessionInvalidationListener = (invalidation: ChatSessionInvalidation) => void;
 type DesktopAgentsReadyListener = () => void;
+type RuntimeBoxesChangedListener = (snapshot: ListRuntimeBoxesOutput) => void;
 type ProductMethod = keyof typeof productRpcRequestSchemas;
+const remoteAccessMutationMethodSet = new Set<string>(remoteAccessMutationMethods);
 export type DesktopAgentsRpcPeer = Pick<RpcPeer, "close" | "remoteIdentity" | "request">;
 export type DesktopAgentsPeerConnector = (
 	options: ConnectRpcClientOptions,
@@ -156,11 +163,12 @@ const remoteOperationErrorDispositions: Record<
 > = {
 	[productRpcMethods.chatSend]: {
 		INVALID_ARGUMENT: "definitive-rejection",
-		AGENTS_NOT_READY: "definitive-rejection",
+		RUNTIME_BOX_NOT_READY: "definitive-rejection",
 		SESSION_NOT_FOUND: "session-retired",
 	},
 	[productRpcMethods.sessionCreate]: {
 		INVALID_ARGUMENT: "definitive-rejection",
+		RUNTIME_BOX_NOT_READY: "definitive-rejection",
 		SESSION_CREATE_KEY_CONFLICT: "definitive-rejection",
 		SESSION_CREATE_CAPACITY: "definitive-rejection",
 	},
@@ -185,6 +193,7 @@ export class DesktopAgentsClient {
 	readonly #chatEventListeners = new Set<ChatEventListener>();
 	readonly #chatSessionInvalidationListeners = new Set<ChatSessionInvalidationListener>();
 	readonly #readyListeners = new Set<DesktopAgentsReadyListener>();
+	readonly #runtimeBoxesChangedListeners = new Set<RuntimeBoxesChangedListener>();
 	readonly #activeRunCursors = new Map<string, ActiveRunCursor>();
 	readonly #sendReservations = new Map<string, SendReservation>();
 	readonly #runReservations = new Map<string, SendReservation>();
@@ -291,6 +300,12 @@ export class DesktopAgentsClient {
 								throw new Error("Chat event delivery failed.");
 							}
 						},
+						[productRpcEvents.runtimeBoxesChanged]: (payload) => {
+							const snapshot = listRuntimeBoxesOutputSchema.parse(payload);
+							for (const listener of this.#runtimeBoxesChangedListeners) {
+								listener(snapshot);
+							}
+						},
 					},
 				},
 				methodAllowlist: {
@@ -300,6 +315,9 @@ export class DesktopAgentsClient {
 					maxFrameBytes: productRpcMaxFrameBytes,
 					maxBufferedOutboundBytes: productRpcMaxBufferedOutboundBytes,
 				},
+				requestTimeoutLimits: Object.fromEntries(
+					remoteAccessMutationMethods.map((method) => [method, remoteAccessMutationRpcTimeoutMs]),
+				),
 				onClose: markExactPeerClosed,
 			});
 			if (!isSameRpcPeerIdentity(peer.remoteIdentity, options.agentsServer.serverIdentity)) {
@@ -459,7 +477,13 @@ export class DesktopAgentsClient {
 				throw new TypeError("Product RPC input is not JSON serializable.");
 			}
 			const payload = rpcJsonValueSchema.parse(JSON.parse(encodedInput));
-			const response = await peer.request(method, payload);
+			const response = await peer.request(
+				method,
+				payload,
+				remoteAccessMutationMethodSet.has(method)
+					? { timeoutMs: remoteAccessMutationRpcTimeoutMs }
+					: undefined,
+			);
 			if (
 				sessionOperation?.retired ||
 				(sessionOperation !== undefined && this.#sessionRetirements.has(sessionOperation.sessionId))
@@ -845,6 +869,13 @@ export class DesktopAgentsClient {
 		};
 	}
 
+	subscribeRuntimeBoxesChanged(listener: RuntimeBoxesChangedListener): () => void {
+		this.#runtimeBoxesChangedListeners.add(listener);
+		return () => {
+			this.#runtimeBoxesChangedListeners.delete(listener);
+		};
+	}
+
 	subscribeChatSessionInvalidations(listener: ChatSessionInvalidationListener): () => void {
 		this.#chatSessionInvalidationListeners.add(listener);
 		return () => {
@@ -905,6 +936,7 @@ export class DesktopAgentsClient {
 		this.#sessionOperations.clear();
 		this.#implicitSessionCreateKey = undefined;
 		this.#chatEventListeners.clear();
+		this.#runtimeBoxesChangedListeners.clear();
 		this.#chatSessionInvalidationListeners.clear();
 		this.#readyListeners.clear();
 		closeActiveConnection?.();

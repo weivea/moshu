@@ -15,7 +15,7 @@ import type { ResolvedProviderConfiguration } from "./provider-registry";
 import {
 	assertExecutorToolDefinitions,
 	createExecutorToolDefinitions,
-	type ExecutorToolGateway,
+	type RuntimeBoxToolGateway,
 } from "./executor-tools";
 
 export interface AskChatMessage {
@@ -39,6 +39,7 @@ export interface AskChatMessageDeltaEvent {
 export interface AskChatRunInput {
 	runId: string;
 	threadId?: string;
+	runtimeBoxId: string;
 	provider: ResolvedProviderConfiguration;
 	messages: readonly AskChatMessage[];
 	signal?: AbortSignal;
@@ -69,7 +70,7 @@ export interface AskChatRuntime {
 export interface AskChatRuntimeOptions {
 	agentDataDirectory: string;
 	modelRuntime: ModelRuntime;
-	executorGateway: ExecutorToolGateway;
+	runtimeBoxGateway: RuntimeBoxToolGateway;
 	workspaceDirectory?: string;
 }
 
@@ -82,6 +83,7 @@ export type AskChatErrorKind =
 	| "provider_network"
 	| "provider_model"
 	| "provider_failure"
+	| "runtime_box_unavailable"
 	| "thread_busy"
 	| "runtime_shutdown"
 	| "unexpected_tool_activity";
@@ -132,19 +134,20 @@ interface ActiveRun {
 
 export class PiAgentRuntime implements AskChatRuntime {
 	readonly #modelRuntime: ModelRuntime;
-	readonly #executorGateway: ExecutorToolGateway;
+	readonly #runtimeBoxGateway: RuntimeBoxToolGateway;
 	readonly #agentDirectory: string;
 	readonly #sessionDirectory: string;
 	readonly #workspaceDirectory: string;
 	readonly #activeRuns = new Map<string, ActiveRun>();
 	readonly #activeThreads = new Set<string>();
 	readonly #runIdByThread = new Map<string, string>();
+	readonly #runtimeBoxIdByThread = new Map<string, string>();
 	readonly #sessions = new Map<string, AgentSession>();
 	#shuttingDown = false;
 
 	constructor(options: AskChatRuntimeOptions) {
 		this.#modelRuntime = options.modelRuntime;
-		this.#executorGateway = options.executorGateway;
+		this.#runtimeBoxGateway = options.runtimeBoxGateway;
 		this.#agentDirectory = resolve(options.agentDataDirectory);
 		this.#sessionDirectory = join(this.#agentDirectory, "sessions");
 		this.#workspaceDirectory = resolve(
@@ -224,6 +227,7 @@ export class PiAgentRuntime implements AskChatRuntime {
 		const loaded = this.#sessions.get(threadId);
 		loaded?.dispose();
 		this.#sessions.delete(threadId);
+		this.#runtimeBoxIdByThread.delete(threadId);
 		const info = (await SessionManager.list(this.#workspaceDirectory, this.#sessionDirectory)).find(
 			(session) => session.id === threadId,
 		);
@@ -258,6 +262,7 @@ export class PiAgentRuntime implements AskChatRuntime {
 			session.dispose();
 		}
 		this.#sessions.clear();
+		this.#runtimeBoxIdByThread.clear();
 	}
 
 	async #start(
@@ -298,7 +303,12 @@ export class PiAgentRuntime implements AskChatRuntime {
 			}
 		};
 		try {
-			const session = await this.#getOrCreateSession(threadId, model, input.provider.thinkingLevel);
+			const session = await this.#getOrCreateSession(
+				threadId,
+				input.runtimeBoxId,
+				model,
+				input.provider.thinkingLevel,
+			);
 			active.session = session;
 			throwIfCancelled();
 			await session.setModel(model);
@@ -366,11 +376,19 @@ export class PiAgentRuntime implements AskChatRuntime {
 
 	async #getOrCreateSession(
 		threadId: string,
+		runtimeBoxId: string,
 		model?: NonNullable<ReturnType<ModelRuntime["getModel"]>>,
 		thinkingLevel?: ThinkingLevel,
 	): Promise<AgentSession> {
 		const loaded = this.#sessions.get(threadId);
 		if (loaded !== undefined) {
+			if (this.#runtimeBoxIdByThread.get(threadId) !== runtimeBoxId) {
+				throw runtimeError(
+					"runtime_box_unavailable",
+					"The chat Session belongs to a different Runtime Box.",
+					false,
+				);
+			}
 			return loaded;
 		}
 		if (model === undefined) {
@@ -405,7 +423,10 @@ export class PiAgentRuntime implements AskChatRuntime {
 		});
 		await resources.reload();
 		const customTools = createExecutorToolDefinitions({
-			gateway: this.#executorGateway,
+			gateway: {
+				invoke: (input, options) =>
+					this.#runtimeBoxGateway.invokeForRuntimeBox(runtimeBoxId, input, options),
+			},
 			cwd: this.#workspaceDirectory,
 			getRunId: () => this.#runIdByThread.get(threadId),
 		});
@@ -439,6 +460,7 @@ export class PiAgentRuntime implements AskChatRuntime {
 		}
 
 		this.#sessions.set(threadId, created.session);
+		this.#runtimeBoxIdByThread.set(threadId, runtimeBoxId);
 		return created.session;
 	}
 

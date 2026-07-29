@@ -8,7 +8,7 @@ import {
 	executorGrepToolArgumentsSchema,
 	executorLsToolArgumentsSchema,
 	executorReadToolArgumentsSchema,
-	executorToolInvokeInputSchema,
+	runtimeBoxToolInvokeInputSchema,
 	executorToolNames,
 	executorWriteToolArgumentsSchema,
 	type ExecutorToolInvokeInput,
@@ -18,6 +18,17 @@ import {
 
 export interface ExecutorToolGateway {
 	invoke(
+		input: ExecutorToolInvokeInput,
+		options?: {
+			signal?: AbortSignal;
+			onProgress?: (event: ExecutorToolProgressEvent) => void;
+		},
+	): Promise<ExecutorToolInvokeOutput>;
+}
+
+export interface RuntimeBoxToolGateway {
+	invokeForRuntimeBox(
+		runtimeBoxId: string,
 		input: ExecutorToolInvokeInput,
 		options?: {
 			signal?: AbortSignal;
@@ -129,7 +140,7 @@ export function createExecutorToolDefinitions(
 		if (runId === undefined) {
 			throw new Error("Executor tool call is not associated with an active agent run");
 		}
-		const input = executorToolInvokeInputSchema.parse({
+		const input = runtimeBoxToolInvokeInputSchema.parse({
 			schemaVersion: 1,
 			invocationId: crypto.randomUUID(),
 			runId,

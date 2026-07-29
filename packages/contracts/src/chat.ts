@@ -8,6 +8,7 @@ import {
 	sessionModelSelectionSchema,
 	thinkingLevelSchema,
 } from "./provider";
+import { runtimeBoxIdSchema } from "./runtime-box";
 
 export const contractSchemaVersion = 1 as const;
 
@@ -148,6 +149,7 @@ export const chatSessionSchema = z
 		schemaVersion: z.literal(contractSchemaVersion),
 		id: uuidV7Schema,
 		agentSessionId: uuidV7Schema,
+		runtimeBoxId: runtimeBoxIdSchema,
 		title: sessionTitleSchema,
 		defaultMode: agentModeSchema,
 		model: sessionModelSelectionSchema.optional(),
@@ -163,6 +165,7 @@ export const chatRunSchema = z
 		schemaVersion: z.literal(contractSchemaVersion),
 		id: uuidV7Schema,
 		sessionId: uuidV7Schema,
+		runtimeBoxId: runtimeBoxIdSchema,
 		mode: agentModeSchema,
 		status: chatRunStatusSchema,
 		provider: runProviderStateSchema,
@@ -287,6 +290,7 @@ export const createChatSessionInputSchema = z
 		title: sessionTitleSchema,
 		defaultMode: agentModeSchema.optional(),
 		model: sessionModelSelectionSchema.optional(),
+		runtimeBoxId: runtimeBoxIdSchema.optional(),
 	})
 	.strict();
 
@@ -301,6 +305,7 @@ export const listChatSessionsInputSchema = z
 		limit: z.int().min(1).max(100).optional(),
 		query: sessionSearchQuerySchema.optional(),
 		archived: z.boolean().optional(),
+		runtimeBoxId: runtimeBoxIdSchema.optional(),
 	})
 	.strict();
 

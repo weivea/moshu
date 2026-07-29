@@ -270,6 +270,7 @@ function buildRun(row: RunRow): ChatRun {
 		schemaVersion: 1,
 		id: row.id,
 		sessionId: row.sessionId,
+		runtimeBoxId: row.runtimeBoxId,
 		mode: row.mode,
 		status: row.status,
 		provider: parseRunProviderState(row.providerJson),
@@ -357,12 +358,13 @@ export class SqliteRunJournalRepository implements RunJournalRepository {
 		const provider = toSafeProviderState(input.provider);
 
 		return this.inTransaction(() => {
-			this.assertSessionExists(sessionId);
+			const runtimeBoxId = this.getSessionRuntimeBoxId(sessionId);
 			const nowMs = this.clock.now();
 			const row: RunRow = {
 				id: this.idGenerator.create(nowMs),
 				clientRequestId,
 				sessionId,
+				runtimeBoxId,
 				mode: input.mode,
 				status: "queued",
 				providerJson: JSON.stringify(provider),
@@ -1030,6 +1032,18 @@ export class SqliteRunJournalRepository implements RunJournalRepository {
 		if (row === undefined) {
 			throw new ChatSessionNotFoundError(sessionId);
 		}
+	}
+
+	private getSessionRuntimeBoxId(sessionId: string): string {
+		const row = this.orm
+			.select({ runtimeBoxId: chatSessionsTable.runtimeBoxId })
+			.from(chatSessionsTable)
+			.where(eq(chatSessionsTable.id, sessionId))
+			.get();
+		if (row === undefined) {
+			throw new ChatSessionNotFoundError(sessionId);
+		}
+		return row.runtimeBoxId;
 	}
 
 	private hasEventType(runId: string, type: ChatRunEvent["type"]): boolean {

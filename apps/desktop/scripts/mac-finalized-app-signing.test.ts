@@ -27,10 +27,8 @@ describe("finalized macOS app signing", () => {
 				"-",
 				"--entitlements",
 				entitlements,
-				`${app}/Contents/Resources/app/companions/moshu-executor`,
+				`${app}/Contents/Resources/app/companions/moshu-runtime-box`,
 			],
-			["codesign", "--force", "--sign", "-", `${app}/Contents/Resources/app/companions/rg`],
-			["codesign", "--force", "--sign", "-", `${app}/Contents/Resources/app/companions/fd`],
 			["codesign", "--force", "--sign", "-", `${app}/Contents/MacOS/bspatch`],
 			[
 				"codesign",
@@ -56,12 +54,7 @@ describe("finalized macOS app signing", () => {
 			"--verbose=2",
 			app,
 		]);
-		expect(plan.verify).toContainEqual([
-			"codesign",
-			"--verify",
-			"--strict",
-			`${app}/Contents/Resources/app/companions/rg`,
-		]);
+		expect(plan.verify.flat()).not.toContain(`${app}/Contents/Resources/app/companions/rg`);
 	});
 
 	test("uses hardened runtime and timestamps for every Developer ID signature", () => {
@@ -79,7 +72,7 @@ describe("finalized macOS app signing", () => {
 			"--timestamp",
 			`${app}/Contents/Resources/app/companions/moshu-agents-server`,
 		]);
-		expect(plan.nested[5]).toEqual([
+		expect(plan.nested[3]).toEqual([
 			"codesign",
 			"--force",
 			"--options",

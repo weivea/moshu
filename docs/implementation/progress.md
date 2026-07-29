@@ -2,8 +2,8 @@
 
 > 更新日期：2026-07-28
 > 当前产品阶段：Phase 0
-> 当前架构里程碑：A3 executor-only 七工具桥接（部分完成）
-> 当前代码基线：三应用角色、公开 Pi Agent runtime、可信本机 executor Tool gateway
+> 当前架构里程碑：RB-06 Runtime 切换、设置与 Projects
+> 当前代码基线：Local/Remote Runtime Box、独立 Runtime ingress、设备认证、Agent Server-owned Dev Tunnel
 
 本文只记录代码或自动化测试已经证明的能力。批准的目标见[技术架构](./architecture.md)，后续顺序见[工程交付计划](./delivery-plan.md)。
 
@@ -11,8 +11,8 @@
 
 | 口径 | 状态 |
 | --- | --- |
-| 批准的应用角色 | Electrobun client、agents server、executor |
-| 当前仓库实现 | client 监管两个 compiled companion；Provider、Agent、产品 DB 和 Agent Session 位于 agents server；七工具只在 executor 执行 |
+| 批准的应用角色 | Client、agents server、Runtime Box；Runtime Box 是 Box 内部执行组件 |
+| 当前仓库实现 | client 监管 agents-server 和 Local Runtime Box companion；Provider、Agent、产品 DB 和 Agent Session 位于 agents server；七工具只在 Box 内部 Executor 执行 |
 
 ```text
 React WebView
@@ -22,8 +22,8 @@ React WebView
   -> public Pi ModelRuntime + headless AgentSession
   -> Product DB RunJournal + Pi SessionManager JSONL
 
-executor
-  -> authenticated registration/readiness + invocation gateway
+Local Runtime Box
+  -> Runtime Box descriptor registration + keyed registry/invocation gateway
   -> read/bash/edit/write/grep/find/ls
   -> MCP/Skill execution（尚未实现）
 ```
@@ -35,6 +35,12 @@ executor
 - 两个 TypeScript + Bun compiled companion 由 desktop supervisor 启动、认证、监管和协作关闭。
 - 动态 loopback bootstrap、stable identity、instance/generation fencing、请求 allowlist、取消和 event replay 已有合同与测试。
 - packaged canary、standalone binary、three-process、parent-death 和 companion smoke 构成当前发布门槛。
+- Remote Runtime Box 可作为普通用户服务安装在 Linux/macOS/Windows；单二进制携带校验后的
+  rg、fd 和 Photon WASM 资源，并使用私有配置、generation 和 workspace。
+- Agent Server 暴露独立 Runtime-only ingress，使用一次性 pairing code、Ed25519 challenge、
+  device-key revocation、持久 generation fence、入口限流和 canonical RPC identity。
+- Agent Server 管理 Dev Tunnel Microsoft device-code 登录、持久 cluster-qualified Tunnel ID、
+  单一 Anonymous HTTP ingress port、Host watchdog、重建/修复、取消和重试；Product RPC 不暴露到 Tunnel。
 - 产品数据库只有 agents server 写入，保存 SessionCatalog、RunJournal、durable events、retirement tombstone 和
   agent-session cleanup outbox。
 - 每个 Chat Session 拥有稳定 Pi session ID；conversation context 由显式
@@ -59,9 +65,9 @@ executor
 - runtime 固定 `noTools: "builtin"`，禁用 extensions、skills、prompt templates、themes、context files 和
   TUI，只注册 `read`、`bash`、`edit`、`write`、`grep`、`find`、`ls` 七个 SDK custom proxy；启动时验证
   active/configured Tool 集合及来源，不能回退到 Pi built-in。
-- proxy 只做 Zod/TypeBox 校验和 executor RPC 映射；标准 tool-call/tool-result 循环、progress、abort、
-  executor unavailable 和 gateway error 已有自动化覆盖。
-- executor 文件变更按稳定 canonical pathname 串行化并使用 atomic rename，覆盖 inode 替换和 dangling
+- proxy 只做 Zod/TypeBox 校验和 Runtime Box RPC 映射；标准 tool-call/tool-result 循环、progress、abort、
+  Runtime Box unavailable 和 gateway error 已有自动化覆盖。
+- Runtime Box 文件变更按稳定 canonical pathname 串行化并使用 atomic rename，覆盖 inode 替换和 dangling
   symlink；`edit` 在读取前执行 16 MiB 上限并先验证有界 diff/result 再提交。
 - `read` 流式读取文本；图片在 Photon 解码前执行 32 MiB 输入、32,768 单维和 25M 像素上限。`grep`
   有界收集 context，避免大文件整文件 materialize。
@@ -87,14 +93,16 @@ executor
 ## 5. 当前明确未实现
 
 - 尚无 Action Broker、Policy Engine、approval、execution grant、durable intent、outcome recovery 或审计。
-- 当前七工具是临时可信本机直连：路径允许绝对路径和 `..`，executor 完整继承 desktop `process.env`，
+- 当前七工具是临时可信本机直连：路径允许绝对路径和 `..`，Runtime Box 完整继承 desktop `process.env`，
   `bash` 可读取其中的 credential。该边界不能作为最终授权机制。
 - 尚无独立 Git Tool；Agent 可经 `bash` 调用环境中可用的 Git，但没有 Git 专用合同、Diff journal 或 revert。
 - MCP lifecycle、MCP credential、Skills 安装/版本/content store 和资源 inventory 尚未实现。
 - Plan、自定义 Agent、subagent、任务中心、Diff/撤销和桌面通知仍是后续产品范围。
 - 当前 Agent 不暴露 MCP、Skill 或 subagent；文档中的相关合同是未来 Moshu-owned 边界，不是现成功能。
 - macOS Provider vault 当前是权限加固的 app-owned 文件；Keychain adapter 仍是外部分发前安全工作。
-- remote client/executor、Docker、cloud VM、TLS 配对和多租户不在当前 desktop 范围。
+- Remote Runtime Box 的 ingress、设备配对认证、三平台 daemon 和 Dev Tunnel 已实现；durable grant、
+  断线 outcome reconciliation、MCP/Skill inventory 和发布级真实 Tunnel 故障矩阵尚未实现。
+  Mobile Client、团队共享、Docker/cloud 和多租户仍不在当前范围。
 
 ## 6. 架构迁移状态
 
@@ -102,10 +110,16 @@ executor
 | --- | --- | --- |
 | A0 RPC / binary POC | 已完成 | compiled companion、动态 loopback、认证 RPC、监管、关闭和 package gate |
 | A1 agents-server extraction | 已完成 | Pi Agent、Provider/auth、产品 DB、Session JSONL 和 cleanup 全部归 agents server |
-| A2 Executor / Agent registry | 部分完成 | executor 注册/readiness 已有；Agent N:1 binding 和 inventory 尚未实现 |
-| A3 Tool Bridge / Action Broker | 部分完成 | 七工具 typed RPC、executor-only 执行、progress/cancel 已有；Policy/intent/grant/recovery 尚未实现 |
-| A4 MCP / Skills | 未开始 | executor-owned secret/lifecycle/store、inventory reconciliation、resource refs |
+| A2 Runtime Box / Agent registry | 部分完成 | Runtime Box 注册/readiness 已有；Agent N:1 binding 和 inventory 尚未实现 |
+| A3 Tool Bridge / Action Broker | 部分完成 | 七工具 typed RPC、Runtime Box-only 执行、progress/cancel 已有；Policy/intent/grant/recovery 尚未实现 |
+| A4 MCP / Skills | 未开始 | Runtime Box-owned secret/lifecycle/store、inventory reconciliation、resource refs |
 | A5 Recovery / release hardening | 部分完成 | restart/package/smoke 已有；签名、公证、Keychain 和完整故障矩阵待完成 |
+| RB-01 Runtime Box domain/local | 已完成 | Runtime Box contract、注册 descriptor、Local stable ID 和 keyed registry |
+| RB-02 Persistence/routing | 已完成 | Box catalog、active CAS、Session/Run 归属、显式 Gateway 路由和 generation fence |
+| RB-03 Ingress/pairing | 已完成 | Runtime-only ingress、Ed25519 配对认证、吊销、防重放、持久 generation 和限流 |
+| RB-04 Remote service | 已完成 | 三平台普通用户服务、pair/run/status/doctor/unpair/uninstall 和单二进制资源 |
+| RB-05 Dev Tunnel | 已完成 | Microsoft device-code、持久 Tunnel、精确端口/ACL、watchdog、修复、取消和重试 |
+| RB-06 Switch/Projects/UI | 进行中 | 设置页、active switch 广播、按 Box 过滤、Projects/path validation 和离线只读 |
 
 ## 7. 开发数据策略
 
@@ -115,7 +129,7 @@ executor
 
 ## 8. 下一优先级
 
-1. 用 Moshu-owned Policy/approval/durable intent/single-use grant 替换当前可信直连七工具边界。
-2. 冻结 Executor/Agent identity、binding、inventory 和 offline Run gate。
-3. 在同一边界上实现 executor-owned MCP 与 Skill storage，不给 Agent runtime 建旁路。
-4. 完成 Keychain、签名、公证、故障矩阵和外部 packaged E2E 后再声明可发布。
+1. 实现 RB-06：Runtime Boxes 设置页、全局切换广播、Sessions/Projects 过滤、Remote path validation 和离线只读。
+2. 用 Moshu-owned Policy/approval/durable intent/single-use grant 替换当前可信直连七工具边界。
+3. 实现断线 invocation reconciliation，禁止非幂等 Action 自动重放。
+4. 在同一边界上实现 Runtime Box-owned MCP 与 Skill storage，不给 Agent runtime 建旁路。

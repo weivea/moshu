@@ -1,16 +1,15 @@
 import {
-	executorImageProcessorWasmFilename,
 	executorToolBinaryNames,
 	getExecutorToolBinaryFilename,
 } from "../../../../packages/contracts/src/executor-tool-assets";
 
-export const COMPANION_EXECUTABLE_ROLES = ["agents-server", "executor"] as const;
+export const COMPANION_EXECUTABLE_ROLES = ["agents-server", "runtime-box"] as const;
 
 export type CompanionExecutableRole = (typeof COMPANION_EXECUTABLE_ROLES)[number];
 
 const COMPANION_EXECUTABLE_BASE_NAMES: Record<CompanionExecutableRole, string> = {
 	"agents-server": "moshu-agents-server",
-	executor: "moshu-executor",
+	"runtime-box": "moshu-runtime-box",
 };
 
 export function getCompanionExecutableFilename(
@@ -36,11 +35,7 @@ export function getExecutorToolExecutableFilenames(
 export function getCompanionResourceFilenames(
 	platform: NodeJS.Platform = process.platform,
 ): string[] {
-	return [
-		...getCompanionExecutableFilenames(platform),
-		...getExecutorToolExecutableFilenames(platform),
-		executorImageProcessorWasmFilename,
-	];
+	return getCompanionExecutableFilenames(platform);
 }
 
 export function assertCompanionResourceFilenames(
@@ -66,15 +61,7 @@ export function createElectrobunCompanionCopyEntries(
 			return [`../${role}/dist/${filename}`, `companions/${filename}`];
 		}),
 	);
-	const tools = Object.fromEntries(
-		getExecutorToolExecutableFilenames(platform).map((filename) => {
-			return [`../executor/dist/${filename}`, `companions/${filename}`];
-		}),
-	);
-	const imageProcessor = {
-		[`../executor/dist/${executorImageProcessorWasmFilename}`]: `companions/${executorImageProcessorWasmFilename}`,
-	};
-	return { ...companions, ...tools, ...imageProcessor };
+	return companions;
 }
 
 export function resolveCurrentHostCompanionPlatform(

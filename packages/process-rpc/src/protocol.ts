@@ -11,7 +11,7 @@ export const rpcProtocolVersionSchema = z
 	})
 	.strict();
 
-export const rpcPeerRoleSchema = z.enum(["agents", "client", "executor"]);
+export const rpcPeerRoleSchema = z.enum(["agents", "client", "runtime-box"]);
 export const rpcJsonValueSchema = z.json();
 
 const rpcIdentifierSchema = z.string().min(1).max(256);
@@ -24,6 +24,7 @@ export const rpcPeerIdentitySchema = z
 		peerId: rpcIdentifierSchema,
 		instanceId: rpcIdentifierSchema,
 		generation: z.number().int().nonnegative().safe(),
+		deviceKeyId: rpcIdentifierSchema.optional(),
 	})
 	.strict();
 
@@ -207,7 +208,8 @@ export function isSameRpcPeerIdentity(left: RpcPeerIdentity, right: RpcPeerIdent
 		left.role === right.role &&
 		left.peerId === right.peerId &&
 		left.instanceId === right.instanceId &&
-		left.generation === right.generation
+		left.generation === right.generation &&
+		left.deviceKeyId === right.deviceKeyId
 	);
 }
 

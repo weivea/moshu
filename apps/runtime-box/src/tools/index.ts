@@ -3,8 +3,8 @@
  * The agent process only receives RPC proxies and never executes these operations.
  */
 import {
-	executorToolInvokeOutputSchema,
-	executorToolProgressEventSchema,
+	runtimeBoxToolInvokeOutputSchema,
+	runtimeBoxToolProgressEventSchema,
 	getExecutorToolBinaryFilename,
 	type ExecutorToolInvokeInput,
 	type ExecutorToolInvokeOutput,
@@ -71,7 +71,7 @@ export class ExecutorToolRuntime {
 		switch (input.call.tool) {
 			case "read": {
 				const result = await executeReadTool(input.call.arguments, input.cwd, options.signal);
-				return executorToolInvokeOutputSchema.parse({
+				return runtimeBoxToolInvokeOutputSchema.parse({
 					...resultBase,
 					tool: "read",
 					...result,
@@ -82,7 +82,7 @@ export class ExecutorToolRuntime {
 				const result = await executeBashTool(input.call.arguments, input.cwd, {
 					...(options.signal ? { signal: options.signal } : {}),
 					onProgress: (progress) => {
-						const event = executorToolProgressEventSchema.parse({
+						const event = runtimeBoxToolProgressEventSchema.parse({
 							schemaVersion: 1,
 							invocationId: input.invocationId,
 							tool: "bash",
@@ -93,7 +93,7 @@ export class ExecutorToolRuntime {
 						options.onProgress?.(event);
 					},
 				});
-				return executorToolInvokeOutputSchema.parse({
+				return runtimeBoxToolInvokeOutputSchema.parse({
 					...resultBase,
 					tool: "bash",
 					...result,
@@ -101,7 +101,7 @@ export class ExecutorToolRuntime {
 			}
 			case "edit": {
 				const result = await executeEditTool(input.call.arguments, input.cwd, options.signal);
-				return executorToolInvokeOutputSchema.parse({
+				return runtimeBoxToolInvokeOutputSchema.parse({
 					...resultBase,
 					tool: "edit",
 					...result,
@@ -109,7 +109,7 @@ export class ExecutorToolRuntime {
 			}
 			case "write": {
 				const result = await executeWriteTool(input.call.arguments, input.cwd, options.signal);
-				return executorToolInvokeOutputSchema.parse({
+				return runtimeBoxToolInvokeOutputSchema.parse({
 					...resultBase,
 					tool: "write",
 					...result,
@@ -122,7 +122,7 @@ export class ExecutorToolRuntime {
 					this.binaries.rg,
 					options.signal,
 				);
-				return executorToolInvokeOutputSchema.parse({
+				return runtimeBoxToolInvokeOutputSchema.parse({
 					...resultBase,
 					tool: "grep",
 					...result,
@@ -135,7 +135,7 @@ export class ExecutorToolRuntime {
 					this.binaries.fd,
 					options.signal,
 				);
-				return executorToolInvokeOutputSchema.parse({
+				return runtimeBoxToolInvokeOutputSchema.parse({
 					...resultBase,
 					tool: "find",
 					...result,
@@ -143,7 +143,7 @@ export class ExecutorToolRuntime {
 			}
 			case "ls": {
 				const result = await executeLsTool(input.call.arguments, input.cwd, options.signal);
-				return executorToolInvokeOutputSchema.parse({
+				return runtimeBoxToolInvokeOutputSchema.parse({
 					...resultBase,
 					tool: "ls",
 					...result,
@@ -160,7 +160,9 @@ function assertNeverTool(call: never): never {
 	throw new Error(`Unsupported executor tool: ${received.tool ?? "unknown"}`);
 }
 
-export async function createExecutorToolRuntime(): Promise<ExecutorToolRuntime> {
+export async function createExecutorToolRuntime(
+	binaries?: ExecutorToolBinaryPaths,
+): Promise<ExecutorToolRuntime> {
 	await pruneExecutorToolOutputFiles();
-	return new ExecutorToolRuntime(await resolveBundledExecutorToolBinaries());
+	return new ExecutorToolRuntime(binaries ?? (await resolveBundledExecutorToolBinaries()));
 }

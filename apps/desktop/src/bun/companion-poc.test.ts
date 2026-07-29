@@ -21,13 +21,10 @@ describe("companion executable platform naming", () => {
 		expect(getCompanionExecutableFilename("agents-server", "win32")).toBe(
 			"moshu-agents-server.exe",
 		);
-		expect(getCompanionExecutableFilename("executor", "win32")).toBe("moshu-executor.exe");
+		expect(getCompanionExecutableFilename("runtime-box", "win32")).toBe("moshu-runtime-box.exe");
 		expect(createElectrobunCompanionCopyEntries("win32")).toEqual({
 			"../agents-server/dist/moshu-agents-server.exe": "companions/moshu-agents-server.exe",
-			"../executor/dist/moshu-executor.exe": "companions/moshu-executor.exe",
-			"../executor/dist/rg.exe": "companions/rg.exe",
-			"../executor/dist/fd.exe": "companions/fd.exe",
-			"../executor/dist/photon_rs_bg.wasm": "companions/photon_rs_bg.wasm",
+			"../runtime-box/dist/moshu-runtime-box.exe": "companions/moshu-runtime-box.exe",
 		});
 	});
 
@@ -38,16 +35,13 @@ describe("companion executable platform naming", () => {
 		);
 	});
 
-	test("allows only the two companions, rg, fd, and Photon runtime asset", () => {
+	test("packages only the two self-contained companions", () => {
 		expect(() =>
-			assertCompanionResourceFilenames(
-				["moshu-executor", "fd", "photon_rs_bg.wasm", "moshu-agents-server", "rg"],
-				"darwin",
-			),
+			assertCompanionResourceFilenames(["moshu-runtime-box", "moshu-agents-server"], "darwin"),
 		).not.toThrow();
 		expect(() =>
 			assertCompanionResourceFilenames(
-				["moshu-executor", "fd", "photon_rs_bg.wasm", "moshu-agents-server", "rg", "extra"],
+				["moshu-runtime-box", "moshu-agents-server", "extra"],
 				"darwin",
 			),
 		).toThrow("Unexpected Moshu companion resource layout");
@@ -71,13 +65,13 @@ describe("resolveBundledCompanionExecutables", () => {
 				"companions",
 				"moshu-agents-server",
 			),
-			executor: posix.resolve(
+			"runtime-box": posix.resolve(
 				applicationRoot,
 				"Contents",
 				"Resources",
 				"app",
 				"companions",
-				"moshu-executor",
+				"moshu-runtime-box",
 			),
 		});
 	});
@@ -92,7 +86,7 @@ describe("resolveBundledCompanionExecutables", () => {
 				"dist",
 				"moshu-agents-server",
 			),
-			executor: resolve(workspaceRoot, "apps", "executor", "dist", "moshu-executor"),
+			"runtime-box": resolve(workspaceRoot, "apps", "runtime-box", "dist", "moshu-runtime-box"),
 		});
 	});
 
@@ -108,12 +102,12 @@ describe("resolveBundledCompanionExecutables", () => {
 				"companions",
 				"moshu-agents-server.exe",
 			),
-			executor: win32.resolve(
+			"runtime-box": win32.resolve(
 				applicationRoot,
 				"Resources",
 				"app",
 				"companions",
-				"moshu-executor.exe",
+				"moshu-runtime-box.exe",
 			),
 		});
 		const workspaceRoot = win32.resolve("C:\\test-fixtures\\workspace");
@@ -125,7 +119,13 @@ describe("resolveBundledCompanionExecutables", () => {
 				"dist",
 				"moshu-agents-server.exe",
 			),
-			executor: win32.resolve(workspaceRoot, "apps", "executor", "dist", "moshu-executor.exe"),
+			"runtime-box": win32.resolve(
+				workspaceRoot,
+				"apps",
+				"runtime-box",
+				"dist",
+				"moshu-runtime-box.exe",
+			),
 		});
 	});
 
@@ -219,7 +219,7 @@ describe("resolveBundledCompanionExecutables", () => {
 	test("reports a missing bundled executable without exposing its path", async () => {
 		const executables = {
 			"agents-server": resolve("private", "signed", "moshu-agents-server"),
-			executor: resolve("private", "signed", "moshu-executor"),
+			"runtime-box": resolve("private", "signed", "moshu-runtime-box"),
 		};
 		const error = await assertCompanionExecutablesAvailable(
 			executables,

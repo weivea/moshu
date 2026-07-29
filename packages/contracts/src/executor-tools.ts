@@ -9,13 +9,39 @@ export const executorToolDefaultTimeoutMs = 30 * 60_000;
 export const executorToolRpcTimeoutMs = executorToolDefaultTimeoutMs + 15_000;
 export const maxExecutorToolImageBase64Chars = 3 * 1024 * 1024;
 export const maxExecutorToolPayloadBytes = 7 * 512 * 1024;
-export const maxExecutorToolTextContentBytes = 256 * 1024;
-export const maxExecutorToolEditDetailBytes = 1024 * 1024;
+export const maxExecutorToolTextContentBytes = 128 * 1024;
+export const maxExecutorToolEditDetailBytes = 256 * 1024;
+export const maxExecutorToolResultPayloadBytes = 7 * 512 * 1024;
 
 const maxPathBytes = 32 * 1024;
 const maxToolStringBytes = 512 * 1024;
 const maxToolCallIdBytes = 512;
 const textEncoder = new TextEncoder();
+
+export const actionIdSchema = z.string().uuid();
+export const executionGrantIdSchema = z.string().uuid();
+export const executionGrantTokenSchema = z
+	.string()
+	.min(32)
+	.max(128)
+	.regex(/^[A-Za-z0-9_-]+$/);
+export const actionParameterDigestSchema = z.string().regex(/^[a-f0-9]{64}$/);
+
+export const runtimeBoxToolAuthorizationSchema = z
+	.object({
+		actionId: actionIdSchema,
+		grantId: executionGrantIdSchema,
+		grantToken: executionGrantTokenSchema,
+		parameterDigest: actionParameterDigestSchema,
+		originInstanceId: z.string().min(1).max(256),
+		originGeneration: z.int().nonnegative().safe(),
+		targetRuntimeBoxId: z.string().min(1).max(128),
+		targetInstanceId: z.string().min(1).max(256),
+		targetGeneration: z.int().nonnegative().safe(),
+		executionScope: z.enum(["request-cwd", "runtime-box-workspace"]),
+		expiresAt: z.string().datetime({ offset: true }),
+	})
+	.strict();
 
 function boundedUtf8String(maxBytes: number, label: string, minimumBytes = 0) {
 	return z
@@ -114,7 +140,7 @@ export const executorToolCallSchema = z.discriminatedUnion("tool", [
 	z.object({ tool: z.literal("ls"), arguments: executorLsToolArgumentsSchema }).strict(),
 ]);
 
-export const executorToolInvokeInputSchema = z
+export const runtimeBoxToolInvokeInputSchema = z
 	.object({
 		schemaVersion: z.literal(1),
 		invocationId: z.string().uuid(),
@@ -122,6 +148,7 @@ export const executorToolInvokeInputSchema = z
 		toolCallId: boundedUtf8String(maxToolCallIdBytes, "Tool call ID", 1),
 		cwd: pathSchema,
 		call: executorToolCallSchema,
+		authorization: runtimeBoxToolAuthorizationSchema.optional(),
 	})
 	.strict()
 	.superRefine((value, context) => {
@@ -232,65 +259,74 @@ const resultBase = {
 };
 const textResultContentSchema = z.array(executorToolTextContentSchema).min(1).max(1);
 
-export const executorToolInvokeOutputSchema = z.discriminatedUnion("tool", [
-	z
-		.object({
-			...resultBase,
-			tool: z.literal("read"),
-			content: z.array(executorToolContentSchema).min(1).max(2),
-			details: executorReadToolDetailsSchema.optional(),
-		})
-		.strict(),
-	z
-		.object({
-			...resultBase,
-			tool: z.literal("bash"),
-			content: textResultContentSchema,
-			details: executorBashToolDetailsSchema.optional(),
-		})
-		.strict(),
-	z
-		.object({
-			...resultBase,
-			tool: z.literal("edit"),
-			content: textResultContentSchema,
-			details: executorEditToolDetailsSchema,
-		})
-		.strict(),
-	z
-		.object({
-			...resultBase,
-			tool: z.literal("write"),
-			content: textResultContentSchema,
-		})
-		.strict(),
-	z
-		.object({
-			...resultBase,
-			tool: z.literal("grep"),
-			content: textResultContentSchema,
-			details: executorGrepToolDetailsSchema.optional(),
-		})
-		.strict(),
-	z
-		.object({
-			...resultBase,
-			tool: z.literal("find"),
-			content: textResultContentSchema,
-			details: executorFindToolDetailsSchema.optional(),
-		})
-		.strict(),
-	z
-		.object({
-			...resultBase,
-			tool: z.literal("ls"),
-			content: textResultContentSchema,
-			details: executorLsToolDetailsSchema.optional(),
-		})
-		.strict(),
-]);
+export const runtimeBoxToolInvokeOutputSchema = z
+	.discriminatedUnion("tool", [
+		z
+			.object({
+				...resultBase,
+				tool: z.literal("read"),
+				content: z.array(executorToolContentSchema).min(1).max(2),
+				details: executorReadToolDetailsSchema.optional(),
+			})
+			.strict(),
+		z
+			.object({
+				...resultBase,
+				tool: z.literal("bash"),
+				content: textResultContentSchema,
+				details: executorBashToolDetailsSchema.optional(),
+			})
+			.strict(),
+		z
+			.object({
+				...resultBase,
+				tool: z.literal("edit"),
+				content: textResultContentSchema,
+				details: executorEditToolDetailsSchema,
+			})
+			.strict(),
+		z
+			.object({
+				...resultBase,
+				tool: z.literal("write"),
+				content: textResultContentSchema,
+			})
+			.strict(),
+		z
+			.object({
+				...resultBase,
+				tool: z.literal("grep"),
+				content: textResultContentSchema,
+				details: executorGrepToolDetailsSchema.optional(),
+			})
+			.strict(),
+		z
+			.object({
+				...resultBase,
+				tool: z.literal("find"),
+				content: textResultContentSchema,
+				details: executorFindToolDetailsSchema.optional(),
+			})
+			.strict(),
+		z
+			.object({
+				...resultBase,
+				tool: z.literal("ls"),
+				content: textResultContentSchema,
+				details: executorLsToolDetailsSchema.optional(),
+			})
+			.strict(),
+	])
+	.superRefine((value, context) => {
+		if (textEncoder.encode(JSON.stringify(value)).byteLength > maxExecutorToolResultPayloadBytes) {
+			context.addIssue({
+				code: "custom",
+				message: `Executor tool result exceeds the ${maxExecutorToolResultPayloadBytes}-byte payload limit.`,
+			});
+		}
+	});
 
-export const executorToolProgressEventSchema = z
+export const runtimeBoxToolProgressEventSchema = z
 	.object({
 		schemaVersion: z.literal(1),
 		invocationId: z.string().uuid(),
@@ -300,6 +336,82 @@ export const executorToolProgressEventSchema = z
 		details: executorBashToolDetailsSchema.optional(),
 	})
 	.strict();
+
+export const runtimeBoxInvocationEvidenceStateSchema = z.enum([
+	"succeeded",
+	"failed",
+	"cancelled",
+	"outcome_unknown",
+]);
+
+export const runtimeBoxInvocationEvidenceSchema = z
+	.object({
+		invocationId: z.string().uuid(),
+		actionId: actionIdSchema,
+		grantId: executionGrantIdSchema,
+		parameterDigest: actionParameterDigestSchema,
+		originInstanceId: z.string().min(1).max(256),
+		originGeneration: z.int().nonnegative().safe(),
+		targetRuntimeBoxId: z.string().min(1).max(128),
+		targetInstanceId: z.string().min(1).max(256),
+		targetGeneration: z.int().nonnegative().safe(),
+		state: runtimeBoxInvocationEvidenceStateSchema,
+		result: runtimeBoxToolInvokeOutputSchema.optional(),
+		safeError: z.string().min(1).max(1_024).optional(),
+		completedAt: z.string().datetime({ offset: true }),
+	})
+	.strict()
+	.superRefine((value, context) => {
+		if (value.state === "succeeded" && value.result === undefined) {
+			context.addIssue({ code: "custom", message: "Succeeded evidence requires a result." });
+		}
+		if (value.state !== "succeeded" && value.result !== undefined) {
+			context.addIssue({
+				code: "custom",
+				message: "Only succeeded evidence may include a result.",
+			});
+		}
+	});
+
+export const reconcileRuntimeBoxInvocationsInputSchema = z
+	.object({
+		items: z.array(runtimeBoxInvocationEvidenceSchema).max(64),
+		acknowledgedInvocationIds: z.array(z.string().uuid()).max(64).default([]),
+	})
+	.strict();
+
+export const reconcileRuntimeBoxInvocationsOutputSchema = z
+	.object({
+		ackedInvocationIds: z.array(z.string().uuid()).max(64),
+		confirmedAcknowledgementIds: z.array(z.string().uuid()).max(64).default([]),
+	})
+	.strict();
+
+export const acknowledgeRuntimeBoxInvocationsInputSchema = z
+	.object({
+		invocationIds: z.array(z.string().uuid()).min(1).max(64),
+	})
+	.strict();
+
+export const acknowledgeRuntimeBoxInvocationsOutputSchema = z
+	.object({
+		ackedInvocationIds: z.array(z.string().uuid()).min(1).max(64),
+	})
+	.strict();
+
+export function createExecutorToolParameterPayload(
+	input: Omit<ExecutorToolInvokeInput, "authorization">,
+): string {
+	return JSON.stringify([
+		"moshu-executor-tool-parameters-v1",
+		input.schemaVersion,
+		input.invocationId,
+		input.runId,
+		input.toolCallId,
+		input.cwd,
+		input.call,
+	]);
+}
 
 export type ExecutorToolName = z.infer<typeof executorToolNameSchema>;
 export type ExecutorReadToolArguments = z.infer<typeof executorReadToolArgumentsSchema>;
@@ -311,7 +423,8 @@ export type ExecutorGrepToolArguments = z.infer<typeof executorGrepToolArguments
 export type ExecutorFindToolArguments = z.infer<typeof executorFindToolArgumentsSchema>;
 export type ExecutorLsToolArguments = z.infer<typeof executorLsToolArgumentsSchema>;
 export type ExecutorToolCall = z.infer<typeof executorToolCallSchema>;
-export type ExecutorToolInvokeInput = z.infer<typeof executorToolInvokeInputSchema>;
+export type ExecutorToolInvokeInput = z.infer<typeof runtimeBoxToolInvokeInputSchema>;
+export type RuntimeBoxToolAuthorization = z.infer<typeof runtimeBoxToolAuthorizationSchema>;
 export type ExecutorToolTextContent = z.infer<typeof executorToolTextContentSchema>;
 export type ExecutorToolImageContent = z.infer<typeof executorToolImageContentSchema>;
 export type ExecutorToolContent = z.infer<typeof executorToolContentSchema>;
@@ -322,5 +435,18 @@ export type ExecutorEditToolDetails = z.infer<typeof executorEditToolDetailsSche
 export type ExecutorGrepToolDetails = z.infer<typeof executorGrepToolDetailsSchema>;
 export type ExecutorFindToolDetails = z.infer<typeof executorFindToolDetailsSchema>;
 export type ExecutorLsToolDetails = z.infer<typeof executorLsToolDetailsSchema>;
-export type ExecutorToolInvokeOutput = z.infer<typeof executorToolInvokeOutputSchema>;
-export type ExecutorToolProgressEvent = z.infer<typeof executorToolProgressEventSchema>;
+export type ExecutorToolInvokeOutput = z.infer<typeof runtimeBoxToolInvokeOutputSchema>;
+export type ExecutorToolProgressEvent = z.infer<typeof runtimeBoxToolProgressEventSchema>;
+export type RuntimeBoxInvocationEvidence = z.infer<typeof runtimeBoxInvocationEvidenceSchema>;
+export type ReconcileRuntimeBoxInvocationsInput = z.infer<
+	typeof reconcileRuntimeBoxInvocationsInputSchema
+>;
+export type ReconcileRuntimeBoxInvocationsOutput = z.infer<
+	typeof reconcileRuntimeBoxInvocationsOutputSchema
+>;
+export type AcknowledgeRuntimeBoxInvocationsInput = z.infer<
+	typeof acknowledgeRuntimeBoxInvocationsInputSchema
+>;
+export type AcknowledgeRuntimeBoxInvocationsOutput = z.infer<
+	typeof acknowledgeRuntimeBoxInvocationsOutputSchema
+>;

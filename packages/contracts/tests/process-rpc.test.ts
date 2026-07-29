@@ -1,15 +1,14 @@
 import { describe, expect, test } from "bun:test";
 
 import {
-	agentsExecutorRequestMethods,
+	agentsRuntimeBoxRequestMethods,
 	agentsServerBootstrapRecordSchema,
 	clientProductRequestMethods,
 	createProcessChatSessionInputSchema,
-	executorProductEventMethods,
-	executorProductRequestMethods,
-	executorToolInvokeInputSchema,
-	executorToolInvokeOutputSchema,
-	executorToolProgressEventSchema,
+	runtimeBoxProductEventMethods,
+	runtimeBoxToolInvokeInputSchema,
+	runtimeBoxToolInvokeOutputSchema,
+	runtimeBoxToolProgressEventSchema,
 	maxRetainedSessionRetirements,
 	productRpcInternalHandlerErrorCode,
 	productRpcMethods,
@@ -17,23 +16,74 @@ import {
 	replayChatEventsInputSchema,
 	replayChatEventsOutputSchema,
 	retiredSessionTombstoneTtlMs,
+	runtimeBoxProductRequestMethods,
+	runtimeBoxRegisterInputSchema,
 	sendAskChatMessageInputSchema,
 } from "../src";
 
 describe("product process RPC contracts", () => {
-	test("keeps client and executor request allowlists disjoint", () => {
+	test("keeps client and Runtime Box request allowlists disjoint", () => {
 		expect(clientProductRequestMethods).toContain(productRpcMethods.chatSend);
 		expect(clientProductRequestMethods).toContain(productRpcMethods.providerAuthStart);
 		expect(clientProductRequestMethods).toContain(productRpcMethods.providerAuthRespond);
-		expect(clientProductRequestMethods).not.toContain(productRpcMethods.executorRegister);
-		expect(executorProductRequestMethods).toEqual([productRpcMethods.executorRegister]);
-		expect(agentsExecutorRequestMethods).toEqual([productRpcMethods.executorToolInvoke]);
-		expect(executorProductEventMethods).toHaveLength(1);
+		expect(clientProductRequestMethods).not.toContain(productRpcMethods.runtimeBoxRegister);
+		expect(runtimeBoxProductRequestMethods).toEqual([
+			productRpcMethods.runtimeBoxRegister,
+			productRpcMethods.runtimeBoxReady,
+			productRpcMethods.runtimeBoxInvocationsReconcile,
+		]);
+		expect(agentsRuntimeBoxRequestMethods).toEqual([
+			productRpcMethods.runtimeBoxToolInvoke,
+			productRpcMethods.runtimeBoxProjectValidatePath,
+			productRpcMethods.runtimeBoxInvocationsAck,
+		]);
+		expect(runtimeBoxProductEventMethods).toHaveLength(1);
 		expect(productRpcInternalHandlerErrorCode).toBe("INTERNAL_HANDLER_ERROR");
 		expect(maxRetainedSessionRetirements).toBe(256);
 	});
 
-	test("strictly discriminates executor tool calls, results, and progress", () => {
+	test("requires a bounded Runtime Box descriptor during registration", () => {
+		const registration = {
+			schemaVersion: 1 as const,
+			status: "ready" as const,
+			runtimeBox: {
+				schemaVersion: 1 as const,
+				runtimeBoxId: "moshu-local-runtime-box",
+				kind: "local" as const,
+				displayName: "Local Runtime Box",
+				runtimeBoxVersion: "0.0.1",
+				platform: "darwin" as const,
+				arch: "arm64",
+				capabilities: ["tool.read", "tool.bash"],
+			},
+		};
+		expect(runtimeBoxRegisterInputSchema.parse(registration)).toEqual(registration);
+		expect(() =>
+			runtimeBoxRegisterInputSchema.parse({
+				...registration,
+				runtimeBox: {
+					...registration.runtimeBox,
+					capabilities: ["tool.read", "tool.read"],
+				},
+			}),
+		).toThrow("capabilities must be unique");
+	});
+
+	test("rejects a tool result whose encoded aggregate exceeds the RPC budget", () => {
+		const detail = "\u0000".repeat(250 * 1024);
+		const content = "\u0000".repeat(120 * 1024);
+		expect(() =>
+			runtimeBoxToolInvokeOutputSchema.parse({
+				schemaVersion: 1,
+				invocationId: crypto.randomUUID(),
+				tool: "edit",
+				content: [{ type: "text", text: content }],
+				details: { diff: detail, patch: detail },
+			}),
+		).toThrow("payload limit");
+	});
+
+	test("strictly discriminates Runtime Box tool calls, results, and progress", () => {
 		const invocationId = crypto.randomUUID();
 		const runId = "018f0f2c-7b19-7abc-8def-1234567890ab";
 		const request = {
@@ -47,9 +97,9 @@ describe("product process RPC contracts", () => {
 				arguments: { path: "README.md", offset: 1, limit: 20 },
 			},
 		};
-		expect(executorToolInvokeInputSchema.parse(request)).toEqual(request);
+		expect(runtimeBoxToolInvokeInputSchema.parse(request)).toEqual(request);
 		expect(() =>
-			executorToolInvokeInputSchema.parse({
+			runtimeBoxToolInvokeInputSchema.parse({
 				...request,
 				call: { tool: "read", arguments: { path: "README.md", command: "pwd" } },
 			}),
@@ -61,9 +111,9 @@ describe("product process RPC contracts", () => {
 			tool: "read" as const,
 			content: [{ type: "text" as const, text: "hello" }],
 		};
-		expect(executorToolInvokeOutputSchema.parse(output)).toEqual(output);
+		expect(runtimeBoxToolInvokeOutputSchema.parse(output)).toEqual(output);
 		expect(() =>
-			executorToolInvokeOutputSchema.parse({
+			runtimeBoxToolInvokeOutputSchema.parse({
 				...output,
 				tool: "write",
 				details: { truncation: {} },
@@ -77,8 +127,8 @@ describe("product process RPC contracts", () => {
 			sequence: 0,
 			content: [],
 		};
-		expect(executorToolProgressEventSchema.parse(progress)).toEqual(progress);
-		expect(() => executorToolProgressEventSchema.parse({ ...progress, tool: "read" })).toThrow();
+		expect(runtimeBoxToolProgressEventSchema.parse(progress)).toEqual(progress);
+		expect(() => runtimeBoxToolProgressEventSchema.parse({ ...progress, tool: "read" })).toThrow();
 	});
 
 	test("accepts only the current Ask send projection", () => {
@@ -157,9 +207,9 @@ describe("product process RPC contracts", () => {
 				{
 					credential: Buffer.alloc(32, 2).toString("base64url"),
 					identity: {
-						role: "executor",
-						peerId: "executor",
-						instanceId: "executor-1",
+						role: "runtime-box",
+						peerId: "runtime-box",
+						instanceId: "runtime-box-1",
 						generation: 1,
 					},
 				},

@@ -14,6 +14,8 @@ import { type MessageKey, useI18n } from "./i18n";
 import { DefaultModelSettingsPage } from "./settings/default-model-page";
 import { GeneralSettingsPage } from "./settings/general-page";
 import { ProvidersSettingsPage } from "./settings/providers/providers-page";
+import { RuntimeBoxesSettingsPage } from "./settings/runtime-boxes-page";
+import { ProjectDetailPage, ProjectsPage } from "./projects-page";
 
 const lastChatSessionStorageKey = "moshu.lastChatSessionId";
 const initialHydrationRetryDelayMs = 100;
@@ -248,6 +250,18 @@ export function DefaultModelSettingsRoutePage({
 
 export function GeneralSettingsRoutePage() {
 	return <GeneralSettingsPage />;
+}
+
+export function RuntimeBoxesSettingsRoutePage() {
+	return <RuntimeBoxesSettingsPage />;
+}
+
+export function ProjectsRoutePage() {
+	return <ProjectsPage />;
+}
+
+export function ProjectDetailRoutePage() {
+	return <ProjectDetailPage />;
 }
 
 export function PlaceholderPage({ titleKey, icon }: { titleKey: MessageKey; icon: AppIconName }) {

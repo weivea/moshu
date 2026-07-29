@@ -13,7 +13,7 @@ const parent = Bun.spawn({
 let companionPids: number[] = [];
 try {
 	const parentReady = parseParentReady(await readLineWithTimeout(parent.stdout, 5_000));
-	companionPids = [parentReady.agentsServerPid, parentReady.executorPid];
+	companionPids = [parentReady.agentsServerPid, parentReady.runtimeBoxPid];
 	parent.kill("SIGKILL");
 	await parent.exited;
 
@@ -75,7 +75,7 @@ async function readLineWithTimeout(
 
 function parseParentReady(input: string): {
 	agentsServerPid: number;
-	executorPid: number;
+	runtimeBoxPid: number;
 } {
 	let parsed: unknown;
 	try {
@@ -87,13 +87,13 @@ function parseParentReady(input: string): {
 		!isObject(parsed) ||
 		parsed.type !== "PARENT_READY" ||
 		!isPid(parsed.agentsServerPid) ||
-		!isPid(parsed.executorPid)
+		!isPid(parsed.runtimeBoxPid)
 	) {
 		throw new Error("Parent host emitted an invalid readiness record.");
 	}
 	return {
 		agentsServerPid: parsed.agentsServerPid,
-		executorPid: parsed.executorPid,
+		runtimeBoxPid: parsed.runtimeBoxPid,
 	};
 }
 

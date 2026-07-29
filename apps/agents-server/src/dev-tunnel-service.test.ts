@@ -1,0 +1,753 @@
+import { describe, expect, test } from "bun:test";
+import { openAppDatabase } from "@moshu/database";
+
+import {
+	DevTunnelService,
+	parseDevTunnelLoginStatus,
+	parseQualifiedTunnelId,
+	parseTunnelPortProtocol,
+	parseTunnelPorts,
+	type DevTunnelAdapter,
+	type DevTunnelAuthenticationProcess,
+	type DevTunnelHostProcess,
+} from "./dev-tunnel-service";
+
+class FakeHost implements DevTunnelHostProcess {
+	readonly ready = Promise.resolve({ publicUrl: "https://moshu-41000.test.devtunnels.ms" });
+	readonly exit = Promise.withResolvers<number>();
+	readonly exited = this.exit.promise;
+	stopped = false;
+
+	stop(): void {
+		this.stopped = true;
+		this.exit.resolve(0);
+	}
+}
+
+class FakeDevTunnelAdapter implements DevTunnelAdapter {
+	authenticated = true;
+	readonly hosts: FakeHost[] = [];
+	readonly deleted: string[] = [];
+	readonly hostedTunnelIds: string[] = [];
+	ensureCalls = 0;
+
+	isAuthenticated(_signal: AbortSignal): Promise<boolean> {
+		return Promise.resolve(this.authenticated);
+	}
+
+	startAuthentication(): DevTunnelAuthenticationProcess {
+		return {
+			completed: Promise.resolve({ exitCode: 0, message: "Authenticated." }),
+			onOutput() {
+				return () => undefined;
+			},
+			stop() {},
+		};
+	}
+
+	ensureTunnel(tunnelId: string, _port: number, _signal: AbortSignal): Promise<string> {
+		this.ensureCalls += 1;
+		return Promise.resolve(tunnelId.includes(".") ? tunnelId : `${tunnelId}.euw`);
+	}
+
+	deleteTunnel(tunnelId: string): Promise<void> {
+		this.deleted.push(tunnelId);
+		return Promise.resolve();
+	}
+
+	startHost(tunnelId: string): DevTunnelHostProcess {
+		this.hostedTunnelIds.push(tunnelId);
+		const host = new FakeHost();
+		this.hosts.push(host);
+		return host;
+	}
+}
+
+class DelayedAuthAdapter extends FakeDevTunnelAdapter {
+	readonly authGate = Promise.withResolvers<boolean>();
+	readonly loginGate = Promise.withResolvers<{ exitCode: number; message: string }>();
+
+	override isAuthenticated(signal: AbortSignal): Promise<boolean> {
+		const aborted = Promise.withResolvers<boolean>();
+		signal.addEventListener(
+			"abort",
+			() =>
+				aborted.reject(
+					signal.reason instanceof Error ? signal.reason : new Error("Authentication cancelled."),
+				),
+			{ once: true },
+		);
+		return Promise.race([this.authGate.promise, aborted.promise]);
+	}
+
+	override startAuthentication(): DevTunnelAuthenticationProcess {
+		return {
+			completed: this.loginGate.promise,
+			onOutput(listener) {
+				queueMicrotask(() =>
+					listener("Open https://github.com/login/device and enter code ABCD-EFGH"),
+				);
+				return () => undefined;
+			},
+			stop: () => this.loginGate.resolve({ exitCode: 1, message: "Stopped." }),
+		};
+	}
+}
+
+class DelayedDeleteAdapter extends FakeDevTunnelAdapter {
+	readonly deleteGate = Promise.withResolvers<void>();
+
+	override deleteTunnel(tunnelId: string): Promise<void> {
+		this.deleted.push(tunnelId);
+		return this.deleteGate.promise;
+	}
+}
+
+class DelayedEnsureAdapter extends FakeDevTunnelAdapter {
+	firstTunnelId: string | undefined;
+
+	override ensureTunnel(tunnelId: string, _port: number, signal: AbortSignal): Promise<string> {
+		this.ensureCalls += 1;
+		if (this.firstTunnelId !== undefined) {
+			return Promise.resolve(tunnelId.includes(".") ? tunnelId : `${tunnelId}.euw`);
+		}
+		this.firstTunnelId = tunnelId;
+		return new Promise((_, reject) => {
+			signal.addEventListener(
+				"abort",
+				() =>
+					reject(
+						signal.reason instanceof Error ? signal.reason : new Error("Tunnel setup cancelled."),
+					),
+				{ once: true },
+			);
+		});
+	}
+}
+
+class DelayedReplacementAdapter extends FakeDevTunnelAdapter {
+	readonly replacementGate = Promise.withResolvers<string>();
+
+	override ensureTunnel(tunnelId: string, _port: number, signal: AbortSignal): Promise<string> {
+		this.ensureCalls += 1;
+		if (this.ensureCalls === 1) {
+			return Promise.resolve(tunnelId.includes(".") ? tunnelId : `${tunnelId}.euw`);
+		}
+		const aborted = Promise.withResolvers<string>();
+		signal.addEventListener(
+			"abort",
+			() =>
+				aborted.reject(
+					signal.reason instanceof Error ? signal.reason : new Error("Replacement cancelled."),
+				),
+			{ once: true },
+		);
+		return Promise.race([this.replacementGate.promise, aborted.promise]);
+	}
+}
+
+class DelayedStopHost extends FakeHost {
+	override stop(): void {
+		this.stopped = true;
+	}
+}
+
+class DelayedStopAdapter extends FakeDevTunnelAdapter {
+	override startHost(tunnelId: string): DevTunnelHostProcess {
+		this.hostedTunnelIds.push(tunnelId);
+		const host = new DelayedStopHost();
+		this.hosts.push(host);
+		return host;
+	}
+}
+
+class RejectedAuthenticationAdapter extends FakeDevTunnelAdapter {
+	override startAuthentication(): DevTunnelAuthenticationProcess {
+		return {
+			completed: Promise.reject(new Error("Authentication output failed.")),
+			onOutput() {
+				return () => undefined;
+			},
+			stop() {},
+		};
+	}
+}
+
+class PendingReadyHost implements DevTunnelHostProcess {
+	readonly readyGate = Promise.withResolvers<{ publicUrl: string }>();
+	readonly ready = this.readyGate.promise;
+	readonly exit = Promise.withResolvers<number>();
+	readonly exited = this.exit.promise;
+	stopped = false;
+
+	stop(): void {
+		this.stopped = true;
+		this.exit.resolve(0);
+	}
+}
+
+class PendingReadyAdapter extends FakeDevTunnelAdapter {
+	readonly pendingHosts: PendingReadyHost[] = [];
+
+	override startHost(tunnelId: string): DevTunnelHostProcess {
+		this.hostedTunnelIds.push(tunnelId);
+		const host = new PendingReadyHost();
+		this.pendingHosts.push(host);
+		return host;
+	}
+}
+
+class DelayedPendingReadyHost extends PendingReadyHost {
+	override stop(): void {
+		this.stopped = true;
+	}
+}
+
+class CancelledRecreateAdapter extends FakeDevTunnelAdapter {
+	readonly replacementHost = new DelayedPendingReadyHost();
+
+	override startHost(tunnelId: string): DevTunnelHostProcess {
+		this.hostedTunnelIds.push(tunnelId);
+		if (this.hostedTunnelIds.length === 2) {
+			return this.replacementHost;
+		}
+		const host = new FakeHost();
+		this.hosts.push(host);
+		return host;
+	}
+}
+
+describe("DevTunnelService", () => {
+	test("parses CLI authentication, cluster-qualified IDs, and port inventory", () => {
+		expect(parseDevTunnelLoginStatus('{"status":"LoggedIn"}')).toBe(true);
+		expect(parseDevTunnelLoginStatus('{"Status":"Not logged in"}')).toBe(false);
+		expect(
+			parseQualifiedTunnelId('{"tunnel":{"tunnelId":"moshu-test","clusterId":"euw"}}', "fallback"),
+		).toBe("moshu-test.euw");
+		expect(
+			parseTunnelPorts(
+				'{"value":[{"portNumber":41000},{"portNumber":42000},{"portNumber":41000}]}',
+			),
+		).toEqual([41000, 42000]);
+		expect(parseTunnelPortProtocol('{"portNumber":41000,"protocol":"http"}')).toBe("http");
+		expect(() => parseTunnelPorts('warning\n{"value":[]}')).toThrow("JSON is invalid");
+	});
+
+	test("persists tunnel identity, hosts the fixed Runtime port, and disables cleanly", async () => {
+		const database = openAppDatabase(":memory:");
+		try {
+			const adapter = new FakeDevTunnelAdapter();
+			const service = new DevTunnelService({
+				repository: database.remoteAccess,
+				runtimeIngressPort: 41_000,
+				adapter,
+			});
+			const enabled = await service.enable();
+			expect(enabled).toMatchObject({
+				enabled: true,
+				state: "online",
+				runtimeIngressPort: 41_000,
+				publicUrl: "https://moshu-41000.test.devtunnels.ms",
+			});
+			expect(enabled.tunnelId).toMatch(/^moshu-/);
+			expect(database.remoteAccess.get()).toMatchObject({
+				enabled: true,
+				tunnelId: enabled.tunnelId,
+			});
+			if (enabled.tunnelId === undefined) {
+				throw new Error("Expected a qualified Dev Tunnel ID.");
+			}
+			expect(adapter.hostedTunnelIds).toEqual([enabled.tunnelId]);
+			expect((await service.disable()).state).toBe("disabled");
+			expect(adapter.hosts[0]?.stopped).toBe(true);
+		} finally {
+			database.close();
+		}
+	});
+
+	test("reports auth-required and recreates a persisted tunnel after authentication", async () => {
+		const database = openAppDatabase(":memory:");
+		try {
+			const adapter = new FakeDevTunnelAdapter();
+			adapter.authenticated = false;
+			const service = new DevTunnelService({
+				repository: database.remoteAccess,
+				runtimeIngressPort: 41_001,
+				adapter,
+			});
+			expect((await service.enable()).state).toBe("auth_required");
+			adapter.authenticated = true;
+			const attempt = service.startAuthentication();
+			await Bun.sleep(0);
+			expect(service.getAuthentication(attempt.attemptId).status).toBe("succeeded");
+			expect(service.getStatus().state).toBe("online");
+			const original = service.getStatus().tunnelId;
+			if (original === undefined) {
+				throw new Error("Expected a persisted Dev Tunnel ID.");
+			}
+			await service.recreate();
+			expect(adapter.deleted).toEqual([original]);
+			expect(adapter.ensureCalls).toBe(2);
+			await service.shutdown();
+		} finally {
+			database.close();
+		}
+	});
+
+	test("exposes device-code output while authentication remains active", async () => {
+		const database = openAppDatabase(":memory:");
+		try {
+			const adapter = new DelayedAuthAdapter();
+			const service = new DevTunnelService({
+				repository: database.remoteAccess,
+				runtimeIngressPort: 41_002,
+				adapter,
+			});
+			const attempt = service.startAuthentication();
+			await Bun.sleep(0);
+			expect(service.getAuthentication(attempt.attemptId)).toMatchObject({
+				status: "running",
+				message: expect.stringContaining("ABCD-EFGH"),
+			});
+			await service.shutdown();
+		} finally {
+			database.close();
+		}
+	});
+
+	test("does not start a host after disable fences a delayed enable", async () => {
+		const database = openAppDatabase(":memory:");
+		try {
+			const adapter = new DelayedAuthAdapter();
+			const service = new DevTunnelService({
+				repository: database.remoteAccess,
+				runtimeIngressPort: 41_003,
+				adapter,
+			});
+			const enabling = service.enable();
+			await Bun.sleep(0);
+			const disabling = service.disable();
+			adapter.authGate.resolve(true);
+			await Promise.all([enabling, disabling]);
+			expect(adapter.hosts).toHaveLength(0);
+			expect(service.getStatus()).toMatchObject({ enabled: false, state: "disabled" });
+		} finally {
+			database.close();
+		}
+	});
+
+	test("cancels stale tunnel setup before recreating and persisting a replacement", async () => {
+		const database = openAppDatabase(":memory:");
+		try {
+			const adapter = new DelayedEnsureAdapter();
+			const service = new DevTunnelService({
+				repository: database.remoteAccess,
+				runtimeIngressPort: 41_005,
+				adapter,
+			});
+			const enabling = service.enable();
+			await Bun.sleep(0);
+			const staleTunnelId = database.remoteAccess.get().tunnelId;
+			if (staleTunnelId === undefined) {
+				throw new Error("Expected the pending Dev Tunnel ID to be persisted.");
+			}
+			if (adapter.firstTunnelId === undefined) {
+				throw new Error("Expected tunnel reconciliation to have started.");
+			}
+			expect(staleTunnelId).toBe(adapter.firstTunnelId);
+			const recreating = service.recreate();
+			await Promise.all([enabling, recreating]);
+			const replacement = service.getStatus().tunnelId;
+			if (replacement === undefined) {
+				throw new Error("Expected the replacement Dev Tunnel ID.");
+			}
+			expect(adapter.deleted).toEqual([staleTunnelId]);
+			expect(replacement).not.toBe(staleTunnelId);
+			expect(adapter.hostedTunnelIds).toEqual([replacement]);
+			await service.shutdown();
+		} finally {
+			database.close();
+		}
+	});
+
+	test("does not report disabled until the public host has exited", async () => {
+		const database = openAppDatabase(":memory:");
+		try {
+			const adapter = new DelayedStopAdapter();
+			const service = new DevTunnelService({
+				repository: database.remoteAccess,
+				runtimeIngressPort: 41_006,
+				adapter,
+			});
+			await service.enable();
+			let disabled = false;
+			const disabling = service.disable().then((status) => {
+				disabled = true;
+				return status;
+			});
+			await Bun.sleep(0);
+			expect(disabled).toBe(false);
+			expect(service.getStatus()).toMatchObject({ enabled: false, state: "stopping" });
+			await service.start();
+			expect(disabled).toBe(false);
+			adapter.hosts[0]?.exit.resolve(0);
+			expect((await disabling).state).toBe("disabled");
+		} finally {
+			database.close();
+		}
+	});
+
+	test("disable interrupts host readiness and terminates the public host", async () => {
+		const database = openAppDatabase(":memory:");
+		try {
+			const adapter = new PendingReadyAdapter();
+			const service = new DevTunnelService({
+				repository: database.remoteAccess,
+				runtimeIngressPort: 41_009,
+				adapter,
+			});
+			const enabling = service.enable();
+			await Bun.sleep(0);
+			expect(adapter.pendingHosts).toHaveLength(1);
+			const disabling = service.disable();
+			await Promise.all([enabling, disabling]);
+			expect(adapter.pendingHosts[0]?.stopped).toBe(true);
+			expect(service.getStatus()).toMatchObject({ enabled: false, state: "disabled" });
+		} finally {
+			database.close();
+		}
+	});
+
+	test("manual retry replaces a stale restart timer", async () => {
+		const database = openAppDatabase(":memory:");
+		try {
+			const adapter = new FakeDevTunnelAdapter();
+			const service = new DevTunnelService({
+				repository: database.remoteAccess,
+				runtimeIngressPort: 41_007,
+				adapter,
+			});
+			await service.enable();
+			adapter.hosts[0]?.exit.resolve(1);
+			await Bun.sleep(0);
+			await service.enable();
+			adapter.hosts[1]?.exit.resolve(1);
+			await Bun.sleep(1_100);
+			expect(adapter.hosts).toHaveLength(3);
+			await service.shutdown();
+		} finally {
+			database.close();
+		}
+	});
+
+	test("records authentication process rejection and rejects work after shutdown", async () => {
+		const database = openAppDatabase(":memory:");
+		try {
+			const adapter = new RejectedAuthenticationAdapter();
+			const service = new DevTunnelService({
+				repository: database.remoteAccess,
+				runtimeIngressPort: 41_008,
+				adapter,
+			});
+			const attempt = service.startAuthentication();
+			await Bun.sleep(0);
+			expect(service.getAuthentication(attempt.attemptId)).toMatchObject({
+				status: "failed",
+				message: "Authentication output failed.",
+			});
+			await service.shutdown();
+			expect(() => service.startAuthentication()).toThrow("shutting down");
+			await expect(service.enable()).rejects.toThrow("shutting down");
+		} finally {
+			database.close();
+		}
+	});
+
+	test("serializes recreate with a concurrent enable", async () => {
+		const database = openAppDatabase(":memory:");
+		try {
+			const adapter = new DelayedDeleteAdapter();
+			const service = new DevTunnelService({
+				repository: database.remoteAccess,
+				runtimeIngressPort: 41_004,
+				adapter,
+			});
+			await service.enable();
+			const recreating = service.recreate();
+			await Bun.sleep(0);
+			const enabling = service.enable();
+			adapter.deleteGate.resolve();
+			await Promise.all([recreating, enabling]);
+			expect(adapter.deleted).toHaveLength(1);
+			expect(service.getStatus().state).toBe("online");
+			const activeHost = adapter.hosts.at(-1);
+			activeHost?.exit.resolve(1);
+			await Bun.sleep(1_100);
+			expect(adapter.hosts.length).toBeGreaterThan(2);
+			await service.shutdown();
+		} finally {
+			database.close();
+		}
+	});
+
+	test("coalesces concurrent recreates after the first deletion succeeds", async () => {
+		const database = openAppDatabase(":memory:");
+		try {
+			const adapter = new DelayedDeleteAdapter();
+			const service = new DevTunnelService({
+				repository: database.remoteAccess,
+				runtimeIngressPort: 41_010,
+				adapter,
+			});
+			await service.enable();
+			const first = service.recreate();
+			await Bun.sleep(0);
+			const second = service.recreate();
+			adapter.deleteGate.resolve();
+			await Promise.all([first, second]);
+			expect(adapter.deleted).toHaveLength(1);
+			expect(service.getStatus().state).toBe("online");
+			await service.shutdown();
+		} finally {
+			database.close();
+		}
+	});
+
+	test("coalesces concurrent recreates while replacement setup is pending", async () => {
+		const database = openAppDatabase(":memory:");
+		try {
+			const adapter = new DelayedReplacementAdapter();
+			const service = new DevTunnelService({
+				repository: database.remoteAccess,
+				runtimeIngressPort: 41_011,
+				adapter,
+			});
+			await service.enable();
+			const first = service.recreate();
+			await Bun.sleep(0);
+			expect(adapter.ensureCalls).toBe(2);
+			const second = service.recreate();
+			adapter.replacementGate.resolve("moshu-replacement.euw");
+			const [firstStatus, secondStatus] = await Promise.all([first, second]);
+			expect(firstStatus).toEqual(secondStatus);
+			expect(adapter.deleted).toHaveLength(1);
+			expect(adapter.ensureCalls).toBe(2);
+			expect(service.getStatus()).toMatchObject({
+				state: "online",
+				tunnelId: "moshu-replacement.euw",
+			});
+			await service.shutdown();
+		} finally {
+			database.close();
+		}
+	});
+
+	test("keeps a coalesced recreate alive while another caller is still waiting", async () => {
+		const database = openAppDatabase(":memory:");
+		try {
+			const adapter = new DelayedReplacementAdapter();
+			const service = new DevTunnelService({
+				repository: database.remoteAccess,
+				runtimeIngressPort: 41_014,
+				adapter,
+			});
+			await service.enable();
+			const firstController = new AbortController();
+			const secondController = new AbortController();
+			const first = service.recreate(firstController.signal);
+			const firstOutcome = first.then(
+				(status) => ({ status, error: undefined }),
+				(error: unknown) => ({ status: undefined, error }),
+			);
+			await Bun.sleep(0);
+			const second = service.recreate(secondController.signal);
+			firstController.abort(new Error("First caller disconnected."));
+			adapter.replacementGate.resolve("moshu-shared-replacement.euw");
+			const outcome = await firstOutcome;
+			expect(outcome.status).toBeUndefined();
+			expect(outcome.error).toBeInstanceOf(Error);
+			if (!(outcome.error instanceof Error)) {
+				throw new Error("Expected the first recreate caller to be cancelled.");
+			}
+			expect(outcome.error.message).toBe("First caller disconnected.");
+			expect(await second).toMatchObject({
+				enabled: true,
+				state: "online",
+				tunnelId: "moshu-shared-replacement.euw",
+			});
+			expect(adapter.ensureCalls).toBe(2);
+			await service.shutdown();
+		} finally {
+			database.close();
+		}
+	});
+
+	test("does not coalesce recreate across an intervening disable", async () => {
+		const database = openAppDatabase(":memory:");
+		try {
+			const adapter = new DelayedDeleteAdapter();
+			const service = new DevTunnelService({
+				repository: database.remoteAccess,
+				runtimeIngressPort: 41_012,
+				adapter,
+			});
+			await service.enable();
+			const first = service.recreate();
+			await Bun.sleep(0);
+			const disabling = service.disable();
+			const second = service.recreate();
+			adapter.deleteGate.resolve();
+			await Promise.all([first, disabling, second]);
+			expect(adapter.deleted).toHaveLength(1);
+			expect(service.getStatus().state).toBe("online");
+			await service.shutdown();
+		} finally {
+			database.close();
+		}
+	});
+
+	test("cancels an in-flight enable when its caller aborts", async () => {
+		const database = openAppDatabase(":memory:");
+		try {
+			const adapter = new PendingReadyAdapter();
+			const service = new DevTunnelService({
+				repository: database.remoteAccess,
+				runtimeIngressPort: 41_013,
+				adapter,
+			});
+			const controller = new AbortController();
+			const enabling = service.enable(controller.signal);
+			await Bun.sleep(0);
+			expect(adapter.pendingHosts).toHaveLength(1);
+			controller.abort(new Error("Caller disconnected."));
+			await expect(enabling).rejects.toThrow("Caller disconnected.");
+			expect(adapter.pendingHosts[0]?.stopped).toBe(true);
+			expect(service.getStatus()).toMatchObject({ enabled: false, state: "disabled" });
+		} finally {
+			database.close();
+		}
+	});
+
+	test("does not commit online when readiness and cancellation race", async () => {
+		const database = openAppDatabase(":memory:");
+		try {
+			const adapter = new PendingReadyAdapter();
+			const service = new DevTunnelService({
+				repository: database.remoteAccess,
+				runtimeIngressPort: 41_017,
+				adapter,
+			});
+			const controller = new AbortController();
+			const outcome = service.enable(controller.signal).then(
+				(status) => ({ status, error: undefined }),
+				(error: unknown) => ({ status: undefined, error }),
+			);
+			await Bun.sleep(0);
+			const host = adapter.pendingHosts[0];
+			host?.readyGate.resolve({ publicUrl: "https://race.test.devtunnels.ms" });
+			controller.abort(new Error("Caller cancelled at readiness."));
+			const settled = await outcome;
+			expect(settled.status).toBeUndefined();
+			expect(host?.stopped).toBe(true);
+			await Bun.sleep(0);
+			expect(service.getStatus()).toMatchObject({ enabled: false, state: "disabled" });
+		} finally {
+			database.close();
+		}
+	});
+
+	test("enable does not join cleanup from a cancelled recreate", async () => {
+		const database = openAppDatabase(":memory:");
+		try {
+			const adapter = new CancelledRecreateAdapter();
+			const service = new DevTunnelService({
+				repository: database.remoteAccess,
+				runtimeIngressPort: 41_018,
+				adapter,
+			});
+			await service.enable();
+			const controller = new AbortController();
+			const recreateOutcome = service.recreate(controller.signal).then(
+				(status) => ({ status, error: undefined }),
+				(error: unknown) => ({ status: undefined, error }),
+			);
+			await Bun.sleep(0);
+			const enabling = service.enable();
+			controller.abort(new Error("Recreate caller disconnected."));
+			await Bun.sleep(0);
+			adapter.replacementHost.exit.resolve(0);
+			const recreated = await recreateOutcome;
+			expect(recreated.status).toBeUndefined();
+			expect(await enabling).toMatchObject({ enabled: true, state: "online" });
+			expect(adapter.hostedTunnelIds).toHaveLength(3);
+			await service.shutdown();
+		} finally {
+			database.close();
+		}
+	});
+
+	test("keeps a shared enable alive while another caller is still waiting", async () => {
+		const database = openAppDatabase(":memory:");
+		try {
+			const adapter = new DelayedAuthAdapter();
+			const service = new DevTunnelService({
+				repository: database.remoteAccess,
+				runtimeIngressPort: 41_015,
+				adapter,
+			});
+			const firstController = new AbortController();
+			const secondController = new AbortController();
+			const firstOutcome = service.enable(firstController.signal).then(
+				(status) => ({ status, error: undefined }),
+				(error: unknown) => ({ status: undefined, error }),
+			);
+			await Bun.sleep(0);
+			const second = service.enable(secondController.signal);
+			firstController.abort(new Error("First enable caller disconnected."));
+			adapter.authGate.resolve(true);
+			const outcome = await firstOutcome;
+			expect(outcome.status).toBeUndefined();
+			if (!(outcome.error instanceof Error)) {
+				throw new Error("Expected the first enable caller to be cancelled.");
+			}
+			expect(outcome.error.message).toBe("First enable caller disconnected.");
+			expect(await second).toMatchObject({ enabled: true, state: "online" });
+			await service.shutdown();
+		} finally {
+			database.close();
+		}
+	});
+
+	test("does not let a retry join an already-cancelled recreate", async () => {
+		const database = openAppDatabase(":memory:");
+		try {
+			const adapter = new DelayedDeleteAdapter();
+			const service = new DevTunnelService({
+				repository: database.remoteAccess,
+				runtimeIngressPort: 41_016,
+				adapter,
+			});
+			await service.enable();
+			const controller = new AbortController();
+			const cancelledOutcome = service.recreate(controller.signal).then(
+				(status) => ({ status, error: undefined }),
+				(error: unknown) => ({ status: undefined, error }),
+			);
+			await Bun.sleep(0);
+			controller.abort(new Error("Recreate caller disconnected."));
+			await Bun.sleep(0);
+			const retry = service.recreate();
+			adapter.deleteGate.resolve();
+			const outcome = await cancelledOutcome;
+			expect(outcome.status).toBeUndefined();
+			if (!(outcome.error instanceof Error)) {
+				throw new Error("Expected the first recreate caller to be cancelled.");
+			}
+			expect(outcome.error.message).toBe("Recreate caller disconnected.");
+			expect(await retry).toMatchObject({ enabled: true, state: "online" });
+			await service.shutdown();
+		} finally {
+			database.close();
+		}
+	});
+});

@@ -116,7 +116,8 @@ Moshu-owned、可版本化合同，SDK 类型不进入产品 RPC。
 
 ### 7.7 决策与执行分离
 
-agents server 拥有 Agent、Run、Policy、审批和持久状态；executor 只执行经过一次性授权的本机动作。角色拆分不等于完整沙箱，但任何扩展都不得绕过这条边界。
+agents server 拥有 Agent、Run、Policy、审批和持久状态；Runtime Box 内部 Executor 只执行经过一次性授权的
+设备动作。角色拆分不等于完整沙箱，但任何 Local/Remote Box 或扩展都不得绕过这条边界。
 
 ## 8. 功能域总览
 
@@ -124,7 +125,8 @@ agents server 拥有 Agent、Run、Policy、审批和持久状态；executor 只
 | --- | --- | --- |
 | Chat | 普通 Chat、附件、流式回复、引用、导出 | [核心体验](./core-experience.md) |
 | Project | 本地目录、项目上下文、文件操作、终端、Git Diff | [核心体验](./core-experience.md) |
-| Agent Runtime | Ask/Plan/Agent、待办、子 Agent、审批、Executor 绑定与恢复 | [核心体验](./core-experience.md) |
+| Agent Runtime | Ask/Plan/Agent、待办、子 Agent、审批、Runtime Box 调度与恢复 | [核心体验](./core-experience.md) |
+| Runtime Box | Local/Remote 执行域、Project、MCP、Skills 与设备连接 | [技术与实施方案](../implementation/runtime-box.md) |
 | Custom Agent | 可视化配置、导入导出、范围与权限 | [Agent 与扩展](./agents-integrations.md) |
 | Provider | 国内外模型、兼容 Endpoint、能力与成本 | [Agent 与扩展](./agents-integrations.md) |
 | MCP | 本地/远程连接、OAuth、工具管理和配置导入 | [Agent 与扩展](./agents-integrations.md) |
@@ -137,11 +139,12 @@ agents server 拥有 Agent、Run、Policy、审批和持久状态；executor 只
 
 | 概念 | 定义 |
 | --- | --- |
-| Project | 指向一个本地文件夹的应用实体；该目录可以是 Git 仓库 |
-| Session | 一条可持久化的会话线程，属于普通 Chat 或某个 Project |
+| Runtime Box | 可安装在本机或远程设备的执行与扩展资源域；拥有该设备上的 MCP、Skills 和实际 host execution |
+| Project | 指向某个 Runtime Box 上文件夹的应用实体；该目录可以是 Git 仓库 |
+| Session | 一条可持久化的会话线程，永久归属一个 Runtime Box，并可属于某个 Project |
 | Run | 用户消息触发的一次 Agent 执行，可包含多个模型和工具步骤 |
-| Agent | 一组提示词、模型策略、工具、Skills、知识与权限配置；MCP/Skill 只引用 assigned Executor 的 stable resource version/hash |
-| Executor | 自身 MCP config/credential/OAuth、Skill immutable content 与实际 Tool/进程树的唯一所有者；server inventory 只是同步 cache，当前 desktop 默认一个本地 Executor |
+| Agent | 全局提示词、模型策略、知识和权限配置；每个 Agent/Runtime Box 的 Runtime Profile 保存稳定资源引用 |
+| Runtime Box | Runtime Box 内部的 Tool 与进程执行组件，不再是产品级切换单位 |
 | Tool | Agent 可调用的原子能力，来源可以是内置工具或 MCP |
 | Skill | 符合 Agent Skills 规范的可复用说明、脚本和资源目录 |
 | Knowledge Base | 经本地切分和索引、按需检索进入上下文的资料集合 |
@@ -179,7 +182,7 @@ agents server 拥有 Agent、Run、Policy、审批和持久状态；executor 只
 | Provider API 差异 | 工具调用、流式和用量字段不一致 | 建立能力注册表、适配层和兼容性测试 |
 | 模型不遵守工具约束 | 越权或重复动作 | 权限在工具层执行，不依赖提示词自律 |
 | Pi API 变化 | Provider、Agent Session 或事件能力变化 | 精确锁定 `0.82.1`、只用公开导出并维护 binary compatibility gate |
-| 三角色连接或 companion 崩溃 | Executor 离线、Run 中断或旧实例结果污染 | stable identity、instance/generation、capped restart、reconcile 和恢复 UX |
+| 三角色连接或 companion 崩溃 | Runtime Box 离线、Run 中断或旧实例结果污染 | stable identity、instance/generation、capped restart、reconcile 和恢复 UX |
 | 本机命令无天然沙箱 | 可能访问项目外资源 | 命令策略、环境隔离、审批和高风险硬限制 |
 | MCP/Skill 供应链 | 第三方扩展可带来副作用 | 安装审查、能力清单、作用域和运行审批 |
 | Canvas 运行不可信代码 | XSS、本地访问或资源滥用 | sandbox BrowserView、独立 origin、CSP；默认断网 POC 失败时禁用任意脚本 |

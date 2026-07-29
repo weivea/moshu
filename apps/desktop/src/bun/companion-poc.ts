@@ -70,7 +70,7 @@ export async function assertCompanionExecutablesAvailable(
 	source: CompanionExecutableSource,
 	checkAccess: (filename: string, mode: number) => Promise<void> = access,
 ): Promise<void> {
-	for (const role of ["agents-server", "executor"] as const) {
+	for (const role of ["agents-server", "runtime-box"] as const) {
 		try {
 			await checkAccess(executables[role], constants.X_OK);
 		} catch {
@@ -84,6 +84,6 @@ function logReadySnapshot(message: string, snapshot: CompanionSupervisorSnapshot
 	console.info(message, {
 		status: snapshot.status,
 		agentsServer: snapshot.processes["agents-server"]?.identity,
-		executor: snapshot.processes.executor?.identity,
+		"runtime-box": snapshot.processes["runtime-box"]?.identity,
 	});
 }

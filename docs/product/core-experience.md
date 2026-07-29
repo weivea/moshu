@@ -215,9 +215,9 @@ Project Chat 属于一个 Project。Project 指向一个本地文件夹，可以
 
 ### 9.2 中断与恢复
 
-- 关闭页面或窗口不自动停止 Run；只要 desktop client 仍运行，任务可在 agents server/executor 中继续。
+- 关闭页面或窗口不自动停止 Run；只要 desktop client 仍运行，任务可在 agents server/Runtime Box 中继续。
 - 用户退出应用时，client 先停止接受新 Run，再协作式要求 agents server flush 产品状态并 dispose Pi Session、
-  executor 取消/清理 invocation 和进程树；不留下孤儿 companion。
+  Runtime Box 取消/清理 invocation 和进程树；不留下孤儿 companion。
 - 再次打开后，Session 显示“可继续”“需确认状态”或“不可恢复”。
 - 恢复前展示已完成动作、待审批动作和下一步。
 - 对执行结果不确定的副作用操作，不得自动重放；要求用户确认或重新检查外部状态。
@@ -238,7 +238,7 @@ Project Chat 属于一个 Project。Project 指向一个本地文件夹，可以
 - 达到上限的新 Run 进入 FIFO 队列；用户可调整优先级或取消。
 - 同一 Session 同一时刻只允许一个产生副作用的 Run，避免文件竞态。
 - 同一 Project 的多个 Run 可并行，但检测到操作同一文件时必须串行或提示冲突。
-- 当前 desktop 的多个 Agent 可绑定同一个 local Executor；Executor offline 时相关 Agent 不能启动新 Run。
+- 当前 desktop 的多个 Agent 可绑定同一个 local Runtime Box；Runtime Box offline 时相关 Agent 不能启动新 Run。
 
 ### 10.2 后台任务
 
@@ -252,9 +252,9 @@ Project Chat 属于一个 Project。Project 指向一个本地文件夹，可以
 展示：
 
 - 运行中、排队、待审批、失败和已完成任务。
-- Session、Project、Agent、Executor、模型、开始时间、耗时和费用。
+- Session、Project、Agent、Runtime Box、模型、开始时间、耗时和费用。
 - 暂停/停止、恢复、打开会话和查看错误。
-- Executor syncing/online/offline、inventory fresh/stale、重连状态和“当前无法启动新 Run”的原因。
+- Runtime Box syncing/online/offline、inventory fresh/stale、重连状态和“当前无法启动新 Run”的原因。
 
 ## 11. Pi 运行时映射
 
@@ -266,7 +266,7 @@ Project Chat 属于一个 Project。Project 指向一个本地文件夹，可以
 | Agent event stream | 规范化文本 delta、final usage、取消和安全错误 |
 
 Plan、待办、Tool、MCP、Skills、审批和 subagent 不直接采用 SDK 产品合同；它们将在后续阶段通过
-Moshu-owned Agent/Policy/Action/executor contract 实现。当前 UI 不应暗示这些能力已经开放。
+Moshu-owned Agent/Policy/Action/Runtime Box contract 实现。当前 UI 不应暗示这些能力已经开放。
 
 ## 12. 文件变更与 Git
 

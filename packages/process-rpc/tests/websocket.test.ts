@@ -100,8 +100,8 @@ describe("Bun WebSocket process RPC", () => {
 			connectRpcClient({
 				url: server.url,
 				identity: {
-					role: "executor",
-					peerId: "spoofed-executor",
+					role: "runtime-box",
+					peerId: "spoofed-runtime-box",
 					instanceId: "spoofed-start",
 					generation: 999,
 				},
@@ -115,7 +115,7 @@ describe("Bun WebSocket process RPC", () => {
 				url: server.url,
 				identity: {
 					...canonicalIdentity,
-					role: "executor",
+					role: "runtime-box",
 				},
 				limits: defaultLimits,
 				getHandshakeHeaders: credential.getHandshakeHeaders,
@@ -332,7 +332,7 @@ describe("Bun WebSocket process RPC", () => {
 
 	test("does not resolve credentials for an already-aborted connection", async () => {
 		const controller = new AbortController();
-		controller.abort(new Error("Executor parent exited."));
+		controller.abort(new Error("RuntimeBox parent exited."));
 		let providerCalls = 0;
 
 		await expect(
@@ -994,25 +994,25 @@ describe("Bun WebSocket process RPC", () => {
 		const server = startServer({
 			handlers: {
 				requests: {
-					"fixture.executor-only": () => ({ allowed: true }),
+					"fixture.runtime-box-only": () => ({ allowed: true }),
 				},
 			},
 			methodAllowlist: {
-				executor: { requests: ["fixture.executor-only"] },
+				"runtime-box": { requests: ["fixture.runtime-box-only"] },
 			},
 		});
 		const client = await connectClient(server, createClientIdentity("allowlist-client"));
-		await expect(client.request("fixture.executor-only", null)).rejects.toMatchObject({
+		await expect(client.request("fixture.runtime-box-only", null)).rejects.toMatchObject({
 			code: "METHOD_NOT_ALLOWED",
 		});
 
-		const executor = await connectClient(server, {
-			role: "executor",
-			peerId: "executor-local",
-			instanceId: "executor-start-1",
+		const runtimeBox = await connectClient(server, {
+			role: "runtime-box",
+			peerId: "runtime-box-local",
+			instanceId: "runtime-box-start-1",
 			generation: 1,
 		});
-		await expect(executor.request("fixture.executor-only", null)).resolves.toEqual({
+		await expect(runtimeBox.request("fixture.runtime-box-only", null)).resolves.toEqual({
 			allowed: true,
 		});
 	});

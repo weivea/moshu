@@ -8,6 +8,9 @@ import {
 	NewChatPage,
 	PlaceholderPage,
 	ProviderSettingsRoutePage,
+	RuntimeBoxesSettingsRoutePage,
+	ProjectDetailRoutePage,
+	ProjectsRoutePage,
 	SettingsPlaceholderPage,
 } from "./pages";
 import { SettingsLayout } from "./settings/settings-layout";
@@ -30,11 +33,11 @@ export const router = createHashRouter([
 			},
 			{
 				path: "projects",
-				element: <PlaceholderPage titleKey="page.projects.title" icon="projects" />,
+				element: <ProjectsRoutePage />,
 			},
 			{
 				path: "projects/:projectId",
-				element: <PlaceholderPage titleKey="page.project.title" icon="projects" />,
+				element: <ProjectDetailRoutePage />,
 			},
 			{
 				path: "projects/:projectId/chat/new",
@@ -76,6 +79,7 @@ export const router = createHashRouter([
 					{ path: "providers", element: <ProviderSettingsRoutePage /> },
 					{ path: "default-model", element: <DefaultModelSettingsRoutePage /> },
 					{ path: "general", element: <GeneralSettingsRoutePage /> },
+					{ path: "runtime-boxes", element: <RuntimeBoxesSettingsRoutePage /> },
 					{ path: ":section", element: <SettingsPlaceholderPage /> },
 				],
 			},

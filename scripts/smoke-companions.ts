@@ -8,7 +8,7 @@ const packagedCompanionDirectory = process.env.MOSHU_COMPANION_SMOKE_DIR;
 const supervisor = new CompanionProcessSupervisor({
 	executables: {
 		"agents-server": resolveCompanionExecutable("agents-server"),
-		executor: resolveCompanionExecutable("executor"),
+		"runtime-box": resolveCompanionExecutable("runtime-box"),
 	},
 	startupTimeoutMs: 5_000,
 	shutdownTimeoutMs: 2_000,
@@ -17,8 +17,8 @@ const supervisor = new CompanionProcessSupervisor({
 try {
 	const snapshot = await supervisor.start();
 	const agentsServer = snapshot.processes["agents-server"];
-	const executor = snapshot.processes.executor;
-	if (agentsServer?.ready.role !== "agents-server" || executor?.ready.role !== "executor") {
+	const runtimeBox = snapshot.processes["runtime-box"];
+	if (agentsServer?.ready.role !== "agents-server" || runtimeBox?.ready.role !== "runtime-box") {
 		throw new Error("Compiled companion smoke test did not receive both READY records.");
 	}
 	console.info(
@@ -29,9 +29,9 @@ try {
 				processVersion: agentsServer.ready.processVersion,
 				endpoint: agentsServer.ready.endpoint,
 			},
-			executor: {
-				pid: executor.identity.pid,
-				processVersion: executor.ready.processVersion,
+			"runtime-box": {
+				pid: runtimeBox.identity.pid,
+				processVersion: runtimeBox.ready.processVersion,
 			},
 		}),
 	);
@@ -39,7 +39,7 @@ try {
 	await supervisor.shutdown();
 }
 
-function resolveCompanionExecutable(role: "agents-server" | "executor"): string {
+function resolveCompanionExecutable(role: "agents-server" | "runtime-box"): string {
 	const directory = packagedCompanionDirectory ?? resolve(repositoryRoot, "apps", role, "dist");
 	return resolve(directory, getCompanionExecutableFilename(role, process.platform));
 }

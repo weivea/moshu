@@ -14,6 +14,41 @@ import {
 import { createAgentsServer } from "./create-agents-server";
 
 describe("createAgentsServer", () => {
+	test("keeps Product RPC available when the persisted Runtime ingress port conflicts", async () => {
+		await withServerDirectory(async (directory) => {
+			const blocker = Bun.serve({
+				hostname: "127.0.0.1",
+				port: 0,
+				fetch: () => new Response("occupied"),
+			});
+			if (blocker.port === undefined) {
+				throw new Error("Port blocker did not bind a port.");
+			}
+			const bootstrap = createBootstrap(directory);
+			const database = openAppDatabase(bootstrap.paths.productDatabase);
+			database.remoteAccess.setRuntimeIngressPort(blocker.port);
+			database.remoteAccess.setEnabled(true);
+			database.close();
+			const instance = await createAgentsServer({
+				bootstrap,
+				serverVersion: "test",
+				createRuntime: () => fakeRuntime(),
+			});
+			try {
+				expect(instance.productRpcServer.port).toBeGreaterThan(0);
+				expect(instance.runtimeRpcServer.port).not.toBe(blocker.port);
+				expect(instance.devTunnelService.getStatus()).toMatchObject({
+					enabled: true,
+					state: "repair_required",
+					runtimeIngressPort: instance.runtimeRpcServer.port,
+				});
+			} finally {
+				await instance.shutdown();
+				await blocker.stop(true);
+			}
+		});
+	});
+
 	test("retries durable agent-session cleanup before readiness", async () => {
 		await withServerDirectory(async (directory) => {
 			const bootstrap = createBootstrap(directory);
@@ -39,7 +74,7 @@ describe("createAgentsServer", () => {
 				},
 			});
 			try {
-				expect(receivedExecutorGateway).toBe(instance.executorReadiness);
+				expect(receivedExecutorGateway).toBe(instance.runtimeBoxRegistry);
 				let ready = false;
 				void instance.ready.then(() => {
 					ready = true;
@@ -191,6 +226,15 @@ function createBootstrap(directory: string): AgentsServerBootstrapRecord {
 				identity: {
 					role: "client",
 					peerId: "desktop-startup-test",
+					instanceId: crypto.randomUUID(),
+					generation: 1,
+				},
+			},
+			{
+				credential: Buffer.alloc(32, 8).toString("base64url"),
+				identity: {
+					role: "runtime-box",
+					peerId: "runtime-box-startup-test",
 					instanceId: crypto.randomUUID(),
 					generation: 1,
 				},

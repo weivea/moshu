@@ -29,7 +29,7 @@ describe("companion signing contract", () => {
 		},
 	);
 
-	test("signs bundled executor tools independently without Bun entitlements", () => {
+	test("signs bundled Runtime Box tools independently without Bun entitlements", () => {
 		expect(createBundledToolCodesignCommand("/tmp/rg", "-")).toEqual([
 			"codesign",
 			"--force",
@@ -59,13 +59,13 @@ describe("companion signing contract", () => {
 	});
 
 	test("inspects the exact executable entitlements as XML", () => {
-		expect(createCompanionEntitlementsInspectionCommand("/tmp/moshu-executor")).toEqual([
+		expect(createCompanionEntitlementsInspectionCommand("/tmp/moshu-runtime-box")).toEqual([
 			"codesign",
 			"-d",
 			"--entitlements",
 			":-",
 			"--xml",
-			"/tmp/moshu-executor",
+			"/tmp/moshu-runtime-box",
 		]);
 	});
 

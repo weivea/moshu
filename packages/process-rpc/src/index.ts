@@ -6,6 +6,8 @@ export {
 	type RpcBearerCredentialBinding,
 	type RpcHandshakeAuthenticator,
 	type RpcHandshakeHeadersProvider,
+	type RpcHttpRequestContext,
+	RpcHandshakeHttpError,
 } from "./authentication";
 export {
 	type ConnectRpcClientOptions,

@@ -18,11 +18,9 @@ import {
 	assertCompanionResourceFilenames,
 	getCompanionResourceFilenames,
 	getCompanionExecutableFilename,
-	getExecutorToolExecutableFilenames,
 } from "../src/shared/companion-executable-names";
 import {
 	assertEmbeddedCompanionEntitlements,
-	createBundledToolCodesignCommand,
 	createCompanionCodesignCommand,
 	createCompanionEntitlementsInspectionCommand,
 	createMacAppVerificationCommand,
@@ -59,12 +57,6 @@ function companionResourceDirectory(appPath: string): string {
 	return join(appPath, "Contents", "Resources", "app", "companions");
 }
 
-function executorToolExecutables(appPath: string): string[] {
-	return getExecutorToolExecutableFilenames("darwin").map((filename) =>
-		join(companionResourceDirectory(appPath), filename),
-	);
-}
-
 function createNestedCodesignCommand(
 	executablePath: string,
 	identity: string,
@@ -88,7 +80,6 @@ export function createFinalizedMacCodesignPlan(
 	entitlementsPath: string,
 ): FinalizedMacCodesignPlan {
 	const companions = COMPANION_EXECUTABLE_ROLES.map((role) => companionExecutable(appPath, role));
-	const tools = executorToolExecutables(appPath);
 	return {
 		nested: [
 			...companions.map((executable) =>
@@ -98,7 +89,6 @@ export function createFinalizedMacCodesignPlan(
 					entitlementsPath,
 				}),
 			),
-			...tools.map((executable) => createBundledToolCodesignCommand(executable, identity)),
 			...lockedElectrobunMacCode.map(({ name, entitlements }) =>
 				createNestedCodesignCommand(
 					join(appPath, "Contents", "MacOS", name),
@@ -114,7 +104,6 @@ export function createFinalizedMacCodesignPlan(
 				["codesign", "--verify", "--strict", executable],
 				createCompanionEntitlementsInspectionCommand(executable),
 			]),
-			...tools.map((executable) => ["codesign", "--verify", "--strict", executable]),
 		],
 	};
 }

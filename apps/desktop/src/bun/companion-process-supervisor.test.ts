@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import {
 	COMPANION_BOOTSTRAP_CHANNEL,
@@ -19,7 +22,7 @@ import {
 
 const EXECUTABLES = {
 	"agents-server": "/opt/moshu/companions/moshu-agents-server",
-	executor: "/opt/moshu/companions/moshu-executor",
+	"runtime-box": "/opt/moshu/companions/moshu-runtime-box",
 } as const;
 const TEST_SERVER_IDENTITY = {
 	role: "agents",
@@ -27,6 +30,7 @@ const TEST_SERVER_IDENTITY = {
 	instanceId: "agents-test-1",
 	generation: 1,
 } as const;
+const ACTION_JOURNAL_EPOCH = "550e8400-e29b-41d4-a716-446655440099";
 
 describe("companion READY control parsing", () => {
 	test("parses a bounded agents-server READY record", () => {
@@ -42,6 +46,8 @@ describe("companion READY control parsing", () => {
 					nonce: "server-generation-1",
 					serverIdentity: TEST_SERVER_IDENTITY,
 					endpoint: { host: "127.0.0.1", port: 41_701, path: "/rpc" },
+					runtimeEndpoint: { host: "127.0.0.1", port: 41_702, path: "/runtime" },
+					actionJournalEpoch: ACTION_JOURNAL_EPOCH,
 				})}\n`,
 				{
 					role: "agents-server",
@@ -54,6 +60,7 @@ describe("companion READY control parsing", () => {
 			role: "agents-server",
 			pid: 701,
 			endpoint: { host: "127.0.0.1", port: 41_701, path: "/rpc" },
+			runtimeEndpoint: { host: "127.0.0.1", port: 41_702, path: "/runtime" },
 		});
 	});
 
@@ -71,6 +78,7 @@ describe("companion READY control parsing", () => {
 				nonce: "different-nonce",
 				serverIdentity: TEST_SERVER_IDENTITY,
 				endpoint: { host: "127.0.0.1", port: 41_701, path: "/rpc" },
+				runtimeEndpoint: { host: "127.0.0.1", port: 41_702, path: "/runtime" },
 			}),
 		],
 		[
@@ -85,6 +93,7 @@ describe("companion READY control parsing", () => {
 				nonce: "server-generation-1",
 				serverIdentity: TEST_SERVER_IDENTITY,
 				endpoint: { host: "0.0.0.0", port: 41_701, path: "/rpc" },
+				runtimeEndpoint: { host: "127.0.0.1", port: 41_702, path: "/runtime" },
 			}),
 		],
 	])("rejects %s", (_name, input) => {
@@ -146,7 +155,7 @@ describe("CompanionProcessSupervisor", () => {
 		expect(spawner.requests.map((request) => request.role)).toEqual([
 			"agents-server",
 			"agents-server",
-			"executor",
+			"runtime-box",
 		]);
 		await supervisor.shutdown();
 	});
@@ -169,7 +178,7 @@ describe("CompanionProcessSupervisor", () => {
 			restartAttempts: 2,
 			processes: {
 				"agents-server": { identity: { generation: 3 } },
-				executor: { identity: { generation: 3 } },
+				"runtime-box": { identity: { generation: 3 } },
 			},
 		});
 		await Bun.sleep(0);
@@ -177,14 +186,14 @@ describe("CompanionProcessSupervisor", () => {
 		expect(spawner.requests.map((request) => request.role)).toEqual([
 			"agents-server",
 			"agents-server",
-			"executor",
+			"runtime-box",
 			"agents-server",
-			"executor",
+			"runtime-box",
 		]);
 		await supervisor.shutdown();
 	});
 
-	test("fails startup when the desktop RPC connection closes before executor readiness", async () => {
+	test("fails startup when the desktop RPC connection closes before Runtime Box readiness", async () => {
 		const spawner = new FakeSpawner([{ ready: "valid" }, { ready: "valid" }]);
 		const supervisor = createSupervisor(spawner, {
 			restartPolicy: { maxAttempts: 0, baseDelayMs: 0, maxDelayMs: 0 },
@@ -195,7 +204,7 @@ describe("CompanionProcessSupervisor", () => {
 			}),
 		});
 
-		await expect(supervisor.start()).rejects.toThrow("closed before executor readiness");
+		await expect(supervisor.start()).rejects.toThrow("closed before Runtime Box readiness");
 		expect(supervisor.getSnapshot().status).toBe("failed");
 	});
 
@@ -232,7 +241,7 @@ describe("CompanionProcessSupervisor", () => {
 		expect(supervisor.getSnapshot().status).toBe("stopped");
 	});
 
-	test("shuts down executor before agents-server", async () => {
+	test("shuts down Runtime Box before agents-server", async () => {
 		const stopOrder: string[] = [];
 		const spawner = new FakeSpawner([{ ready: "valid" }, { ready: "valid" }], stopOrder);
 		const supervisor = createSupervisor(spawner);
@@ -240,7 +249,7 @@ describe("CompanionProcessSupervisor", () => {
 
 		await supervisor.shutdown();
 
-		expect(stopOrder).toEqual(["executor:stdin", "agents-server:stdin"]);
+		expect(stopOrder).toEqual(["runtime-box:stdin", "agents-server:stdin"]);
 		expect(supervisor.getSnapshot()).toMatchObject({
 			status: "stopped",
 			processes: {},
@@ -255,6 +264,7 @@ describe("CompanionProcessSupervisor", () => {
 		const restarted = new Promise<void>((resolve) => {
 			resolveRestarted = resolve;
 		});
+
 		const spawner = new FakeSpawner([
 			{ ready: "valid" },
 			{ ready: "valid" },
@@ -298,7 +308,7 @@ describe("CompanionProcessSupervisor", () => {
 			restartAttempts: 1,
 			processes: {
 				"agents-server": { identity: { generation: 2 } },
-				executor: { identity: { generation: 2 } },
+				"runtime-box": { identity: { generation: 2 } },
 			},
 		});
 		expect(restartLog).not.toContain("test-generation");
@@ -307,6 +317,33 @@ describe("CompanionProcessSupervisor", () => {
 		expect(clientIdentities).toHaveLength(2);
 		expect(clientIdentities[1]).toEqual(clientIdentities[0]);
 		await supervisor.shutdown();
+	});
+
+	test("persists Local Runtime Box generation across supervisor instances", async () => {
+		const directory = mkdtempSync(join(tmpdir(), "moshu-runtime-box-generation-"));
+		const dataPaths = {
+			productDatabase: join(directory, "moshu.db"),
+			agentDataDirectory: join(directory, "agent-data"),
+		};
+		try {
+			const first = createSupervisor(new FakeSpawner([{ ready: "valid" }, { ready: "valid" }]), {
+				dataPaths,
+			});
+			const firstSnapshot = await first.start();
+			const firstGeneration = firstSnapshot.processes["runtime-box"]?.identity.generation;
+			await first.shutdown();
+
+			const second = createSupervisor(new FakeSpawner([{ ready: "valid" }, { ready: "valid" }]), {
+				dataPaths,
+			});
+			const secondSnapshot = await second.start();
+			expect(secondSnapshot.processes["runtime-box"]?.identity.generation).toBe(
+				(firstGeneration ?? 0) + 1,
+			);
+			await second.shutdown();
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
 	});
 
 	test("keeps replacement connection loss inside the active restart owner", async () => {
@@ -373,7 +410,7 @@ describe("CompanionProcessSupervisor", () => {
 			restartAttempts: 2,
 			processes: {
 				"agents-server": { identity: { generation: 3 } },
-				executor: { identity: { generation: 3 } },
+				"runtime-box": { identity: { generation: 3 } },
 			},
 		});
 		expect(spawner.requests).toHaveLength(6);
@@ -596,7 +633,7 @@ describe("CompanionProcessSupervisor", () => {
 			restartAttempts: 2,
 			processes: {
 				"agents-server": { identity: { generation: 3 } },
-				executor: { identity: { generation: 3 } },
+				"runtime-box": { identity: { generation: 3 } },
 			},
 		});
 		await supervisor.shutdown();
@@ -616,12 +653,12 @@ describe("CompanionProcessSupervisor", () => {
 		await expect(supervisor.shutdown()).rejects.toThrow("did not exit after SIGKILL");
 		expect(supervisor.getSnapshot()).toMatchObject({
 			status: "failed",
-			processes: { executor: { identity: { pid: spawner.processes[1]?.pid } } },
+			processes: { "runtime-box": { identity: { pid: spawner.processes[1]?.pid } } },
 		});
 		expect(stopOrder).toEqual([
-			"executor:stdin",
-			"executor:SIGTERM",
-			"executor:SIGKILL",
+			"runtime-box:stdin",
+			"runtime-box:SIGTERM",
+			"runtime-box:SIGKILL",
 			"agents-server:stdin",
 		]);
 		expect(spawner.requests).toHaveLength(2);
@@ -654,7 +691,7 @@ describe("CompanionProcessSupervisor", () => {
 		await fatal.promise;
 		await Bun.sleep(5);
 		expect(supervisor.getSnapshot().status).toBe("failed");
-		expect(supervisor.getSnapshot().processes.executor).toBeDefined();
+		expect(supervisor.getSnapshot().processes["runtime-box"]).toBeDefined();
 		expect(spawner.requests).toHaveLength(2);
 		spawner.processes[1]?.crash(0);
 	});
@@ -665,7 +702,7 @@ describe("CompanionProcessSupervisor", () => {
 				new CompanionProcessSupervisor({
 					executables: {
 						"agents-server": "relative/agents-server",
-						executor: EXECUTABLES.executor,
+						"runtime-box": EXECUTABLES["runtime-box"],
 					},
 				}),
 		).toThrow("agents-server executable path must be absolute");
@@ -807,7 +844,7 @@ class FakeProcess implements SpawnedCompanionProcess {
 		}
 		const nonce = parsed.nonce;
 		const agentsServer =
-			this.role === "executor" ? parseFakeAgentsServerBinding(parsed.agentsServer) : undefined;
+			this.role === "runtime-box" ? parseFakeAgentsServerBinding(parsed.agentsServer) : undefined;
 		const ready =
 			this.role === "agents-server"
 				? {
@@ -824,12 +861,18 @@ class FakeProcess implements SpawnedCompanionProcess {
 							port: 40_000 + this.pid,
 							path: "/rpc",
 						},
+						runtimeEndpoint: {
+							host: "127.0.0.1",
+							port: 50_000 + this.pid,
+							path: "/runtime",
+						},
+						actionJournalEpoch: ACTION_JOURNAL_EPOCH,
 					}
 				: {
 						channel: COMPANION_BOOTSTRAP_CHANNEL,
 						controlVersion: COMPANION_CONTROL_VERSION,
 						type: "READY",
-						role: "executor",
+						role: "runtime-box",
 						pid: this.pid,
 						processVersion: "0.0.1",
 						nonce,
@@ -884,7 +927,7 @@ function parseFakeAgentsServerBinding(value: unknown): {
 		typeof value.endpoint.port !== "number" ||
 		typeof value.endpoint.path !== "string"
 	) {
-		throw new Error("Fake executor received no agents-server READY record.");
+		throw new Error("Fake Runtime Box received no agents-server READY record.");
 	}
 	return {
 		identity: value.identity,

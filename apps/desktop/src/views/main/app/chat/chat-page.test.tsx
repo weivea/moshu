@@ -1,4 +1,5 @@
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { defaultLocalRuntimeBoxId } from "@moshu/contracts";
 import { beforeEach, describe, expect, test, vi } from "vitest";
 import { AgentsUnavailableError, ChatSessionNotFoundError } from "../../../../shared/rpc-errors";
 import { I18nProvider } from "../i18n";
@@ -599,6 +600,7 @@ describe("ChatPage", () => {
 		transport.captureSessionBeforeGate = true;
 		const initialSession: ChatSession = {
 			id: "initial-hydration-session",
+			runtimeBoxId: defaultLocalRuntimeBoxId,
 			title: "Stale initial title",
 			updatedAt: "2026-01-01T00:00:00.000Z",
 			model: sessionModel,
@@ -654,6 +656,7 @@ describe("ChatPage", () => {
 		transport.sessionLoadGate = gate.promise;
 		const session: ChatSession = {
 			id: "subscribe-first-session",
+			runtimeBoxId: defaultLocalRuntimeBoxId,
 			title: "Subscribe first",
 			updatedAt: "2026-01-01T00:00:00.000Z",
 			model: sessionModel,
@@ -739,6 +742,7 @@ describe("ChatPage", () => {
 		transport.captureSessionBeforeGate = true;
 		const session: ChatSession = {
 			id: "cursor-session",
+			runtimeBoxId: defaultLocalRuntimeBoxId,
 			title: "Cursor reconciliation",
 			updatedAt: "2026-01-01T00:00:00.000Z",
 			model: sessionModel,
@@ -800,6 +804,7 @@ describe("ChatPage", () => {
 		});
 		const staleSession: ChatSession = {
 			id: "back-session",
+			runtimeBoxId: defaultLocalRuntimeBoxId,
 			title: "Stale history title",
 			updatedAt: "2026-01-01T00:00:00.000Z",
 			model: sessionModel,
@@ -1226,6 +1231,17 @@ async function waitForRequest(transport: FakeChatTransport) {
 	return transport.lastRequestId;
 }
 
+type ChatSessionFixture = Omit<ChatSession, "runtimeBoxId"> & { runtimeBoxId?: string };
+
+class FakeSessionMap extends Map<string, ChatSession> {
+	override set(key: string, value: ChatSessionFixture): this {
+		return super.set(key, {
+			...value,
+			runtimeBoxId: value.runtimeBoxId ?? defaultLocalRuntimeBoxId,
+		});
+	}
+}
+
 class FakeChatTransport extends ProviderModelTransportDefaults implements ChatTransport {
 	sendCalls: Array<{ requestId: string; sessionId: string; message: string }> = [];
 	cancelCalls: Array<{ sessionId: string; requestId: string }> = [];
@@ -1235,7 +1251,7 @@ class FakeChatTransport extends ProviderModelTransportDefaults implements ChatTr
 	listSessionCalls = 0;
 	listeners = new Set<ChatTransportListener>();
 	invalidationListeners = new Set<ChatSessionInvalidationListener>();
-	sessions = new Map<string, ChatSession>();
+	sessions = new FakeSessionMap();
 	pending = new Map<string, { sessionId: string; messageId: string }>();
 	nextSendError: Error | null = null;
 	nextCancelError: Error | null = null;
@@ -1276,6 +1292,7 @@ class FakeChatTransport extends ProviderModelTransportDefaults implements ChatTr
 			model ?? (this.configuredModel === "" ? undefined : modelSelectionFor(this.configuredModel));
 		const session: ChatSession = {
 			id: `session-${this.nextSessionNumber}`,
+			runtimeBoxId: defaultLocalRuntimeBoxId,
 			title: "New chat",
 			updatedAt: "2026-01-01T00:00:00.000Z",
 			...(resolvedModel === undefined ? {} : { model: resolvedModel }),
@@ -1319,6 +1336,7 @@ class FakeChatTransport extends ProviderModelTransportDefaults implements ChatTr
 			.slice(0, input.limit ?? 50)
 			.map((session) => ({
 				id: session.id,
+				runtimeBoxId: session.runtimeBoxId,
 				title: session.title,
 				createdAt: session.updatedAt,
 				updatedAt: session.updatedAt,
@@ -1562,6 +1580,7 @@ class FakeChatTransport extends ProviderModelTransportDefaults implements ChatTr
 	private toSummary(session: ChatSession) {
 		return {
 			id: session.id,
+			runtimeBoxId: session.runtimeBoxId,
 			title: session.title,
 			createdAt: session.updatedAt,
 			updatedAt: session.updatedAt,

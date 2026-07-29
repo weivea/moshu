@@ -38,6 +38,7 @@ import { and, desc, eq, isNotNull, isNull, sql } from "drizzle-orm";
 
 import type { AppDrizzleDatabase } from "./database";
 import { createUuidV7 } from "./ids";
+import type { RuntimeBoxRepository } from "./runtime-box-repository";
 import { chatSessionCreateRequestsTable, chatSessionsTable } from "./schema";
 
 interface RepositoryClock {
@@ -49,6 +50,7 @@ interface RepositoryIdGenerator {
 }
 
 type SessionRow = typeof chatSessionsTable.$inferSelect;
+type AppDatabaseTransaction = Parameters<Parameters<AppDrizzleDatabase["transaction"]>[0]>[0];
 
 export const maxSessionCreateIdempotencyRecords = 1_024;
 
@@ -80,6 +82,7 @@ export interface IdempotentSessionCreateInput {
 
 export interface SessionRepository {
 	create(input: CreateChatSessionInput): CreateChatSessionOutput;
+	findIdempotent(input: IdempotentSessionCreateInput): CreateChatSessionOutput | undefined;
 	createIdempotently(input: IdempotentSessionCreateInput): CreateChatSessionOutput;
 	list(input?: ListChatSessionsInput): ListChatSessionsOutput;
 	get(input: GetChatSessionInput): ChatSession;
@@ -121,6 +124,7 @@ function buildSession(row: SessionRow): ChatSession {
 		schemaVersion: 1,
 		id: row.id,
 		agentSessionId: row.piSessionId,
+		runtimeBoxId: row.runtimeBoxId,
 		title: row.title,
 		defaultMode: row.defaultMode,
 		model: buildSessionModel(row),
@@ -134,16 +138,20 @@ function buildSession(row: SessionRow): ChatSession {
 export class SqliteSessionRepository implements SessionRepository {
 	constructor(
 		private readonly orm: AppDrizzleDatabase,
+		private readonly runtimeBoxes: RuntimeBoxRepository,
 		private readonly idGenerator: RepositoryIdGenerator = { create: createUuidV7 },
 		private readonly clock: RepositoryClock = { now: () => Date.now() },
 	) {}
 
 	create(input: CreateChatSessionInput): CreateChatSessionOutput {
 		const parsedInput = createChatSessionInputSchema.parse(input);
+		const runtimeBoxId = parsedInput.runtimeBoxId ?? this.runtimeBoxes.getActive().runtimeBoxId;
+		this.runtimeBoxes.get(runtimeBoxId);
 		const nowMs = this.clock.now();
 		const id = this.idGenerator.create(nowMs);
 		const row: typeof chatSessionsTable.$inferInsert = {
 			id,
+			runtimeBoxId,
 			piSessionId: id,
 			title: parsedInput.title,
 			defaultMode: parsedInput.defaultMode ?? "agent",
@@ -166,31 +174,9 @@ export class SqliteSessionRepository implements SessionRepository {
 		}
 
 		return this.orm.transaction((transaction) => {
-			const existing = transaction
-				.select()
-				.from(chatSessionCreateRequestsTable)
-				.where(eq(chatSessionCreateRequestsTable.createKey, request.createKey))
-				.get();
+			const existing = this.#findIdempotent(transaction, request, origin);
 			if (existing !== undefined) {
-				if (
-					existing.originRole !== origin.role ||
-					existing.originPeerId !== origin.peerId ||
-					existing.originInstanceId !== origin.instanceId ||
-					existing.originGeneration !== origin.generation ||
-					existing.title !== request.title ||
-					existing.defaultMode !== request.defaultMode
-				) {
-					throw new SessionCreateKeyConflictError(request.createKey);
-				}
-				const row = transaction
-					.select()
-					.from(chatSessionsTable)
-					.where(eq(chatSessionsTable.id, existing.sessionId))
-					.get();
-				if (row === undefined) {
-					throw new Error("Session create idempotency record refers to a missing Session.");
-				}
-				return createChatSessionOutputSchema.parse({ session: buildSession(row) });
+				return existing;
 			}
 
 			const recordCount =
@@ -203,9 +189,12 @@ export class SqliteSessionRepository implements SessionRepository {
 			}
 
 			const nowMs = this.clock.now();
+			const runtimeBoxId = request.runtimeBoxId ?? this.runtimeBoxes.getActive().runtimeBoxId;
+			this.runtimeBoxes.get(runtimeBoxId);
 			const id = this.idGenerator.create(nowMs);
 			const row: typeof chatSessionsTable.$inferInsert = {
 				id,
+				runtimeBoxId,
 				piSessionId: id,
 				title: request.title,
 				defaultMode: request.defaultMode,
@@ -220,6 +209,7 @@ export class SqliteSessionRepository implements SessionRepository {
 				.insert(chatSessionCreateRequestsTable)
 				.values({
 					createKey: request.createKey,
+					runtimeBoxId,
 					originRole: origin.role,
 					originPeerId: origin.peerId,
 					originInstanceId: origin.instanceId,
@@ -234,9 +224,22 @@ export class SqliteSessionRepository implements SessionRepository {
 		});
 	}
 
+	findIdempotent(input: IdempotentSessionCreateInput): CreateChatSessionOutput | undefined {
+		const request = createProcessChatSessionInputSchema.parse(input.request);
+		const origin = processPeerIdentitySchema.parse(input.origin);
+		if (origin.role !== "client") {
+			throw new TypeError("Idempotent Session creation requires a client origin.");
+		}
+		return this.#findIdempotent(this.orm, request, origin);
+	}
+
 	list(input: ListChatSessionsInput = {}): ListChatSessionsOutput {
 		const parsedInput = listChatSessionsInputSchema.parse(input);
 		const conditions = [
+			eq(
+				chatSessionsTable.runtimeBoxId,
+				parsedInput.runtimeBoxId ?? this.runtimeBoxes.getActive().runtimeBoxId,
+			),
 			parsedInput.archived
 				? isNotNull(chatSessionsTable.archivedAtMs)
 				: isNull(chatSessionsTable.archivedAtMs),
@@ -313,6 +316,41 @@ export class SqliteSessionRepository implements SessionRepository {
 		return deleteChatSessionOutputSchema.parse({ sessionId: parsedInput.sessionId });
 	}
 
+	#findIdempotent(
+		database: AppDrizzleDatabase | AppDatabaseTransaction,
+		request: CreateProcessChatSessionInput,
+		origin: ProcessPeerIdentity,
+	): CreateChatSessionOutput | undefined {
+		const existing = database
+			.select()
+			.from(chatSessionCreateRequestsTable)
+			.where(eq(chatSessionCreateRequestsTable.createKey, request.createKey))
+			.get();
+		if (existing === undefined) {
+			return undefined;
+		}
+		if (
+			existing.originRole !== origin.role ||
+			existing.originPeerId !== origin.peerId ||
+			existing.originInstanceId !== origin.instanceId ||
+			existing.originGeneration !== origin.generation ||
+			existing.title !== request.title ||
+			existing.defaultMode !== request.defaultMode ||
+			(request.runtimeBoxId !== undefined && existing.runtimeBoxId !== request.runtimeBoxId)
+		) {
+			throw new SessionCreateKeyConflictError(request.createKey);
+		}
+		const row = database
+			.select()
+			.from(chatSessionsTable)
+			.where(eq(chatSessionsTable.id, existing.sessionId))
+			.get();
+		if (row === undefined) {
+			throw new Error("Session create idempotency record refers to a missing Session.");
+		}
+		return createChatSessionOutputSchema.parse({ session: buildSession(row) });
+	}
+
 	private selectRow(sessionId: string): SessionRow {
 		const row = this.orm
 			.select()
@@ -326,6 +364,9 @@ export class SqliteSessionRepository implements SessionRepository {
 	}
 }
 
-export function createSessionRepository(database: { orm: AppDrizzleDatabase }): SessionRepository {
-	return new SqliteSessionRepository(database.orm);
+export function createSessionRepository(database: {
+	orm: AppDrizzleDatabase;
+	runtimeBoxes: RuntimeBoxRepository;
+}): SessionRepository {
+	return new SqliteSessionRepository(database.orm, database.runtimeBoxes);
 }

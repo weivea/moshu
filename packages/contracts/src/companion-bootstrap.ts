@@ -15,10 +15,11 @@ const processVersionSchema = z.string().min(1).max(64);
 const pidSchema = z.int().positive().safe();
 const portSchema = z.int().min(1).max(65_535);
 const absolutePathSchema = z.string().trim().min(1).max(2048);
+export const actionJournalEpochSchema = z.string().uuid();
 
 export const processPeerIdentitySchema = z
 	.object({
-		role: z.enum(["agents", "client", "executor"]),
+		role: z.enum(["agents", "client", "runtime-box"]),
 		peerId: identifierSchema,
 		instanceId: identifierSchema,
 		generation: generationSchema,
@@ -66,6 +67,14 @@ export const agentsServerEndpointSchema = z
 	})
 	.strict();
 
+export const runtimeIngressEndpointSchema = z
+	.object({
+		host: z.literal("127.0.0.1"),
+		port: portSchema,
+		path: z.literal("/runtime"),
+	})
+	.strict();
+
 export const agentsServerBootstrapRecordSchema = z
 	.object({
 		channel: z.literal(companionBootstrapChannel),
@@ -85,7 +94,7 @@ export const agentsServerBootstrapRecordSchema = z
 					if (binding.identity.role === "agents") {
 						context.addIssue({
 							code: "custom",
-							message: "Agents-server peer bindings may only contain client or executor roles.",
+							message: "Agents-server peer bindings may only contain client or Runtime Box roles.",
 							path: [index, "identity", "role"],
 						});
 					}
@@ -110,8 +119,8 @@ export const agentsServerBootstrapRecordSchema = z
 				if (!bindings.some((binding) => binding.identity.role === "client")) {
 					context.addIssue({ code: "custom", message: "A client binding is required." });
 				}
-				if (!bindings.some((binding) => binding.identity.role === "executor")) {
-					context.addIssue({ code: "custom", message: "An executor binding is required." });
+				if (!bindings.some((binding) => binding.identity.role === "runtime-box")) {
+					context.addIssue({ code: "custom", message: "A Runtime Box binding is required." });
 				}
 			}),
 		paths: agentsServerDataPathsSchema,
@@ -129,41 +138,45 @@ export const agentsServerReadyRecordSchema = z
 		nonce: nonceSchema,
 		serverIdentity: processPeerIdentitySchema.refine((identity) => identity.role === "agents"),
 		endpoint: agentsServerEndpointSchema,
+		runtimeEndpoint: runtimeIngressEndpointSchema,
+		actionJournalEpoch: actionJournalEpochSchema,
 	})
 	.strict();
 
-export const executorBootstrapRecordSchema = z
+export const runtimeBoxBootstrapRecordSchema = z
 	.object({
 		channel: z.literal(companionBootstrapChannel),
 		controlVersion: z.literal(companionControlVersion),
 		type: z.literal("START"),
-		role: z.literal("executor"),
+		role: z.literal("runtime-box"),
 		nonce: nonceSchema,
-		identity: processPeerIdentitySchema.refine((identity) => identity.role === "executor"),
+		identity: processPeerIdentitySchema.refine((identity) => identity.role === "runtime-box"),
 		credential: bootstrapCredentialSchema,
+		dataDirectory: absolutePathSchema,
+		actionJournalEpoch: actionJournalEpochSchema,
 		agentsServer: z
 			.object({
 				identity: processPeerIdentitySchema.refine((identity) => identity.role === "agents"),
-				endpoint: agentsServerEndpointSchema,
+				endpoint: runtimeIngressEndpointSchema,
 			})
 			.strict(),
 	})
 	.strict();
 
-export const executorReadyRecordSchema = z
+export const runtimeBoxReadyRecordSchema = z
 	.object({
 		channel: z.literal(companionBootstrapChannel),
 		controlVersion: z.literal(companionControlVersion),
 		type: z.literal("READY"),
-		role: z.literal("executor"),
+		role: z.literal("runtime-box"),
 		pid: pidSchema,
 		processVersion: processVersionSchema,
 		nonce: nonceSchema,
-		identity: processPeerIdentitySchema.refine((identity) => identity.role === "executor"),
+		identity: processPeerIdentitySchema.refine((identity) => identity.role === "runtime-box"),
 		agentsServer: z
 			.object({
 				identity: processPeerIdentitySchema.refine((identity) => identity.role === "agents"),
-				endpoint: agentsServerEndpointSchema,
+				endpoint: runtimeIngressEndpointSchema,
 			})
 			.strict(),
 	})
@@ -173,11 +186,12 @@ export type ProcessPeerIdentity = z.infer<typeof processPeerIdentitySchema>;
 export type RpcCredentialBinding = z.infer<typeof rpcCredentialBindingSchema>;
 export type AgentsServerDataPaths = z.infer<typeof agentsServerDataPathsSchema>;
 export type AgentsServerEndpoint = z.infer<typeof agentsServerEndpointSchema>;
+export type RuntimeIngressEndpoint = z.infer<typeof runtimeIngressEndpointSchema>;
 export type AgentsServerBootstrapRecord = z.infer<typeof agentsServerBootstrapRecordSchema>;
 export type AgentsServerReadyRecord = z.infer<typeof agentsServerReadyRecordSchema>;
-export type ExecutorBootstrapRecord = z.infer<typeof executorBootstrapRecordSchema>;
-export type ExecutorReadyRecord = z.infer<typeof executorReadyRecordSchema>;
-export type CompanionReadyRecord = AgentsServerReadyRecord | ExecutorReadyRecord;
+export type RuntimeBoxBootstrapRecord = z.infer<typeof runtimeBoxBootstrapRecordSchema>;
+export type RuntimeBoxReadyRecord = z.infer<typeof runtimeBoxReadyRecordSchema>;
+export type CompanionReadyRecord = AgentsServerReadyRecord | RuntimeBoxReadyRecord;
 
 export function parseCompanionControlRecord<T>(
 	input: string,

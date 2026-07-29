@@ -4,6 +4,7 @@ import type {
 	ProviderAuthType,
 	UpdateProviderInput,
 } from "@moshu/contracts";
+import { defaultLocalRuntimeBoxId } from "@moshu/contracts";
 import type {
 	AvailableModel,
 	ChatMessage,
@@ -323,6 +324,7 @@ export function createPreviewChatTransport(): ChatTransport {
 			const selection = model ?? requireConfiguredProvider();
 			const session: ChatSession = {
 				id: `preview-session-${nextSessionNumber}`,
+				runtimeBoxId: defaultLocalRuntimeBoxId,
 				title: "New chat",
 				updatedAt: new Date().toISOString(),
 				model: structuredClone(selection),
@@ -459,6 +461,7 @@ function toSessionSummary(session: ChatSession): ChatSessionSummary {
 	const lastMessageAt = session.messages.at(-1)?.createdAt;
 	return {
 		id: session.id,
+		runtimeBoxId: session.runtimeBoxId,
 		title: session.title,
 		createdAt: session.updatedAt,
 		updatedAt: session.updatedAt,

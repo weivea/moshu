@@ -1,4 +1,8 @@
-import { maxRetainedSessionRetirements, retiredSessionTombstoneTtlMs } from "@moshu/contracts";
+import {
+	defaultLocalRuntimeBoxId,
+	maxRetainedSessionRetirements,
+	retiredSessionTombstoneTtlMs,
+} from "@moshu/contracts";
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { StrictMode } from "react";
 import { MemoryRouter, Route, Routes, useLocation, useNavigate } from "react-router-dom";
@@ -674,6 +678,7 @@ function createSession(): ChatSession {
 function createSessionForId(id: string, title: string): ChatSession {
 	return {
 		id,
+		runtimeBoxId: defaultLocalRuntimeBoxId,
 		title,
 		updatedAt: "2026-07-26T00:00:00.000Z",
 		model: modelSelectionFor("gpt-5.4"),

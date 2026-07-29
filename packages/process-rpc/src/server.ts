@@ -1,4 +1,8 @@
-import type { RpcHandshakeAuthenticator } from "./authentication";
+import {
+	type RpcHandshakeAuthenticator,
+	RpcHandshakeHttpError,
+	type RpcHttpRequestContext,
+} from "./authentication";
 import { invokeRpcCallback } from "./callback-errors";
 import { RpcHandshakeError } from "./errors";
 import {
@@ -34,10 +38,15 @@ export interface RpcServerBaseOptions extends RpcEndpointOptions {
 	readonly hostname?: string;
 	readonly port?: number;
 	readonly path?: string;
+	readonly maxRequestBodyBytes?: number;
 	readonly protocol?: RpcProtocolVersion;
 	readonly acceptedPeerRoles?: readonly RpcPeerRole[];
 	readonly generationFence?: RpcGenerationFence;
 	readonly onConnection?: (peer: RpcPeer) => void | Promise<void>;
+	readonly handleHttpRequest?: (
+		request: Request,
+		context: RpcHttpRequestContext,
+	) => Response | undefined | Promise<Response | undefined>;
 }
 
 export type RpcServerOptions = RpcServerBaseOptions &
@@ -100,21 +109,51 @@ export class RpcServer {
 		this.limits = resolveRpcLimits(options.limits);
 		this.hostname = options.hostname ?? "127.0.0.1";
 		this.path = normalizePath(options.path ?? "/rpc");
-		this.#acceptedPeerRoles = new Set(options.acceptedPeerRoles ?? ["client", "executor"]);
+		this.#acceptedPeerRoles = new Set(options.acceptedPeerRoles ?? ["client", "runtime-box"]);
 		this.#generationFence = options.generationFence ?? new InMemoryRpcGenerationFence();
 		this.#options = options;
+		if (
+			options.maxRequestBodyBytes !== undefined &&
+			(!Number.isSafeInteger(options.maxRequestBodyBytes) || options.maxRequestBodyBytes <= 0)
+		) {
+			throw new TypeError("maxRequestBodyBytes must be a positive safe integer.");
+		}
 
 		this.#server = Bun.serve<RpcServerSocketData>({
 			hostname: this.hostname,
 			port: options.port ?? 0,
+			...(options.maxRequestBodyBytes === undefined
+				? {}
+				: { maxRequestBodySize: options.maxRequestBodyBytes }),
 			fetch: async (request, server) => {
+				const requestContext: RpcHttpRequestContext = {
+					remoteAddress: server.requestIP(request)?.address ?? null,
+				};
+				const handled = await this.#options.handleHttpRequest?.(request, requestContext);
+				if (handled !== undefined) {
+					return handled;
+				}
 				if (new URL(request.url).pathname !== this.path) {
 					return new Response("Not found.", { status: 404 });
 				}
 
 				let authenticatedIdentity: RpcPeerIdentity | null = null;
 				if (this.#options.authenticate !== undefined) {
-					const authenticated = await this.#options.authenticate(request);
+					let authenticated: RpcPeerIdentity | null;
+					try {
+						authenticated = await this.#options.authenticate(request, requestContext);
+					} catch (error) {
+						if (error instanceof RpcHandshakeHttpError) {
+							return new Response(error.message, {
+								status: error.status,
+								headers: {
+									"cache-control": "no-store",
+									...error.headers,
+								},
+							});
+						}
+						throw error;
+					}
 					if (authenticated === null) {
 						return new Response("RPC authentication failed.", {
 							status: 401,

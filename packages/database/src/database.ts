@@ -2,13 +2,25 @@ import Database from "bun:sqlite";
 import { chmodSync, existsSync, lstatSync, mkdirSync, rmSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { drizzle } from "drizzle-orm/bun-sqlite";
+import { defaultLocalRuntimeBoxId } from "@moshu/contracts";
 
 import {
 	applyAppMigrations,
 	currentAppDatabaseVersion,
 	getDatabaseUserVersion,
 } from "./migrations";
+import { type ActionRepository, SqliteActionRepository } from "./action-repository";
 import { createRunJournalRepository, type RunJournalRepository } from "./run-journal-repository";
+import { type ProjectRepository, SqliteProjectRepository } from "./project-repository";
+import {
+	type RemoteAccessRepository,
+	SqliteRemoteAccessRepository,
+} from "./remote-access-repository";
+import {
+	type RuntimeBoxPairingRepository,
+	SqliteRuntimeBoxPairingRepository,
+} from "./runtime-box-pairing-repository";
+import { type RuntimeBoxRepository, SqliteRuntimeBoxRepository } from "./runtime-box-repository";
 import { appSchema } from "./schema";
 import { createSessionRepository, type SessionRepository } from "./session-repository";
 
@@ -19,6 +31,11 @@ export interface AppDatabase {
 	orm: AppDrizzleDatabase;
 	sessions: SessionRepository;
 	runs: RunJournalRepository;
+	actions: ActionRepository;
+	runtimeBoxes: RuntimeBoxRepository;
+	projects: ProjectRepository;
+	runtimeBoxPairings: RuntimeBoxPairingRepository;
+	remoteAccess: RemoteAccessRepository;
 	close(): void;
 }
 
@@ -88,13 +105,37 @@ export function openAppDatabase(filename: string): AppDatabase {
 		throw error;
 	}
 	const orm = drizzle(client, { schema: appSchema });
+	const runtimeBoxes = new SqliteRuntimeBoxRepository(orm);
+	const platform = requireSupportedPlatform(process.platform);
+	runtimeBoxes.initializeDefault({
+		schemaVersion: 1,
+		runtimeBoxId: defaultLocalRuntimeBoxId,
+		kind: "local",
+		displayName: "Local Runtime Box",
+		runtimeBoxVersion: "unregistered",
+		platform,
+		arch: process.arch,
+		capabilities: [],
+	});
 	return {
 		client,
 		orm,
-		sessions: createSessionRepository({ orm }),
+		runtimeBoxes,
+		projects: new SqliteProjectRepository(orm, runtimeBoxes),
+		runtimeBoxPairings: new SqliteRuntimeBoxPairingRepository(orm),
+		remoteAccess: new SqliteRemoteAccessRepository(orm),
+		sessions: createSessionRepository({ orm, runtimeBoxes }),
 		runs: createRunJournalRepository({ client, orm }),
+		actions: new SqliteActionRepository(orm),
 		close: () => client.close(),
 	};
+}
+
+function requireSupportedPlatform(platform: NodeJS.Platform): "darwin" | "win32" | "linux" {
+	if (platform === "darwin" || platform === "win32" || platform === "linux") {
+		return platform;
+	}
+	throw new Error(`Unsupported Runtime Box platform: ${platform}.`);
 }
 
 function requireDatabaseFilename(value: string): string {

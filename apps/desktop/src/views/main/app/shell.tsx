@@ -1,5 +1,5 @@
 import { AppIcon, type AppIconName } from "@moshu/ui";
-import { type CSSProperties, useCallback, useEffect, useMemo, useState } from "react";
+import { type CSSProperties, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, Outlet, useLocation, useNavigate, useNavigationType } from "react-router-dom";
 import { CanvasPanel, type CanvasTab } from "./canvas-panel";
 import { chatTransport } from "./chat/rpc-chat-transport";
@@ -10,6 +10,8 @@ import { type MessageKey, useI18n } from "./i18n";
 import { useLocalProfile } from "./local-profile";
 import { AppShellContext, type ShellSessionUpdate } from "./shell-context";
 import { usePersistedPanelResize } from "./use-persisted-panel-resize";
+import { useRuntimeBoxes } from "./runtime-boxes";
+import { ProjectsSidebar } from "./projects-page";
 
 const primaryNavigation = [
 	{ label: "nav.home", icon: "home", active: true },
@@ -38,6 +40,7 @@ export function AppShell() {
 	const location = useLocation();
 	const navigate = useNavigate();
 	const navigationType = useNavigationType();
+	const runtimeBoxes = useRuntimeBoxes();
 	const { pathname } = location;
 	const activeSessionId = readActiveChatSessionId(pathname);
 	const isChatWorkspace =
@@ -54,7 +57,7 @@ export function AppShell() {
 	const [activeCanvasTab, setActiveCanvasTab] = useState<CanvasTab>("changes");
 	const [isCanvasExpanded, setIsCanvasExpanded] = useState(false);
 	const [titlebarTarget, setTitlebarTarget] = useState<HTMLElement | null>(null);
-	const [isNewSessionDisabled, setNewSessionDisabled] = useState(false);
+	const [isPageNewSessionDisabled, setNewSessionDisabled] = useState(false);
 	const [sessionUpdate, setSessionUpdate] = useState<ShellSessionUpdate | null>(null);
 	const [routeHistory, setRouteHistory] = useState<RouteHistoryState>(() => ({
 		entries: [location.key],
@@ -79,6 +82,8 @@ export function AppShell() {
 	const canNavigateForward = routeHistory.index < routeHistory.entries.length - 1;
 	const isCanvasVisible = isCanvasAvailable && isCanvasOpen;
 	const isCanvasFullscreen = isCanvasVisible && isCanvasExpanded;
+	const isNewSessionDisabled = isPageNewSessionDisabled || !runtimeBoxes.isActiveReady;
+	const previousRuntimeBoxIdRef = useRef(runtimeBoxes.snapshot.active.runtimeBoxId);
 
 	useEffect(() => {
 		localStorage.setItem(sidebarOpenStorageKey, String(isSidebarOpen));
@@ -96,6 +101,15 @@ export function AppShell() {
 			setIsCanvasExpanded(false);
 		}
 	}, [isCanvasAvailable]);
+
+	useEffect(() => {
+		const previousRuntimeBoxId = previousRuntimeBoxIdRef.current;
+		const activeRuntimeBoxId = runtimeBoxes.snapshot.active.runtimeBoxId;
+		previousRuntimeBoxIdRef.current = activeRuntimeBoxId;
+		if (previousRuntimeBoxId !== activeRuntimeBoxId && isChatWorkspace) {
+			navigate("/chat/new", { replace: true });
+		}
+	}, [isChatWorkspace, navigate, runtimeBoxes.snapshot.active.runtimeBoxId]);
 
 	useEffect(() => {
 		setRouteHistory((current) => {
@@ -242,27 +256,18 @@ export function AppShell() {
 									<SessionSidebar
 										transport={chatTransport}
 										selectedSessionId={activeSessionId ?? undefined}
-										refreshKey={`${location.key}:${pathname}`}
+										refreshKey={`${location.key}:${pathname}:${runtimeBoxes.snapshot.active.runtimeBoxId}:${runtimeBoxes.snapshot.active.revision}`}
 										isNewSessionDisabled={isNewSessionDisabled}
+										isReadOnly={!runtimeBoxes.isActiveReady}
 										onNewSession={() => navigate("/chat/new")}
 										onSessionUpdated={handleSessionUpdated}
 										onSelectSession={(sessionId) => navigate(`/chat/${sessionId}`)}
 									/>
 
-									<section className="projects-sidebar" aria-labelledby="projects-sidebar-title">
-										<header>
-											<h2 id="projects-sidebar-title">{t("nav.projects")}</h2>
-											<button
-												type="button"
-												aria-label={t("action.addProject")}
-												title={t("action.addProject")}
-												disabled
-											>
-												<AppIcon name="plus" size={17} />
-											</button>
-										</header>
-										<div className="projects-sidebar__empty" />
-									</section>
+									<ProjectsSidebar
+										refreshKey={`${runtimeBoxes.snapshot.active.runtimeBoxId}:${runtimeBoxes.snapshot.active.revision}`}
+										onAdd={() => navigate("/projects")}
+									/>
 								</div>
 
 								<footer className="app-sidebar__footer">
@@ -307,6 +312,26 @@ export function AppShell() {
 						<div className="workspace-titlebar__slot" ref={setTitlebarTarget}>
 							{!isChatWorkspace ? <h1>{getWorkspaceTitle(pathname, t)}</h1> : null}
 						</div>
+
+						<label className="runtime-box-selector electrobun-webkit-app-region-no-drag">
+							<span className="chat-live-region">Runtime Box</span>
+							<i
+								className={runtimeBoxes.isActiveReady ? "is-online" : "is-offline"}
+								aria-hidden="true"
+							/>
+							<select
+								aria-label="Runtime Box"
+								value={runtimeBoxes.snapshot.active.runtimeBoxId}
+								disabled={runtimeBoxes.isLoading}
+								onChange={(event) => void runtimeBoxes.switchRuntimeBox(event.currentTarget.value)}
+							>
+								{runtimeBoxes.snapshot.items.map((item) => (
+									<option key={item.runtimeBox.runtimeBoxId} value={item.runtimeBox.runtimeBoxId}>
+										{item.runtimeBox.displayName}
+									</option>
+								))}
+							</select>
+						</label>
 
 						{isCanvasAvailable ? (
 							<PanelToggleButton

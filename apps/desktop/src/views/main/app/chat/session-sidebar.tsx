@@ -10,6 +10,7 @@ export interface SessionSidebarProps {
 	selectedSessionId?: string;
 	refreshKey: string;
 	isNewSessionDisabled?: boolean;
+	isReadOnly?: boolean;
 	onNewSession(): void;
 	onSessionUpdated?(session: ChatSessionSummary): void;
 	onSelectSession(sessionId: string): void;
@@ -20,6 +21,7 @@ export function SessionSidebar({
 	selectedSessionId,
 	refreshKey,
 	isNewSessionDisabled = false,
+	isReadOnly = false,
 	onNewSession,
 	onSessionUpdated,
 	onSelectSession,
@@ -319,7 +321,7 @@ export function SessionSidebar({
 												<div>
 													<button
 														type="submit"
-														disabled={isPending || editingTitle.trim().length === 0}
+														disabled={isReadOnly || isPending || editingTitle.trim().length === 0}
 													>
 														{t("sessions.rename.save")}
 													</button>
@@ -354,6 +356,7 @@ export function SessionSidebar({
 														aria-label={t("sessions.actions")}
 														aria-expanded={openMenuSessionId === session.id}
 														title={t("sessions.actions")}
+														disabled={isReadOnly}
 														onClick={(event) => {
 															event.preventDefault();
 															setOpenMenuSessionId((current) =>
@@ -367,14 +370,14 @@ export function SessionSidebar({
 														<div>
 															<button
 																type="button"
-																disabled={isPending}
+																disabled={isReadOnly || isPending}
 																onClick={() => startRename(session)}
 															>
 																{t("sessions.rename.action")}
 															</button>
 															<button
 																type="button"
-																disabled={isPending}
+																disabled={isReadOnly || isPending}
 																onClick={() => void toggleArchived(session)}
 															>
 																{session.archivedAt === undefined
@@ -384,7 +387,7 @@ export function SessionSidebar({
 															<ConfirmationDialog
 																isOpen={sessionToDelete?.id === session.id}
 																isPending={isPending}
-																isTriggerDisabled={isPending}
+																isTriggerDisabled={isReadOnly || isPending}
 																triggerLabel={t("sessions.delete.action")}
 																triggerClassName="confirmation-dialog-trigger confirmation-dialog-trigger--menu session-item__delete"
 																title={t("sessions.delete.title")}

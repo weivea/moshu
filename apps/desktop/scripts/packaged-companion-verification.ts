@@ -10,7 +10,7 @@ export async function verifyPackagedCompanionLaunch(
 	const supervisor = new CompanionProcessSupervisor({
 		executables: {
 			"agents-server": executables[0],
-			executor: executables[1],
+			"runtime-box": executables[1],
 		},
 		dataPaths: {
 			productDatabase: join(directory, "moshu.db"),

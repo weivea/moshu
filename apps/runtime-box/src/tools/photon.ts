@@ -8,6 +8,7 @@ const fs = require("node:fs") as typeof import("node:fs");
 const wasmFilename = "photon_rs_bg.wasm";
 let photonModule: typeof import("@silvia-odwyer/photon-node") | undefined;
 let loadPromise: Promise<typeof import("@silvia-odwyer/photon-node")> | undefined;
+let configuredWasmPath: string | undefined;
 
 export type PhotonImage = import("@silvia-odwyer/photon-node").PhotonImage;
 
@@ -24,10 +25,18 @@ function pathFromDescriptor(file: PathOrFileDescriptor): string | undefined {
 function fallbackWasmPaths(): string[] {
 	const executableDirectory = dirname(process.execPath);
 	return [
+		...(configuredWasmPath === undefined ? [] : [configuredWasmPath]),
 		join(executableDirectory, wasmFilename),
 		join(executableDirectory, "photon", wasmFilename),
 		join(process.cwd(), wasmFilename),
 	];
+}
+
+export function configurePhotonWasmPath(path: string): void {
+	if (loadPromise !== undefined || photonModule !== undefined) {
+		throw new Error("Photon WASM path must be configured before the image runtime loads.");
+	}
+	configuredWasmPath = path;
 }
 
 function patchPhotonWasmRead(): () => void {

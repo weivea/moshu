@@ -1,22 +1,36 @@
 import { randomBytes, randomUUID } from "node:crypto";
+import {
+	chmodSync,
+	closeSync,
+	existsSync,
+	fsyncSync,
+	lstatSync,
+	mkdirSync,
+	openSync,
+	readFileSync,
+	renameSync,
+	unlinkSync,
+	writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
-import type {
-	AgentsServerBootstrapRecord,
-	AgentsServerDataPaths,
-	ExecutorBootstrapRecord,
-	ProcessPeerIdentity,
-	RpcCredentialBinding,
+import {
+	type AgentsServerBootstrapRecord,
+	type AgentsServerDataPaths,
+	defaultLocalRuntimeBoxId,
+	type RuntimeBoxBootstrapRecord,
+	type ProcessPeerIdentity,
+	type RpcCredentialBinding,
 } from "@moshu/contracts";
 
 import {
 	type AgentsServerReadyRecord,
 	type CompanionReadyRecord,
 	type CompanionRole,
-	type ExecutorReadyRecord,
+	type RuntimeBoxReadyRecord,
 	readCompanionReadyRecord,
 	serializeAgentsServerBootstrap,
-	serializeExecutorBootstrap,
+	serializeRuntimeBoxBootstrap,
 } from "./companion-control";
 
 export type { CompanionRole } from "./companion-control";
@@ -52,8 +66,8 @@ export interface CompanionProcessIdentity {
 
 export type CompanionReadySnapshot =
 	| Omit<AgentsServerReadyRecord, "nonce">
-	| (Omit<ExecutorReadyRecord, "nonce" | "agentsServer"> & {
-			agentsServer: Omit<ExecutorReadyRecord["agentsServer"], "nonce">;
+	| (Omit<RuntimeBoxReadyRecord, "nonce" | "agentsServer"> & {
+			agentsServer: Omit<RuntimeBoxReadyRecord["agentsServer"], "nonce">;
 	  });
 
 export interface CompanionProcessSnapshot {
@@ -66,7 +80,7 @@ export interface CompanionSupervisorSnapshot {
 		| "idle"
 		| "starting"
 		| "connecting-client"
-		| "waiting-executor"
+		| "waiting-runtime-box"
 		| "running"
 		| "restarting"
 		| "stopping"
@@ -146,6 +160,7 @@ export interface CompanionProcessSupervisorOptions {
 	startupTimeoutMs?: number;
 	shutdownTimeoutMs?: number;
 	restartPolicy?: RestartPolicy;
+	runtimeBoxGenerationStore?: RuntimeBoxGenerationStore;
 	hooks?: CompanionSupervisorHooks;
 	dependencies?: Partial<CompanionSupervisorDependencies>;
 }
@@ -158,6 +173,10 @@ interface ManagedCompanionProcess {
 	expectedExit: boolean;
 	watching: boolean;
 	stopPromise?: Promise<void>;
+}
+
+export interface RuntimeBoxGenerationStore {
+	next(): number;
 }
 
 const DEFAULT_RESTART_POLICY: RestartPolicy = {
@@ -256,9 +275,10 @@ export class CompanionProcessSupervisor {
 	private readonly connectClient: NonNullable<CompanionProcessSupervisorOptions["connectClient"]>;
 	private readonly additionalPeerBindings: readonly RpcCredentialBinding[];
 	private readonly restartBudget: RestartBudget;
+	private readonly runtimeBoxGenerationStore: RuntimeBoxGenerationStore;
 	private readonly generations: Record<CompanionRole | "client", number> = {
 		"agents-server": 0,
-		executor: 0,
+		"runtime-box": 0,
 		client: 0,
 	};
 	private readonly processes: Partial<Record<CompanionRole, ManagedCompanionProcess>> = {};
@@ -275,7 +295,7 @@ export class CompanionProcessSupervisor {
 
 	constructor(options: CompanionProcessSupervisorOptions) {
 		assertAbsoluteExecutablePath("agents-server", options.executables["agents-server"]);
-		assertAbsoluteExecutablePath("executor", options.executables.executor);
+		assertAbsoluteExecutablePath("runtime-box", options.executables["runtime-box"]);
 		this.executables = options.executables;
 		this.dataPaths = options.dataPaths ?? createDefaultDataPaths();
 		this.connectClient = options.connectClient ?? createNoopDesktopConnection;
@@ -291,6 +311,16 @@ export class CompanionProcessSupervisor {
 		);
 		this.hooks = options.hooks ?? {};
 		this.restartBudget = new RestartBudget(options.restartPolicy ?? DEFAULT_RESTART_POLICY);
+		this.runtimeBoxGenerationStore =
+			options.runtimeBoxGenerationStore ??
+			new FileRuntimeBoxGenerationStore(
+				join(
+					this.dataPaths.agentDataDirectory,
+					"runtime-boxes",
+					defaultLocalRuntimeBoxId,
+					"connection-generation.json",
+				),
+			);
 		this.dependencies = {
 			spawnProcess: options.dependencies?.spawnProcess ?? spawnBunCompanionProcess,
 			now: options.dependencies?.now ?? Date.now,
@@ -312,7 +342,7 @@ export class CompanionProcessSupervisor {
 
 	getSnapshot(): CompanionSupervisorSnapshot {
 		const processSnapshots: Partial<Record<CompanionRole, CompanionProcessSnapshot>> = {};
-		for (const role of ["agents-server", "executor"] as const) {
+		for (const role of ["agents-server", "runtime-box"] as const) {
 			const process = this.processes[role];
 			if (process?.ready !== undefined) {
 				processSnapshots[role] = {
@@ -443,7 +473,7 @@ export class CompanionProcessSupervisor {
 
 	private async startPair(lifecycleEpoch: number): Promise<void> {
 		this.assertLifecycleActive(lifecycleEpoch);
-		for (const role of ["executor", "agents-server"] as const) {
+		for (const role of ["runtime-box", "agents-server"] as const) {
 			if (this.processes[role] !== undefined) {
 				throw new TerminationUnconfirmedError(
 					`Cannot start ${role} while its previous process is still tracked.`,
@@ -452,9 +482,9 @@ export class CompanionProcessSupervisor {
 		}
 		const serverIdentity = this.createPeerIdentity("agents-server");
 		const clientIdentity = this.createPeerIdentity("client");
-		const executorIdentity = this.createPeerIdentity("executor");
+		const runtimeBoxIdentity = this.createPeerIdentity("runtime-box");
 		const clientCredential = this.dependencies.createCredential();
-		const executorCredential = this.dependencies.createCredential();
+		const runtimeBoxCredential = this.dependencies.createCredential();
 		const agentsBootstrap: AgentsServerBootstrapRecord = {
 			channel: "moshu-companion-bootstrap",
 			controlVersion: 2,
@@ -464,7 +494,7 @@ export class CompanionProcessSupervisor {
 			serverIdentity,
 			peerBindings: [
 				{ credential: clientCredential, identity: clientIdentity },
-				{ credential: executorCredential, identity: executorIdentity },
+				{ credential: runtimeBoxCredential, identity: runtimeBoxIdentity },
 				...this.additionalPeerBindings,
 			],
 			paths: this.dataPaths,
@@ -502,24 +532,26 @@ export class CompanionProcessSupervisor {
 		this.assertLifecycleActive(lifecycleEpoch);
 		this.clientConnection = connection;
 		this.observeClientConnection(connection);
-		this.status = "waiting-executor";
-		const executorBootstrap: ExecutorBootstrapRecord = {
+		this.status = "waiting-runtime-box";
+		const runtimeBoxBootstrap: RuntimeBoxBootstrapRecord = {
 			channel: "moshu-companion-bootstrap",
 			controlVersion: 2,
 			type: "START",
-			role: "executor",
+			role: "runtime-box",
 			nonce: this.dependencies.createNonce(),
-			identity: executorIdentity,
-			credential: executorCredential,
+			identity: runtimeBoxIdentity,
+			credential: runtimeBoxCredential,
+			dataDirectory: join(dirname(this.dataPaths.agentDataDirectory), "runtime-box"),
+			actionJournalEpoch: agentsServer.ready.actionJournalEpoch,
 			agentsServer: {
 				identity: agentsServer.ready.serverIdentity,
-				endpoint: agentsServer.ready.endpoint,
+				endpoint: agentsServer.ready.runtimeEndpoint,
 			},
 		};
 		await Promise.race([
-			this.launchCompanion("executor", executorBootstrap, lifecycleEpoch),
+			this.launchCompanion("runtime-box", runtimeBoxBootstrap, lifecycleEpoch),
 			connection.closed.then(() => {
-				throw new Error("Desktop agents connection closed before executor readiness.");
+				throw new Error("Desktop agents connection closed before Runtime Box readiness.");
 			}),
 		]);
 		if (connection.isClosed()) {
@@ -529,7 +561,7 @@ export class CompanionProcessSupervisor {
 
 	private async launchCompanion(
 		role: CompanionRole,
-		bootstrapRecord: AgentsServerBootstrapRecord | ExecutorBootstrapRecord,
+		bootstrapRecord: AgentsServerBootstrapRecord | RuntimeBoxBootstrapRecord,
 		lifecycleEpoch: number,
 	): Promise<ManagedCompanionProcess> {
 		this.assertLifecycleActive(lifecycleEpoch);
@@ -558,7 +590,7 @@ export class CompanionProcessSupervisor {
 		const bootstrap =
 			role === "agents-server"
 				? serializeAgentsServerBootstrap(bootstrapRecord as AgentsServerBootstrapRecord)
-				: serializeExecutorBootstrap(bootstrapRecord as ExecutorBootstrapRecord);
+				: serializeRuntimeBoxBootstrap(bootstrapRecord as RuntimeBoxBootstrapRecord);
 
 		try {
 			await this.waitForLifecycle(child.writeStdin(bootstrap), lifecycleEpoch);
@@ -574,11 +606,11 @@ export class CompanionProcessSupervisor {
 							role,
 							pid: child.pid,
 							nonce: bootstrapRecord.nonce,
-							identity: (bootstrapRecord as ExecutorBootstrapRecord).identity,
+							identity: (bootstrapRecord as RuntimeBoxBootstrapRecord).identity,
 							agentsServer:
 								this.processes["agents-server"]?.ready?.role === "agents-server"
 									? this.processes["agents-server"].ready
-									: fail("executor requires an agents-server READY record."),
+									: fail("Runtime Box requires an agents-server READY record."),
 						};
 			managed.ready = await this.waitForLifecycle(
 				withTimeout(
@@ -601,7 +633,8 @@ export class CompanionProcessSupervisor {
 		if (role === "client" && this.clientIdentity !== undefined) {
 			return this.clientIdentity;
 		}
-		this.generations[role] += 1;
+		this.generations[role] =
+			role === "runtime-box" ? this.runtimeBoxGenerationStore.next() : this.generations[role] + 1;
 		const identity: ProcessPeerIdentity = {
 			role: role === "agents-server" ? "agents" : role,
 			peerId:
@@ -609,7 +642,7 @@ export class CompanionProcessSupervisor {
 					? "moshu-local-agents"
 					: role === "client"
 						? "moshu-desktop-client"
-						: "moshu-local-executor",
+						: defaultLocalRuntimeBoxId,
 			instanceId: this.dependencies.createInstanceId(),
 			generation: this.generations[role],
 		};
@@ -661,7 +694,7 @@ export class CompanionProcessSupervisor {
 	}
 
 	private activateCrashDetection(): void {
-		for (const role of ["agents-server", "executor"] as const) {
+		for (const role of ["agents-server", "runtime-box"] as const) {
 			const process = this.processes[role];
 			if (process === undefined) {
 				continue;
@@ -853,12 +886,12 @@ export class CompanionProcessSupervisor {
 
 	private hasRunningPair(): boolean {
 		const agentsServer = this.processes["agents-server"];
-		const executor = this.processes.executor;
+		const runtimeBox = this.processes["runtime-box"];
 		return (
 			agentsServer?.ready?.role === "agents-server" &&
 			agentsServer.exitCode === undefined &&
-			executor?.ready?.role === "executor" &&
-			executor.exitCode === undefined
+			runtimeBox?.ready?.role === "runtime-box" &&
+			runtimeBox.exitCode === undefined
 		);
 	}
 
@@ -899,7 +932,7 @@ export class CompanionProcessSupervisor {
 		}
 		let stopError: unknown;
 		try {
-			await this.stopProcess("executor");
+			await this.stopProcess("runtime-box");
 		} catch (error) {
 			stopError = error;
 		}
@@ -1023,6 +1056,8 @@ function createReadySnapshot(ready: CompanionReadyRecord): CompanionReadySnapsho
 			role: ready.role,
 			serverIdentity: { ...ready.serverIdentity },
 			endpoint: { ...ready.endpoint },
+			runtimeEndpoint: { ...ready.runtimeEndpoint },
+			actionJournalEpoch: ready.actionJournalEpoch,
 		};
 	}
 	return {
@@ -1037,11 +1072,91 @@ function createReadySnapshot(ready: CompanionReadyRecord): CompanionReadySnapsho
 }
 
 function createDefaultDataPaths(): AgentsServerDataPaths {
-	const directory = join(tmpdir(), `moshu-companion-${process.pid}`);
+	const directory = join(tmpdir(), `moshu-companion-${process.pid}-${randomUUID()}`);
 	return {
 		productDatabase: join(directory, "moshu.db"),
 		agentDataDirectory: join(directory, "agent-data"),
 	};
+}
+
+function fsyncFile(filename: string): void {
+	const descriptor = openSync(filename, "r");
+	try {
+		fsyncSync(descriptor);
+	} finally {
+		closeSync(descriptor);
+	}
+}
+
+class FileRuntimeBoxGenerationStore implements RuntimeBoxGenerationStore {
+	constructor(private readonly filename: string) {}
+
+	next(): number {
+		const current = this.#read();
+		const next = current + 1;
+		if (!Number.isSafeInteger(next)) {
+			throw new Error("Runtime Box generation exhausted the safe integer range.");
+		}
+		const directory = dirname(this.filename);
+		mkdirSync(directory, { recursive: true, mode: 0o700 });
+		chmodSync(directory, 0o700);
+		const temporary = `${this.filename}.${process.pid}.${randomUUID()}.tmp`;
+		let renamed = false;
+		try {
+			writeFileSync(temporary, JSON.stringify({ schemaVersion: 1, generation: next }), {
+				encoding: "utf8",
+				flag: "wx",
+				mode: 0o600,
+			});
+			const descriptor = openSync(temporary, "r");
+			try {
+				fsyncSync(descriptor);
+			} finally {
+				closeSync(descriptor);
+			}
+			renameSync(temporary, this.filename);
+			renamed = true;
+			chmodSync(this.filename, 0o600);
+			fsyncFile(this.filename);
+			if (process.platform !== "win32") {
+				fsyncFile(directory);
+			}
+			return next;
+		} finally {
+			if (!renamed && existsSync(temporary)) {
+				unlinkSync(temporary);
+			}
+		}
+	}
+
+	#read(): number {
+		if (!existsSync(this.filename)) {
+			return 0;
+		}
+		const metadata = lstatSync(this.filename);
+		if (!metadata.isFile() || metadata.isSymbolicLink()) {
+			throw new Error("Runtime Box generation state must be a regular file.");
+		}
+		let value: unknown;
+		try {
+			value = JSON.parse(readFileSync(this.filename, "utf8"));
+		} catch (error) {
+			throw new Error("Runtime Box generation state is invalid.", { cause: error });
+		}
+		if (
+			typeof value !== "object" ||
+			value === null ||
+			!("schemaVersion" in value) ||
+			value.schemaVersion !== 1 ||
+			!("generation" in value) ||
+			typeof value.generation !== "number" ||
+			!Number.isSafeInteger(value.generation) ||
+			value.generation < 0
+		) {
+			throw new Error("Runtime Box generation state is invalid.");
+		}
+		return value.generation;
+	}
 }
 
 async function createNoopDesktopConnection(): Promise<DesktopAgentsConnection> {

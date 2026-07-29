@@ -237,6 +237,7 @@ export function createRpcChatTransport(
 			const { session } = await client.createChatSession(model);
 			return {
 				id: session.id,
+				runtimeBoxId: session.runtimeBoxId,
 				title: session.title,
 				updatedAt: session.updatedAt,
 				...(session.model === undefined ? {} : { model: session.model }),
@@ -253,6 +254,7 @@ export function createRpcChatTransport(
 			);
 			const session: ChatSession = {
 				id: snapshot.session.id,
+				runtimeBoxId: snapshot.session.runtimeBoxId,
 				title: snapshot.session.title,
 				updatedAt: snapshot.session.updatedAt,
 				...(snapshot.session.archivedAt === undefined
@@ -356,6 +358,7 @@ export function createRpcChatTransport(
 function mapSessionSummary(session: ListChatSessionsOutput["items"][number]): ChatSessionSummary {
 	return {
 		id: session.id,
+		runtimeBoxId: session.runtimeBoxId,
 		title: session.title,
 		createdAt: session.createdAt,
 		updatedAt: session.updatedAt,

@@ -10,6 +10,7 @@
 		"test": "bun test"
 	},
 	"dependencies": {
+		"@moshu/action-broker": "workspace:*",
 		"@moshu/agent-runtime": "workspace:*",
 		"@moshu/contracts": "workspace:*",
 		"@moshu/database": "workspace:*",

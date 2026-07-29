@@ -59,7 +59,7 @@ React WebView 使用 Vite HMR，通常不重开窗口。agents server 和 execut
 
 ```text
 apps/agents-server/src/
-apps/executor/src/
+apps/runtime-box/src/
 packages/agent-runtime/src/
 packages/contracts/src/
 packages/database/src/
@@ -90,7 +90,7 @@ bun run dev
 
 ```text
 apps/agents-server/dist/moshu-agents-server
-apps/executor/dist/moshu-executor
+apps/runtime-box/dist/moshu-runtime-box
 apps/desktop/dist/mainview/
 apps/desktop/build/
 apps/desktop/artifacts/

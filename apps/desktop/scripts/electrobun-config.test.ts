@@ -22,7 +22,7 @@ describe("Electrobun config", () => {
 		expect(config.build.watch).toEqual(companionSourceWatchPaths);
 		expect(config.build.watch).toEqual([
 			"../agents-server/src",
-			"../executor/src",
+			"../runtime-box/src",
 			"../../packages/agent-runtime/src",
 			"../../packages/contracts/src",
 			"../../packages/database/src",

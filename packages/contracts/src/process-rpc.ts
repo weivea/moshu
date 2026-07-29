@@ -49,15 +49,73 @@ import {
 	respondProviderAuthInputSchema,
 	startProviderAuthInputSchema,
 } from "./provider-auth";
+import {
+	createProjectInputSchema,
+	createProjectOutputSchema,
+	deleteProjectInputSchema,
+	deleteProjectOutputSchema,
+	getProjectInputSchema,
+	getProjectOutputSchema,
+	listProjectsInputSchema,
+	listProjectsOutputSchema,
+	setProjectArchivedInputSchema,
+	setProjectArchivedOutputSchema,
+	updateProjectInputSchema,
+	updateProjectOutputSchema,
+	validateRuntimeBoxProjectPathInputSchema,
+	validateRuntimeBoxProjectPathOutputSchema,
+} from "./project";
 import { agentsRuntimeInfoSchema, emptyParamsSchema } from "./runtime";
 import {
-	executorToolInvokeInputSchema,
-	executorToolInvokeOutputSchema,
-	executorToolProgressEventSchema,
+	runtimeBoxToolInvokeInputSchema,
+	runtimeBoxToolInvokeOutputSchema,
+	runtimeBoxToolProgressEventSchema,
+	acknowledgeRuntimeBoxInvocationsInputSchema,
+	acknowledgeRuntimeBoxInvocationsOutputSchema,
+	reconcileRuntimeBoxInvocationsInputSchema,
+	reconcileRuntimeBoxInvocationsOutputSchema,
 } from "./executor-tools";
+import {
+	approveRuntimeBoxPairingInputSchema,
+	approveRuntimeBoxPairingOutputSchema,
+	createRuntimeBoxPairingOutputSchema,
+	listRuntimeBoxPairingClaimsOutputSchema,
+	listRuntimeBoxesOutputSchema,
+	rejectRuntimeBoxPairingInputSchema,
+	rejectRuntimeBoxPairingOutputSchema,
+	revokeRuntimeBoxDeviceInputSchema,
+	revokeRuntimeBoxDeviceOutputSchema,
+	remoteAccessAuthAttemptInputSchema,
+	remoteAccessAuthAttemptSchema,
+	remoteAccessMutationOutputSchema,
+	remoteAccessStatusOutputSchema,
+	runtimeBoxDescriptorSchema,
+	runtimeBoxIdSchema,
+	switchRuntimeBoxInputSchema,
+	switchRuntimeBoxOutputSchema,
+} from "./runtime-box";
 
 export const productRpcMethods = {
 	runtimeGet: "moshu.v1.runtime.get",
+	runtimeBoxesList: "moshu.v1.runtimeBoxes.list",
+	runtimeBoxesSwitch: "moshu.v1.runtimeBoxes.switch",
+	runtimeBoxesPairingCreate: "moshu.v1.runtimeBoxes.pairing.create",
+	runtimeBoxesPairingListClaims: "moshu.v1.runtimeBoxes.pairing.listClaims",
+	runtimeBoxesPairingApprove: "moshu.v1.runtimeBoxes.pairing.approve",
+	runtimeBoxesPairingReject: "moshu.v1.runtimeBoxes.pairing.reject",
+	runtimeBoxesDeviceRevoke: "moshu.v1.runtimeBoxes.device.revoke",
+	remoteAccessStatus: "moshu.v1.remoteAccess.status",
+	remoteAccessAuthStart: "moshu.v1.remoteAccess.auth.start",
+	remoteAccessAuthGet: "moshu.v1.remoteAccess.auth.get",
+	remoteAccessEnable: "moshu.v1.remoteAccess.enable",
+	remoteAccessDisable: "moshu.v1.remoteAccess.disable",
+	remoteAccessRecreate: "moshu.v1.remoteAccess.recreate",
+	projectsCreate: "moshu.v1.projects.create",
+	projectsList: "moshu.v1.projects.list",
+	projectsGet: "moshu.v1.projects.get",
+	projectsUpdate: "moshu.v1.projects.update",
+	projectsArchive: "moshu.v1.projects.archive",
+	projectsDelete: "moshu.v1.projects.delete",
 	providersList: "moshu.v1.providers.list",
 	providersCreate: "moshu.v1.providers.create",
 	providersUpdate: "moshu.v1.providers.update",
@@ -83,13 +141,25 @@ export const productRpcMethods = {
 	chatSend: "moshu.v1.chat.send",
 	chatCancel: "moshu.v1.chat.cancel",
 	chatReplay: "moshu.v1.chat.replay",
-	executorRegister: "moshu.v1.executor.register",
-	executorToolInvoke: "moshu.v1.executor.tool.invoke",
+	runtimeBoxRegister: "moshu.v1.runtimeBox.register",
+	runtimeBoxReady: "moshu.v1.runtimeBox.ready",
+	runtimeBoxToolInvoke: "moshu.v1.runtimeBox.tool.invoke",
+	runtimeBoxProjectValidatePath: "moshu.v1.runtimeBox.projects.validatePath",
+	runtimeBoxInvocationsReconcile: "moshu.v1.runtimeBox.invocations.reconcile",
+	runtimeBoxInvocationsAck: "moshu.v1.runtimeBox.invocations.ack",
 } as const;
+
+export const remoteAccessMutationRpcTimeoutMs = 2 * 60_000;
+export const remoteAccessMutationMethods = [
+	productRpcMethods.remoteAccessEnable,
+	productRpcMethods.remoteAccessDisable,
+	productRpcMethods.remoteAccessRecreate,
+] as const;
 
 export const productRpcEvents = {
 	chatEvent: "moshu.v1.chat.event",
-	executorToolProgress: "moshu.v1.executor.tool.progress",
+	runtimeBoxesChanged: "moshu.v1.runtimeBoxes.changed",
+	runtimeBoxToolProgress: "moshu.v1.runtimeBox.tool.progress",
 } as const;
 
 export const productRpcMaxFrameBytes = 4 * 1024 * 1024;
@@ -118,17 +188,19 @@ export const createProcessChatSessionInputSchema = createChatSessionInputSchema
 	})
 	.strict();
 
-export const executorRegisterInputSchema = z
+export const runtimeBoxRegisterInputSchema = z
 	.object({
 		schemaVersion: z.literal(1),
 		status: z.literal("ready"),
+		runtimeBox: runtimeBoxDescriptorSchema,
 	})
 	.strict();
 
-export const executorRegisterOutputSchema = z
+export const runtimeBoxRegisterOutputSchema = z
 	.object({
 		schemaVersion: z.literal(1),
 		accepted: z.literal(true),
+		runtimeBoxId: runtimeBoxIdSchema,
 	})
 	.strict();
 
@@ -189,6 +261,82 @@ export const getChatSessionPageOutputSchema = z
 
 export const productRpcRequestSchemas = {
 	[productRpcMethods.runtimeGet]: { input: emptyParamsSchema, output: agentsRuntimeInfoSchema },
+	[productRpcMethods.runtimeBoxesList]: {
+		input: emptyParamsSchema,
+		output: listRuntimeBoxesOutputSchema,
+	},
+	[productRpcMethods.runtimeBoxesSwitch]: {
+		input: switchRuntimeBoxInputSchema,
+		output: switchRuntimeBoxOutputSchema,
+	},
+	[productRpcMethods.runtimeBoxesPairingCreate]: {
+		input: emptyParamsSchema,
+		output: createRuntimeBoxPairingOutputSchema,
+	},
+	[productRpcMethods.runtimeBoxesPairingListClaims]: {
+		input: emptyParamsSchema,
+		output: listRuntimeBoxPairingClaimsOutputSchema,
+	},
+	[productRpcMethods.runtimeBoxesPairingApprove]: {
+		input: approveRuntimeBoxPairingInputSchema,
+		output: approveRuntimeBoxPairingOutputSchema,
+	},
+	[productRpcMethods.runtimeBoxesPairingReject]: {
+		input: rejectRuntimeBoxPairingInputSchema,
+		output: rejectRuntimeBoxPairingOutputSchema,
+	},
+	[productRpcMethods.runtimeBoxesDeviceRevoke]: {
+		input: revokeRuntimeBoxDeviceInputSchema,
+		output: revokeRuntimeBoxDeviceOutputSchema,
+	},
+	[productRpcMethods.remoteAccessStatus]: {
+		input: emptyParamsSchema,
+		output: remoteAccessStatusOutputSchema,
+	},
+	[productRpcMethods.remoteAccessAuthStart]: {
+		input: emptyParamsSchema,
+		output: remoteAccessAuthAttemptSchema,
+	},
+	[productRpcMethods.remoteAccessAuthGet]: {
+		input: remoteAccessAuthAttemptInputSchema,
+		output: remoteAccessAuthAttemptSchema,
+	},
+	[productRpcMethods.remoteAccessEnable]: {
+		input: emptyParamsSchema,
+		output: remoteAccessMutationOutputSchema,
+	},
+	[productRpcMethods.remoteAccessDisable]: {
+		input: emptyParamsSchema,
+		output: remoteAccessMutationOutputSchema,
+	},
+	[productRpcMethods.remoteAccessRecreate]: {
+		input: emptyParamsSchema,
+		output: remoteAccessMutationOutputSchema,
+	},
+	[productRpcMethods.projectsCreate]: {
+		input: createProjectInputSchema,
+		output: createProjectOutputSchema,
+	},
+	[productRpcMethods.projectsList]: {
+		input: listProjectsInputSchema,
+		output: listProjectsOutputSchema,
+	},
+	[productRpcMethods.projectsGet]: {
+		input: getProjectInputSchema,
+		output: getProjectOutputSchema,
+	},
+	[productRpcMethods.projectsUpdate]: {
+		input: updateProjectInputSchema,
+		output: updateProjectOutputSchema,
+	},
+	[productRpcMethods.projectsArchive]: {
+		input: setProjectArchivedInputSchema,
+		output: setProjectArchivedOutputSchema,
+	},
+	[productRpcMethods.projectsDelete]: {
+		input: deleteProjectInputSchema,
+		output: deleteProjectOutputSchema,
+	},
 	[productRpcMethods.providersList]: {
 		input: emptyParamsSchema,
 		output: listProvidersOutputSchema,
@@ -289,23 +437,59 @@ export const productRpcRequestSchemas = {
 		input: replayChatEventsInputSchema,
 		output: replayChatEventsOutputSchema,
 	},
-	[productRpcMethods.executorRegister]: {
-		input: executorRegisterInputSchema,
-		output: executorRegisterOutputSchema,
+	[productRpcMethods.runtimeBoxRegister]: {
+		input: runtimeBoxRegisterInputSchema,
+		output: runtimeBoxRegisterOutputSchema,
 	},
-	[productRpcMethods.executorToolInvoke]: {
-		input: executorToolInvokeInputSchema,
-		output: executorToolInvokeOutputSchema,
+	[productRpcMethods.runtimeBoxReady]: {
+		input: emptyParamsSchema,
+		output: runtimeBoxRegisterOutputSchema,
+	},
+	[productRpcMethods.runtimeBoxToolInvoke]: {
+		input: runtimeBoxToolInvokeInputSchema,
+		output: runtimeBoxToolInvokeOutputSchema,
+	},
+	[productRpcMethods.runtimeBoxProjectValidatePath]: {
+		input: validateRuntimeBoxProjectPathInputSchema,
+		output: validateRuntimeBoxProjectPathOutputSchema,
+	},
+	[productRpcMethods.runtimeBoxInvocationsReconcile]: {
+		input: reconcileRuntimeBoxInvocationsInputSchema,
+		output: reconcileRuntimeBoxInvocationsOutputSchema,
+	},
+	[productRpcMethods.runtimeBoxInvocationsAck]: {
+		input: acknowledgeRuntimeBoxInvocationsInputSchema,
+		output: acknowledgeRuntimeBoxInvocationsOutputSchema,
 	},
 } as const;
 
 export const productRpcEventSchemas = {
 	[productRpcEvents.chatEvent]: chatEventDeliverySchema,
-	[productRpcEvents.executorToolProgress]: executorToolProgressEventSchema,
+	[productRpcEvents.runtimeBoxesChanged]: listRuntimeBoxesOutputSchema,
+	[productRpcEvents.runtimeBoxToolProgress]: runtimeBoxToolProgressEventSchema,
 } as const;
 
 export const clientProductRequestMethods = [
 	productRpcMethods.runtimeGet,
+	productRpcMethods.runtimeBoxesList,
+	productRpcMethods.runtimeBoxesSwitch,
+	productRpcMethods.runtimeBoxesPairingCreate,
+	productRpcMethods.runtimeBoxesPairingListClaims,
+	productRpcMethods.runtimeBoxesPairingApprove,
+	productRpcMethods.runtimeBoxesPairingReject,
+	productRpcMethods.runtimeBoxesDeviceRevoke,
+	productRpcMethods.remoteAccessStatus,
+	productRpcMethods.remoteAccessAuthStart,
+	productRpcMethods.remoteAccessAuthGet,
+	productRpcMethods.remoteAccessEnable,
+	productRpcMethods.remoteAccessDisable,
+	productRpcMethods.remoteAccessRecreate,
+	productRpcMethods.projectsCreate,
+	productRpcMethods.projectsList,
+	productRpcMethods.projectsGet,
+	productRpcMethods.projectsUpdate,
+	productRpcMethods.projectsArchive,
+	productRpcMethods.projectsDelete,
 	productRpcMethods.providersList,
 	productRpcMethods.providersCreate,
 	productRpcMethods.providersUpdate,
@@ -333,15 +517,26 @@ export const clientProductRequestMethods = [
 	productRpcMethods.chatReplay,
 ] as const;
 
-export const executorProductRequestMethods = [productRpcMethods.executorRegister] as const;
-export const agentsProductEventMethods = [productRpcEvents.chatEvent] as const;
-export const agentsExecutorRequestMethods = [productRpcMethods.executorToolInvoke] as const;
-export const executorProductEventMethods = [productRpcEvents.executorToolProgress] as const;
+export const runtimeBoxProductRequestMethods = [
+	productRpcMethods.runtimeBoxRegister,
+	productRpcMethods.runtimeBoxReady,
+	productRpcMethods.runtimeBoxInvocationsReconcile,
+] as const;
+export const agentsProductEventMethods = [
+	productRpcEvents.chatEvent,
+	productRpcEvents.runtimeBoxesChanged,
+] as const;
+export const agentsRuntimeBoxRequestMethods = [
+	productRpcMethods.runtimeBoxToolInvoke,
+	productRpcMethods.runtimeBoxProjectValidatePath,
+	productRpcMethods.runtimeBoxInvocationsAck,
+] as const;
+export const runtimeBoxProductEventMethods = [productRpcEvents.runtimeBoxToolProgress] as const;
 
 export type SendAskChatMessageInput = z.infer<typeof sendAskChatMessageInputSchema>;
 export type CreateProcessChatSessionInput = z.infer<typeof createProcessChatSessionInputSchema>;
-export type ExecutorRegisterInput = z.infer<typeof executorRegisterInputSchema>;
-export type ExecutorRegisterOutput = z.infer<typeof executorRegisterOutputSchema>;
+export type RuntimeBoxRegisterInput = z.infer<typeof runtimeBoxRegisterInputSchema>;
+export type RuntimeBoxRegisterOutput = z.infer<typeof runtimeBoxRegisterOutputSchema>;
 export type ChatEventDelivery = z.infer<typeof chatEventDeliverySchema>;
 export type ReplayChatEventsInput = z.infer<typeof replayChatEventsInputSchema>;
 export type ReplayChatEventsOutput = z.infer<typeof replayChatEventsOutputSchema>;

@@ -13,10 +13,21 @@ import {
 	chatEventDeliverySchema,
 	chatRunEventSchema,
 	clientProductRequestMethods,
-	executorProductEventMethods,
-	executorProductRequestMethods,
-	executorRegisterOutputSchema,
-	executorToolProgressEventSchema,
+	runtimeBoxProductEventMethods,
+	runtimeBoxProductRequestMethods,
+	runtimeBoxRegisterOutputSchema,
+	listRuntimeBoxesOutputSchema,
+	type ListRuntimeBoxesOutput,
+	remoteAccessMutationOutputSchema,
+	remoteAccessStatusOutputSchema,
+	createProjectOutputSchema,
+	deleteProjectOutputSchema,
+	getProjectOutputSchema,
+	listProjectsOutputSchema,
+	updateProjectOutputSchema,
+	setProjectArchivedOutputSchema,
+	switchRuntimeBoxOutputSchema,
+	runtimeBoxToolProgressEventSchema,
 	productRpcInternalHandlerErrorCode,
 	productRpcEvents,
 	productRpcMethods,
@@ -24,6 +35,17 @@ import {
 } from "@moshu/contracts";
 import {
 	ChatSessionNotFoundError,
+	ActiveRuntimeRevisionConflictError,
+	RuntimeBoxArchivedError,
+	RuntimeBoxNotFoundError,
+	PairingFingerprintMismatchError,
+	PairingSessionNotFoundError,
+	PairingSessionStateError,
+	type RuntimeBoxRepository,
+	type RuntimeBoxPairingRepository,
+	type ProjectRepository,
+	ProjectNotFoundError,
+	ProjectPathConflictError,
 	SessionCreateCapacityError,
 	SessionCreateKeyConflictError,
 } from "@moshu/database";
@@ -34,17 +56,25 @@ import {
 	type RpcHandlers,
 	type RpcMethodAllowlist,
 	type RpcPeer,
+	type RpcRequestContext,
 	rpcJsonValueSchema,
 } from "@moshu/process-rpc";
 import { ZodError, type ZodType, type z } from "zod";
 
 import type { ChatApplicationService } from "./chat-application-service";
-import type { ExecutorReadiness } from "./executor-readiness";
 import { ProviderCatalogError } from "./provider-catalog";
+import { type RuntimeBoxRegistry, RuntimeBoxUnavailableError } from "./runtime-box-registry";
+import type { RuntimeIngressAuth } from "./runtime-ingress-auth";
+import type { DevTunnelService } from "./dev-tunnel-service";
 
 export interface ProductRpcDependencies {
 	chatService: ChatApplicationService;
-	executorReadiness: ExecutorReadiness;
+	runtimeBoxRegistry: RuntimeBoxRegistry;
+	runtimeBoxes: RuntimeBoxRepository;
+	runtimeBoxPairings?: RuntimeBoxPairingRepository;
+	projects?: ProjectRepository;
+	runtimeIngressAuth: RuntimeIngressAuth;
+	getDevTunnelService: () => DevTunnelService;
 	eventRouter: ProductEventRouter;
 	serverVersion: string;
 	authController: HeadlessAuthController;
@@ -155,31 +185,194 @@ function createRouteBinding(peer: RpcPeer): ProductEventRouteBinding {
 	};
 }
 
-export const agentsServerMethodAllowlist: RpcMethodAllowlist = {
+export const agentsServerClientMethodAllowlist: RpcMethodAllowlist = {
 	client: { requests: clientProductRequestMethods },
-	executor: {
-		requests: executorProductRequestMethods,
-		events: executorProductEventMethods,
+};
+
+export const agentsServerRuntimeMethodAllowlist: RpcMethodAllowlist = {
+	"runtime-box": {
+		requests: runtimeBoxProductRequestMethods,
+		events: runtimeBoxProductEventMethods,
 	},
 };
 
 export function createProductRpcHandlers(dependencies: ProductRpcDependencies): RpcHandlers {
-	const { chatService, executorReadiness, eventRouter, authController } = dependencies;
+	const {
+		chatService,
+		runtimeBoxRegistry,
+		runtimeBoxes,
+		runtimeBoxPairings,
+		projects,
+		runtimeIngressAuth,
+		getDevTunnelService,
+		eventRouter,
+		authController,
+	} = dependencies;
+	const getProjects = (): ProjectRepository => {
+		if (projects === undefined) {
+			throw new Error("Project repository is not initialized.");
+		}
+		return projects;
+	};
+	const requireProjectRuntimeReady = (projectId: string): void => {
+		const project = getProjects().get({ projectId }).project;
+		if (!runtimeBoxRegistry.isReady(project.runtimeBoxId)) {
+			throw new RuntimeBoxUnavailableError(
+				`Runtime Box ${project.runtimeBoxId} is not available for Project mutation.`,
+			);
+		}
+	};
 	return {
 		requests: {
 			[productRpcMethods.runtimeGet]: createRequestHandler(
 				productRpcRequestSchemas[productRpcMethods.runtimeGet],
 				() =>
 					agentsRuntimeInfoSchema.parse({
-						apiVersion: 2,
+						apiVersion: 3,
 						serverVersion: dependencies.serverVersion,
 						bunVersion: Bun.version,
 						platform: process.platform,
 						arch: process.arch,
 						agentRuntime: probeAgentRuntime(),
-						ready: executorReadiness.isReady(),
-						executor: executorReadiness.getInfo(),
+						activeRuntimeBoxId: runtimeBoxes.getActive().runtimeBoxId,
+						runtimeBoxes: runtimeBoxRegistry.listInfo(),
 					}),
+			),
+			[productRpcMethods.runtimeBoxesList]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.runtimeBoxesList],
+				() => createRuntimeBoxesSnapshot(runtimeBoxes, runtimeBoxRegistry, runtimeBoxPairings),
+			),
+			[productRpcMethods.runtimeBoxesSwitch]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.runtimeBoxesSwitch],
+				(input) => {
+					const active = runtimeBoxes.switchActive(input);
+					runtimeBoxRegistry.setActiveRuntimeBoxId(active.runtimeBoxId);
+					return switchRuntimeBoxOutputSchema.parse({ active });
+				},
+			),
+			[productRpcMethods.runtimeBoxesPairingCreate]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.runtimeBoxesPairingCreate],
+				() => {
+					const pairing = runtimeIngressAuth.createPairing();
+					const remoteStatus = getDevTunnelService().getStatus();
+					const publicUrl = remoteStatus.state === "online" ? remoteStatus.publicUrl : undefined;
+					return {
+						...pairing,
+						...(publicUrl === undefined ? {} : { runtimeBaseUrl: publicUrl }),
+					};
+				},
+			),
+			[productRpcMethods.runtimeBoxesPairingListClaims]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.runtimeBoxesPairingListClaims],
+				() => runtimeIngressAuth.listPendingClaims(),
+			),
+			[productRpcMethods.runtimeBoxesPairingApprove]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.runtimeBoxesPairingApprove],
+				(input) => {
+					const output = runtimeIngressAuth.approve(input);
+					runtimeBoxRegistry.addDescriptor(output.runtimeBox);
+					return output;
+				},
+			),
+			[productRpcMethods.runtimeBoxesPairingReject]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.runtimeBoxesPairingReject],
+				(input) => runtimeIngressAuth.reject(input),
+			),
+			[productRpcMethods.runtimeBoxesDeviceRevoke]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.runtimeBoxesDeviceRevoke],
+				(input) => {
+					const output = runtimeIngressAuth.revokeDeviceKey(input);
+					runtimeBoxRegistry.disconnectRuntimeBox(
+						input.runtimeBoxId,
+						"Runtime Box device key revoked.",
+					);
+					return output;
+				},
+			),
+			[productRpcMethods.remoteAccessStatus]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.remoteAccessStatus],
+				() => remoteAccessStatusOutputSchema.parse(getDevTunnelService().getStatus()),
+			),
+			[productRpcMethods.remoteAccessAuthStart]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.remoteAccessAuthStart],
+				() => getDevTunnelService().startAuthentication(),
+			),
+			[productRpcMethods.remoteAccessAuthGet]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.remoteAccessAuthGet],
+				(input) => getDevTunnelService().getAuthentication(input.attemptId),
+			),
+			[productRpcMethods.remoteAccessEnable]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.remoteAccessEnable],
+				async (_input, _peer, context) =>
+					remoteAccessMutationOutputSchema.parse({
+						status: await getDevTunnelService().enable(context.signal),
+					}),
+			),
+			[productRpcMethods.remoteAccessDisable]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.remoteAccessDisable],
+				async () =>
+					remoteAccessMutationOutputSchema.parse({
+						status: await getDevTunnelService().disable(),
+					}),
+			),
+			[productRpcMethods.remoteAccessRecreate]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.remoteAccessRecreate],
+				async (_input, _peer, context) =>
+					remoteAccessMutationOutputSchema.parse({
+						status: await getDevTunnelService().recreate(context.signal),
+					}),
+			),
+			[productRpcMethods.projectsCreate]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.projectsCreate],
+				async (input, _peer, context) => {
+					const runtimeBoxId = input.runtimeBoxId ?? runtimeBoxes.getActive().runtimeBoxId;
+					runtimeBoxes.get(runtimeBoxId);
+					const validated = await runtimeBoxRegistry.validateProjectPath(
+						runtimeBoxId,
+						{ path: input.path },
+						context.signal,
+					);
+					return createProjectOutputSchema.parse(
+						getProjects().create({
+							runtimeBoxId,
+							name: input.name ?? validated.displayName,
+							path: validated.normalizedPath,
+							...(validated.gitRootPath === undefined
+								? {}
+								: { gitRootPath: validated.gitRootPath }),
+							...(validated.gitBranch === undefined ? {} : { gitBranch: validated.gitBranch }),
+						}),
+					);
+				},
+			),
+			[productRpcMethods.projectsList]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.projectsList],
+				(input) => listProjectsOutputSchema.parse(getProjects().list(input)),
+			),
+			[productRpcMethods.projectsGet]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.projectsGet],
+				(input) => getProjectOutputSchema.parse(getProjects().get(input)),
+			),
+			[productRpcMethods.projectsUpdate]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.projectsUpdate],
+				(input) => {
+					requireProjectRuntimeReady(input.projectId);
+					return updateProjectOutputSchema.parse(getProjects().update(input));
+				},
+			),
+			[productRpcMethods.projectsArchive]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.projectsArchive],
+				(input) => {
+					requireProjectRuntimeReady(input.projectId);
+					return setProjectArchivedOutputSchema.parse(getProjects().setArchived(input));
+				},
+			),
+			[productRpcMethods.projectsDelete]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.projectsDelete],
+				(input) => {
+					requireProjectRuntimeReady(input.projectId);
+					return deleteProjectOutputSchema.parse(getProjects().delete(input));
+				},
 			),
 			[productRpcMethods.providersList]: createRequestHandler(
 				productRpcRequestSchemas[productRpcMethods.providersList],
@@ -283,6 +476,7 @@ export function createProductRpcHandlers(dependencies: ProductRpcDependencies): 
 						) {
 							eventRouter.release(routeLease);
 						}
+
 						return output;
 					} catch (error) {
 						eventRouter.rollback(routeLease);
@@ -298,32 +492,78 @@ export function createProductRpcHandlers(dependencies: ProductRpcDependencies): 
 				productRpcRequestSchemas[productRpcMethods.chatReplay],
 				(input) => chatService.replayEvents(input),
 			),
-			[productRpcMethods.executorRegister]: createRequestHandler(
-				productRpcRequestSchemas[productRpcMethods.executorRegister],
+			[productRpcMethods.runtimeBoxRegister]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.runtimeBoxRegister],
+				(input, peer) => {
+					runtimeBoxRegistry.register(peer, input.runtimeBox);
+					return runtimeBoxRegisterOutputSchema.parse({
+						schemaVersion: 1,
+						accepted: true,
+						runtimeBoxId: input.runtimeBox.runtimeBoxId,
+					});
+				},
+			),
+			[productRpcMethods.runtimeBoxReady]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.runtimeBoxReady],
 				(_input, peer) => {
-					executorReadiness.register(peer);
-					return executorRegisterOutputSchema.parse({ schemaVersion: 1, accepted: true });
+					runtimeBoxRegistry.markReady(peer);
+					return runtimeBoxRegisterOutputSchema.parse({
+						schemaVersion: 1,
+						accepted: true,
+						runtimeBoxId: peer.remoteIdentity.peerId,
+					});
+				},
+			),
+			[productRpcMethods.runtimeBoxInvocationsReconcile]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.runtimeBoxInvocationsReconcile],
+				(input, peer) => {
+					if (peer.remoteIdentity.role !== "runtime-box") {
+						throw new RpcHandlerError(
+							"RUNTIME_BOX_IDENTITY_REQUIRED",
+							"Action reconciliation requires an authenticated Runtime Box.",
+						);
+					}
+					return runtimeBoxRegistry.reconcileInvocations(
+						peer.remoteIdentity.peerId,
+						input.items,
+						input.acknowledgedInvocationIds,
+					);
 				},
 			),
 		},
 		events: {
-			[productRpcEvents.executorToolProgress]: (payload, context) => {
-				let event: z.infer<typeof executorToolProgressEventSchema>;
+			[productRpcEvents.runtimeBoxToolProgress]: (payload, context) => {
+				let event: z.infer<typeof runtimeBoxToolProgressEventSchema>;
 				try {
-					event = executorToolProgressEventSchema.parse(payload);
+					event = runtimeBoxToolProgressEventSchema.parse(payload);
 				} catch (error) {
 					if (error instanceof ZodError) {
 						throw new RpcHandlerError(
-							"INVALID_EXECUTOR_TOOL_PROGRESS",
-							"The executor tool progress payload is invalid.",
+							"INVALID_RUNTIME_BOX_TOOL_PROGRESS",
+							"The Runtime Box tool progress payload is invalid.",
 						);
 					}
 					throw error;
 				}
-				executorReadiness.handleProgress(context.peer, event);
+				runtimeBoxRegistry.handleProgress(context.peer, event);
 			},
 		},
 	};
+}
+
+export function createRuntimeBoxesSnapshot(
+	runtimeBoxes: RuntimeBoxRepository,
+	registry: RuntimeBoxRegistry,
+	pairings?: RuntimeBoxPairingRepository,
+): ListRuntimeBoxesOutput {
+	return listRuntimeBoxesOutputSchema.parse({
+		active: runtimeBoxes.getActive(),
+		items: registry.listInfo().map((item) => ({
+			...item,
+			deviceKeyIds:
+				pairings?.listActiveDeviceKeys(item.runtimeBox.runtimeBoxId).map((key) => key.keyId) ?? [],
+		})),
+	});
 }
 
 export function publishChatEvent(
@@ -357,8 +597,9 @@ function createRequestHandler<TInputSchema extends ZodType, TOutputSchema extend
 	execute: (
 		input: z.output<TInputSchema>,
 		peer: RpcPeer,
+		context: RpcRequestContext,
 	) => z.input<TOutputSchema> | Promise<z.input<TOutputSchema>>,
-): (payload: JsonValue, context: { peer: RpcPeer }) => Promise<JsonValue> {
+): (payload: JsonValue, context: RpcRequestContext) => Promise<JsonValue> {
 	return async (payload, context) => {
 		let input: z.output<TInputSchema>;
 		try {
@@ -374,7 +615,7 @@ function createRequestHandler<TInputSchema extends ZodType, TOutputSchema extend
 		}
 		let output: z.input<TOutputSchema>;
 		try {
-			output = await execute(input, context.peer);
+			output = await execute(input, context.peer, context);
 		} catch (error) {
 			rethrowProductHandlerError(error);
 		}
@@ -420,11 +661,36 @@ function rethrowProductHandlerError(error: unknown): never {
 			"Session create recovery capacity is full.",
 		);
 	}
+	if (error instanceof ActiveRuntimeRevisionConflictError) {
+		throw new RpcHandlerError("ACTIVE_RUNTIME_REVISION_CONFLICT", error.message, {
+			actualRevision: error.actualRevision,
+		});
+	}
+	if (error instanceof RuntimeBoxNotFoundError) {
+		throw new RpcHandlerError("RUNTIME_BOX_NOT_FOUND", "The Runtime Box was not found.");
+	}
+	if (error instanceof RuntimeBoxArchivedError) {
+		throw new RpcHandlerError("RUNTIME_BOX_ARCHIVED", "The Runtime Box is archived.");
+	}
+	if (error instanceof RuntimeBoxUnavailableError) {
+		throw new RpcHandlerError("RUNTIME_BOX_NOT_READY", error.message);
+	}
+	if (error instanceof ProjectNotFoundError) {
+		throw new RpcHandlerError("PROJECT_NOT_FOUND", "The Project was not found.");
+	}
+	if (error instanceof ProjectPathConflictError) {
+		throw new RpcHandlerError("PROJECT_PATH_CONFLICT", "The Project path is already registered.");
+	}
+	if (
+		error instanceof PairingSessionNotFoundError ||
+		error instanceof PairingSessionStateError ||
+		error instanceof PairingFingerprintMismatchError
+	) {
+		throw new RpcHandlerError("RUNTIME_BOX_PAIRING_REJECTED", "Runtime Box pairing failed.");
+	}
 	if (error instanceof AskChatRuntimeError) {
 		throw new RpcHandlerError(
-			error.message.includes("executor is not authenticated")
-				? "AGENTS_NOT_READY"
-				: "CHAT_REQUEST_FAILED",
+			error.kind === "runtime_box_unavailable" ? "RUNTIME_BOX_NOT_READY" : "CHAT_REQUEST_FAILED",
 			error.message,
 		);
 	}

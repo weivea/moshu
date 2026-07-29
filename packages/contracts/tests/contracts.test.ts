@@ -11,7 +11,7 @@ import {
 describe("Pi-neutral backend contracts", () => {
 	test("accepts Pi runtime and provider state without secret output fields", () => {
 		const runtime = agentsRuntimeInfoSchema.parse({
-			apiVersion: 2,
+			apiVersion: 3,
 			serverVersion: "0.0.1",
 			bunVersion: "1.3.14",
 			platform: "darwin",
@@ -21,10 +21,29 @@ describe("Pi-neutral backend contracts", () => {
 				foundation: "pi-agent",
 				versions: { piAi: "0.82.1", piAgentCore: "0.82.1", piCodingAgent: "0.82.1" },
 			},
-			ready: true,
-			executor: { connected: true, registered: true },
+			activeRuntimeBoxId: "moshu-local-runtime-box",
+			runtimeBoxes: [
+				{
+					runtimeBox: {
+						schemaVersion: 1,
+						runtimeBoxId: "moshu-local-runtime-box",
+						kind: "local",
+						displayName: "Local Runtime Box",
+						runtimeBoxVersion: "0.0.1",
+						platform: "darwin",
+						arch: "arm64",
+						capabilities: ["tool.read"],
+					},
+					connected: true,
+					registered: true,
+					deviceKeyIds: [],
+					instanceId: "local-instance",
+					generation: 1,
+				},
+			],
 		});
 		expect(runtime.agentRuntime.foundation).toBe("pi-agent");
+		expect(runtime.runtimeBoxes[0]?.runtimeBox.kind).toBe("local");
 
 		const runProvider = runProviderConfigInputSchema.parse({
 			schemaVersion: 1,

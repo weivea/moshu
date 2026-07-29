@@ -8,13 +8,14 @@ import {
 	type Provider,
 } from "@earendil-works/pi-ai";
 import { ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
-import type { ExecutorToolInvokeInput } from "@moshu/contracts";
+import { defaultLocalRuntimeBoxId, type ExecutorToolInvokeInput } from "@moshu/contracts";
 
 import {
 	AskChatCancelledError,
 	AskChatRuntimeError,
 	type ExecutorToolGateway,
 	PiAgentRuntime,
+	type RuntimeBoxToolGateway,
 } from "../src";
 
 const sessionId = "0198a20c-6f76-7e18-92da-353e2fc25b3e";
@@ -50,10 +51,11 @@ describe("Pi Agent runtime", () => {
 			const first = new PiAgentRuntime({
 				agentDataDirectory,
 				modelRuntime,
-				executorGateway: unavailableExecutorGateway,
+				runtimeBoxGateway: toRuntimeBoxGateway(unavailableExecutorGateway),
 			});
 			const deltas: string[] = [];
 			const stream = first.stream({
+				runtimeBoxId: defaultLocalRuntimeBoxId,
 				runId: "run-1",
 				threadId: sessionId,
 				provider,
@@ -73,7 +75,7 @@ describe("Pi Agent runtime", () => {
 			const restored = new PiAgentRuntime({
 				agentDataDirectory,
 				modelRuntime,
-				executorGateway: unavailableExecutorGateway,
+				runtimeBoxGateway: toRuntimeBoxGateway(unavailableExecutorGateway),
 			});
 			await expect(restored.getThreadMessages("../outside")).rejects.toThrow("Pi session IDs");
 			expect(await restored.getThreadMessages(sessionId)).toEqual([
@@ -110,9 +112,16 @@ describe("Pi Agent runtime", () => {
 					};
 				},
 			};
-			const { runtime, provider } = await createRuntime(agentDataDirectory, faux, gateway);
+			const runtimeBoxId = "remote-tool-box";
+			const { runtime, provider } = await createRuntime(
+				agentDataDirectory,
+				faux,
+				gateway,
+				runtimeBoxId,
+			);
 			try {
 				const result = await runtime.run({
+					runtimeBoxId,
 					runId: "018f47a2-9bcd-7def-8abc-1234567890ab",
 					threadId: "tool-thread",
 					provider,
@@ -144,6 +153,7 @@ describe("Pi Agent runtime", () => {
 			try {
 				let cancelled = false;
 				const result = runtime.run({
+					runtimeBoxId: defaultLocalRuntimeBoxId,
 					runId: "cancel-run",
 					threadId: "cancel-thread",
 					provider,
@@ -165,6 +175,7 @@ describe("Pi Agent runtime", () => {
 				const callsBefore = faux.state.callCount;
 				await expect(
 					runtime.run({
+						runtimeBoxId: defaultLocalRuntimeBoxId,
 						runId: "pre-aborted-run",
 						threadId: "pre-aborted-thread",
 						provider,
@@ -212,6 +223,7 @@ describe("Pi Agent runtime", () => {
 			};
 			try {
 				const run = runtime.run({
+					runtimeBoxId: defaultLocalRuntimeBoxId,
 					runId: "preflight-cancel-run",
 					threadId: "preflight-cancel-thread",
 					provider,
@@ -252,6 +264,7 @@ describe("Pi Agent runtime", () => {
 			const { runtime, provider } = await createRuntime(agentDataDirectory, faux);
 			try {
 				const first = runtime.run({
+					runtimeBoxId: defaultLocalRuntimeBoxId,
 					runId: "first-run",
 					threadId: "shared-thread",
 					provider,
@@ -260,6 +273,7 @@ describe("Pi Agent runtime", () => {
 				await started.promise;
 				await expect(
 					runtime.run({
+						runtimeBoxId: defaultLocalRuntimeBoxId,
 						runId: "blocked-run",
 						threadId: "shared-thread",
 						provider,
@@ -268,6 +282,7 @@ describe("Pi Agent runtime", () => {
 				).rejects.toMatchObject({ kind: "thread_busy" });
 
 				const second = runtime.run({
+					runtimeBoxId: defaultLocalRuntimeBoxId,
 					runId: "second-run",
 					threadId: "other-thread",
 					provider,
@@ -311,6 +326,7 @@ describe("Pi Agent runtime", () => {
 				].entries()) {
 					const error = await runtime
 						.run({
+							runtimeBoxId: defaultLocalRuntimeBoxId,
 							runId: `error-run-${index}`,
 							threadId: `error-thread-${index}`,
 							provider,
@@ -336,6 +352,7 @@ describe("Pi Agent runtime", () => {
 			faux.setResponses([fauxAssistantMessage("persist me")]);
 			const { runtime, provider, modelRuntime } = await createRuntime(agentDataDirectory, faux);
 			await runtime.run({
+				runtimeBoxId: defaultLocalRuntimeBoxId,
 				runId: "containment-run",
 				threadId: "containment-thread",
 				provider,
@@ -356,7 +373,7 @@ describe("Pi Agent runtime", () => {
 			const restarted = new PiAgentRuntime({
 				agentDataDirectory,
 				modelRuntime,
-				executorGateway: unavailableExecutorGateway,
+				runtimeBoxGateway: toRuntimeBoxGateway(unavailableExecutorGateway),
 			});
 			try {
 				await expect(restarted.deleteThread("containment-thread")).rejects.toThrow(
@@ -373,18 +390,35 @@ async function createRuntime(
 	agentDataDirectory: string,
 	faux: ReturnType<typeof fauxProvider>,
 	executorGateway: ExecutorToolGateway = unavailableExecutorGateway,
+	runtimeBoxId: string = defaultLocalRuntimeBoxId,
 ) {
 	const modelRuntime = await createModelRuntime(agentDataDirectory, faux.provider);
 	const fauxModel = faux.getModel();
 	return {
 		modelRuntime,
-		runtime: new PiAgentRuntime({ agentDataDirectory, modelRuntime, executorGateway }),
+		runtime: new PiAgentRuntime({
+			agentDataDirectory,
+			modelRuntime,
+			runtimeBoxGateway: toRuntimeBoxGateway(executorGateway, runtimeBoxId),
+		}),
 		provider: {
 			providerId: faux.provider.id,
 			providerName: faux.provider.name,
 			source: "builtin" as const,
 			api: fauxModel.api,
 			model: fauxModel.id,
+		},
+	};
+}
+
+function toRuntimeBoxGateway(
+	gateway: ExecutorToolGateway,
+	expectedRuntimeBoxId: string = defaultLocalRuntimeBoxId,
+): RuntimeBoxToolGateway {
+	return {
+		invokeForRuntimeBox(runtimeBoxId, input, options) {
+			expect(runtimeBoxId).toBe(expectedRuntimeBoxId);
+			return gateway.invoke(input, options);
 		},
 	};
 }

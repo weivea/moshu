@@ -1,7 +1,7 @@
 # 墨枢产品需求文档
 
 > 正式名称：墨枢
-> 文档版本：v0.2
+> 文档版本：v0.3
 > 状态：需求基线与三应用角色架构已确认
 > 更新日期：2026-07-24
 
@@ -15,6 +15,7 @@
 | [Canvas](./canvas.md) | Canvas 类型、编辑/预览、版本、导出、Agent 协作与隔离运行 |
 | [安全、权限与本地数据](./security-data.md) | 权限模型、Allow all、命令与文件安全、密钥、隐私和 Electrobun 安全 |
 | [阶段路线图与验收](./roadmap.md) | 分阶段交付范围、依赖、验收场景、质量门槛和待决策事项 |
+| [Runtime Box 技术与实施方案](../implementation/runtime-box.md) | Local/Remote Runtime Box、切换、Tunnel、配对和实施边界 |
 | [工程实施计划](../implementation/README.md) | 技术架构、数据契约、工作包、测试和发布计划 |
 
 文档中的 P0/P1/P2 表示某项能力在其**所属交付阶段内**的优先级：P0 为阶段发布阻塞项，P1 为应交付项，P2 为可后置项；它不等同于全产品阶段编号。
@@ -29,16 +30,16 @@
 | --- | --- |
 | 目标用户 | 会使用 AI 工具的泛技术用户，兼顾编程与通用任务 |
 | 产品形态 | Electrobun + React 桌面应用，首发 macOS 14+ |
-| 应用角色 | Electrobun client、agents server、executor；“三进程”指三种应用角色，不限制 Electrobun framework 的实际 PID 数 |
-| Desktop 部署 | client 启动并监管一个本地 agents server 和一个本地 executor；退出时协作关闭，异常时 capped backoff 并显示恢复 UX |
-| RPC | `client <-> agents server <-> executor`，WebSocket + versioned JSON RPC；desktop server 只绑定动态 loopback |
-| 身份 | `clientId`/`executorId` 跨重连重启稳定；每次启动/连接使用新的 `instanceId` 和 `generation` |
-| Agent/Executor | 当前 desktop 一个 host-backed local Executor 承载多个 Agent，Agent N:1 Executor；Executor 离线时相关 Agent 不能启动新 Run |
+| 应用角色 | Client、agents server、Runtime Box；Runtime Box 是 Runtime Box 内部执行组件 |
+| Desktop 部署 | Desktop 启停本地 agents server 和 Local Runtime Box；退出时协作关闭，Remote Box 保持安装并等待重连 |
+| RPC | `client <-> agents server <-> Runtime Box`；Product RPC 仅 loopback，独立 Runtime ingress 可由 Agent Server Dev Tunnel 暴露 |
+| 身份 | `clientId`/`runtimeBoxId` 稳定；每次启动/注册使用新的 `instanceId` 和持久递增 `generation` |
+| Agent/Runtime | 一个 Agent Server 管理多个 Box；Agent/Provider 全局共享，`agentId + runtimeBoxId` 形成 Runtime Profile |
 | 数据策略 | Local-first，首版无需账号，数据和配置默认保存在本机 |
 | Project | 一个本地文件夹或 Git 仓库，可用于代码、文档或通用任务 |
 | Chat 类型 | 普通 Chat 不绑定目录；Project Chat 绑定项目并可操作项目环境 |
 | Agent 模式 | 当前已实现 no-tools Ask；Plan、Agent 和 Tool execution 是后续目标 |
-| 本机能力 | 当前 Ask 不执行文件或命令；未来由 Moshu-owned Policy/grant/executor 边界提供 |
+| 本机能力 | 当前 Ask 不执行文件或命令；未来由 Moshu-owned Policy/grant/Runtime Box 边界提供 |
 | Allow all | 输入框可开启，仅当前会话生效；重启后关闭；系统级高风险操作仍需确认 |
 | 并发 | 默认最多 3 个活跃会话，可配置为 1–5 个，超出后排队 |
 | Pi runtime | public Pi `0.82.1` 提供 `ModelRuntime`、headless `AgentSession`、stream/usage、取消和 Session JSONL |
@@ -56,7 +57,7 @@
 | 后台运行 | 多会话并行，完成或待审批时发送桌面通知 |
 | 国际化 | 中英双语，默认跟随系统语言 |
 | 发布模式 | 应用开源，用户自备 API Key；后续可增加付费增值服务 |
-| 远程范围 | 独立启动/注册 client 或 executor 是未来扩展缝；Docker、cloud VM 和 remote-server transport 不属于当前 desktop 范围 |
+| 远程范围 | Remote Runtime Box 进入当前实施范围；Mobile Client、团队共享、云端 Agent Server 和多 Server 绑定后置 |
 
 ## 4. 产品边界
 
@@ -87,31 +88,32 @@ Project Chat、Plan/Agent、Tool、审批、Diff、MCP、Skills 和 subagent 仍
 | 层级 | 约束 |
 | --- | --- |
 | Client | 锁定 Electrobun `1.18.1`；负责 WebView、窗口、系统集成和两个本地 companion 的监管，不拥有业务 DB、Agent runtime 或 Tool 执行 |
-| Companions | agents server 与 executor 都使用 TypeScript + Bun 编译为二进制，并随 desktop 构建、签名和更新；终端用户无需安装 Bun/Node |
+| Companions | agents server 与 Runtime Box 都使用 TypeScript + Bun 编译为二进制，并随 desktop 构建、签名和更新；终端用户无需安装 Bun/Node |
 | UI | React + React Router |
 | 组件库 | HeroUI；统一主题 Token、浅色/深色模式和无障碍行为 |
 | 图标 | `@gravity-ui/icons`；应用提供统一 Icon 包装层处理尺寸、颜色、标签和 tree-shaking |
 | Agents server | 当前独占产品 DB、Pi Session JSONL、Provider/model credential、Session/Run/event、Provider access 和 Pi Agent runtime；未来再承载 Policy/approval 和 Action intent/result |
-| Executor | 独占自身 MCP config/credential/OAuth/lifecycle、Skill install/immutable version/content/hash/resources、实际 Tool、取消、进程树和 private local data |
+| Runtime Box | 独占自身 MCP config/credential/OAuth/lifecycle、Skill install/immutable version/content/hash/resources、实际 Tool、取消、进程树和 private local data |
 | Agent | public Pi `0.82.1` 只在 agents server 运行；当前是禁用全部动态资源和 Tool 的 headless Ask |
 | 持久化 | agents server 单写产品 DB；public Pi `SessionManager` 在显式 `agentDataDirectory/sessions` 保存 JSONL |
-| RPC | 应用协议为 `client <-> agents server <-> executor` 的 WebSocket + versioned JSON RPC；WebView 仍只使用最小 Electrobun RPC |
-| Authorization | agents server 决定并持久化 Policy/approval，再签发一次性 execution grant；executor 验证后执行 |
-| Secret | Provider/model credential 永远留在 agents server；MCP credential 只在 owning executor 的 `ExecutorSecretStore` 与目标 connection/process 使用，不复制到 server 或暴露给 query/UI/prompt/log/export |
+| RPC | 应用协议为 `client <-> agents server <-> Runtime Box` 的 WebSocket + versioned JSON RPC；WebView 仍只使用最小 Electrobun RPC |
+| Authorization | agents server 决定并持久化 Policy/approval，再签发一次性 execution grant；Runtime Box 验证后执行 |
+| Secret | Provider/model credential 永远留在 agents server；MCP credential 只在 owning Runtime Box 的 `ExecutorSecretStore` 与目标 connection/process 使用，不复制到 server 或暴露给 query/UI/prompt/log/export |
 | Canvas | 不可信 Web Canvas 使用无应用 RPC 的 sandbox `BrowserView`；默认断网能力必须通过阻断性 POC |
 
 ## 6. 架构落地边界
 
 - 批准的是三个应用角色，不是“Electrobun 永远只有三个 OS 进程”。Electrobun launcher/WebView 等 framework process 不改变职责划分。
-- 当前 desktop 只实现本地 supervisor 路径：server 绑定动态 loopback，client/executor 连接并注册。远程配对、TLS、多租户、Docker 和 cloud VM 留待后续 ADR。
+- 当前代码只实现本地 supervisor 路径；已批准的下一目标包含 Agent Server 管理的 Anonymous Dev Tunnel、
+  Remote Runtime Box 配对和设备认证。Mobile Client、多租户、Docker 和 cloud VM 后置。
 - stable ID 用于逻辑绑定；新的 `instanceId`/`generation` 用于拒绝 restart/reconnect 后的迟到消息。
-- agents server 是产品业务与授权事实来源；每个 executor 是自身 MCP/Skill 数据和实际 host execution 的事实来源。拆分角色不是完整 OS 沙箱，仍需路径、命令、网络和 grant 校验。
-- 每次 executor 注册/重连先 full sync redacted inventory；成功前状态为 syncing。运行期使用 revision hint、60 秒 ±20% jitter poll 和 delta/snapshot fallback；cache stale/failed poll 不代表删除。
-- Agent 只保存 assigned executor stable resource ref；server 按 version/hash 获取 Skill metadata 与 `SKILL.md`，resources/scripts 仍通过 executor。
-- executor-owned MCP credential 与 execution grant 分离：连接可保持认证，但每次 Tool 仍需 server 的一次性授权；runtime teardown 不宣称 JavaScript 可可靠清零 string memory。
+- agents server 是产品业务与授权事实来源；每个 Runtime Box 是自身 MCP/Skill 数据和实际 host execution 的事实来源。拆分角色不是完整 OS 沙箱，仍需路径、命令、网络和 grant 校验。
+- 每次 Runtime Box 注册/重连先 full sync redacted inventory；成功前状态为 syncing。运行期使用 revision hint、60 秒 ±20% jitter poll 和 delta/snapshot fallback；cache stale/failed poll 不代表删除。
+- Agent 只保存 assigned Runtime Box stable resource ref；server 按 version/hash 获取 Skill metadata 与 `SKILL.md`，resources/scripts 仍通过 Runtime Box。
+- Runtime Box-owned MCP credential 与 execution grant 分离：连接可保持认证，但每次 Tool 仍需 server 的一次性授权；runtime teardown 不宣称 JavaScript 可可靠清零 string memory。
 - 两个 companion 必须随 desktop 整体打包、签名和更新，不能要求用户安装 runtime，也不能运行时下载未知 binary。
 - 当前已实现 compiled companion supervision、动态 loopback/authenticated RPC、Provider/auth、no-tools Pi Ask、
-  产品 DB 与 Pi Session JSONL。Executor Tool/MCP/Skill、Policy/grant 和 Agent binding 尚未实现，详见
+  产品 DB 与 Pi Session JSONL。Runtime Box Tool/MCP/Skill、Policy/grant 和 Agent binding 尚未实现，详见
   [实施进度](../implementation/progress.md)。
 - 本次开发阶段重构无需迁移旧 runtime/Provider 开发数据；不兼容时明确 reset。首次外部发布后再冻结正式
   migration gate。

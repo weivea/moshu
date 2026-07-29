@@ -13,24 +13,43 @@ import {
 	executorToolRpcTimeoutMs,
 	productRpcMaxBufferedOutboundBytes,
 	productRpcMaxFrameBytes,
+	productRpcEvents,
 	productRpcMethods,
+	remoteAccessMutationMethods,
+	remoteAccessMutationRpcTimeoutMs,
 } from "@moshu/contracts";
 import { openAppDatabase, prepareCoordinatedDatabaseReset } from "@moshu/database";
-import { createRpcBearerAuthenticator, createRpcServer, type RpcServer } from "@moshu/process-rpc";
+import { PairingSessionNotFoundError } from "@moshu/database";
+import {
+	createRpcBearerAuthenticator,
+	createRpcServer,
+	type RpcServer,
+	rpcJsonValueSchema,
+} from "@moshu/process-rpc";
 
 import { ChatApplicationService } from "./chat-application-service";
-import { ExecutorReadiness } from "./executor-readiness";
+import { DurableActionAuthorizationService } from "./action-authorization-service";
+import { AgentServerIdentity } from "./agent-server-identity";
+import { DevTunnelService } from "./dev-tunnel-service";
+import { RuntimeBoxRegistry } from "./runtime-box-registry";
+import { RuntimeBoxGenerationFence } from "./runtime-box-generation-fence";
+import { RuntimeIngressAuth } from "./runtime-ingress-auth";
 import { FileProviderRegistryStore } from "./file-provider-registry-store";
 import { createProviderAuthDiagnosticLog } from "./provider-auth-diagnostic-log";
 import {
-	agentsServerMethodAllowlist,
+	agentsServerClientMethodAllowlist,
+	agentsServerRuntimeMethodAllowlist,
+	createRuntimeBoxesSnapshot,
 	createProductRpcHandlers,
 	ProductEventRouter,
 } from "./product-rpc";
 
 export interface AgentsServerInstance {
-	readonly rpcServer: RpcServer;
-	readonly executorReadiness: ExecutorReadiness;
+	readonly productRpcServer: RpcServer;
+	readonly runtimeRpcServer: RpcServer;
+	readonly devTunnelService: DevTunnelService;
+	readonly runtimeBoxRegistry: RuntimeBoxRegistry;
+	readonly actionJournalEpoch: string;
 	readonly ready: Promise<void>;
 	shutdown(): Promise<void>;
 }
@@ -41,7 +60,7 @@ export interface CreateAgentsServerOptions {
 	createRuntime?: (
 		providers: ProviderRegistry,
 		modelRuntime: ModelRuntime,
-		executorGateway: ExecutorReadiness,
+		runtimeBoxRegistry: RuntimeBoxRegistry,
 	) => AskChatRuntime;
 	fetchProviderModels?: ConstructorParameters<
 		typeof ChatApplicationService
@@ -79,8 +98,17 @@ export async function createAgentsServer(
 	}
 
 	const database = openAppDatabase(options.bootstrap.paths.productDatabase);
+	const recoveredActions = database.actions.recoverOnStartup();
+	if (recoveredActions.cancelled > 0 || recoveredActions.outcomeUnknown > 0) {
+		reportDiagnostic(
+			`Recovered ${recoveredActions.cancelled} undispatched Actions and ` +
+				`${recoveredActions.outcomeUnknown} Actions with unknown outcomes.`,
+		);
+	}
 	let chatService: ChatApplicationService | undefined;
-	let rpcServer: RpcServer | undefined;
+	let productRpcServer: RpcServer | undefined;
+	let runtimeRpcServer: RpcServer | undefined;
+	let devTunnelService: DevTunnelService | undefined;
 	let unsubscribe: (() => void) | undefined;
 	let authController: HeadlessAuthController | undefined;
 	try {
@@ -99,13 +127,61 @@ export async function createAgentsServer(
 			credentials,
 		);
 		await providers.initialize();
-		const executorReadiness = new ExecutorReadiness();
+		const activeRuntimeBox = database.runtimeBoxes.getActive();
+		let publishRuntimeBoxesChanged = () => undefined;
+		const actionAuthorizer = new DurableActionAuthorizationService(
+			database.actions,
+			options.bootstrap.serverIdentity,
+		);
+		const runtimeBoxRegistry = new RuntimeBoxRegistry({
+			descriptors: database.runtimeBoxes.list(),
+			activeRuntimeBoxId: activeRuntimeBox.runtimeBoxId,
+			onRegister: (descriptor) => database.runtimeBoxes.upsertRegistration(descriptor),
+			onChange: () => publishRuntimeBoxesChanged(),
+			actionAuthorizer,
+			reportDiagnostic,
+			isDeviceKeyActive: (runtimeBoxId, deviceKeyId) => {
+				try {
+					database.runtimeBoxPairings.getActiveDeviceKey(runtimeBoxId, deviceKeyId);
+					return true;
+				} catch (error) {
+					if (error instanceof PairingSessionNotFoundError) {
+						return false;
+					}
+					throw error;
+				}
+			},
+		});
+		publishRuntimeBoxesChanged = () => {
+			const server = productRpcServer;
+			if (server === undefined) {
+				return;
+			}
+			const payload = rpcJsonValueSchema.parse(
+				createRuntimeBoxesSnapshot(
+					database.runtimeBoxes,
+					runtimeBoxRegistry,
+					database.runtimeBoxPairings,
+				),
+			);
+			for (const peer of server.peers) {
+				if (peer.remoteIdentity.role !== "client") {
+					continue;
+				}
+				try {
+					peer.emitEvent(productRpcEvents.runtimeBoxesChanged, payload);
+				} catch (error) {
+					peer.close(1011, "Runtime Box snapshot publication failed.");
+					console.error("Failed to publish Runtime Box snapshot.", error);
+				}
+			}
+		};
 		const runtime =
-			options.createRuntime?.(providers, modelRuntime, executorReadiness) ??
+			options.createRuntime?.(providers, modelRuntime, runtimeBoxRegistry) ??
 			new PiAgentRuntime({
 				agentDataDirectory,
 				modelRuntime,
-				executorGateway: executorReadiness,
+				runtimeBoxGateway: runtimeBoxRegistry,
 			});
 		const writeAuthDiagnostic = createProviderAuthDiagnosticLog(
 			join(agentDataDirectory, "diagnostics", "provider-auth.jsonl"),
@@ -118,15 +194,29 @@ export async function createAgentsServer(
 			},
 		});
 		const eventRouter = new ProductEventRouter();
+		const runtimeIngressAuth = new RuntimeIngressAuth({
+			pairings: database.runtimeBoxPairings,
+			runtimeBoxes: database.runtimeBoxes,
+			identity: AgentServerIdentity.open(
+				join(agentDataDirectory, "runtime-ingress", "identity.json"),
+			),
+			rpcIdentity: options.bootstrap.serverIdentity,
+			actionJournalEpoch: database.runtimeBoxes.getActionJournalEpoch(),
+			localAuthenticator: createRpcBearerAuthenticator(
+				options.bootstrap.peerBindings.filter((binding) => binding.identity.role === "runtime-box"),
+			),
+		});
 		chatService = new ChatApplicationService({
 			sessions: database.sessions,
 			runs: database.runs,
+			actions: database.actions,
 			providers,
 			runtime,
 			...(options.fetchProviderModels === undefined
 				? {}
 				: { fetchProviderModels: options.fetchProviderModels }),
-			isRuntimeReady: () => executorReadiness.isReady(),
+			isRuntimeReady: (runtimeBoxId) => runtimeBoxRegistry.isReady(runtimeBoxId),
+			getActiveRuntimeBoxId: () => database.runtimeBoxes.getActive().runtimeBoxId,
 			logger: {
 				error(message, error) {
 					console.error(message, error);
@@ -161,36 +251,104 @@ export async function createAgentsServer(
 		});
 		const ready = chatService.drainPendingAgentSessionCleanups({ batchSize: 64 });
 
-		rpcServer = createRpcServer({
+		const handlers = createProductRpcHandlers({
+			chatService,
+			runtimeBoxRegistry,
+			runtimeBoxes: database.runtimeBoxes,
+			runtimeBoxPairings: database.runtimeBoxPairings,
+			projects: database.projects,
+			runtimeIngressAuth,
+			getDevTunnelService: () => {
+				if (devTunnelService === undefined) {
+					throw new Error("Dev Tunnel service is not initialized.");
+				}
+				return devTunnelService;
+			},
+			eventRouter,
+			serverVersion: options.serverVersion,
+			authController,
+		});
+		productRpcServer = createRpcServer({
 			identity: options.bootstrap.serverIdentity,
-			authenticate: createRpcBearerAuthenticator(options.bootstrap.peerBindings),
-			acceptedPeerRoles: ["client", "executor"],
-			handlers: createProductRpcHandlers({
-				chatService,
-				executorReadiness,
-				eventRouter,
-				serverVersion: options.serverVersion,
-				authController,
-			}),
-			methodAllowlist: agentsServerMethodAllowlist,
+			authenticate: createRpcBearerAuthenticator(
+				options.bootstrap.peerBindings.filter((binding) => binding.identity.role === "client"),
+			),
+			acceptedPeerRoles: ["client"],
+			handlers,
+			methodAllowlist: agentsServerClientMethodAllowlist,
 			limits: {
 				maxFrameBytes: productRpcMaxFrameBytes,
 				maxBufferedOutboundBytes: productRpcMaxBufferedOutboundBytes,
 			},
-			requestTimeoutLimits: {
-				[productRpcMethods.executorToolInvoke]: executorToolRpcTimeoutMs,
-			},
+			requestTimeoutLimits: Object.fromEntries(
+				remoteAccessMutationMethods.map((method) => [method, remoteAccessMutationRpcTimeoutMs]),
+			),
 			onClose(_info, peer) {
-				executorReadiness.clear(peer);
 				eventRouter.releasePeer(peer);
 			},
 			onError(error) {
-				console.error("agents-server RPC error.", error);
+				console.error("agents-server product RPC error.", error);
 			},
+		});
+		const createRuntimeRpcServer = (port?: number): RpcServer =>
+			createRpcServer({
+				identity: options.bootstrap.serverIdentity,
+				hostname: "127.0.0.1",
+				...(port === undefined ? {} : { port }),
+				path: "/runtime",
+				maxRequestBodyBytes: 32 * 1024,
+				authenticate: runtimeIngressAuth.authenticate,
+				handleHttpRequest: runtimeIngressAuth.handleHttpRequest,
+				acceptedPeerRoles: ["runtime-box"],
+				generationFence: new RuntimeBoxGenerationFence(database.runtimeBoxes),
+				handlers,
+				methodAllowlist: agentsServerRuntimeMethodAllowlist,
+				limits: {
+					maxFrameBytes: productRpcMaxFrameBytes,
+					maxBufferedOutboundBytes: productRpcMaxBufferedOutboundBytes,
+				},
+				requestTimeoutLimits: {
+					[productRpcMethods.runtimeBoxToolInvoke]: executorToolRpcTimeoutMs,
+				},
+				onClose(_info, peer) {
+					runtimeBoxRegistry.clear(peer);
+				},
+				onError(error) {
+					console.error("agents-server Runtime ingress RPC error.", error);
+				},
+			});
+		const persistedRuntimePort = database.remoteAccess.get().runtimeIngressPort;
+		let portConflict: { expectedPort: number; boundPort: number } | undefined;
+		try {
+			runtimeRpcServer = createRuntimeRpcServer(persistedRuntimePort);
+		} catch (error) {
+			if (persistedRuntimePort === undefined || !isAddressInUseError(error)) {
+				throw error;
+			}
+			runtimeRpcServer = createRuntimeRpcServer();
+			portConflict = {
+				expectedPort: persistedRuntimePort,
+				boundPort: runtimeRpcServer.port,
+			};
+			reportDiagnostic(
+				`Runtime ingress port ${persistedRuntimePort} is unavailable; Remote Access requires repair.`,
+			);
+		}
+		if (persistedRuntimePort === undefined) {
+			database.remoteAccess.setRuntimeIngressPort(runtimeRpcServer.port);
+		}
+		devTunnelService = new DevTunnelService({
+			repository: database.remoteAccess,
+			runtimeIngressPort: runtimeRpcServer.port,
+			reportDiagnostic,
+			...(portConflict === undefined ? {} : { portConflict }),
+		});
+		void devTunnelService.start().catch((error: unknown) => {
+			reportDiagnostic(error instanceof Error ? error.message : "Dev Tunnel startup failed.");
 		});
 		const service = chatService;
 		unsubscribe = service.subscribe((event) => {
-			const server = rpcServer;
+			const server = productRpcServer;
 			if (server !== undefined) {
 				eventRouter.publish(server.peers, event, service.getClientRequestId(event.runId));
 			}
@@ -198,8 +356,11 @@ export async function createAgentsServer(
 
 		let shutdownPromise: Promise<void> | undefined;
 		return {
-			rpcServer,
-			executorReadiness,
+			productRpcServer,
+			runtimeRpcServer,
+			devTunnelService,
+			runtimeBoxRegistry,
+			actionJournalEpoch: database.runtimeBoxes.getActionJournalEpoch(),
 			ready,
 			shutdown() {
 				if (shutdownPromise !== undefined) {
@@ -207,7 +368,9 @@ export async function createAgentsServer(
 				}
 				shutdownPromise = (async () => {
 					unsubscribe?.();
-					rpcServer?.stop();
+					productRpcServer?.stop();
+					runtimeRpcServer?.stop();
+					await devTunnelService?.shutdown();
 					await authController?.dispose();
 					await chatService?.shutdown();
 					database.close();
@@ -217,7 +380,9 @@ export async function createAgentsServer(
 		};
 	} catch (error) {
 		unsubscribe?.();
-		rpcServer?.stop();
+		await devTunnelService?.shutdown();
+		productRpcServer?.stop();
+		runtimeRpcServer?.stop();
 		await authController?.dispose();
 		await chatService?.shutdown();
 		database.close();
@@ -231,4 +396,12 @@ function assertAbsoluteDataPaths(bootstrap: AgentsServerBootstrapRecord): void {
 			throw new Error(`agents-server ${name} path must be absolute.`);
 		}
 	}
+}
+
+function isAddressInUseError(error: unknown): boolean {
+	return (
+		error instanceof Error &&
+		"code" in error &&
+		(error as Error & { code?: unknown }).code === "EADDRINUSE"
+	);
 }

@@ -8,8 +8,27 @@ export const MIN_RPC_BOOTSTRAP_CREDENTIAL_BYTES = 32;
 export const MAX_RPC_BOOTSTRAP_CREDENTIAL_BYTES = 128;
 const MAX_RPC_BOOTSTRAP_CREDENTIAL_CHARACTERS = 171;
 
+export interface RpcHttpRequestContext {
+	readonly remoteAddress: string | null;
+}
+
+export class RpcHandshakeHttpError extends Error {
+	constructor(
+		readonly status: number,
+		message: string,
+		readonly headers: Readonly<Record<string, string>> = {},
+	) {
+		super(message);
+		this.name = "RpcHandshakeHttpError";
+		if (!Number.isSafeInteger(status) || status < 400 || status > 599) {
+			throw new TypeError("RPC handshake HTTP status must be between 400 and 599.");
+		}
+	}
+}
+
 export type RpcHandshakeAuthenticator = (
 	request: Request,
+	context?: RpcHttpRequestContext,
 ) => RpcPeerIdentity | null | Promise<RpcPeerIdentity | null>;
 
 export type RpcHandshakeHeadersProvider = () => Bun.HeadersInit | Promise<Bun.HeadersInit>;

@@ -5,22 +5,24 @@ import {
 	BOOTSTRAP_CHANNEL,
 	BOOTSTRAP_CONTROL_VERSION,
 	openBootstrapControlChannel,
-	parseExecutorBootstrapRecord,
+	parseRuntimeBoxBootstrapRecord,
 } from "./bootstrap";
 
 const validRecord = {
 	channel: BOOTSTRAP_CHANNEL,
 	controlVersion: BOOTSTRAP_CONTROL_VERSION,
 	type: "START",
-	role: "executor",
-	nonce: "executor-generation-1",
+	role: "runtime-box",
+	nonce: "runtime-box-generation-1",
 	identity: {
-		role: "executor",
-		peerId: "moshu-local-executor",
-		instanceId: "executor-1",
+		role: "runtime-box",
+		peerId: "moshu-local-runtime-box",
+		instanceId: "runtime-box-1",
 		generation: 1,
 	},
 	credential: Buffer.alloc(32, 8).toString("base64url"),
+	dataDirectory: "/tmp/moshu-runtime-box-test",
+	actionJournalEpoch: "550e8400-e29b-41d4-a716-446655440099",
 	agentsServer: {
 		identity: {
 			role: "agents",
@@ -31,14 +33,14 @@ const validRecord = {
 		endpoint: {
 			host: "127.0.0.1",
 			port: 42_101,
-			path: "/rpc",
+			path: "/runtime",
 		},
 	},
 } as const;
 
-describe("executor bootstrap control", () => {
+describe("Runtime Box bootstrap control", () => {
 	test("parses the authenticated agents-server binding", () => {
-		expect(parseExecutorBootstrapRecord(`${JSON.stringify(validRecord)}\n`)).toEqual(validRecord);
+		expect(parseRuntimeBoxBootstrapRecord(`${JSON.stringify(validRecord)}\n`)).toEqual(validRecord);
 	});
 
 	test.each([
@@ -55,7 +57,7 @@ describe("executor bootstrap control", () => {
 		],
 		["invalid credential", { ...validRecord, credential: "not-a-credential" }],
 	])("rejects %s", (_name, record) => {
-		expect(() => parseExecutorBootstrapRecord(JSON.stringify(record))).toThrow();
+		expect(() => parseRuntimeBoxBootstrapRecord(JSON.stringify(record))).toThrow();
 	});
 
 	test("keeps the parent channel open after parsing bootstrap", async () => {
@@ -67,7 +69,7 @@ describe("executor bootstrap control", () => {
 		});
 		controller?.enqueue(new TextEncoder().encode(`${JSON.stringify(validRecord)}\n`));
 		const channel = await openBootstrapControlChannel(stream);
-		expect(parseExecutorBootstrapRecord(channel.input)).toEqual(validRecord);
+		expect(parseRuntimeBoxBootstrapRecord(channel.input)).toEqual(validRecord);
 		controller?.close();
 		await expect(channel.parentClosed).resolves.toBeUndefined();
 	});
