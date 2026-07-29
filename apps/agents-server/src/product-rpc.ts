@@ -357,7 +357,10 @@ export function createProductRpcHandlers(dependencies: ProductRpcDependencies): 
 			),
 			[productRpcMethods.remoteAccessStatus]: createRequestHandler(
 				productRpcRequestSchemas[productRpcMethods.remoteAccessStatus],
-				() => remoteAccessStatusOutputSchema.parse(getDevTunnelService().getStatus()),
+				async (_input, _peer, context) =>
+					remoteAccessStatusOutputSchema.parse(
+						await getDevTunnelService().refreshAuthentication(context.signal),
+					),
 			),
 			[productRpcMethods.remoteAccessAuthStart]: createRequestHandler(
 				productRpcRequestSchemas[productRpcMethods.remoteAccessAuthStart],

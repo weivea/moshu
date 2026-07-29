@@ -133,6 +133,7 @@ describe("Runtime Box product RPC", () => {
 				inventories: [],
 				remoteAccess: {
 					enabled: false,
+					authenticated: false,
 					state: "disabled",
 					runtimeIngressPort: 41_000,
 					trafficEstimate: {

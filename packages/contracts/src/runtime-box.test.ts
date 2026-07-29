@@ -23,6 +23,7 @@ const diagnostics: RuntimeDiagnosticsOutput = {
 	inventories: [],
 	remoteAccess: {
 		enabled: false,
+		authenticated: false,
 		state: "disabled" as const,
 		runtimeIngressPort: 41_000,
 		trafficEstimate: {

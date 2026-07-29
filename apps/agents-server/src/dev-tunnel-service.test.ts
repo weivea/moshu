@@ -225,6 +225,12 @@ describe("DevTunnelService", () => {
 			parseQualifiedTunnelId('{"tunnel":{"tunnelId":"moshu-test","clusterId":"euw"}}', "fallback"),
 		).toBe("moshu-test.euw");
 		expect(
+			parseQualifiedTunnelId(
+				'{"tunnel":{"tunnelId":"moshu-test.jpe1","hostConnections":0}}',
+				"moshu-test",
+			),
+		).toBe("moshu-test.jpe1");
+		expect(
 			parseTunnelPorts(
 				'{"value":[{"portNumber":41000},{"portNumber":42000},{"portNumber":41000}]}',
 			),
@@ -343,6 +349,7 @@ describe("DevTunnelService", () => {
 				runtimeIngressPort: 41_001,
 				adapter,
 			});
+
 			expect((await service.enable()).state).toBe("auth_required");
 			adapter.authenticated = true;
 			const attempt = service.startAuthentication();
@@ -356,6 +363,31 @@ describe("DevTunnelService", () => {
 			await service.recreate();
 			expect(adapter.deleted).toEqual([original]);
 			expect(adapter.ensureCalls).toBe(2);
+			await service.shutdown();
+		} finally {
+			database.close();
+		}
+	});
+
+	test("refreshes and briefly caches the CLI authentication status", async () => {
+		const database = openAppDatabase(":memory:");
+		let now = Date.now();
+		try {
+			const adapter = new FakeDevTunnelAdapter();
+			const service = new DevTunnelService({
+				repository: database.remoteAccess,
+				runtimeIngressPort: 41_019,
+				adapter,
+				now: () => now,
+			});
+			expect(service.getStatus().authenticated).toBe(false);
+			expect((await service.refreshAuthentication()).authenticated).toBe(true);
+
+			adapter.authenticated = false;
+			expect((await service.refreshAuthentication()).authenticated).toBe(true);
+
+			now += 5_000;
+			expect((await service.refreshAuthentication()).authenticated).toBe(false);
 			await service.shutdown();
 		} finally {
 			database.close();

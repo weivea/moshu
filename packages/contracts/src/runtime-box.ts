@@ -286,6 +286,7 @@ export const remoteAccessStateSchema = z.enum([
 export const remoteAccessStatusOutputSchema = z
 	.object({
 		enabled: z.boolean(),
+		authenticated: z.boolean(),
 		state: remoteAccessStateSchema,
 		runtimeIngressPort: z.int().min(1).max(65_535),
 		tunnelId: z.string().min(3).max(60).optional(),

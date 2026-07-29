@@ -10,6 +10,7 @@ import type { RemoteAccessRepository } from "@moshu/database";
 const devTunnelMonthlyLimitBytes = 5 * 1024 * 1024 * 1024;
 const devTunnelTrafficFlushBytes = 1024 * 1024;
 const devTunnelTrafficFlushMs = 1_000;
+const devTunnelAuthenticationRefreshMs = 5_000;
 
 export interface DevTunnelHostProcess {
 	readonly ready: Promise<{ publicUrl: string }>;
@@ -48,6 +49,11 @@ interface SharedMutationOperation {
 	settled: boolean;
 }
 
+interface AuthenticationProbe {
+	readonly promise: Promise<boolean>;
+	readonly controller: AbortController;
+}
+
 class DevTunnelAuthenticationRequiredError extends Error {
 	constructor(message = "Dev Tunnels authentication is required.") {
 		super(message);
@@ -64,6 +70,9 @@ export class DevTunnelService {
 	#portConflict: { expectedPort: number; boundPort: number } | undefined;
 	readonly #authAttempts = new Map<string, RemoteAccessAuthAttempt>();
 	readonly #authProcesses = new Set<DevTunnelAuthenticationProcess>();
+	#authenticated = false;
+	#authenticationCheckedAt: number | undefined;
+	#authenticationProbe: AuthenticationProbe | undefined;
 	#state: RemoteAccessStatusOutput["state"] = "disabled";
 	#lastError: string | undefined;
 	#host: DevTunnelHostProcess | undefined;
@@ -130,6 +139,7 @@ export class DevTunnelService {
 				: "disabled";
 		return remoteAccessStatusOutputSchema.parse({
 			enabled: settings.enabled,
+			authenticated: this.#authenticated,
 			state,
 			runtimeIngressPort: this.#runtimeIngressPort,
 			...(settings.tunnelId === undefined ? {} : { tunnelId: settings.tunnelId }),
@@ -150,6 +160,39 @@ export class DevTunnelService {
 				maxBytesPerSecond: 20 * 1024 * 1024,
 			},
 		});
+	}
+
+	async refreshAuthentication(signal?: AbortSignal): Promise<RemoteAccessStatusOutput> {
+		this.#assertRunning();
+		throwIfAborted(signal);
+		if (
+			this.#authenticationCheckedAt !== undefined &&
+			this.#now() - this.#authenticationCheckedAt < devTunnelAuthenticationRefreshMs
+		) {
+			return this.getStatus();
+		}
+		let probe = this.#authenticationProbe;
+		if (probe === undefined) {
+			const controller = new AbortController();
+			const promise = withAbortTimeout(
+				this.#adapter.isAuthenticated(controller.signal),
+				10_000,
+				"Dev Tunnels authentication check",
+				controller,
+			).then((authenticated) => {
+				this.#setAuthenticated(authenticated);
+				return authenticated;
+			});
+			const createdProbe = { promise, controller };
+			probe = createdProbe;
+			this.#authenticationProbe = createdProbe;
+			void promise.then(
+				() => this.#settleAuthenticationProbe(createdProbe),
+				() => this.#settleAuthenticationProbe(createdProbe),
+			);
+		}
+		await (signal === undefined ? probe.promise : withAbortSignal(probe.promise, signal));
+		return this.getStatus();
 	}
 
 	recordTraffic(direction: "inbound" | "outbound", bytes: number): void {
@@ -224,6 +267,9 @@ export class DevTunnelService {
 					message: message.slice(-4_096),
 				});
 				this.#authAttempts.set(attemptId, completed);
+				if (exitCode === 0) {
+					this.#setAuthenticated(true);
+				}
 				if (exitCode === 0 && this.#repository.get().enabled && !this.#stopping) {
 					const generation = this.#operationGeneration;
 					await this.#enqueueMutation(generation, async () => {
@@ -430,6 +476,7 @@ export class DevTunnelService {
 						return this.getStatus();
 					}
 					if (error instanceof DevTunnelAuthenticationRequiredError) {
+						this.#setAuthenticated(false);
 						this.#state = "auth_required";
 						this.#lastError = undefined;
 					} else {
@@ -446,13 +493,19 @@ export class DevTunnelService {
 		const epoch = ++this.#mutationEpoch;
 		this.#operationGeneration = epoch;
 		this.#cancelStart("The Agent Server is shutting down.");
+		const authenticationProbe = this.#authenticationProbe;
+		authenticationProbe?.controller.abort(new Error("The Agent Server is shutting down."));
 		if (this.#trafficFlushTimer !== undefined) {
 			clearTimeout(this.#trafficFlushTimer);
 			this.#trafficFlushTimer = undefined;
 		}
 		this.#flushTraffic();
 		const hostShutdown = this.#stopHost();
-		await Promise.allSettled([this.#mutationTail, this.#startPromise ?? Promise.resolve()]);
+		await Promise.allSettled([
+			this.#mutationTail,
+			this.#startPromise ?? Promise.resolve(),
+			authenticationProbe?.promise ?? Promise.resolve(),
+		]);
 		await hostShutdown.catch((error: unknown) =>
 			this.#reportDiagnostic(safeMessage(error, "Dev Tunnel host shutdown failed.")),
 		);
@@ -549,6 +602,7 @@ export class DevTunnelService {
 				"Dev Tunnels authentication check",
 				startAbortController,
 			);
+			this.#setAuthenticated(authenticated);
 			throwIfAborted(startAbortController.signal);
 			if (!this.#isCurrent(generation)) {
 				return;
@@ -626,6 +680,7 @@ export class DevTunnelService {
 					return;
 				}
 				if (failure instanceof DevTunnelAuthenticationRequiredError) {
+					this.#setAuthenticated(false);
 					this.#state = "auth_required";
 					this.#lastError = undefined;
 					return;
@@ -704,6 +759,17 @@ export class DevTunnelService {
 	#assertRunning(): void {
 		if (this.#stopping) {
 			throw new Error("Dev Tunnel service is shutting down.");
+		}
+	}
+
+	#setAuthenticated(authenticated: boolean): void {
+		this.#authenticated = authenticated;
+		this.#authenticationCheckedAt = this.#now();
+	}
+
+	#settleAuthenticationProbe(probe: AuthenticationProbe): void {
+		if (this.#authenticationProbe === probe) {
+			this.#authenticationProbe = undefined;
 		}
 	}
 
@@ -820,12 +886,12 @@ export class DevTunnelCliAdapter implements DevTunnelAdapter {
 		await requireSuccess(this.executable, ["access", "reset", qualifiedTunnelId], signal);
 		await requireSuccess(
 			this.executable,
-			["access", "reset", qualifiedTunnelId, "--port", String(port)],
+			["access", "reset", qualifiedTunnelId, "--port-number", String(port)],
 			signal,
 		);
 		await requireSuccess(
 			this.executable,
-			["access", "create", qualifiedTunnelId, "--port", String(port), "--anonymous"],
+			["access", "create", qualifiedTunnelId, "--port-number", String(port), "--anonymous"],
 			signal,
 		);
 		return qualifiedTunnelId;
@@ -1187,6 +1253,9 @@ export function parseQualifiedTunnelId(message: string, fallback: string): strin
 	collectNamedStrings(value, "clusterid", clusterIds);
 	const tunnelId = tunnelIds[0];
 	const clusterId = clusterIds[0];
+	if (tunnelId?.includes(".")) {
+		return tunnelId;
+	}
 	if (tunnelId && clusterId) {
 		return `${tunnelId}.${clusterId}`;
 	}

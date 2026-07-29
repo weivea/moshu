@@ -17,6 +17,7 @@ export function RuntimeBoxesSettingsPage() {
 	const [remoteAccess, setRemoteAccess] = useState<RemoteAccessStatusOutput>();
 	const [authAttempt, setAuthAttempt] = useState<RemoteAccessAuthAttempt>();
 	const [pairing, setPairing] = useState<CreateRuntimeBoxPairingOutput>();
+	const [pairingRemainingSeconds, setPairingRemainingSeconds] = useState<number>();
 	const [claims, setClaims] = useState<RuntimeBoxPairingClaim[]>([]);
 	const [pendingAction, setPendingAction] = useState<string>();
 	const [errorMessage, setErrorMessage] = useState<string>();
@@ -73,6 +74,26 @@ export function RuntimeBoxesSettingsPage() {
 		}, 750);
 		return () => clearInterval(timer);
 	}, [authAttempt, loadRemoteAccess, t]);
+
+	useEffect(() => {
+		if (pairing === undefined) {
+			setPairingRemainingSeconds(undefined);
+			return;
+		}
+		const expiresAtMs = Date.parse(pairing.expiresAt);
+		const updateCountdown = () => {
+			const remainingMs = expiresAtMs - Date.now();
+			if (remainingMs <= 0) {
+				setPairing((current) => (current?.pairingId === pairing.pairingId ? undefined : current));
+				setPairingRemainingSeconds(undefined);
+				return;
+			}
+			setPairingRemainingSeconds(Math.ceil(remainingMs / 1_000));
+		};
+		updateCountdown();
+		const timer = setInterval(updateCountdown, 1_000);
+		return () => clearInterval(timer);
+	}, [pairing]);
 
 	const runRemoteMutation = async (
 		action: string,
@@ -224,12 +245,19 @@ export function RuntimeBoxesSettingsPage() {
 				<div className="provider-form__actions">
 					<Button
 						className="chat-button"
-						isDisabled={pendingAction !== undefined || authAttempt?.status === "running"}
+						isDisabled={
+							pendingAction !== undefined ||
+							authAttempt?.status === "running" ||
+							remoteAccess === undefined ||
+							remoteAccess.authenticated
+						}
 						onPress={() =>
 							void desktopClient.startRemoteAccessAuthentication().then(setAuthAttempt)
 						}
 					>
-						{t("remoteAccess.authenticate")}
+						{remoteAccess?.authenticated
+							? t("remoteAccess.authenticated")
+							: t("remoteAccess.authenticate")}
 					</Button>
 					<Button
 						className="chat-button chat-button--primary"
@@ -280,7 +308,11 @@ export function RuntimeBoxesSettingsPage() {
 					<div className="pairing-code">
 						<strong>{pairing.code}</strong>
 						{pairing.runtimeBaseUrl ? <code>{pairing.runtimeBaseUrl}</code> : null}
-						<span>{pairing.expiresAt}</span>
+						{pairingRemainingSeconds === undefined ? null : (
+							<span>
+								{t("runtimeBoxes.pairingExpiresIn", formatCountdown(pairingRemainingSeconds))}
+							</span>
+						)}
 					</div>
 				) : (
 					<p>{t("runtimeBoxes.pairingHint")}</p>
@@ -343,4 +375,10 @@ function formatBytes(bytes: number): string {
 		return `${(bytes / (1024 * 1024)).toFixed(2)} MiB`;
 	}
 	return `${Math.ceil(bytes / 1024)} KiB`;
+}
+
+function formatCountdown(totalSeconds: number): string {
+	const minutes = Math.floor(totalSeconds / 60);
+	const seconds = totalSeconds % 60;
+	return `${minutes}:${String(seconds).padStart(2, "0")}`;
 }
