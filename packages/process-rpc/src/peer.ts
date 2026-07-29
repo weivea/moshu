@@ -91,6 +91,7 @@ export interface RpcEndpointOptions {
 	readonly onProtocolError?: (error: RpcProtocolErrorEnvelope, peer: RpcPeer) => void;
 	readonly onError?: (error: unknown, peer: RpcPeer) => void;
 	readonly onClose?: (info: RpcCloseInfo, peer: RpcPeer) => void;
+	readonly onTraffic?: (direction: "inbound" | "outbound", bytes: number, peer: RpcPeer) => void;
 }
 
 export interface RpcRequestOptions {
@@ -164,6 +165,9 @@ export class RpcPeer {
 	readonly #onProtocolError: ((error: RpcProtocolErrorEnvelope, peer: RpcPeer) => void) | undefined;
 	readonly #onError: ((error: unknown, peer: RpcPeer) => void) | undefined;
 	readonly #onClose: ((info: RpcCloseInfo, peer: RpcPeer) => void) | undefined;
+	readonly #onTraffic:
+		| ((direction: "inbound" | "outbound", bytes: number, peer: RpcPeer) => void)
+		| undefined;
 	readonly #pendingRequests = new Map<string, PendingRequest>();
 	readonly #inboundRequests = new Map<string, InboundRequest>();
 	readonly #inboundEvents = new Set<InboundEvent>();
@@ -189,6 +193,7 @@ export class RpcPeer {
 		this.#onProtocolError = options.onProtocolError;
 		this.#onError = options.onError;
 		this.#onClose = options.onClose;
+		this.#onTraffic = options.onTraffic;
 
 		let resolveClosed: ((info: RpcCloseInfo) => void) | undefined;
 		this.closed = new Promise<RpcCloseInfo>((resolve) => {
@@ -374,6 +379,7 @@ export class RpcPeer {
 			);
 			return;
 		}
+		this.#reportTraffic("inbound", frameBytes);
 		if (!hasSafeRpcJsonStructure(text)) {
 			this.#rejectMalformedFrame("Frame exceeded the JSON structural limits.");
 			return;
@@ -956,7 +962,17 @@ export class RpcPeer {
 
 	#sendEnvelope(envelope: RpcEnvelope): void {
 		this.#assertOpen();
-		this.#transport.send(this.#encodeEnvelope(envelope));
+		const text = this.#encodeEnvelope(envelope);
+		this.#reportTraffic("outbound", getTextBytes(text));
+		this.#transport.send(text);
+	}
+
+	#reportTraffic(direction: "inbound" | "outbound", bytes: number): void {
+		try {
+			this.#onTraffic?.(direction, bytes, this);
+		} catch (error) {
+			this.#reportError(error);
+		}
 	}
 
 	#encodeEnvelope(envelope: RpcEnvelope): string {

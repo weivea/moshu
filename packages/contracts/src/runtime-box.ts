@@ -2,6 +2,11 @@ import { z } from "zod";
 import { actionJournalEpochSchema, processPeerIdentitySchema } from "./companion-bootstrap";
 
 export const defaultLocalRuntimeBoxId = "moshu-local-runtime-box" as const;
+export const runtimeBoxProtocolMinVersion = 1 as const;
+export const runtimeBoxProtocolMaxVersion = 1 as const;
+export const currentRuntimeBoxProtocolVersion = runtimeBoxProtocolMaxVersion;
+export const runtimeBoxProtocolVersionSchema = z.int().positive().max(65_535);
+export const runtimeBoxTransportSecuritySchema = z.enum(["relay-tls", "noise-xx"]);
 
 export const runtimeBoxIdSchema = z
 	.string()
@@ -60,6 +65,12 @@ export const runtimeBoxConnectionInfoSchema = z
 		instanceId: z.string().min(1).max(256).optional(),
 		generation: z.int().nonnegative().safe().optional(),
 		deviceKeyIds: z.array(runtimeBoxDeviceKeyIdSchema).max(32),
+		state: z.enum(["online", "syncing", "offline", "upgrade_required"]).default("offline"),
+		compatibility: z.enum(["compatible", "unknown", "upgrade_required"]).default("unknown"),
+		requiredProtocolMinVersion: runtimeBoxProtocolVersionSchema.optional(),
+		requiredProtocolMaxVersion: runtimeBoxProtocolVersionSchema.optional(),
+		negotiatedProtocolVersion: runtimeBoxProtocolVersionSchema.optional(),
+		transportSecurity: runtimeBoxTransportSecuritySchema.optional(),
 	})
 	.strict();
 
@@ -214,7 +225,7 @@ export const runtimeBoxChallengeInputSchema = z
 		deviceKeyId: runtimeBoxDeviceKeyIdSchema,
 		instanceId: z.string().min(1).max(256),
 		generation: z.int().nonnegative().safe(),
-		protocolVersion: z.literal(1),
+		protocolVersion: runtimeBoxProtocolVersionSchema,
 	})
 	.strict();
 
@@ -226,9 +237,41 @@ export const runtimeBoxChallengeOutputSchema = z
 		agentServerId: z.string().uuid(),
 		rpcIdentity: processPeerIdentitySchema.refine((identity) => identity.role === "agents"),
 		actionJournalEpoch: actionJournalEpochSchema,
+		negotiatedProtocolVersion: z.literal(currentRuntimeBoxProtocolVersion),
+		transportSecurity: z.literal("relay-tls"),
+		supportedTransportSecurity: z.array(runtimeBoxTransportSecuritySchema).min(1).max(4),
 		signature: pairingSecretSchema,
 	})
 	.strict();
+
+const runtimeBoxCompatibilityReportUnsignedSchema = z
+	.object({
+		runtimeBoxId: runtimeBoxIdSchema,
+		deviceKeyId: runtimeBoxDeviceKeyIdSchema,
+		instanceId: z.string().min(1).max(256),
+		generation: z.int().nonnegative().safe(),
+		protocolVersion: runtimeBoxProtocolVersionSchema,
+		reportId: z.string().uuid(),
+		issuedAt: z.string().datetime({ offset: true }),
+	})
+	.strict();
+
+export const runtimeBoxCompatibilityReportInputSchema =
+	runtimeBoxCompatibilityReportUnsignedSchema.extend({
+		signature: pairingSecretSchema,
+	});
+
+export const runtimeBoxCompatibilityReportOutputSchema = z
+	.object({
+		accepted: z.literal(true),
+		requiredProtocolMinVersion: runtimeBoxProtocolVersionSchema,
+		requiredProtocolMaxVersion: runtimeBoxProtocolVersionSchema,
+	})
+	.strict()
+	.refine(
+		(value) => value.requiredProtocolMinVersion <= value.requiredProtocolMaxVersion,
+		"Runtime Box compatibility report protocol range is invalid.",
+	);
 
 export const remoteAccessStateSchema = z.enum([
 	"disabled",
@@ -248,6 +291,24 @@ export const remoteAccessStatusOutputSchema = z
 		tunnelId: z.string().min(3).max(60).optional(),
 		publicUrl: z.string().url().optional(),
 		lastError: z.string().min(1).max(1_024).optional(),
+		trafficEstimate: z
+			.object({
+				month: z.string().regex(/^\d{4}-\d{2}$/),
+				receivedBytes: z.int().nonnegative().safe(),
+				sentBytes: z.int().nonnegative().safe(),
+				totalBytes: z.int().nonnegative().safe(),
+				monthlyLimitBytes: z.literal(5 * 1024 * 1024 * 1024),
+				warningLevel: z.enum(["none", "50", "80", "100"]),
+				source: z.literal("runtime-rpc-application-payload-estimate"),
+			})
+			.strict(),
+		serviceLimits: z
+			.object({
+				maxTunnelsPerUser: z.literal(10),
+				maxPortsPerTunnel: z.literal(10),
+				maxBytesPerSecond: z.literal(20 * 1024 * 1024),
+			})
+			.strict(),
 	})
 	.strict();
 
@@ -271,7 +332,52 @@ export const remoteAccessMutationOutputSchema = z
 	})
 	.strict();
 
+export const runtimeDiagnosticsOutputSchema = z
+	.object({
+		generatedAt: z.string().datetime({ offset: true }),
+		server: z
+			.object({
+				version: z.string().min(1).max(64),
+				identity: processPeerIdentitySchema,
+				processRpcProtocol: z
+					.object({
+						major: z.int().nonnegative(),
+						minor: z.int().nonnegative(),
+					})
+					.strict(),
+				runtimeProtocolMinVersion: z.literal(runtimeBoxProtocolMinVersion),
+				runtimeProtocolMaxVersion: z.literal(runtimeBoxProtocolMaxVersion),
+				transportSecurity: z.literal("relay-tls"),
+				noiseUpgradeAvailable: z.literal(false),
+			})
+			.strict(),
+		database: z
+			.object({
+				schemaVersion: z.int().positive().safe(),
+				integrity: z.enum(["ok", "error"]),
+			})
+			.strict(),
+		runtimeBoxes: z.array(runtimeBoxConnectionInfoSchema).max(128),
+		inventories: z
+			.array(
+				z
+					.object({
+						runtimeBoxId: runtimeBoxIdSchema,
+						inventoryEpoch: z.string().uuid().optional(),
+						inventoryRevision: z.int().nonnegative().safe().optional(),
+						stale: z.boolean(),
+						resourceCount: z.int().nonnegative().max(512),
+					})
+					.strict(),
+			)
+			.max(128),
+		remoteAccess: remoteAccessStatusOutputSchema,
+	})
+	.strict();
+
 export type RuntimeBoxId = z.infer<typeof runtimeBoxIdSchema>;
+export type RuntimeBoxProtocolVersion = z.infer<typeof runtimeBoxProtocolVersionSchema>;
+export type RuntimeBoxTransportSecurity = z.infer<typeof runtimeBoxTransportSecuritySchema>;
 export type RuntimeBoxKind = z.infer<typeof runtimeBoxKindSchema>;
 export type RuntimeBoxDescriptor = z.infer<typeof runtimeBoxDescriptorSchema>;
 export type RuntimeBoxConnectionInfo = z.infer<typeof runtimeBoxConnectionInfoSchema>;
@@ -295,9 +401,16 @@ export type RevokeRuntimeBoxDeviceOutput = z.infer<typeof revokeRuntimeBoxDevice
 export type RuntimeBoxPairingStatusOutput = z.infer<typeof runtimeBoxPairingStatusOutputSchema>;
 export type RuntimeBoxChallengeInput = z.infer<typeof runtimeBoxChallengeInputSchema>;
 export type RuntimeBoxChallengeOutput = z.infer<typeof runtimeBoxChallengeOutputSchema>;
+export type RuntimeBoxCompatibilityReportInput = z.infer<
+	typeof runtimeBoxCompatibilityReportInputSchema
+>;
+export type RuntimeBoxCompatibilityReportOutput = z.infer<
+	typeof runtimeBoxCompatibilityReportOutputSchema
+>;
 export type RemoteAccessStatusOutput = z.infer<typeof remoteAccessStatusOutputSchema>;
 export type RemoteAccessAuthAttempt = z.infer<typeof remoteAccessAuthAttemptSchema>;
 export type RemoteAccessMutationOutput = z.infer<typeof remoteAccessMutationOutputSchema>;
+export type RuntimeDiagnosticsOutput = z.infer<typeof runtimeDiagnosticsOutputSchema>;
 
 export function createRuntimeBoxServerChallengePayload(
 	input: RuntimeBoxChallengeInput,
@@ -311,6 +424,9 @@ export function createRuntimeBoxServerChallengePayload(
 		output.rpcIdentity.instanceId,
 		output.rpcIdentity.generation,
 		output.actionJournalEpoch,
+		output.negotiatedProtocolVersion,
+		output.transportSecurity,
+		output.supportedTransportSecurity,
 		input.runtimeBoxId,
 		input.deviceKeyId,
 		input.instanceId,
@@ -334,6 +450,9 @@ export function createRuntimeBoxAuthenticationPayload(
 		challenge.rpcIdentity.instanceId,
 		challenge.rpcIdentity.generation,
 		challenge.actionJournalEpoch,
+		challenge.negotiatedProtocolVersion,
+		challenge.transportSecurity,
+		challenge.supportedTransportSecurity,
 		input.runtimeBoxId,
 		input.deviceKeyId,
 		input.instanceId,
@@ -342,5 +461,23 @@ export function createRuntimeBoxAuthenticationPayload(
 		challenge.challengeId,
 		challenge.nonce,
 		challenge.expiresAt,
+	]);
+}
+
+export function createRuntimeBoxCompatibilityReportPayload(
+	agentServerId: string,
+	report: Omit<RuntimeBoxCompatibilityReportInput, "signature">,
+): string {
+	const parsed = runtimeBoxCompatibilityReportUnsignedSchema.parse(report);
+	return JSON.stringify([
+		"moshu-runtime-box-compatibility-report-v1",
+		agentServerId,
+		parsed.runtimeBoxId,
+		parsed.deviceKeyId,
+		parsed.instanceId,
+		parsed.generation,
+		parsed.protocolVersion,
+		parsed.reportId,
+		parsed.issuedAt,
 	]);
 }

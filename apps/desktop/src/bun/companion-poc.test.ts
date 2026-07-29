@@ -35,13 +35,16 @@ describe("companion executable platform naming", () => {
 		);
 	});
 
-	test("packages only the two self-contained companions", () => {
+	test("packages the self-contained companions and their release manifest", () => {
 		expect(() =>
-			assertCompanionResourceFilenames(["moshu-runtime-box", "moshu-agents-server"], "darwin"),
+			assertCompanionResourceFilenames(
+				["moshu-runtime-box", "moshu-agents-server", "manifest.json"],
+				"darwin",
+			),
 		).not.toThrow();
 		expect(() =>
 			assertCompanionResourceFilenames(
-				["moshu-runtime-box", "moshu-agents-server", "extra"],
+				["moshu-runtime-box", "moshu-agents-server", "manifest.json", "extra"],
 				"darwin",
 			),
 		).toThrow("Unexpected Moshu companion resource layout");

@@ -3,9 +3,9 @@ import {
 	actionIdSchema,
 	actionParameterDigestSchema,
 	executionGrantIdSchema,
-	type ExecutorToolInvokeOutput,
+	type RuntimeBoxActionResult,
+	runtimeBoxActionResultSchema,
 	runtimeBoxInvocationEvidenceSchema,
-	runtimeBoxToolInvokeOutputSchema,
 	type RuntimeBoxInvocationEvidence,
 } from "@moshu/contracts";
 import { and, eq, inArray, isNull } from "drizzle-orm";
@@ -51,7 +51,7 @@ export interface ActionIntentRecord {
 	tool: string;
 	parameterDigest: string;
 	state: ActionIntentState;
-	result?: ExecutorToolInvokeOutput;
+	result?: RuntimeBoxActionResult;
 	safeError?: string;
 	grantConsumedAtMs?: number;
 	serverAckedAtMs?: number;
@@ -81,7 +81,7 @@ export interface ActionRepository {
 	markOutcomeUnknown(invocationId: string, safeError: string): void;
 	complete(runtimeBoxId: string, evidence: RuntimeBoxInvocationEvidence): void;
 	markServerAcked(invocationIds: readonly string[]): void;
-	markReceiptConfirmed(invocationIds: readonly string[]): void;
+	markReceiptConfirmed(runtimeBoxId: string, invocationIds: readonly string[]): void;
 	cancelUndispatched(invocationId: string, safeError: string): void;
 	recoverOnStartup(): { cancelled: number; outcomeUnknown: number };
 	hasUnacknowledgedForSession(sessionId: string): boolean;
@@ -242,10 +242,16 @@ export class SqliteActionRepository implements ActionRepository {
 		const nextResult =
 			evidence.result === undefined
 				? undefined
-				: runtimeBoxToolInvokeOutputSchema.parse(evidence.result);
+				: runtimeBoxActionResultSchema.parse(evidence.result);
+		const resultTool =
+			nextResult === undefined
+				? undefined
+				: "tool" in nextResult
+					? nextResult.tool
+					: `mcp:${nextResult.mcpServerId}:${nextResult.stableToolId}`;
 		if (
 			nextResult !== undefined &&
-			(nextResult.invocationId !== action.invocationId || nextResult.tool !== action.tool)
+			(nextResult.invocationId !== action.invocationId || resultTool !== action.tool)
 		) {
 			throw new ActionEvidenceConflictError(
 				"Runtime Box result did not match the Action invocation or tool.",
@@ -295,7 +301,7 @@ export class SqliteActionRepository implements ActionRepository {
 		}
 	}
 
-	markReceiptConfirmed(invocationIds: readonly string[]): void {
+	markReceiptConfirmed(runtimeBoxId: string, invocationIds: readonly string[]): void {
 		const now = this.clock.now();
 		for (const invocationId of new Set(invocationIds)) {
 			const action = this.orm
@@ -305,6 +311,11 @@ export class SqliteActionRepository implements ActionRepository {
 				.get();
 			if (action === undefined) {
 				continue;
+			}
+			if (action.runtimeBoxId !== runtimeBoxId) {
+				throw new ActionEvidenceConflictError(
+					"Box receipt confirmation did not match the Runtime Box.",
+				);
 			}
 			if (action.serverAckedAtMs === null) {
 				throw new ActionEvidenceConflictError(
@@ -422,7 +433,7 @@ export class SqliteActionRepository implements ActionRepository {
 			state: action.state,
 			...(action.resultJson === null
 				? {}
-				: { result: runtimeBoxToolInvokeOutputSchema.parse(JSON.parse(action.resultJson)) }),
+				: { result: runtimeBoxActionResultSchema.parse(JSON.parse(action.resultJson)) }),
 			...(action.safeError === null ? {} : { safeError: action.safeError }),
 			...(grant.consumedAtMs === null ? {} : { grantConsumedAtMs: grant.consumedAtMs }),
 			...(action.serverAckedAtMs === null ? {} : { serverAckedAtMs: action.serverAckedAtMs }),

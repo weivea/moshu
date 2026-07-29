@@ -4,6 +4,7 @@ import {
 } from "../../../../packages/contracts/src/executor-tool-assets";
 
 export const COMPANION_EXECUTABLE_ROLES = ["agents-server", "runtime-box"] as const;
+export const companionReleaseManifestFilename = "manifest.json";
 
 export type CompanionExecutableRole = (typeof COMPANION_EXECUTABLE_ROLES)[number];
 
@@ -35,7 +36,7 @@ export function getExecutorToolExecutableFilenames(
 export function getCompanionResourceFilenames(
 	platform: NodeJS.Platform = process.platform,
 ): string[] {
-	return getCompanionExecutableFilenames(platform);
+	return [...getCompanionExecutableFilenames(platform), companionReleaseManifestFilename];
 }
 
 export function assertCompanionResourceFilenames(

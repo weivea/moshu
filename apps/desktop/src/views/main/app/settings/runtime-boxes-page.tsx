@@ -4,6 +4,7 @@ import type {
 	RemoteAccessAuthAttempt,
 	RemoteAccessStatusOutput,
 	RuntimeBoxPairingClaim,
+	RuntimeDiagnosticsOutput,
 } from "@moshu/contracts";
 import { useCallback, useEffect, useState } from "react";
 import { desktopClient } from "../../lib/rpc";
@@ -19,6 +20,7 @@ export function RuntimeBoxesSettingsPage() {
 	const [claims, setClaims] = useState<RuntimeBoxPairingClaim[]>([]);
 	const [pendingAction, setPendingAction] = useState<string>();
 	const [errorMessage, setErrorMessage] = useState<string>();
+	const [diagnostics, setDiagnostics] = useState<RuntimeDiagnosticsOutput>();
 
 	const loadRemoteAccess = useCallback(async () => {
 		try {
@@ -123,6 +125,21 @@ export function RuntimeBoxesSettingsPage() {
 					<Button className="chat-button" onPress={() => void runtimeBoxes.refresh()}>
 						{t("runtimeBoxes.refresh")}
 					</Button>
+					<Button
+						className="chat-button"
+						onPress={() =>
+							void desktopClient
+								.getRuntimeDiagnostics()
+								.then(setDiagnostics)
+								.catch((error: unknown) =>
+									setErrorMessage(
+										error instanceof Error ? error.message : t("runtimeBoxes.error.diagnostics"),
+									),
+								)
+						}
+					>
+						{t("runtimeBoxes.diagnostics")}
+					</Button>
 				</div>
 				{runtimeBoxes.snapshot.items.map((item) => {
 					const descriptor = item.runtimeBox;
@@ -130,7 +147,10 @@ export function RuntimeBoxesSettingsPage() {
 					return (
 						<article className="runtime-box-card" key={descriptor.runtimeBoxId}>
 							<div className="runtime-box-card__identity">
-								<i className={item.connected ? "is-online" : "is-offline"} aria-hidden="true" />
+								<i
+									className={item.state === "online" ? "is-online" : "is-offline"}
+									aria-hidden="true"
+								/>
 								<div>
 									<strong>{descriptor.displayName}</strong>
 									<span>
@@ -140,7 +160,15 @@ export function RuntimeBoxesSettingsPage() {
 								</div>
 							</div>
 							<div className="runtime-box-card__actions">
-								<span>{item.connected ? t("runtimeBoxes.online") : t("runtimeBoxes.offline")}</span>
+								<span>
+									{item.state === "online"
+										? t("runtimeBoxes.online")
+										: item.state === "syncing"
+											? t("runtimeBoxes.syncing")
+											: item.state === "upgrade_required"
+												? t("runtimeBoxes.upgradeRequired")
+												: t("runtimeBoxes.offline")}
+								</span>
 								<Button
 									className="chat-button"
 									isDisabled={active}
@@ -182,6 +210,16 @@ export function RuntimeBoxesSettingsPage() {
 				</div>
 				<p>{t("remoteAccess.description")}</p>
 				{remoteAccess?.publicUrl ? <code>{remoteAccess.publicUrl}</code> : null}
+				{remoteAccess ? (
+					<p>
+						{t("remoteAccess.traffic")}: {formatBytes(remoteAccess.trafficEstimate.totalBytes)} /{" "}
+						{formatBytes(remoteAccess.trafficEstimate.monthlyLimitBytes)} (
+						{remoteAccess.trafficEstimate.month})
+						{remoteAccess.trafficEstimate.warningLevel === "none"
+							? ""
+							: ` · ${remoteAccess.trafficEstimate.warningLevel}%`}
+					</p>
+				) : null}
 				{remoteAccess?.lastError ? <p role="alert">{remoteAccess.lastError}</p> : null}
 				<div className="provider-form__actions">
 					<Button
@@ -287,6 +325,22 @@ export function RuntimeBoxesSettingsPage() {
 					</article>
 				))}
 			</section>
+			{diagnostics ? (
+				<section className="chat-card">
+					<h2>{t("runtimeBoxes.diagnostics")}</h2>
+					<pre className="runtime-box-auth-output">{JSON.stringify(diagnostics, null, 2)}</pre>
+				</section>
+			) : null}
 		</section>
 	);
+}
+
+function formatBytes(bytes: number): string {
+	if (bytes >= 1024 * 1024 * 1024) {
+		return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GiB`;
+	}
+	if (bytes >= 1024 * 1024) {
+		return `${(bytes / (1024 * 1024)).toFixed(2)} MiB`;
+	}
+	return `${Math.ceil(bytes / 1024)} KiB`;
 }

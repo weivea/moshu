@@ -8,9 +8,12 @@ import {
 	executorToolRpcTimeoutMs,
 	productRpcMaxBufferedOutboundBytes,
 	productRpcMaxFrameBytes,
+	productRpcEvents,
 	productRpcMethods,
+	currentRuntimeBoxProtocolVersion,
 	runtimeBoxRegisterInputSchema,
 	runtimeBoxRegisterOutputSchema,
+	moshuReleaseVersion,
 } from "@moshu/contracts";
 import {
 	type ConnectRpcClientOptions,
@@ -18,6 +21,7 @@ import {
 	createRpcBearerHandshakeHeaders,
 	isSameRpcPeerIdentity,
 	type RpcPeer,
+	type RpcRequestHandler,
 	rpcJsonValueSchema,
 } from "@moshu/process-rpc";
 import {
@@ -30,10 +34,14 @@ import {
 	watchInvocationReconciliation,
 } from "./invocation-journal";
 import { validateProjectPathRequestHandler } from "./project-path";
+import { createRuntimeResourceRequestHandlers } from "./resource-handler";
+import { RuntimeResourceStore } from "./runtime-resource-store";
 import { createExecutorToolRuntime, type ExecutorToolRuntime } from "./tools/index";
 import { runRuntimeBoxCli } from "./cli";
 import { extractEmbeddedRuntimeBoxAssets, type EmbeddedRuntimeBoxAssets } from "./embedded-assets";
 import { configurePhotonWasmPath } from "./tools/photon";
+import { McpLifecycleManager } from "./mcp-lifecycle-manager";
+import { createMcpToolRequestHandler } from "./mcp-tool-handler";
 
 import {
 	type BootstrapControlChannel,
@@ -42,12 +50,13 @@ import {
 	serializeReadyRecord,
 } from "./bootstrap";
 
-const PROCESS_VERSION = "0.0.1";
+const PROCESS_VERSION = moshuReleaseVersion;
 
 export type RuntimeBoxRpcPeer = Pick<
 	RpcPeer,
 	"close" | "closed" | "remoteIdentity" | "request" | "terminate"
->;
+> &
+	Partial<Pick<RpcPeer, "emitEvent" | "isClosed">>;
 
 export interface RuntimeBoxSignalSource {
 	add(signal: "SIGINT" | "SIGTERM", listener: () => void): void;
@@ -74,6 +83,7 @@ export interface RunRuntimeBoxProcessOptions {
 	readonly cleanupTimeoutMs?: number;
 	readonly toolRuntime?: ExecutorToolRuntime;
 	readonly invocationJournal?: RuntimeBoxInvocationJournal;
+	readonly resourceStore?: RuntimeResourceStore | null;
 }
 
 const processSignalSource: RuntimeBoxSignalSource = {
@@ -94,6 +104,7 @@ export async function runRuntimeBoxProcess(
 	const connectPeer = options.connectPeer ?? connectRpcClient;
 	const readyWriter = options.readyWriter ?? processReadyWriter;
 	const cleanupTimeoutMs = options.cleanupTimeoutMs ?? 250;
+	const activeExecutions = new Set<Promise<unknown>>();
 	if (!Number.isSafeInteger(cleanupTimeoutMs) || cleanupTimeoutMs <= 0) {
 		throw new TypeError("cleanupTimeoutMs must be a positive safe integer.");
 	}
@@ -103,7 +114,13 @@ export async function runRuntimeBoxProcess(
 	let lateConnectionObservation: Promise<void> = Promise.resolve();
 	let reconciliationObservation: Promise<void> = Promise.resolve();
 	let peer: RuntimeBoxRpcPeer | undefined;
-
+	let resourceStore: RuntimeResourceStore | undefined;
+	let mcpLifecycle: McpLifecycleManager | undefined;
+	let ownsResourceStore = false;
+	let recordTransportClose: (reason: RuntimeBoxLifecycleStop) => void = () => undefined;
+	const transportClosed = new Promise<RuntimeBoxLifecycleStop>((resolve) => {
+		recordTransportClose = resolve;
+	});
 	const stop = (reason: RuntimeBoxLifecycleStop): void => {
 		if (!lifecycle.signal.aborted) {
 			lifecycle.abort(reason);
@@ -138,12 +155,62 @@ export async function runRuntimeBoxProcess(
 			new RuntimeBoxInvocationJournal(
 				join(bootstrap.dataDirectory, "journal", bootstrap.actionJournalEpoch),
 			);
+		resourceStore =
+			options.resourceStore === null
+				? undefined
+				: (options.resourceStore ??
+					new RuntimeResourceStore(join(bootstrap.dataDirectory, "resources")));
+		ownsResourceStore = options.resourceStore === undefined;
+		if (resourceStore !== undefined) {
+			mcpLifecycle = new McpLifecycleManager(resourceStore);
+			await mcpLifecycle.start(lifecycle.signal);
+		}
+		const resourceCapabilities = [
+			"inventory.v1",
+			"mcp.config.v1",
+			"mcp.tools.v1",
+			"skills.store.v1",
+		] as const;
+		const runtimeCapabilities = [
+			...executorToolNames.map((tool) => `tool.${tool}`),
+			"projects.validate-path",
+			...resourceCapabilities,
+		];
+		const resourceHandlers =
+			resourceStore === undefined
+				? {}
+				: createRuntimeResourceRequestHandlers(resourceStore, {
+						runtimeBoxId: bootstrap.identity.peerId,
+						generation: bootstrap.identity.generation,
+						capabilities: runtimeCapabilities,
+					});
 		const toolRequestHandler =
 			options.toolRuntime === undefined
 				? undefined
 				: createExecutorToolRequestHandler(options.toolRuntime, {
 						journal: invocationJournal,
+						activeExecutions,
+						lifecycleSignal: lifecycle.signal,
 					});
+		const mcpToolHandler =
+			mcpLifecycle === undefined
+				? undefined
+				: createMcpToolRequestHandler(mcpLifecycle, invocationJournal, {
+						activeExecutions,
+						lifecycleSignal: lifecycle.signal,
+					});
+		const runtimeRequestHandlers: Record<string, RpcRequestHandler> = {
+			[productRpcMethods.runtimeBoxProjectValidatePath]: validateProjectPathRequestHandler,
+			[productRpcMethods.runtimeBoxInvocationsAck]:
+				createInvocationAcknowledgementHandler(invocationJournal),
+			...resourceHandlers,
+		};
+		if (toolRequestHandler !== undefined) {
+			runtimeRequestHandlers[productRpcMethods.runtimeBoxToolInvoke] = toolRequestHandler;
+		}
+		if (mcpToolHandler !== undefined) {
+			runtimeRequestHandlers[productRpcMethods.runtimeBoxMcpToolInvoke] = mcpToolHandler;
+		}
 
 		const connection = Promise.resolve(
 			connectPeer({
@@ -152,31 +219,14 @@ export async function runRuntimeBoxProcess(
 				expectedServerIdentity: bootstrap.agentsServer.identity,
 				signal: lifecycle.signal,
 				getHandshakeHeaders: createRpcBearerHandshakeHeaders(bootstrap.credential),
-				methodAllowlist: {
-					agents: {
-						requests: options.toolRuntime
-							? agentsRuntimeBoxRequestMethods
-							: [
-									productRpcMethods.runtimeBoxProjectValidatePath,
-									productRpcMethods.runtimeBoxInvocationsAck,
-								],
-					},
-				},
-				handlers: {
-					requests: {
-						[productRpcMethods.runtimeBoxProjectValidatePath]: validateProjectPathRequestHandler,
-						[productRpcMethods.runtimeBoxInvocationsAck]:
-							createInvocationAcknowledgementHandler(invocationJournal),
-						...(toolRequestHandler === undefined
-							? {}
-							: { [productRpcMethods.runtimeBoxToolInvoke]: toolRequestHandler }),
-					},
-				},
-				...(toolRequestHandler === undefined
+				methodAllowlist: { agents: { requests: agentsRuntimeBoxRequestMethods } },
+				handlers: { requests: runtimeRequestHandlers },
+				...(toolRequestHandler === undefined && mcpToolHandler === undefined
 					? {}
 					: {
 							requestTimeoutLimits: {
 								[productRpcMethods.runtimeBoxToolInvoke]: executorToolRpcTimeoutMs,
+								[productRpcMethods.runtimeBoxMcpToolInvoke]: executorToolRpcTimeoutMs,
 							},
 						}),
 				limits: {
@@ -184,7 +234,9 @@ export async function runRuntimeBoxProcess(
 					maxBufferedOutboundBytes: productRpcMaxBufferedOutboundBytes,
 				},
 				onClose() {
-					stop(new RuntimeBoxLifecycleStop("Agents-server RPC connection closed.", false));
+					recordTransportClose(
+						new RuntimeBoxLifecycleStop("Agents-server RPC connection closed.", false),
+					);
 				},
 			}),
 		);
@@ -197,6 +249,20 @@ export async function runRuntimeBoxProcess(
 			() => undefined,
 		);
 		peer = await raceWithLifecycle(connection, lifecycle.signal);
+		resourceStore?.setInventoryChangedListener((hint) => {
+			if (peer?.isClosed === true || peer?.emitEvent === undefined) {
+				return;
+			}
+			try {
+				peer.emitEvent(productRpcEvents.runtimeBoxInventoryChanged, rpcJsonValueSchema.parse(hint));
+			} catch (error) {
+				console.error(
+					error instanceof Error
+						? `Runtime Box inventory hint failed: ${error.message}`
+						: "Runtime Box inventory hint failed.",
+				);
+			}
+		});
 		assertExpectedAgentsServerIdentity(peer.remoteIdentity, bootstrap.agentsServer.identity);
 		throwIfLifecycleStopped(lifecycle.signal);
 
@@ -207,6 +273,8 @@ export async function runRuntimeBoxProcess(
 					runtimeBoxRegisterInputSchema.parse({
 						schemaVersion: 1,
 						status: "ready",
+						protocolVersion: currentRuntimeBoxProtocolVersion,
+						transportSecurity: "relay-tls",
 						runtimeBox: {
 							schemaVersion: 1,
 							runtimeBoxId: bootstrap.identity.peerId,
@@ -215,10 +283,7 @@ export async function runRuntimeBoxProcess(
 							runtimeBoxVersion: PROCESS_VERSION,
 							platform: process.platform,
 							arch: process.arch,
-							capabilities: [
-								...executorToolNames.map((tool) => `tool.${tool}`),
-								"projects.validate-path",
-							],
+							capabilities: runtimeCapabilities,
 						},
 					}),
 				),
@@ -260,7 +325,14 @@ export async function runRuntimeBoxProcess(
 		throwIfLifecycleStopped(lifecycle.signal);
 		const publication = readyWriter.enqueue(serializeReadyRecord(ready), lifecycle.signal);
 		await raceWithLifecycle(publication.drained, lifecycle.signal);
-		await waitForLifecycleStop(lifecycle.signal);
+		const terminal = await Promise.race([
+			waitForLifecycleStop(lifecycle.signal).then(() => ({ kind: "lifecycle" }) as const),
+			transportClosed.then((reason) => ({ kind: "transport", reason }) as const),
+		]);
+		if (terminal.kind === "transport") {
+			await waitForActiveExecutions(activeExecutions);
+			throw terminal.reason;
+		}
 		throwIfLifecycleStopped(lifecycle.signal);
 	} catch (error) {
 		const stopReason = getLifecycleStop(lifecycle.signal.reason);
@@ -280,9 +352,35 @@ export async function runRuntimeBoxProcess(
 			.catch(() => undefined);
 		await settlesWithin(cancelParentMonitor, cleanupDeadline);
 		shutdownPeer(peer);
+		await waitForActiveExecutions(activeExecutions, 5_000);
+		await mcpLifecycle?.shutdown();
+		resourceStore?.setInventoryChangedListener(undefined);
+		if (ownsResourceStore) {
+			resourceStore?.close();
+		}
 		await settlesWithin(parentObservation, cleanupDeadline);
 		await settlesWithin(reconciliationObservation, cleanupDeadline);
 		void lateConnectionObservation;
+	}
+
+	async function waitForActiveExecutions(
+		executions: Set<Promise<unknown>>,
+		timeoutMs?: number,
+	): Promise<void> {
+		if (executions.size === 0) {
+			return;
+		}
+		const settled = Promise.allSettled([...executions]).then(() => undefined);
+		if (timeoutMs === undefined) {
+			await settled;
+			return;
+		}
+		await Promise.race([
+			settled,
+			Bun.sleep(timeoutMs).then(() => {
+				throw new Error("Runtime Box active invocation cleanup timed out.");
+			}),
+		]);
 	}
 }
 

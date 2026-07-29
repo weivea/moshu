@@ -13,7 +13,12 @@ import {
 	createCompanionEntitlementsInspectionCommand,
 	resolveCompanionCodesignIdentity,
 } from "./companion-signing";
+import {
+	verifyCompanionReleaseManifest,
+	writeCompanionReleaseManifest,
+} from "./companion-release-manifest";
 import { verifyPackagedCompanionLaunch } from "./packaged-companion-verification";
+import { signAndVerifyWindowsBundle } from "./windows-package-signing";
 
 const buildDirectory = requireEnvironment("ELECTROBUN_BUILD_DIR");
 const targetOs = requireEnvironment("ELECTROBUN_OS");
@@ -47,6 +52,15 @@ for (const executable of [...executables, ...toolExecutables]) {
 		}
 	}
 }
+if (targetPlatform === "win32" && process.env.MOSHU_STABLE_RELEASE === "1") {
+	signAndVerifyWindowsBundle({
+		bundleDirectory: resolve(companionDirectory, "..", "..", ".."),
+		certificateSha1: requireEnvironment("MOSHU_WINDOWS_CERT_SHA1"),
+		timestampUrl: requireEnvironment("MOSHU_WINDOWS_TIMESTAMP_URL"),
+	});
+}
+const manifestPath = writeCompanionReleaseManifest(companionDirectory, targetPlatform);
+verifyCompanionReleaseManifest(companionDirectory, targetPlatform);
 if (targetPlatform !== "darwin") {
 	await verifyPackagedCompanionLaunch(executables as [string, string], buildDirectory);
 }
@@ -55,7 +69,8 @@ console.info(
 	`Prepared ${executables.length} companion and ${toolExecutables.length} tool executables in ${companionDirectory}` +
 		(targetPlatform === "darwin"
 			? ` with ${signingIdentity === "-" ? "ad-hoc" : "configured identity"} signatures.`
-			: "."),
+			: ".") +
+		` Release manifest: ${manifestPath}.`,
 );
 
 function findCompanionDirectory(buildDirectory: string, targetPlatform: NodeJS.Platform): string {

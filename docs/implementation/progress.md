@@ -2,8 +2,8 @@
 
 > 更新日期：2026-07-28
 > 当前产品阶段：Phase 0
-> 当前架构里程碑：RB-06 Runtime 切换、设置与 Projects
-> 当前代码基线：Local/Remote Runtime Box、独立 Runtime ingress、设备认证、Agent Server-owned Dev Tunnel
+> 当前架构里程碑：RB-09 发布加固
+> 当前代码基线：Local/Remote Runtime Box、强认证 ingress、Dev Tunnel、durable Action recovery、Box-owned MCP/Skills
 
 本文只记录代码或自动化测试已经证明的能力。批准的目标见[技术架构](./architecture.md)，后续顺序见[工程交付计划](./delivery-plan.md)。
 
@@ -25,7 +25,7 @@ React WebView
 Local Runtime Box
   -> Runtime Box descriptor registration + keyed registry/invocation gateway
   -> read/bash/edit/write/grep/find/ls
-  -> MCP/Skill execution（尚未实现）
+  -> MCP stdio/Streamable HTTP/SSE + immutable Skills
 ```
 
 “三进程”表示三个应用角色；Electrobun framework 仍会创建 launcher、application worker 和 WebView 等额外进程。
@@ -35,12 +35,41 @@ Local Runtime Box
 - 两个 TypeScript + Bun compiled companion 由 desktop supervisor 启动、认证、监管和协作关闭。
 - 动态 loopback bootstrap、stable identity、instance/generation fencing、请求 allowlist、取消和 event replay 已有合同与测试。
 - packaged canary、standalone binary、three-process、parent-death 和 companion smoke 构成当前发布门槛。
+- Runtime protocol v1 已冻结到独立 min/max/current；不兼容 Remote Box 在 Upgrade 前收到 HTTP 426，
+  再用设备 key 提交短时防重放兼容性报告；Server 验证 generation 后持久化，registry/UI 跨重启显示
+  `upgrade_required`。报告受 lifecycle/5 秒 timeout 约束；Relay TLS 与未来 Noise negotiation 字段均进入签名。
+- Runtime RPC 收发字节按月持久估算，设置页显示 5 GiB 的 50/80/100% 告警及公开 Dev Tunnels 数量、
+  端口和速率限制；该值不冒充 Microsoft Relay 计费。
+- Product RPC 提供严格 Schema 的脱敏 Runtime diagnostics，仅包含版本/identity/protocol、registry、
+  inventory 摘要、DB quick-check 和 Remote Access 状态，不包含 Secret、MCP config、Skill body 或 locator。
+- desktop、agents-server 和 Runtime Box 共用 release version；最终 package 写入两个 companion 的
+  SHA-256/protocol 清单，supervisor 拒绝 READY version mismatch，package smoke 在无系统 Bun/Node PATH 下启动。
+- stable package gate 要求永久 app ID、HTTPS release origin 和 Ed25519 更新密钥；macOS 要求 Developer ID、
+  notarization/staple/Gatekeeper，Windows 对完整 bundle 执行 Authenticode SHA-256 + RFC 3161。
+  最终 `Setup.exe` 也在 installer ZIP 内签名并验证；update metadata/archive/installer 由一个签名清单整体绑定。
 - Remote Runtime Box 可作为普通用户服务安装在 Linux/macOS/Windows；单二进制携带校验后的
   rg、fd 和 Photon WASM 资源，并使用私有配置、generation 和 workspace。
 - Agent Server 暴露独立 Runtime-only ingress，使用一次性 pairing code、Ed25519 challenge、
   device-key revocation、持久 generation fence、入口限流和 canonical RPC identity。
 - Agent Server 管理 Dev Tunnel Microsoft device-code 登录、持久 cluster-qualified Tunnel ID、
   单一 Anonymous HTTP ingress port、Host watchdog、重建/修复、取消和重试；Product RPC 不暴露到 Tunnel。
+- Agent Server 在派发前持久化 Action intent，并签发参数、来源、目标 generation 与 execution scope
+  绑定的短时单次 grant；Runtime Box 执行前 fsync invocation journal。
+- Runtime 断线不会提前终止已开始 Action；执行继续到原 RPC deadline，显式取消、deadline 或 daemon
+  shutdown 才立即取消。结果通过 evidence ack、Box receipt、Server confirmation 三阶段幂等收敛，
+  非幂等 Action 不自动重放。
+- Remote Runtime Box 使用 data-directory 单实例锁；永久认证失败或 daemon shutdown 会先取消并排空所有
+  Action，再释放锁。数据库 reset 通过 `actionJournalEpoch` 隔离旧 journal。
+- Runtime Box 私有 SQLite/SecretStore/Skill store 保存 MCP config/credential、immutable Skill content、
+  inventory epoch/revision/change log；Agent Server 仅保存严格脱敏 projection 和稳定 Runtime Profile ref。
+- MCP list 给 renderer 的 DTO 不含 command/args/cwd/URL 等 transport config；启停使用 Box 内部
+  `setEnabled` mutation，不再把持久 transport round-trip 到 WebView。
+- 每次连接先 full inventory sync，连续 delta/hint 和 48–72 秒独立 poll 维持 cache；gap、压缩、epoch reset、
+  无前进 cursor 或旧 peer 结果均 fail closed/full snapshot，offline 只标 stale。
+- MCP stdio、Streamable HTTP 与兼容 SSE lifecycle 已接入，进程树/session/stream 均可回收；每次 MCP Tool
+  仍使用 durable intent、版本/hash/schema 绑定的单次 grant 与 invocation journal。
+- Skills 使用 YAML 规范校验、内容 hash、不可变版本、filesystem-safe 目录和 fsync commit；Run 启动时 live
+  验证并只在内存加载 `SKILL.md`，不会写入 Product DB、事件或 Pi Session JSONL。
 - 产品数据库只有 agents server 写入，保存 SessionCatalog、RunJournal、durable events、retirement tombstone 和
   agent-session cleanup outbox。
 - 每个 Chat Session 拥有稳定 Pi session ID；conversation context 由显式
@@ -62,9 +91,9 @@ Local Runtime Box
   text/secret/select/manual code、info/auth URL/device code/progress；secret 回答不回显、不持久化。
 - 默认 Chat Session/Run 使用 `agent` mode。`PiAgentRuntime` 使用 `createAgentSession`、
   `DefaultResourceLoader`、`SettingsManager` 和 `SessionManager`。
-- runtime 固定 `noTools: "builtin"`，禁用 extensions、skills、prompt templates、themes、context files 和
-  TUI，只注册 `read`、`bash`、`edit`、`write`、`grep`、`find`、`ls` 七个 SDK custom proxy；启动时验证
-  active/configured Tool 集合及来源，不能回退到 Pi built-in。
+- runtime 固定 `noTools: "builtin"`，禁用 Pi extensions/skills/prompt templates/themes/context files 和
+  TUI；注册七个 Executor SDK proxy，并按 live Runtime Profile 增加 MCP SDK ToolDefinition，不能回退到
+  Pi built-in 或绕过 Runtime Box grant。
 - proxy 只做 Zod/TypeBox 校验和 Runtime Box RPC 映射；标准 tool-call/tool-result 循环、progress、abort、
   Runtime Box unavailable 和 gateway error 已有自动化覆盖。
 - Runtime Box 文件变更按稳定 canonical pathname 串行化并使用 atomic rename，覆盖 inode 替换和 dangling
@@ -92,16 +121,16 @@ Local Runtime Box
 
 ## 5. 当前明确未实现
 
-- 尚无 Action Broker、Policy Engine、approval、execution grant、durable intent、outcome recovery 或审计。
-- 当前七工具是临时可信本机直连：路径允许绝对路径和 `..`，Runtime Box 完整继承 desktop `process.env`，
-  `bash` 可读取其中的 credential。该边界不能作为最终授权机制。
+- 当前 POC 的 Policy 默认信任已认证且绑定的 Agent Server，包括 Remote `bash`；用户级命令审批与 shell
+  sandbox 明确后置。现有 grant 用于 durable dispatch、单次消费、generation fencing 和恢复，不是交互审批。
+- Remote 直接 path tools 受 Box workspace canonical containment；`bash` 按当前完全信任决策不受该限制。
 - 尚无独立 Git Tool；Agent 可经 `bash` 调用环境中可用的 Git，但没有 Git 专用合同、Diff journal 或 revert。
-- MCP lifecycle、MCP credential、Skills 安装/版本/content store 和资源 inventory 尚未实现。
 - Plan、自定义 Agent、subagent、任务中心、Diff/撤销和桌面通知仍是后续产品范围。
-- 当前 Agent 不暴露 MCP、Skill 或 subagent；文档中的相关合同是未来 Moshu-owned 边界，不是现成功能。
+- MCP OAuth 2.1 浏览器授权/DCR、Git URL Skill 更新和完整目录/压缩包导入 UI 仍是后续产品增强。
 - macOS Provider vault 当前是权限加固的 app-owned 文件；Keychain adapter 仍是外部分发前安全工作。
-- Remote Runtime Box 的 ingress、设备配对认证、三平台 daemon 和 Dev Tunnel 已实现；durable grant、
-  断线 outcome reconciliation、MCP/Skill inventory 和发布级真实 Tunnel 故障矩阵尚未实现。
+- Remote Runtime Box 的 ingress、设备配对认证、三平台 daemon、Dev Tunnel、durable grant、断线
+  outcome reconciliation、MCP/Skill ownership 和发布故障矩阵已实现。真实 Microsoft Tunnel 探针、
+  macOS 正式公证和 Windows 正式签名仍是需要外部账号、证书和对应 runner 的 release 执行门。
   Mobile Client、团队共享、Docker/cloud 和多租户仍不在当前范围。
 
 ## 6. 架构迁移状态
@@ -110,16 +139,19 @@ Local Runtime Box
 | --- | --- | --- |
 | A0 RPC / binary POC | 已完成 | compiled companion、动态 loopback、认证 RPC、监管、关闭和 package gate |
 | A1 agents-server extraction | 已完成 | Pi Agent、Provider/auth、产品 DB、Session JSONL 和 cleanup 全部归 agents server |
-| A2 Runtime Box / Agent registry | 部分完成 | Runtime Box 注册/readiness 已有；Agent N:1 binding 和 inventory 尚未实现 |
-| A3 Tool Bridge / Action Broker | 部分完成 | 七工具 typed RPC、Runtime Box-only 执行、progress/cancel 已有；Policy/intent/grant/recovery 尚未实现 |
-| A4 MCP / Skills | 未开始 | Runtime Box-owned secret/lifecycle/store、inventory reconciliation、resource refs |
-| A5 Recovery / release hardening | 部分完成 | restart/package/smoke 已有；签名、公证、Keychain 和完整故障矩阵待完成 |
+| A2 Runtime Box / Agent registry | 部分完成 | Runtime Box 注册/readiness/inventory 已有；自定义 Agent N:1 binding 尚未实现 |
+| A3 Tool Bridge / Action Broker | 已完成（POC trust policy） | durable intent、单次 grant、journal、transport-loss lease、evidence/receipt reconciliation |
+| A4 MCP / Skills | 已完成（POC） | Box-owned secret/lifecycle/store、inventory reconciliation、Runtime Profile、live Tool/Skill resolution |
+| A5 Recovery / release hardening | 已完成（外部 release gate 待执行） | restart/fault/package/update-signing 自动化完成；正式凭据与三平台 runner 不在仓库内 |
 | RB-01 Runtime Box domain/local | 已完成 | Runtime Box contract、注册 descriptor、Local stable ID 和 keyed registry |
 | RB-02 Persistence/routing | 已完成 | Box catalog、active CAS、Session/Run 归属、显式 Gateway 路由和 generation fence |
 | RB-03 Ingress/pairing | 已完成 | Runtime-only ingress、Ed25519 配对认证、吊销、防重放、持久 generation 和限流 |
 | RB-04 Remote service | 已完成 | 三平台普通用户服务、pair/run/status/doctor/unpair/uninstall 和单二进制资源 |
 | RB-05 Dev Tunnel | 已完成 | Microsoft device-code、持久 Tunnel、精确端口/ACL、watchdog、修复、取消和重试 |
-| RB-06 Switch/Projects/UI | 进行中 | 设置页、active switch 广播、按 Box 过滤、Projects/path validation 和离线只读 |
+| RB-06 Switch/Projects/UI | 已完成 | 设置页、active switch 广播、按 Box 过滤、Projects/path validation 和离线只读 |
+| RB-07 Grants/recovery | 已完成 | durable Action/grant、Box journal、deadline lease、三阶段结果确认和 reset epoch |
+| RB-08 MCP/Skills | 已完成 | Box private store、SecretStore、inventory sync、Runtime Profile、live validation 与 MCP grant bridge |
+| RB-09 Hardening/release | 已完成（外部 release gate 待执行） | protocol/quota/diagnostics/fault matrix/signed package gates；真实 Tunnel 与正式平台签名由 release runner 验证 |
 
 ## 7. 开发数据策略
 
@@ -129,7 +161,7 @@ Local Runtime Box
 
 ## 8. 下一优先级
 
-1. 实现 RB-06：Runtime Boxes 设置页、全局切换广播、Sessions/Projects 过滤、Remote path validation 和离线只读。
-2. 用 Moshu-owned Policy/approval/durable intent/single-use grant 替换当前可信直连七工具边界。
-3. 实现断线 invocation reconciliation，禁止非幂等 Action 自动重放。
-4. 在同一边界上实现 Runtime Box-owned MCP 与 Skill storage，不给 Agent runtime 建旁路。
+1. 在有 Microsoft 登录状态的 release 环境执行真实 Dev Tunnel 探针。
+2. 在 macOS/Windows/Linux runner 执行 stable package、正式签名/公证和安装级 E2E。
+3. 在外部分发前完成 Provider vault Keychain adapter。
+4. 后续版本实现 Noise 端到端握手和用户级命令审批。

@@ -117,6 +117,9 @@ async function main(): Promise<void> {
 		assertRealDirectory(artifactApp, "app embedded in final Electrobun update artifact");
 		verifyOuterApp(artifactApp);
 		await verifyCompanionsInApp(artifactApp, verificationDirectory);
+		if (process.env.MOSHU_STABLE_RELEASE === "1") {
+			verifyStableMacDistributionArtifacts(artifactDirectory, artifactEntries ?? [], targetArch);
+		}
 		verified = true;
 		console.info(`Verified final signed macOS update artifact ${paths.updateArtifact}.`);
 	} finally {
@@ -131,6 +134,44 @@ function verifyOuterApp(appBundle: string): void {
 	runCommand(
 		createMacAppVerificationCommand(appBundle),
 		`Final app signature verification failed for ${appBundle}`,
+	);
+	if (process.env.MOSHU_STABLE_RELEASE === "1") {
+		runCommand(
+			["xcrun", "stapler", "validate", appBundle],
+			`Notarization staple validation failed for ${appBundle}`,
+		);
+		runCommand(
+			["spctl", "--assess", "--type", "execute", "--verbose=4", appBundle],
+			`Gatekeeper rejected ${appBundle}`,
+		);
+	}
+}
+
+function verifyStableMacDistributionArtifacts(
+	artifactDirectory: string,
+	entries: readonly string[],
+	targetArch: string,
+): void {
+	const prefix = `stable-macos-${targetArch}-`;
+	const dmgEntries = entries.filter((entry) => entry.startsWith(prefix) && entry.endsWith(".dmg"));
+	if (dmgEntries.length !== 1 || dmgEntries[0] === undefined) {
+		throw new Error(
+			`Expected exactly one stable signed DMG; found ${dmgEntries.join(", ") || "none"}.`,
+		);
+	}
+	const dmgPath = join(artifactDirectory, dmgEntries[0]);
+	assertRegularFile(dmgPath, "stable macOS DMG");
+	runCommand(
+		["codesign", "--verify", "--strict", "--verbose=2", dmgPath],
+		`Stable DMG signature verification failed for ${dmgPath}`,
+	);
+	runCommand(
+		["xcrun", "stapler", "validate", dmgPath],
+		`Stable DMG notarization staple validation failed for ${dmgPath}`,
+	);
+	runCommand(
+		["spctl", "--assess", "--type", "open", "--context", "context:primary-signature", dmgPath],
+		`Gatekeeper rejected ${dmgPath}`,
 	);
 }
 

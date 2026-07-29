@@ -2,6 +2,8 @@ import {
 	AskChatCancelledError,
 	type AskChatMessage,
 	type AskChatRuntime,
+	type AskChatSkillResource,
+	type AgentMcpResource,
 	AskChatRuntimeError,
 	ProviderModelNotFoundError,
 	ProviderNotFoundError,
@@ -155,6 +157,13 @@ export interface ChatApplicationServiceOptions {
 	isRuntimeReady?: (runtimeBoxId: string) => boolean;
 	getActiveRuntimeBoxId?: () => string;
 	actions?: ActionRepository;
+	resolveRuntimeResources?: (
+		runtimeBoxId: string,
+		signal: AbortSignal,
+	) => Promise<{
+		skills: readonly AskChatSkillResource[];
+		mcpResources: readonly AgentMcpResource[];
+	}>;
 	agentSessionCleanupRetryBaseMs?: number;
 	agentSessionCleanupRetryMaxMs?: number;
 	agentSessionCleanupAttemptTimeoutMs?: number;
@@ -200,6 +209,15 @@ export class ChatApplicationService {
 	readonly #isRuntimeReady: (runtimeBoxId: string) => boolean;
 	readonly #getActiveRuntimeBoxId: () => string;
 	readonly #actions: ActionRepository | undefined;
+	readonly #resolveRuntimeResources:
+		| ((
+				runtimeBoxId: string,
+				signal: AbortSignal,
+		  ) => Promise<{
+				skills: readonly AskChatSkillResource[];
+				mcpResources: readonly AgentMcpResource[];
+		  }>)
+		| undefined;
 	readonly #listeners = new Set<ChatEventListener>();
 	readonly #publicationQueue: ChatRunEvent[][] = [];
 	readonly #activeRuns = new Map<string, ActiveChatRun>();
@@ -245,6 +263,7 @@ export class ChatApplicationService {
 		this.#isRuntimeReady = options.isRuntimeReady ?? (() => true);
 		this.#getActiveRuntimeBoxId = options.getActiveRuntimeBoxId ?? (() => defaultLocalRuntimeBoxId);
 		this.#actions = options.actions;
+		this.#resolveRuntimeResources = options.resolveRuntimeResources;
 		this.#agentSessionCleanupRetryBaseMs = requirePositiveSafeInteger(
 			options.agentSessionCleanupRetryBaseMs ?? defaultAgentSessionCleanupRetryBaseMs,
 			"agentSessionCleanupRetryBaseMs",
@@ -1371,6 +1390,16 @@ export class ChatApplicationService {
 				await this.#finishCancelledRun(activeRun);
 				return;
 			}
+			const runtimeResources =
+				this.#resolveRuntimeResources === undefined
+					? { skills: [], mcpResources: [] }
+					: await this.#resolveRuntimeResources(
+							activeRun.runtimeBoxId,
+							activeRun.abortController.signal,
+						);
+			if (this.#resolveRuntimeResources !== undefined) {
+				this.#throwIfRunFenced(activeRun);
+			}
 
 			const running = this.#runs.updateStatus({
 				runId: activeRun.runId,
@@ -1391,6 +1420,8 @@ export class ChatApplicationService {
 				runtimeBoxId: activeRun.runtimeBoxId,
 				provider: activeRun.provider,
 				messages: activeRun.messages,
+				skills: runtimeResources.skills,
+				mcpResources: runtimeResources.mcpResources,
 				signal: activeRun.abortController.signal,
 				onEvent: async (event) => {
 					this.#throwIfRunFenced(activeRun);

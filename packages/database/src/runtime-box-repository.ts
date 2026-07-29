@@ -53,6 +53,13 @@ export type RuntimeBoxGenerationAcceptance =
 			currentGeneration: number;
 	  };
 
+export interface RuntimeBoxCompatibility {
+	runtimeBoxId: string;
+	state: "upgrade_required";
+	generation: number;
+	protocolVersion: number;
+}
+
 export interface RuntimeBoxRepository {
 	initializeDefault(descriptor: RuntimeBoxDescriptor): ActiveRuntimeBoxSelection;
 	upsertRegistration(descriptor: RuntimeBoxDescriptor): void;
@@ -60,6 +67,13 @@ export interface RuntimeBoxRepository {
 	get(runtimeBoxId: string): RuntimeBoxDescriptor;
 	getActive(): ActiveRuntimeBoxSelection;
 	getActionJournalEpoch(): string;
+	listCompatibility(): RuntimeBoxCompatibility[];
+	markUpgradeRequired(
+		runtimeBoxId: string,
+		instanceId: string,
+		generation: number,
+		protocolVersion: number,
+	): RuntimeBoxGenerationAcceptance;
 	switchActive(input: SwitchRuntimeBoxInput): ActiveRuntimeBoxSelection;
 	acceptGeneration(
 		runtimeBoxId: string,
@@ -156,6 +170,66 @@ export class SqliteRuntimeBoxRepository implements RuntimeBoxRepository {
 		return row.value;
 	}
 
+	listCompatibility(): RuntimeBoxCompatibility[] {
+		return this.orm
+			.select()
+			.from(runtimeBoxesTable)
+			.where(isNull(runtimeBoxesTable.archivedAtMs))
+			.all()
+			.flatMap((row) => {
+				if (row.compatibility === null) {
+					return [];
+				}
+				if (row.compatibilityGeneration === null || row.compatibilityProtocolVersion === null) {
+					throw new Error(`Runtime Box ${row.id} compatibility state is incomplete.`);
+				}
+				return [
+					{
+						runtimeBoxId: row.id,
+						state: row.compatibility,
+						generation: row.compatibilityGeneration,
+						protocolVersion: row.compatibilityProtocolVersion,
+					},
+				];
+			});
+	}
+
+	markUpgradeRequired(
+		runtimeBoxId: string,
+		instanceId: string,
+		generation: number,
+		protocolVersion: number,
+	): RuntimeBoxGenerationAcceptance {
+		if (
+			instanceId.length === 0 ||
+			instanceId.length > 256 ||
+			!Number.isSafeInteger(generation) ||
+			generation < 0 ||
+			!Number.isSafeInteger(protocolVersion) ||
+			protocolVersion < 1 ||
+			protocolVersion > 65_535
+		) {
+			throw new TypeError("Runtime Box compatibility generation and protocol must be valid.");
+		}
+		return this.orm.transaction((transaction) => {
+			const accepted = this.#acceptGeneration(transaction, runtimeBoxId, instanceId, generation);
+			if (!accepted.accepted) {
+				return accepted;
+			}
+			transaction
+				.update(runtimeBoxesTable)
+				.set({
+					compatibility: "upgrade_required",
+					compatibilityGeneration: generation,
+					compatibilityProtocolVersion: protocolVersion,
+					updatedAtMs: this.clock.now(),
+				})
+				.where(eq(runtimeBoxesTable.id, runtimeBoxId))
+				.run();
+			return accepted;
+		});
+	}
+
 	switchActive(inputValue: SwitchRuntimeBoxInput): ActiveRuntimeBoxSelection {
 		const input = switchRuntimeBoxInputSchema.parse(inputValue);
 		return this.orm.transaction((transaction) => {
@@ -213,61 +287,70 @@ export class SqliteRuntimeBoxRepository implements RuntimeBoxRepository {
 		if (instanceId.length === 0 || instanceId.length > 256) {
 			throw new TypeError("Runtime Box instanceId must be between 1 and 256 characters.");
 		}
-		return this.orm.transaction((transaction) => {
-			const runtimeBox = transaction
-				.select({ archivedAtMs: runtimeBoxesTable.archivedAtMs })
-				.from(runtimeBoxesTable)
-				.where(eq(runtimeBoxesTable.id, runtimeBoxId))
-				.get();
-			if (runtimeBox === undefined) {
-				throw new RuntimeBoxNotFoundError(runtimeBoxId);
+		return this.orm.transaction((transaction) =>
+			this.#acceptGeneration(transaction, runtimeBoxId, instanceId, generation),
+		);
+	}
+
+	#acceptGeneration(
+		transaction: AppDatabaseTransaction,
+		runtimeBoxId: string,
+		instanceId: string,
+		generation: number,
+	): RuntimeBoxGenerationAcceptance {
+		const runtimeBox = transaction
+			.select({ archivedAtMs: runtimeBoxesTable.archivedAtMs })
+			.from(runtimeBoxesTable)
+			.where(eq(runtimeBoxesTable.id, runtimeBoxId))
+			.get();
+		if (runtimeBox === undefined) {
+			throw new RuntimeBoxNotFoundError(runtimeBoxId);
+		}
+		if (runtimeBox.archivedAtMs !== null) {
+			throw new RuntimeBoxArchivedError(runtimeBoxId);
+		}
+		const existing = transaction
+			.select()
+			.from(runtimeBoxGenerationFencesTable)
+			.where(eq(runtimeBoxGenerationFencesTable.runtimeBoxId, runtimeBoxId))
+			.get();
+		if (existing !== undefined) {
+			if (generation < existing.acceptedGeneration) {
+				return {
+					accepted: false,
+					code: "STALE_GENERATION",
+					currentGeneration: existing.acceptedGeneration,
+				};
 			}
-			if (runtimeBox.archivedAtMs !== null) {
-				throw new RuntimeBoxArchivedError(runtimeBoxId);
+			if (
+				generation === existing.acceptedGeneration &&
+				instanceId !== existing.acceptedInstanceId
+			) {
+				return {
+					accepted: false,
+					code: "GENERATION_CONFLICT",
+					currentGeneration: existing.acceptedGeneration,
+				};
 			}
-			const existing = transaction
-				.select()
-				.from(runtimeBoxGenerationFencesTable)
-				.where(eq(runtimeBoxGenerationFencesTable.runtimeBoxId, runtimeBoxId))
-				.get();
-			if (existing !== undefined) {
-				if (generation < existing.acceptedGeneration) {
-					return {
-						accepted: false,
-						code: "STALE_GENERATION",
-						currentGeneration: existing.acceptedGeneration,
-					};
-				}
-				if (
-					generation === existing.acceptedGeneration &&
-					instanceId !== existing.acceptedInstanceId
-				) {
-					return {
-						accepted: false,
-						code: "GENERATION_CONFLICT",
-						currentGeneration: existing.acceptedGeneration,
-					};
-				}
-			}
-			transaction
-				.insert(runtimeBoxGenerationFencesTable)
-				.values({
-					runtimeBoxId,
+		}
+		transaction
+			.insert(runtimeBoxGenerationFencesTable)
+			.values({
+				runtimeBoxId,
+				acceptedGeneration: generation,
+				acceptedInstanceId: instanceId,
+				updatedAtMs: this.clock.now(),
+			})
+			.onConflictDoUpdate({
+				target: runtimeBoxGenerationFencesTable.runtimeBoxId,
+				set: {
 					acceptedGeneration: generation,
 					acceptedInstanceId: instanceId,
 					updatedAtMs: this.clock.now(),
-				})
-				.onConflictDoUpdate({
-					target: runtimeBoxGenerationFencesTable.runtimeBoxId,
-					set: {
-						acceptedGeneration: generation,
-						acceptedInstanceId: instanceId,
-						updatedAtMs: this.clock.now(),
-					},
-				})
-				.run();
-			return { accepted: true };
-		});
+				},
+			})
+			.run();
+		return { accepted: true };
 	}
 
 	#upsertDescriptor(
@@ -305,6 +388,9 @@ export class SqliteRuntimeBoxRepository implements RuntimeBoxRepository {
 				updatedAtMs: now,
 				lastSeenAtMs: markSeen ? now : (existing?.lastSeenAtMs ?? null),
 				archivedAtMs: null,
+				compatibility: null,
+				compatibilityGeneration: null,
+				compatibilityProtocolVersion: null,
 			})
 			.onConflictDoUpdate({
 				target: runtimeBoxesTable.id,
@@ -315,6 +401,9 @@ export class SqliteRuntimeBoxRepository implements RuntimeBoxRepository {
 					arch: descriptor.arch,
 					capabilitiesJson: JSON.stringify(descriptor.capabilities),
 					updatedAtMs: now,
+					compatibility: null,
+					compatibilityGeneration: null,
+					compatibilityProtocolVersion: null,
 					...(markSeen ? { lastSeenAtMs: now } : {}),
 				},
 			})

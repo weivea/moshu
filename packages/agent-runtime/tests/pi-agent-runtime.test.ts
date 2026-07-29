@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, renameSync, rmSync, symlinkSync } from "node:fs";
+import { mkdirSync, readFileSync, readdirSync, renameSync, rmSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 import {
 	fauxAssistantMessage,
@@ -8,7 +8,11 @@ import {
 	type Provider,
 } from "@earendil-works/pi-ai";
 import { ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
-import { defaultLocalRuntimeBoxId, type ExecutorToolInvokeInput } from "@moshu/contracts";
+import {
+	defaultLocalRuntimeBoxId,
+	type ExecutorToolInvokeInput,
+	type RuntimeBoxMcpToolInvokeInput,
+} from "@moshu/contracts";
 
 import {
 	AskChatCancelledError,
@@ -94,6 +98,7 @@ describe("Pi Agent runtime", () => {
 				provider: "moshu-tool-test",
 				models: [{ id: "tool-model" }],
 			});
+
 			faux.setResponses([
 				fauxAssistantMessage([fauxToolCall("read", { path: "README.md" })], {
 					stopReason: "toolUse",
@@ -137,6 +142,111 @@ describe("Pi Agent runtime", () => {
 			} finally {
 				await runtime.shutdown();
 			}
+		});
+	});
+
+	test("loads verified Skills in memory and routes MCP Tools through the Runtime Box gateway", async () => {
+		await withAppData(async (agentDataDirectory) => {
+			const faux = fauxProvider({
+				provider: "moshu-resource-test",
+				models: [{ id: "resource-model" }],
+			});
+			faux.setResponses([
+				fauxAssistantMessage(
+					[
+						fauxToolCall("mcp_database_tools_tool_query", {
+							sql: "select 1",
+						}),
+					],
+					{ stopReason: "toolUse" },
+				),
+				fauxAssistantMessage("The MCP query completed."),
+			]);
+			const modelRuntime = await createModelRuntime(agentDataDirectory, faux.provider);
+			const model = faux.getModel();
+			if (model === undefined) {
+				throw new Error("Expected the fake Provider model.");
+			}
+			const mcpCalls: RuntimeBoxMcpToolInvokeInput[] = [];
+			const runtime = new PiAgentRuntime({
+				agentDataDirectory,
+				modelRuntime,
+				runtimeBoxGateway: {
+					async invokeForRuntimeBox() {
+						throw new Error("Executor Tool should not be called.");
+					},
+					async invokeMcpForRuntimeBox(runtimeBoxId, input) {
+						expect(runtimeBoxId).toBe(defaultLocalRuntimeBoxId);
+						mcpCalls.push(input);
+						return {
+							schemaVersion: 1,
+							invocationId: input.invocationId,
+							mcpServerId: input.mcpServerId,
+							stableToolId: input.stableToolId,
+							result: { content: [{ type: "text", text: "one row" }] },
+							isError: false,
+						};
+					},
+				},
+			});
+			const skillMarker = "SKILL-CONTENT-MUST-STAY-IN-MEMORY";
+			try {
+				const result = await runtime.run({
+					runtimeBoxId: defaultLocalRuntimeBoxId,
+					runId: "018f47a2-9bcd-7def-8abc-1234567890ab",
+					threadId: "resource-thread",
+					provider: {
+						providerId: faux.provider.id,
+						providerName: faux.provider.name,
+						source: "builtin",
+						api: model.api,
+						model: model.id,
+					},
+					messages: [{ role: "user", content: "Use the database Skill." }],
+					skills: [
+						{
+							stableResourceId: "database-skill",
+							version: "550e8400-e29b-41d4-a716-446655440000",
+							contentHash: "b".repeat(64),
+							skillMarkdown: `---\nname: database-skill\ndescription: Query data\n---\n${skillMarker}`,
+						},
+					],
+					mcpResources: [
+						{
+							stableResourceId: "database-tools",
+							version: "550e8400-e29b-41d4-a716-446655440001",
+							contentHash: "c".repeat(64),
+							tools: [
+								{
+									stableToolId: "tool-query",
+									name: "query",
+									schemaHash: "d".repeat(64),
+									inputSchema: {
+										type: "object",
+										properties: { sql: { type: "string" } },
+										required: ["sql"],
+									},
+								},
+							],
+						},
+					],
+				});
+				expect(result.text).toBe("The MCP query completed.");
+				expect(mcpCalls).toMatchObject([
+					{
+						runId: "018f47a2-9bcd-7def-8abc-1234567890ab",
+						mcpServerId: "database-tools",
+						stableToolId: "tool-query",
+						arguments: { sql: "select 1" },
+					},
+				]);
+			} finally {
+				await runtime.shutdown();
+			}
+			const persistedSessionText = readdirSync(join(agentDataDirectory, "sessions"))
+				.map((filename) => readFileSync(join(agentDataDirectory, "sessions", filename), "utf8"))
+				.join("\n");
+			expect(persistedSessionText).not.toContain(skillMarker);
 		});
 	});
 

@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, statSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -11,6 +11,7 @@ import {
 import { rpcJsonValueSchema } from "@moshu/process-rpc";
 import {
 	InvocationGrantRejectedError,
+	reconcileInvocationJournal,
 	RuntimeBoxInvocationJournal,
 	watchInvocationReconciliation,
 } from "./invocation-journal";
@@ -53,6 +54,7 @@ describe("RuntimeBoxInvocationJournal", () => {
 					result,
 				},
 			]);
+			expect(reopened.acknowledge([input.invocationId])).toEqual([input.invocationId]);
 			expect(reopened.acknowledge([input.invocationId])).toEqual([input.invocationId]);
 			expect(reopened.listEvidence()).toEqual([]);
 			expect(() => reopened.begin(input, authority, target)).toThrow("acknowledged and consumed");
@@ -135,6 +137,38 @@ describe("RuntimeBoxInvocationJournal", () => {
 		}
 	});
 
+	test("rejects acknowledgements outside the sent reconciliation batch", async () => {
+		const root = mkdtempSync(join(tmpdir(), "moshu-invocations-"));
+		try {
+			const journal = new RuntimeBoxInvocationJournal(root);
+			const input = createAuthorizedInput();
+			journal.begin(input, authority, target);
+			journal.succeed(input.invocationId, {
+				schemaVersion: 1,
+				invocationId: input.invocationId,
+				tool: "read",
+				content: [{ type: "text", text: "evidence" }],
+			});
+			await expect(
+				reconcileInvocationJournal(
+					{
+						async request() {
+							return rpcJsonValueSchema.parse({
+								ackedInvocationIds: [crypto.randomUUID()],
+								confirmedAcknowledgementIds: [],
+							});
+						},
+					},
+					journal,
+					new AbortController().signal,
+				),
+			).rejects.toThrow("invalid evidence acknowledgement");
+			expect(journal.listEvidence()).toHaveLength(1);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
 	test("retains an unconfirmed receipt after the execution grant expires", async () => {
 		const root = mkdtempSync(join(tmpdir(), "moshu-invocations-"));
 		try {
@@ -158,6 +192,39 @@ describe("RuntimeBoxInvocationJournal", () => {
 				items: [],
 				acknowledgedInvocationIds: [input.invocationId],
 			});
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("loads and strips the legacy receipt recovery expiry field", () => {
+		const root = mkdtempSync(join(tmpdir(), "moshu-invocations-"));
+		try {
+			const journal = new RuntimeBoxInvocationJournal(root);
+			const input = createAuthorizedInput();
+			journal.begin(input, authority, target);
+			journal.succeed(input.invocationId, {
+				schemaVersion: 1,
+				invocationId: input.invocationId,
+				tool: "read",
+				content: [{ type: "text", text: "legacy" }],
+			});
+			journal.acknowledge([input.invocationId]);
+			const filename = join(root, "invocations.json");
+			const stored = JSON.parse(readFileSync(filename, "utf8")) as {
+				consumedGrants: Array<Record<string, unknown>>;
+			};
+			const consumed = stored.consumedGrants[0];
+			if (consumed === undefined) {
+				throw new Error("Expected a consumed grant.");
+			}
+			consumed.recoveryExpiresAt = new Date(Date.now() + 60_000).toISOString();
+			writeFileSync(filename, JSON.stringify(stored), "utf8");
+
+			const reopened = new RuntimeBoxInvocationJournal(root);
+			expect(reopened.nextReconciliationBatch().acknowledgedInvocationIds).toEqual([
+				input.invocationId,
+			]);
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 		}

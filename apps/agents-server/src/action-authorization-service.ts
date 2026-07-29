@@ -2,6 +2,7 @@ import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { DefaultActionPolicy, getExecutorToolMetadata } from "@moshu/action-broker";
 import {
 	createExecutorToolParameterPayload,
+	createMcpToolParameterPayload,
 	type ExecutorToolInvokeInput,
 	type ExecutorToolInvokeOutput,
 	type ProcessPeerIdentity,
@@ -9,6 +10,10 @@ import {
 	type ReconcileRuntimeBoxInvocationsOutput,
 	type RuntimeBoxInvocationEvidence,
 	type RuntimeBoxToolAuthorization,
+	type RuntimeBoxMcpToolInvokeInput,
+	type RuntimeBoxMcpToolInvokeOutput,
+	type RuntimeBoxActionResult,
+	runtimeBoxMcpToolInvokeInputSchema,
 	runtimeBoxToolInvokeInputSchema,
 } from "@moshu/contracts";
 import type { ActionRepository } from "@moshu/database";
@@ -26,6 +31,7 @@ export class ActionPolicyDeniedError extends Error {
 
 export class DurableActionAuthorizationService implements RuntimeBoxActionAuthorizer {
 	readonly #policy: DefaultActionPolicy;
+	readonly #allowMcpTools: boolean;
 
 	constructor(
 		private readonly actions: ActionRepository,
@@ -33,6 +39,7 @@ export class DurableActionAuthorizationService implements RuntimeBoxActionAuthor
 		options: { allowSideEffects: boolean } = { allowSideEffects: true },
 	) {
 		this.#policy = new DefaultActionPolicy(options.allowSideEffects);
+		this.#allowMcpTools = options.allowSideEffects;
 	}
 
 	async authorize(
@@ -101,27 +108,94 @@ export class DurableActionAuthorizationService implements RuntimeBoxActionAuthor
 		return authorizedInput;
 	}
 
+	async authorizeMcp(
+		runtimeBoxId: string,
+		input: RuntimeBoxMcpToolInvokeInput,
+		targetIdentity: RpcPeerIdentity,
+	): Promise<RuntimeBoxMcpToolInvokeInput> {
+		if (input.authorization !== undefined) {
+			throw new ActionPolicyDeniedError("MCP Tool authorization is Server-owned.");
+		}
+		if (!this.#allowMcpTools) {
+			throw new ActionPolicyDeniedError("MCP Tool execution is denied by policy.");
+		}
+		if (targetIdentity.role !== "runtime-box" || targetIdentity.peerId !== runtimeBoxId) {
+			throw new ActionPolicyDeniedError("Execution grant target identity is invalid.");
+		}
+		const actionId = randomUUID();
+		const grantId = randomUUID();
+		const grantToken = randomBytes(32).toString("base64url");
+		const parameterDigest = sha256(createMcpToolParameterPayload(input));
+		const expiresAtMs = Date.now() + executionGrantLifetimeMs;
+		const authorization: RuntimeBoxToolAuthorization = {
+			actionId,
+			grantId,
+			grantToken,
+			parameterDigest,
+			originInstanceId: this.authority.instanceId,
+			originGeneration: this.authority.generation,
+			targetRuntimeBoxId: runtimeBoxId,
+			targetInstanceId: targetIdentity.instanceId,
+			targetGeneration: targetIdentity.generation,
+			executionScope: "runtime-box-workspace",
+			expiresAt: new Date(expiresAtMs).toISOString(),
+		};
+		const authorizedInput = runtimeBoxMcpToolInvokeInputSchema.parse({
+			...input,
+			authorization,
+		});
+		this.actions.createGrant({
+			actionId,
+			grantId,
+			grantTokenHash: sha256(grantToken),
+			invocationId: input.invocationId,
+			runtimeBoxId,
+			runId: input.runId,
+			toolCallId: input.toolCallId,
+			tool: `mcp:${input.mcpServerId}:${input.stableToolId}`,
+			parameterDigest,
+			riskClass: "critical",
+			sideEffectClass: "external",
+			idempotencyClass: "non_idempotent",
+			policyRule: "poc.trusted-bound-agent-server.mcp",
+			originInstanceId: this.authority.instanceId,
+			originGeneration: this.authority.generation,
+			targetInstanceId: targetIdentity.instanceId,
+			targetGeneration: targetIdentity.generation,
+			executionScope: "runtime-box-workspace",
+			expiresAtMs,
+		});
+		this.actions.consumeGrant(actionId, grantId, sha256(grantToken));
+		return authorizedInput;
+	}
+
 	complete(
 		runtimeBoxId: string,
-		input: ExecutorToolInvokeInput,
-		result: ExecutorToolInvokeOutput,
+		input: ExecutorToolInvokeInput | RuntimeBoxMcpToolInvokeInput,
+		result: ExecutorToolInvokeOutput | RuntimeBoxMcpToolInvokeOutput,
 	): void {
 		this.actions.complete(runtimeBoxId, createEvidence(input, "succeeded", { result }));
 	}
 
-	fail(input: ExecutorToolInvokeInput, safeError: string): void {
+	fail(input: ExecutorToolInvokeInput | RuntimeBoxMcpToolInvokeInput, safeError: string): void {
 		this.actions.markFailed(input.invocationId, safeError);
 	}
 
-	cancel(input: ExecutorToolInvokeInput, safeError: string): void {
+	cancel(input: ExecutorToolInvokeInput | RuntimeBoxMcpToolInvokeInput, safeError: string): void {
 		this.actions.markCancelled(input.invocationId, safeError);
 	}
 
-	cancelUndispatched(input: ExecutorToolInvokeInput, safeError: string): void {
+	cancelUndispatched(
+		input: ExecutorToolInvokeInput | RuntimeBoxMcpToolInvokeInput,
+		safeError: string,
+	): void {
 		this.actions.cancelUndispatched(input.invocationId, safeError);
 	}
 
-	markOutcomeUnknown(input: ExecutorToolInvokeInput, safeError: string): void {
+	markOutcomeUnknown(
+		input: ExecutorToolInvokeInput | RuntimeBoxMcpToolInvokeInput,
+		safeError: string,
+	): void {
 		this.actions.markOutcomeUnknown(input.invocationId, safeError);
 	}
 
@@ -136,7 +210,7 @@ export class DurableActionAuthorizationService implements RuntimeBoxActionAuthor
 		const ackedInvocationIds = items.map((item) => item.invocationId);
 		const confirmedAcknowledgementIds = [...new Set(acknowledgedInvocationIds)];
 		this.actions.markServerAcked(ackedInvocationIds);
-		this.actions.markReceiptConfirmed(confirmedAcknowledgementIds);
+		this.actions.markReceiptConfirmed(runtimeBoxId, confirmedAcknowledgementIds);
 		return reconcileRuntimeBoxInvocationsOutputSchema.parse({
 			ackedInvocationIds,
 			confirmedAcknowledgementIds,
@@ -147,15 +221,15 @@ export class DurableActionAuthorizationService implements RuntimeBoxActionAuthor
 		this.actions.markServerAcked(invocationIds);
 	}
 
-	markReceiptConfirmed(invocationIds: readonly string[]): void {
-		this.actions.markReceiptConfirmed(invocationIds);
+	markReceiptConfirmed(runtimeBoxId: string, invocationIds: readonly string[]): void {
+		this.actions.markReceiptConfirmed(runtimeBoxId, invocationIds);
 	}
 }
 
 function createEvidence(
-	input: ExecutorToolInvokeInput,
+	input: ExecutorToolInvokeInput | RuntimeBoxMcpToolInvokeInput,
 	state: "succeeded",
-	detail: { result: ExecutorToolInvokeOutput },
+	detail: { result: RuntimeBoxActionResult },
 ): RuntimeBoxInvocationEvidence {
 	const authorization = requireAuthorization(input);
 	return {
@@ -174,7 +248,9 @@ function createEvidence(
 	};
 }
 
-function requireAuthorization(input: ExecutorToolInvokeInput): RuntimeBoxToolAuthorization {
+function requireAuthorization(
+	input: ExecutorToolInvokeInput | RuntimeBoxMcpToolInvokeInput,
+): RuntimeBoxToolAuthorization {
 	if (input.authorization === undefined) {
 		throw new Error("Authorized invocation is missing its execution grant.");
 	}

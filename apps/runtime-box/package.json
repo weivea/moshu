@@ -13,6 +13,7 @@
 		"@moshu/contracts": "workspace:*",
 		"@moshu/process-rpc": "workspace:*",
 		"diff": "8.0.4",
+		"yaml": "2.9.0",
 		"zod": "4.4.3"
 	}
 }

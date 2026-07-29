@@ -1,6 +1,6 @@
 # 数据与接口契约
 
-> 状态：Provider、Ask、Session/Run 已实现；Tool/MCP/Skill 合同仍是目标
+> 状态：Provider、Session/Run、Tool/Action、Runtime Box inventory、MCP/Skill 与 Runtime Profile 合同已实现
 > 当前实现边界见[实施进度](./progress.md)
 
 ## 1. 目标

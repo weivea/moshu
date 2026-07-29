@@ -3,6 +3,7 @@ import { createPrivateKey, createPublicKey, sign, verify } from "node:crypto";
 import {
 	pairRemoteRuntimeBox,
 	RemoteRuntimePermanentError,
+	RemoteRuntimeUpgradeRequiredError,
 	runRemoteRuntimeBox,
 } from "./remote-client";
 import { RemoteRuntimeBoxState } from "./remote-state";
@@ -47,6 +48,7 @@ export async function runRuntimeBoxCli(
 		}
 		case "run": {
 			const controller = new AbortController();
+			const processLock = await state.acquireProcessLock();
 			const stop = () => controller.abort();
 			process.once("SIGINT", stop);
 			process.once("SIGTERM", stop);
@@ -59,6 +61,10 @@ export async function runRuntimeBoxCli(
 						onState: (status) => write(JSON.stringify({ status })),
 					});
 				} catch (error) {
+					if (error instanceof RemoteRuntimeUpgradeRequiredError) {
+						write(JSON.stringify({ status: "upgrade_required", message: error.message }));
+						return 0;
+					}
 					if (!(error instanceof RemoteRuntimePermanentError)) {
 						throw error;
 					}
@@ -68,6 +74,7 @@ export async function runRuntimeBoxCli(
 			} finally {
 				process.off("SIGINT", stop);
 				process.off("SIGTERM", stop);
+				processLock.release();
 			}
 		}
 		case "status": {

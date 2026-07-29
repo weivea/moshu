@@ -5,6 +5,7 @@ import {
 	claimRuntimeBoxPairingInputSchema,
 	claimRuntimeBoxPairingOutputSchema,
 	createRuntimeBoxAuthenticationPayload,
+	createRuntimeBoxCompatibilityReportPayload,
 	createRuntimeBoxPairingOutputSchema,
 	createRuntimeBoxServerChallengePayload,
 	getRuntimeBoxPairingStatusInputSchema,
@@ -15,13 +16,19 @@ import {
 	revokeRuntimeBoxDeviceOutputSchema,
 	runtimeBoxChallengeInputSchema,
 	runtimeBoxChallengeOutputSchema,
+	runtimeBoxCompatibilityReportInputSchema,
+	runtimeBoxCompatibilityReportOutputSchema,
 	runtimeBoxPairingStatusOutputSchema,
 	type ApproveRuntimeBoxPairingInput,
 	type ClaimRuntimeBoxPairingInput,
 	type CreateRuntimeBoxPairingOutput,
 	type RuntimeBoxChallengeInput,
+	type RuntimeBoxCompatibilityReportInput,
 	type RuntimeBoxPairingStatusOutput,
 	type ProcessPeerIdentity,
+	currentRuntimeBoxProtocolVersion,
+	runtimeBoxProtocolMinVersion,
+	runtimeBoxProtocolMaxVersion,
 } from "@moshu/contracts";
 import {
 	PairingFingerprintMismatchError,
@@ -46,6 +53,7 @@ const challengeTtlMs = 30_000;
 const maxOutstandingChallenges = 128;
 const maxConcurrentPreAuthRequests = 128;
 const preAuthRequestTimeoutMs = 5_000;
+const compatibilityReportTtlMs = 60_000;
 
 interface PendingChallenge {
 	readonly input: RuntimeBoxChallengeInput;
@@ -63,6 +71,14 @@ interface RuntimeIngressAuthOptions {
 	now?: () => number;
 	preAuthRequestTimeoutMs?: number;
 	maxConcurrentPreAuthRequests?: number;
+	onUpgradeRequired?: (runtimeBoxId: string) => void;
+}
+
+class RuntimeBoxUpgradeRequiredError extends Error {
+	constructor(readonly runtimeBoxId: string) {
+		super("Runtime Box protocol version is incompatible.");
+		this.name = "RuntimeBoxUpgradeRequiredError";
+	}
 }
 
 export class RuntimeIngressAuth {
@@ -74,14 +90,17 @@ export class RuntimeIngressAuth {
 	readonly #localAuthenticator: RpcHandshakeAuthenticator;
 	readonly #now: () => number;
 	readonly #challenges = new Map<string, PendingChallenge>();
+	readonly #compatibilityReports = new Map<string, number>();
 	readonly #httpLimiters = new Map([
 		["/runtime-pair/claim", new PreAuthRateLimiter(120, 60)],
 		["/runtime-pair/status", new PreAuthRateLimiter(360, 180)],
 		["/runtime-auth/challenge", new PreAuthRateLimiter(360, 60)],
+		["/runtime-auth/compatibility", new PreAuthRateLimiter(120, 30)],
 	]);
 	readonly #upgradeLimiter = new PreAuthRateLimiter(600, 30);
 	readonly #preAuthRequestTimeoutMs: number;
 	readonly #maxConcurrentPreAuthRequests: number;
+	readonly #onUpgradeRequired: ((runtimeBoxId: string) => void) | undefined;
 	#activeHttpRequests = 0;
 
 	constructor(options: RuntimeIngressAuthOptions) {
@@ -98,6 +117,7 @@ export class RuntimeIngressAuth {
 		this.#preAuthRequestTimeoutMs = options.preAuthRequestTimeoutMs ?? preAuthRequestTimeoutMs;
 		this.#maxConcurrentPreAuthRequests =
 			options.maxConcurrentPreAuthRequests ?? maxConcurrentPreAuthRequests;
+		this.#onUpgradeRequired = options.onUpgradeRequired;
 		if (
 			!Number.isSafeInteger(this.#preAuthRequestTimeoutMs) ||
 			this.#preAuthRequestTimeoutMs <= 0 ||
@@ -170,7 +190,8 @@ export class RuntimeIngressAuth {
 		if (
 			pathname !== "/runtime-pair/claim" &&
 			pathname !== "/runtime-pair/status" &&
-			pathname !== "/runtime-auth/challenge"
+			pathname !== "/runtime-auth/challenge" &&
+			pathname !== "/runtime-auth/compatibility"
 		) {
 			return undefined;
 		}
@@ -194,8 +215,23 @@ export class RuntimeIngressAuth {
 			if (pathname === "/runtime-pair/status") {
 				return jsonResponse(this.#getPairingStatus(body));
 			}
+			if (pathname === "/runtime-auth/compatibility") {
+				return jsonResponse(
+					this.#reportCompatibility(runtimeBoxCompatibilityReportInputSchema.parse(body)),
+				);
+			}
 			return jsonResponse(this.#createChallenge(runtimeBoxChallengeInputSchema.parse(body)));
 		} catch (error) {
+			if (error instanceof RuntimeBoxUpgradeRequiredError) {
+				return jsonResponse(
+					{
+						error: "RUNTIME_BOX_UPGRADE_REQUIRED",
+						minProtocolVersion: runtimeBoxProtocolMinVersion,
+						maxProtocolVersion: runtimeBoxProtocolMaxVersion,
+					},
+					426,
+				);
+			}
 			if (
 				error instanceof PairingSessionNotFoundError ||
 				error instanceof PairingSessionStateError ||
@@ -253,6 +289,9 @@ export class RuntimeIngressAuth {
 	}
 
 	#createChallenge(input: RuntimeBoxChallengeInput) {
+		if (input.protocolVersion !== currentRuntimeBoxProtocolVersion) {
+			throw new RuntimeBoxUpgradeRequiredError(input.runtimeBoxId);
+		}
 		this.#removeExpiredChallenges();
 		if (this.#challenges.size >= maxOutstandingChallenges) {
 			throw new Error("Runtime Box challenge capacity is full.");
@@ -268,18 +307,94 @@ export class RuntimeIngressAuth {
 		const challengeId = randomUUID();
 		const nonce = randomBytes(32).toString("base64url");
 		const expiresAt = new Date(this.#now() + challengeTtlMs).toISOString();
-		const unsigned = {
+		const unsigned = runtimeBoxChallengeOutputSchema.omit({ signature: true }).parse({
 			challengeId,
 			nonce,
 			expiresAt,
 			agentServerId: this.#identity.agentServerId,
 			rpcIdentity: this.#rpcIdentity,
 			actionJournalEpoch: this.#actionJournalEpoch,
-		};
+			negotiatedProtocolVersion: currentRuntimeBoxProtocolVersion,
+			transportSecurity: "relay-tls" as const,
+			supportedTransportSecurity: ["relay-tls"],
+		});
 		this.#challenges.set(challengeId, { input, nonce, expiresAt });
 		return runtimeBoxChallengeOutputSchema.parse({
 			...unsigned,
 			signature: this.#identity.sign(createRuntimeBoxServerChallengePayload(input, unsigned)),
+		});
+	}
+
+	#reportCompatibility(input: RuntimeBoxCompatibilityReportInput) {
+		if (
+			input.protocolVersion >= runtimeBoxProtocolMinVersion &&
+			input.protocolVersion <= runtimeBoxProtocolMaxVersion
+		) {
+			throw new Error("Runtime Box protocol is already compatible.");
+		}
+		const issuedAtMs = Date.parse(input.issuedAt);
+		const now = this.#now();
+		if (issuedAtMs < now - compatibilityReportTtlMs || issuedAtMs > now + 5_000) {
+			throw new Error("Runtime Box compatibility report is expired.");
+		}
+		for (const [reportId, expiresAtMs] of this.#compatibilityReports) {
+			if (expiresAtMs <= now) {
+				this.#compatibilityReports.delete(reportId);
+			}
+		}
+		if (
+			this.#compatibilityReports.has(input.reportId) ||
+			this.#compatibilityReports.size >= maxOutstandingChallenges
+		) {
+			throw new Error("Runtime Box compatibility report is not consumable.");
+		}
+		const key = this.#pairings.getActiveDeviceKey(input.runtimeBoxId, input.deviceKeyId);
+		let signature: Buffer;
+		try {
+			signature = Buffer.from(input.signature, "base64url");
+			if (signature.toString("base64url") !== input.signature) {
+				throw new Error("non-canonical signature");
+			}
+		} catch (error) {
+			throw new Error("Runtime Box compatibility signature is invalid.", { cause: error });
+		}
+		const unsigned = {
+			runtimeBoxId: input.runtimeBoxId,
+			deviceKeyId: input.deviceKeyId,
+			instanceId: input.instanceId,
+			generation: input.generation,
+			protocolVersion: input.protocolVersion,
+			reportId: input.reportId,
+			issuedAt: input.issuedAt,
+		};
+		if (
+			!verify(
+				null,
+				Buffer.from(
+					createRuntimeBoxCompatibilityReportPayload(this.#identity.agentServerId, unsigned),
+					"utf8",
+				),
+				parsePublicKey(key.publicKey),
+				signature,
+			)
+		) {
+			throw new Error("Runtime Box compatibility signature is invalid.");
+		}
+		const generation = this.#runtimeBoxes.markUpgradeRequired(
+			input.runtimeBoxId,
+			input.instanceId,
+			input.generation,
+			input.protocolVersion,
+		);
+		if (!generation.accepted) {
+			throw new Error("Runtime Box compatibility generation is stale or conflicting.");
+		}
+		this.#compatibilityReports.set(input.reportId, now + compatibilityReportTtlMs);
+		this.#onUpgradeRequired?.(input.runtimeBoxId);
+		return runtimeBoxCompatibilityReportOutputSchema.parse({
+			accepted: true,
+			requiredProtocolMinVersion: runtimeBoxProtocolMinVersion,
+			requiredProtocolMaxVersion: runtimeBoxProtocolMaxVersion,
 		});
 	}
 
@@ -317,6 +432,12 @@ export class RuntimeIngressAuth {
 		if (!parsedInput.success) {
 			return null;
 		}
+		if (parsedInput.data.protocolVersion !== currentRuntimeBoxProtocolVersion) {
+			throw new RpcHandshakeHttpError(426, "Runtime Box upgrade required.", {
+				"x-moshu-runtime-protocol-min": String(runtimeBoxProtocolMinVersion),
+				"x-moshu-runtime-protocol-max": String(runtimeBoxProtocolMaxVersion),
+			});
+		}
 		if (!this.#upgradeLimiter.allow(resolveRateLimitSource(request, context), this.#now())) {
 			throw new RpcHandshakeHttpError(429, "Runtime ingress authentication rate limited.", {
 				"retry-after": "60",
@@ -337,14 +458,17 @@ export class RuntimeIngressAuth {
 		} catch {
 			return null;
 		}
-		const unsigned = {
+		const unsigned = runtimeBoxChallengeOutputSchema.omit({ signature: true }).parse({
 			challengeId,
 			nonce: challenge.nonce,
 			expiresAt: challenge.expiresAt,
 			agentServerId: this.#identity.agentServerId,
 			rpcIdentity: this.#rpcIdentity,
 			actionJournalEpoch: this.#actionJournalEpoch,
-		};
+			negotiatedProtocolVersion: currentRuntimeBoxProtocolVersion,
+			transportSecurity: "relay-tls" as const,
+			supportedTransportSecurity: ["relay-tls"],
+		});
 		let signatureBytes: Buffer;
 		try {
 			signatureBytes = Buffer.from(signature, "base64url");

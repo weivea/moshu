@@ -64,6 +64,21 @@ import {
 	type UpdateProviderInput,
 	type UpdateProjectInput,
 	type UpdateProjectOutput,
+	type ListRuntimeBoxInventoryOutput,
+	type ListRuntimeBoxMcpServersInput,
+	type ListRuntimeBoxMcpServerSummariesOutput,
+	type SetRuntimeBoxMcpServerEnabledInput,
+	type UpsertRuntimeBoxMcpServerInput,
+	type DeleteRuntimeBoxMcpServerInput,
+	type RuntimeBoxResourceMutationResult,
+	type ListRuntimeBoxSkillsInput,
+	type ListRuntimeBoxSkillsOutput,
+	type InstallRuntimeBoxSkillInput,
+	type DeleteRuntimeBoxSkillInput,
+	type GetRuntimeProfileInput,
+	type GetRuntimeProfileOutput,
+	type UpdateRuntimeProfileInput,
+	type RuntimeDiagnosticsOutput,
 	uuidV7Schema,
 } from "@moshu/contracts";
 import type { RPCSchema } from "electrobun/bun";
@@ -169,6 +184,10 @@ export type DesktopRpc = {
 				params: EmptyParams;
 				response: RemoteAccessMutationOutput;
 			};
+			getRuntimeDiagnostics: {
+				params: EmptyParams;
+				response: RuntimeDiagnosticsOutput;
+			};
 			createProject: {
 				params: CreateProjectInput;
 				response: CreateProjectOutput;
@@ -192,6 +211,46 @@ export type DesktopRpc = {
 			deleteProject: {
 				params: DeleteProjectInput;
 				response: DeleteProjectOutput;
+			};
+			listRuntimeInventory: {
+				params: { runtimeBoxId?: string };
+				response: ListRuntimeBoxInventoryOutput;
+			};
+			listMcpServers: {
+				params: ListRuntimeBoxMcpServersInput;
+				response: ListRuntimeBoxMcpServerSummariesOutput;
+			};
+			upsertMcpServer: {
+				params: UpsertRuntimeBoxMcpServerInput;
+				response: RuntimeBoxResourceMutationResult;
+			};
+			setMcpServerEnabled: {
+				params: SetRuntimeBoxMcpServerEnabledInput;
+				response: RuntimeBoxResourceMutationResult;
+			};
+			deleteMcpServer: {
+				params: DeleteRuntimeBoxMcpServerInput;
+				response: RuntimeBoxResourceMutationResult;
+			};
+			listSkills: {
+				params: ListRuntimeBoxSkillsInput;
+				response: ListRuntimeBoxSkillsOutput;
+			};
+			installSkill: {
+				params: InstallRuntimeBoxSkillInput;
+				response: RuntimeBoxResourceMutationResult;
+			};
+			deleteSkill: {
+				params: DeleteRuntimeBoxSkillInput;
+				response: RuntimeBoxResourceMutationResult;
+			};
+			getRuntimeProfile: {
+				params: GetRuntimeProfileInput;
+				response: GetRuntimeProfileOutput;
+			};
+			updateRuntimeProfile: {
+				params: UpdateRuntimeProfileInput;
+				response: GetRuntimeProfileOutput;
 			};
 			listProviders: {
 				params: EmptyParams;

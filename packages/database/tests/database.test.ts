@@ -204,6 +204,146 @@ describe("application database", () => {
 		});
 	});
 
+	test("persists authenticated upgrade state and clears it on compatible registration", () => {
+		withTempDatabase((databasePath) => {
+			const descriptor = {
+				schemaVersion: 1 as const,
+				runtimeBoxId: "remote-upgrade-box",
+				kind: "remote" as const,
+				displayName: "Remote Upgrade Box",
+				runtimeBoxVersion: "0.0.1",
+				platform: "linux" as const,
+				arch: "x64",
+				capabilities: [],
+			};
+			const database = openAppDatabase(databasePath);
+			database.runtimeBoxes.upsertRegistration(descriptor);
+			expect(
+				database.runtimeBoxes.markUpgradeRequired(descriptor.runtimeBoxId, "old-instance", 2, 2),
+			).toEqual({ accepted: true });
+			expect(
+				database.runtimeBoxes.markUpgradeRequired(descriptor.runtimeBoxId, "stale-instance", 1, 3),
+			).toMatchObject({ accepted: false, code: "STALE_GENERATION" });
+			database.close();
+
+			const reopened = openAppDatabase(databasePath);
+			try {
+				expect(reopened.runtimeBoxes.listCompatibility()).toEqual([
+					{
+						runtimeBoxId: descriptor.runtimeBoxId,
+						state: "upgrade_required",
+						generation: 2,
+						protocolVersion: 2,
+					},
+				]);
+				reopened.runtimeBoxes.upsertRegistration({
+					...descriptor,
+					runtimeBoxVersion: "2.0.0",
+				});
+				expect(reopened.runtimeBoxes.listCompatibility()).toEqual([]);
+			} finally {
+				reopened.close();
+			}
+		});
+	});
+
+	test("stores only redacted inventory projections and stable Runtime Profile refs", () => {
+		const database = openAppDatabase(":memory:");
+		try {
+			const runtimeBoxId = defaultLocalRuntimeBoxId;
+			const epoch = crypto.randomUUID();
+			const version = crypto.randomUUID();
+			const contentHash = "a".repeat(64);
+			database.runtimeBoxInventory.replaceSnapshot({
+				runtimeBoxId,
+				runtimeBoxGeneration: 3,
+				inventoryEpoch: epoch,
+				inventoryRevision: 1,
+				generatedAt: new Date().toISOString(),
+				capabilities: ["inventory.v1"],
+				resources: [
+					{
+						resourceKind: "skill",
+						stableResourceId: "release-helper",
+						version,
+						contentHash,
+						health: "ready",
+					},
+				],
+			});
+			expect(database.runtimeBoxInventory.list(runtimeBoxId)).toEqual({
+				runtimeBoxId,
+				inventoryEpoch: epoch,
+				inventoryRevision: 1,
+				stale: false,
+				resources: [
+					{
+						resourceKind: "skill",
+						stableResourceId: "release-helper",
+						version,
+						contentHash,
+						health: "ready",
+					},
+				],
+			});
+			const initialProfile = database.runtimeProfiles.getOrCreate("moshu.default", runtimeBoxId);
+			const ref = {
+				runtimeBoxId,
+				resourceKind: "skill" as const,
+				stableResourceId: "release-helper",
+				version,
+				contentHash,
+			};
+			const updatedProfile = database.runtimeProfiles.update({
+				agentId: "moshu.default",
+				runtimeBoxId,
+				expectedRevision: initialProfile.revision,
+				resources: [ref],
+			});
+			expect(updatedProfile.resources).toEqual([ref]);
+			expect(() =>
+				database.runtimeProfiles.update({
+					agentId: "moshu.default",
+					runtimeBoxId,
+					expectedRevision: initialProfile.revision,
+					resources: [],
+				}),
+			).toThrow("revision conflict");
+
+			database.runtimeBoxInventory.markStale(runtimeBoxId);
+			expect(database.runtimeBoxInventory.list(runtimeBoxId)).toMatchObject({
+				stale: true,
+				resources: [{ stableResourceId: "release-helper" }],
+			});
+			database.runtimeBoxInventory.applyChanges({
+				runtimeBoxId,
+				inventoryEpoch: epoch,
+				fromRevisionExclusive: 1,
+				throughRevision: 2,
+				changes: [
+					{
+						revision: 2,
+						category: "skill",
+						operation: "delete",
+						stableResourceId: "release-helper",
+						tombstone: {
+							resourceKind: "skill",
+							stableResourceId: "release-helper",
+							deletedVersion: version,
+						},
+					},
+				],
+			});
+			expect(database.runtimeBoxInventory.list(runtimeBoxId)).toMatchObject({
+				inventoryRevision: 2,
+				stale: false,
+				resources: [],
+			});
+		} finally {
+			database.close();
+		}
+	});
+
 	test("lists active device keys independently of Runtime Box connectivity", () => {
 		const database = openAppDatabase(":memory:");
 		try {
@@ -357,7 +497,7 @@ describe("application database", () => {
 			expect(database.actions.hasUnacknowledgedForSession(session.id)).toBe(true);
 			database.actions.markServerAcked([invocationId]);
 			expect(database.actions.hasUnacknowledgedForSession(session.id)).toBe(true);
-			database.actions.markReceiptConfirmed([invocationId]);
+			database.actions.markReceiptConfirmed(defaultLocalRuntimeBoxId, [invocationId]);
 			expect(database.actions.hasUnacknowledgedForSession(session.id)).toBe(false);
 			expect(database.actions.get(invocationId)).toMatchObject({
 				actionId,

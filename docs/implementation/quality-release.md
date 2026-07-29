@@ -401,6 +401,20 @@ clean tagged commit
 - 有活动 Run/Action 时不强制更新退出。
 - stable package 不含源 Secret、bootstrap token、测试 driver 或开发 endpoint。
 
+当前自动化实现：
+
+- `moshuReleaseVersion` 是 desktop/agents-server/Runtime Box 的共同版本源；package 额外保存两个
+  companion 的 SHA-256 和 companion/process-RPC/Runtime protocol matrix，READY version 不一致即拒绝。
+- packaged launch 使用不可解析系统 Bun/Node 的 PATH，仍须完成启动、readiness 和 cooperative shutdown。
+- `bun run package:release` 在 stable 前检查永久 app ID、HTTPS update origin、Ed25519 key pair 和平台凭据。
+- macOS stable 开启 Developer ID、notarization、staple、Gatekeeper 和 DMG gate；Windows stable 对 bundle
+  内全部 EXE/DLL 执行 Authenticode SHA-256、RFC 3161 timestamp 和 verify，并在最终 ZIP 生成后重新封装
+  已签名的 `Setup.exe`。
+- stable 产物的 update JSON、完整 archive、patch/installer（存在时）由 Ed25519 signed manifest 统一绑定；
+  缺件、hash 变化、错误 key 或 signature 均阻止发布。
+- 真实 Tunnel 使用 `MOSHU_LIVE_RUNTIME_BASE_URL=... bun run smoke:live-tunnel`；正式证书、Microsoft 账号和
+  三平台 runner 是外部 release 条件，仓库不会保存这些 Secret，也不能把本地 ad-hoc canary 当成通过。
+
 ## 17. 数据 reset 与未来 migration
 
 当前重构阶段：

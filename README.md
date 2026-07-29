@@ -35,6 +35,8 @@ executor
 bun install --frozen-lockfile
 ```
 
+Remote Runtime Box 的安装、配对和后台服务操作见[连接 Remote Runtime Box](./docs/guides/remote-runtime-box.md)。
+
 ## 开发
 
 推荐使用带 WebView 热更新的开发入口：

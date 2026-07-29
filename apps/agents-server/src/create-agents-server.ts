@@ -2,6 +2,7 @@ import { mkdirSync } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
 import {
 	type AskChatRuntime,
+	AskChatRuntimeError,
 	HeadlessAuthController,
 	ModelRuntime,
 	PiAgentRuntime,
@@ -17,14 +18,22 @@ import {
 	productRpcMethods,
 	remoteAccessMutationMethods,
 	remoteAccessMutationRpcTimeoutMs,
+	runtimeBoxProtocolMinVersion,
+	runtimeBoxProtocolMaxVersion,
+	runtimeDiagnosticsOutputSchema,
 } from "@moshu/contracts";
-import { openAppDatabase, prepareCoordinatedDatabaseReset } from "@moshu/database";
+import {
+	currentAppDatabaseVersion,
+	openAppDatabase,
+	prepareCoordinatedDatabaseReset,
+} from "@moshu/database";
 import { PairingSessionNotFoundError } from "@moshu/database";
 import {
 	createRpcBearerAuthenticator,
 	createRpcServer,
 	type RpcServer,
 	rpcJsonValueSchema,
+	CURRENT_PROCESS_RPC_PROTOCOL,
 } from "@moshu/process-rpc";
 
 import { ChatApplicationService } from "./chat-application-service";
@@ -135,10 +144,12 @@ export async function createAgentsServer(
 		);
 		const runtimeBoxRegistry = new RuntimeBoxRegistry({
 			descriptors: database.runtimeBoxes.list(),
+			compatibilities: database.runtimeBoxes.listCompatibility(),
 			activeRuntimeBoxId: activeRuntimeBox.runtimeBoxId,
 			onRegister: (descriptor) => database.runtimeBoxes.upsertRegistration(descriptor),
 			onChange: () => publishRuntimeBoxesChanged(),
 			actionAuthorizer,
+			inventoryRepository: database.runtimeBoxInventory,
 			reportDiagnostic,
 			isDeviceKeyActive: (runtimeBoxId, deviceKeyId) => {
 				try {
@@ -205,6 +216,7 @@ export async function createAgentsServer(
 			localAuthenticator: createRpcBearerAuthenticator(
 				options.bootstrap.peerBindings.filter((binding) => binding.identity.role === "runtime-box"),
 			),
+			onUpgradeRequired: (runtimeBoxId) => runtimeBoxRegistry.markUpgradeRequired(runtimeBoxId),
 		});
 		chatService = new ChatApplicationService({
 			sessions: database.sessions,
@@ -217,6 +229,47 @@ export async function createAgentsServer(
 				: { fetchProviderModels: options.fetchProviderModels }),
 			isRuntimeReady: (runtimeBoxId) => runtimeBoxRegistry.isReady(runtimeBoxId),
 			getActiveRuntimeBoxId: () => database.runtimeBoxes.getActive().runtimeBoxId,
+			resolveRuntimeResources: async (runtimeBoxId, signal) => {
+				const profile = database.runtimeProfiles.getOrCreate("moshu.default", runtimeBoxId);
+				const validation = await runtimeBoxRegistry.validateResources(
+					runtimeBoxId,
+					{ refs: profile.resources },
+					signal,
+				);
+				if (!validation.valid) {
+					throw new AskChatRuntimeError({
+						kind: "runtime_box_unavailable",
+						message: validation.issues[0]?.message ?? "Runtime Profile resource validation failed.",
+						retryable: true,
+					});
+				}
+				const skills = await Promise.all(
+					profile.resources
+						.filter((ref) => ref.resourceKind === "skill")
+						.map(async (ref) => {
+							const content = await runtimeBoxRegistry.getSkillContent(
+								runtimeBoxId,
+								{ ref },
+								signal,
+							);
+							return {
+								stableResourceId: ref.stableResourceId,
+								version: ref.version,
+								contentHash: ref.contentHash,
+								skillMarkdown: content.skillMarkdown,
+							};
+						}),
+				);
+				const mcpResources = validation.resources
+					.filter((resource) => resource.resourceKind === "mcp")
+					.map((resource) => ({
+						stableResourceId: resource.stableResourceId,
+						version: resource.version,
+						contentHash: resource.contentHash,
+						tools: resource.mcpTools,
+					}));
+				return { skills, mcpResources };
+			},
 			logger: {
 				error(message, error) {
 					console.error(message, error);
@@ -250,6 +303,12 @@ export async function createAgentsServer(
 				: { shutdownTimeoutMs: options.shutdownTimeoutMs }),
 		});
 		const ready = chatService.drainPendingAgentSessionCleanups({ batchSize: 64 });
+		const requireDevTunnelService = (): DevTunnelService => {
+			if (devTunnelService === undefined) {
+				throw new Error("Dev Tunnel service is not initialized.");
+			}
+			return devTunnelService;
+		};
 
 		const handlers = createProductRpcHandlers({
 			chatService,
@@ -257,16 +316,51 @@ export async function createAgentsServer(
 			runtimeBoxes: database.runtimeBoxes,
 			runtimeBoxPairings: database.runtimeBoxPairings,
 			projects: database.projects,
+			runtimeBoxInventory: database.runtimeBoxInventory,
+			runtimeProfiles: database.runtimeProfiles,
 			runtimeIngressAuth,
-			getDevTunnelService: () => {
-				if (devTunnelService === undefined) {
-					throw new Error("Dev Tunnel service is not initialized.");
-				}
-				return devTunnelService;
-			},
+			getDevTunnelService: requireDevTunnelService,
 			eventRouter,
 			serverVersion: options.serverVersion,
 			authController,
+			getRuntimeDiagnostics: () => {
+				const integrity = database.client
+					.query<{ integrity_check: string }, []>("PRAGMA quick_check")
+					.get()?.integrity_check;
+				const runtimeBoxes = runtimeBoxRegistry.listInfo();
+				return runtimeDiagnosticsOutputSchema.parse({
+					generatedAt: new Date().toISOString(),
+					server: {
+						version: options.serverVersion,
+						identity: options.bootstrap.serverIdentity,
+						processRpcProtocol: CURRENT_PROCESS_RPC_PROTOCOL,
+						runtimeProtocolMinVersion: runtimeBoxProtocolMinVersion,
+						runtimeProtocolMaxVersion: runtimeBoxProtocolMaxVersion,
+						transportSecurity: "relay-tls",
+						noiseUpgradeAvailable: false,
+					},
+					database: {
+						schemaVersion: currentAppDatabaseVersion,
+						integrity: integrity === "ok" ? "ok" : "error",
+					},
+					runtimeBoxes,
+					inventories: runtimeBoxes.map((item) => {
+						const inventory = database.runtimeBoxInventory.list(item.runtimeBox.runtimeBoxId);
+						return {
+							runtimeBoxId: inventory.runtimeBoxId,
+							...(inventory.inventoryEpoch === undefined
+								? {}
+								: { inventoryEpoch: inventory.inventoryEpoch }),
+							...(inventory.inventoryRevision === undefined
+								? {}
+								: { inventoryRevision: inventory.inventoryRevision }),
+							stale: inventory.stale,
+							resourceCount: inventory.resources.length,
+						};
+					}),
+					remoteAccess: requireDevTunnelService().getStatus(),
+				});
+			},
 		});
 		productRpcServer = createRpcServer({
 			identity: options.bootstrap.serverIdentity,
@@ -309,6 +403,12 @@ export async function createAgentsServer(
 				},
 				requestTimeoutLimits: {
 					[productRpcMethods.runtimeBoxToolInvoke]: executorToolRpcTimeoutMs,
+					[productRpcMethods.runtimeBoxMcpToolInvoke]: executorToolRpcTimeoutMs,
+				},
+				onTraffic(direction, bytes, peer) {
+					if (peer.remoteIdentity.deviceKeyId !== undefined) {
+						devTunnelService?.recordTraffic(direction, bytes);
+					}
 				},
 				onClose(_info, peer) {
 					runtimeBoxRegistry.clear(peer);
@@ -373,6 +473,7 @@ export async function createAgentsServer(
 					await devTunnelService?.shutdown();
 					await authController?.dispose();
 					await chatService?.shutdown();
+					await runtimeBoxRegistry.shutdown();
 					database.close();
 				})();
 				return shutdownPromise;

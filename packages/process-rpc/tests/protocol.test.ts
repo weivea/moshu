@@ -177,6 +177,46 @@ describe("process RPC protocol", () => {
 		);
 	});
 
+	test("reports application frame traffic without exposing payloads", () => {
+		const sent: string[] = [];
+		const traffic: Array<{ direction: string; bytes: number }> = [];
+		const peer = new RpcPeer({
+			localIdentity: agentsIdentity,
+			remoteIdentity: clientIdentity,
+			protocol: CURRENT_PROCESS_RPC_PROTOCOL,
+			resolvedLimits: resolveRpcLimits({ heartbeatIntervalMs: 0 }),
+			methodAllowlist: { client: { events: ["fixture.event"] } },
+			handlers: { events: { "fixture.event": () => undefined } },
+			onTraffic(direction, bytes) {
+				traffic.push({ direction, bytes });
+			},
+			transport: {
+				send(text) {
+					sent.push(text);
+				},
+				close() {},
+				terminate() {},
+				isOpen: () => true,
+			},
+		});
+		const inbound = JSON.stringify({
+			schemaVersion: PROCESS_RPC_SCHEMA_VERSION,
+			protocol: CURRENT_PROCESS_RPC_PROTOCOL,
+			type: "event",
+			eventId: "event-1",
+			traceId: "trace-1",
+			method: "fixture.event",
+			payload: { secret: "not-reported" },
+		});
+		peer.handleTextFrame(inbound);
+		peer.emitEvent("fixture.outbound", { value: "payload" });
+		expect(traffic).toEqual([
+			{ direction: "inbound", bytes: Buffer.byteLength(inbound) },
+			{ direction: "outbound", bytes: Buffer.byteLength(sent[0] ?? "") },
+		]);
+		peer.close();
+	});
+
 	test("raises request deadlines only for explicitly configured methods", async () => {
 		const sent: string[] = [];
 		const peer = new RpcPeer({

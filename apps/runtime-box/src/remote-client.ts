@@ -11,17 +11,22 @@ import {
 	agentsRuntimeBoxRequestMethods,
 	claimRuntimeBoxPairingOutputSchema,
 	createRuntimeBoxAuthenticationPayload,
+	createRuntimeBoxCompatibilityReportPayload,
 	createRuntimeBoxServerChallengePayload,
 	executorToolNames,
 	executorToolRpcTimeoutMs,
 	productRpcMaxBufferedOutboundBytes,
 	productRpcMaxFrameBytes,
+	productRpcEvents,
 	productRpcMethods,
 	runtimeBoxChallengeOutputSchema,
+	runtimeBoxCompatibilityReportOutputSchema,
 	runtimeBoxPairingStatusOutputSchema,
 	runtimeBoxRegisterInputSchema,
 	runtimeBoxRegisterOutputSchema,
 	type ProcessPeerIdentity,
+	currentRuntimeBoxProtocolVersion,
+	moshuReleaseVersion,
 } from "@moshu/contracts";
 import {
 	type ConnectRpcClientOptions,
@@ -41,8 +46,12 @@ import {
 	watchInvocationReconciliation,
 } from "./invocation-journal";
 import { validateProjectPathRequestHandler } from "./project-path";
+import { createRuntimeResourceRequestHandlers } from "./resource-handler";
 import type { RemoteRuntimeBoxConfig, RemoteRuntimeBoxState } from "./remote-state";
 import { normalizeRuntimeBaseUrl } from "./remote-state";
+import { RuntimeResourceStore } from "./runtime-resource-store";
+import { McpLifecycleManager } from "./mcp-lifecycle-manager";
+import { createMcpToolRequestHandler } from "./mcp-tool-handler";
 import type { ExecutorToolRuntime } from "./tools";
 
 const stableConnectionMs = 30_000;
@@ -53,6 +62,8 @@ export type RuntimeFetch = (input: string | URL | Request, init?: RequestInit) =
 interface RemoteRuntimeRpcPeer {
 	readonly closed: Promise<unknown>;
 	close: RpcPeer["close"];
+	emitEvent?: RpcPeer["emitEvent"];
+	readonly isClosed?: boolean;
 	request: RpcPeer["request"];
 }
 
@@ -60,6 +71,13 @@ export class RemoteRuntimePermanentError extends Error {
 	constructor(message: string, options?: ErrorOptions) {
 		super(message, options);
 		this.name = "RemoteRuntimePermanentError";
+	}
+}
+
+export class RemoteRuntimeUpgradeRequiredError extends RemoteRuntimePermanentError {
+	constructor(message = "Remote Runtime Box upgrade is required by Agent Server.") {
+		super(message);
+		this.name = "RemoteRuntimeUpgradeRequiredError";
 	}
 }
 
@@ -174,200 +192,300 @@ export async function runRemoteRuntimeBox(options: RunRemoteRuntimeBoxOptions): 
 	const now = options.now ?? Date.now;
 	const random = options.random ?? Math.random;
 	options.state.initializeDirectories();
+	const journals = new Map<string, RuntimeBoxInvocationJournal>();
+	const activeExecutions = new Set<Promise<unknown>>();
+	const executionLifecycle = new AbortController();
+	const executionSignal = AbortSignal.any([options.signal, executionLifecycle.signal]);
+	const resourceStore = new RuntimeResourceStore(join(options.state.root, "resources"));
+	const mcpLifecycle = new McpLifecycleManager(resourceStore);
+	const resourceCapabilities = [
+		"inventory.v1",
+		"mcp.config.v1",
+		"mcp.tools.v1",
+		"skills.store.v1",
+	] as const;
+	const runtimeCapabilities = [
+		...executorToolNames.map((tool) => `tool.${tool}`),
+		"projects.validate-path",
+		...resourceCapabilities,
+	];
+	let inventoryPeer: RemoteRuntimeRpcPeer | undefined;
+	resourceStore.setInventoryChangedListener((hint) => {
+		if (inventoryPeer?.isClosed === true || inventoryPeer?.emitEvent === undefined) {
+			return;
+		}
+		try {
+			inventoryPeer.emitEvent(
+				productRpcEvents.runtimeBoxInventoryChanged,
+				rpcJsonValueSchema.parse(hint),
+			);
+		} catch (error) {
+			console.error(
+				error instanceof Error
+					? `Remote Runtime Box inventory hint failed: ${error.message}`
+					: "Remote Runtime Box inventory hint failed.",
+			);
+		}
+	});
 	let attempt = 0;
 	let authenticationFailures = 0;
-	while (!options.signal.aborted) {
-		options.onState?.("connecting");
-		const identity = options.state.nextConnectionIdentity();
-		try {
-			const challengeInput = {
-				runtimeBoxId: identity.config.runtimeBoxId,
-				deviceKeyId: identity.config.deviceKeyId,
-				instanceId: identity.instanceId,
-				generation: identity.generation,
-				protocolVersion: 1 as const,
-			};
-			const challenge = runtimeBoxChallengeOutputSchema.parse(
-				await postJson(
-					fetcher,
-					identity.config.runtimeBaseUrl,
-					"/runtime-auth/challenge",
-					challengeInput,
-					options.signal,
-				),
-			);
-			options.signal.throwIfAborted();
-			verifyServerChallenge(identity.config, challengeInput, challenge, now());
-			const invocationJournal = new RuntimeBoxInvocationJournal(
-				join(
+	try {
+		await mcpLifecycle.start(options.signal);
+		while (!options.signal.aborted) {
+			options.onState?.("connecting");
+			const identity = options.state.nextConnectionIdentity();
+			try {
+				const challengeInput = {
+					runtimeBoxId: identity.config.runtimeBoxId,
+					deviceKeyId: identity.config.deviceKeyId,
+					instanceId: identity.instanceId,
+					generation: identity.generation,
+					protocolVersion: currentRuntimeBoxProtocolVersion,
+				};
+				const challenge = runtimeBoxChallengeOutputSchema.parse(
+					await postJson(
+						fetcher,
+						identity.config.runtimeBaseUrl,
+						"/runtime-auth/challenge",
+						challengeInput,
+						options.signal,
+					),
+				);
+				if (
+					challenge.negotiatedProtocolVersion !== currentRuntimeBoxProtocolVersion ||
+					challenge.transportSecurity !== "relay-tls"
+				) {
+					throw new RemoteRuntimePermanentError(
+						"Agent Server selected an unsupported Runtime transport.",
+					);
+				}
+				options.signal.throwIfAborted();
+				verifyServerChallenge(identity.config, challengeInput, challenge, now());
+				const journalPath = join(
 					options.state.root,
 					"journal",
 					identity.config.agentServerId,
 					identity.config.runtimeBoxId,
 					challenge.actionJournalEpoch,
-				),
-			);
-			const toolHandler = createExecutorToolRequestHandler(options.toolRuntime, {
-				cwd: options.state.workspacePath,
-				journal: invocationJournal,
-			});
-			const privateKey = createPrivateKey({
-				key: Buffer.from(identity.config.privateKey, "base64url"),
-				format: "der",
-				type: "pkcs8",
-			});
-			const signature = sign(
-				null,
-				Buffer.from(
-					createRuntimeBoxAuthenticationPayload(challengeInput, {
-						challengeId: challenge.challengeId,
-						nonce: challenge.nonce,
-						expiresAt: challenge.expiresAt,
-						agentServerId: challenge.agentServerId,
-						rpcIdentity: challenge.rpcIdentity,
-						actionJournalEpoch: challenge.actionJournalEpoch,
-					}),
-					"utf8",
-				),
-				privateKey,
-			).toString("base64url");
-			const peer = await connect({
-				url: toRuntimeWebSocketUrl(identity.config.runtimeBaseUrl),
-				identity: {
-					role: "runtime-box",
-					peerId: identity.config.runtimeBoxId,
-					instanceId: identity.instanceId,
+				);
+				let invocationJournal = journals.get(journalPath);
+				if (invocationJournal === undefined) {
+					invocationJournal = new RuntimeBoxInvocationJournal(journalPath);
+					journals.set(journalPath, invocationJournal);
+				}
+				const toolHandler = createExecutorToolRequestHandler(options.toolRuntime, {
+					cwd: options.state.workspacePath,
+					journal: invocationJournal,
+					enforceCwdContainment: true,
+					activeExecutions,
+					lifecycleSignal: executionSignal,
+				});
+				const resourceHandlers = createRuntimeResourceRequestHandlers(resourceStore, {
+					runtimeBoxId: identity.config.runtimeBoxId,
 					generation: identity.generation,
-					deviceKeyId: identity.config.deviceKeyId,
-				},
-				expectedServerIdentity: challenge.rpcIdentity,
-				signal: options.signal,
-				getHandshakeHeaders: () => ({
-					"x-moshu-runtime-box-id": identity.config.runtimeBoxId,
-					"x-moshu-device-key-id": identity.config.deviceKeyId,
-					"x-moshu-instance-id": identity.instanceId,
-					"x-moshu-generation": String(identity.generation),
-					"x-moshu-protocol-version": "1",
-					"x-moshu-challenge-id": challenge.challengeId,
-					"x-moshu-signature": signature,
-				}),
-				methodAllowlist: { agents: { requests: agentsRuntimeBoxRequestMethods } },
-				handlers: {
-					requests: {
-						[productRpcMethods.runtimeBoxToolInvoke]: toolHandler,
-						[productRpcMethods.runtimeBoxProjectValidatePath]: validateProjectPathRequestHandler,
-						[productRpcMethods.runtimeBoxInvocationsAck]:
-							createInvocationAcknowledgementHandler(invocationJournal),
-					},
-				},
-				requestTimeoutLimits: {
-					[productRpcMethods.runtimeBoxToolInvoke]: executorToolRpcTimeoutMs,
-				},
-				limits: {
-					maxFrameBytes: productRpcMaxFrameBytes,
-					maxBufferedOutboundBytes: productRpcMaxBufferedOutboundBytes,
-				},
-			});
-			options.signal.throwIfAborted();
-			const onAbort = () => peer.close(1000, "Remote Runtime Box shutting down.");
-			options.signal.addEventListener("abort", onAbort, { once: true });
-			const reconciliationController = new AbortController();
-			const reconciliationSignal = AbortSignal.any([
-				options.signal,
-				reconciliationController.signal,
-			]);
-			let reconciliationObservation: Promise<void> = Promise.resolve();
-			let registeredAt: number | undefined;
-			try {
-				const registration = await peer.request(
-					productRpcMethods.runtimeBoxRegister,
-					rpcJsonValueSchema.parse(
-						runtimeBoxRegisterInputSchema.parse({
-							schemaVersion: 1,
-							status: "ready",
-							runtimeBox: {
-								schemaVersion: 1,
-								runtimeBoxId: identity.config.runtimeBoxId,
-								kind: "remote",
-								displayName: identity.config.displayName,
-								runtimeBoxVersion: "0.0.1",
-								platform: requireSupportedPlatform(process.platform),
-								arch: process.arch,
-								capabilities: [
-									...executorToolNames.map((tool) => `tool.${tool}`),
-									"projects.validate-path",
-								],
-							},
+					capabilities: runtimeCapabilities,
+				});
+				const mcpToolHandler = createMcpToolRequestHandler(mcpLifecycle, invocationJournal, {
+					activeExecutions,
+					lifecycleSignal: executionSignal,
+				});
+				const privateKey = createPrivateKey({
+					key: Buffer.from(identity.config.privateKey, "base64url"),
+					format: "der",
+					type: "pkcs8",
+				});
+				const signature = sign(
+					null,
+					Buffer.from(
+						createRuntimeBoxAuthenticationPayload(challengeInput, {
+							challengeId: challenge.challengeId,
+							nonce: challenge.nonce,
+							expiresAt: challenge.expiresAt,
+							agentServerId: challenge.agentServerId,
+							rpcIdentity: challenge.rpcIdentity,
+							actionJournalEpoch: challenge.actionJournalEpoch,
+							negotiatedProtocolVersion: challenge.negotiatedProtocolVersion,
+							transportSecurity: challenge.transportSecurity,
+							supportedTransportSecurity: challenge.supportedTransportSecurity,
 						}),
+						"utf8",
 					),
-				);
-				runtimeBoxRegisterOutputSchema.parse(registration);
-				await reconcileInvocationJournal(peer, invocationJournal, reconciliationSignal);
-				await peer.request(
-					productRpcMethods.runtimeBoxReady,
-					{},
-					{
-						signal: reconciliationSignal,
+					privateKey,
+				).toString("base64url");
+				const peer = await connect({
+					url: toRuntimeWebSocketUrl(identity.config.runtimeBaseUrl),
+					identity: {
+						role: "runtime-box",
+						peerId: identity.config.runtimeBoxId,
+						instanceId: identity.instanceId,
+						generation: identity.generation,
+						deviceKeyId: identity.config.deviceKeyId,
 					},
-				);
-				reconciliationObservation = watchInvocationReconciliation(
-					peer,
-					invocationJournal,
-					reconciliationSignal,
-					{
-						onError: (error) =>
-							console.error(
-								error instanceof Error
-									? error.message
-									: "Remote Runtime Box Action reconciliation failed.",
-							),
+					expectedServerIdentity: challenge.rpcIdentity,
+					signal: options.signal,
+					getHandshakeHeaders: () => ({
+						"x-moshu-runtime-box-id": identity.config.runtimeBoxId,
+						"x-moshu-device-key-id": identity.config.deviceKeyId,
+						"x-moshu-instance-id": identity.instanceId,
+						"x-moshu-generation": String(identity.generation),
+						"x-moshu-protocol-version": String(currentRuntimeBoxProtocolVersion),
+						"x-moshu-challenge-id": challenge.challengeId,
+						"x-moshu-signature": signature,
+					}),
+					methodAllowlist: { agents: { requests: agentsRuntimeBoxRequestMethods } },
+					handlers: {
+						requests: {
+							[productRpcMethods.runtimeBoxToolInvoke]: toolHandler,
+							[productRpcMethods.runtimeBoxMcpToolInvoke]: mcpToolHandler,
+							[productRpcMethods.runtimeBoxProjectValidatePath]: validateProjectPathRequestHandler,
+							[productRpcMethods.runtimeBoxInvocationsAck]:
+								createInvocationAcknowledgementHandler(invocationJournal),
+							...resourceHandlers,
+						},
 					},
-				);
-				registeredAt = now();
-				options.onState?.("online");
-				authenticationFailures = 0;
-				await peer.closed;
-			} finally {
-				reconciliationController.abort();
-				await reconciliationObservation;
-				options.signal.removeEventListener("abort", onAbort);
-				peer.close(1000, "Remote Runtime Box connection attempt ended.");
-			}
-			if (registeredAt !== undefined && now() - registeredAt >= stableConnectionMs) {
-				attempt = 0;
-			} else {
+					requestTimeoutLimits: {
+						[productRpcMethods.runtimeBoxToolInvoke]: executorToolRpcTimeoutMs,
+						[productRpcMethods.runtimeBoxMcpToolInvoke]: executorToolRpcTimeoutMs,
+					},
+					limits: {
+						maxFrameBytes: productRpcMaxFrameBytes,
+						maxBufferedOutboundBytes: productRpcMaxBufferedOutboundBytes,
+					},
+				});
+				inventoryPeer = peer;
+				options.signal.throwIfAborted();
+				const onAbort = () => peer.close(1000, "Remote Runtime Box shutting down.");
+				options.signal.addEventListener("abort", onAbort, { once: true });
+				const reconciliationController = new AbortController();
+				const reconciliationSignal = AbortSignal.any([
+					options.signal,
+					reconciliationController.signal,
+				]);
+				let reconciliationObservation: Promise<void> = Promise.resolve();
+				let registeredAt: number | undefined;
+				try {
+					const registration = await peer.request(
+						productRpcMethods.runtimeBoxRegister,
+						rpcJsonValueSchema.parse(
+							runtimeBoxRegisterInputSchema.parse({
+								schemaVersion: 1,
+								status: "ready",
+								protocolVersion: currentRuntimeBoxProtocolVersion,
+								transportSecurity: challenge.transportSecurity,
+								runtimeBox: {
+									schemaVersion: 1,
+									runtimeBoxId: identity.config.runtimeBoxId,
+									kind: "remote",
+									displayName: identity.config.displayName,
+									runtimeBoxVersion: moshuReleaseVersion,
+									platform: requireSupportedPlatform(process.platform),
+									arch: process.arch,
+									capabilities: runtimeCapabilities,
+								},
+							}),
+						),
+					);
+					runtimeBoxRegisterOutputSchema.parse(registration);
+					await reconcileInvocationJournal(peer, invocationJournal, reconciliationSignal);
+					await peer.request(
+						productRpcMethods.runtimeBoxReady,
+						{},
+						{
+							signal: reconciliationSignal,
+						},
+					);
+					reconciliationObservation = watchInvocationReconciliation(
+						peer,
+						invocationJournal,
+						reconciliationSignal,
+						{
+							onError: (error) =>
+								console.error(
+									error instanceof Error
+										? error.message
+										: "Remote Runtime Box Action reconciliation failed.",
+								),
+						},
+					);
+					registeredAt = now();
+					options.onState?.("online");
+					authenticationFailures = 0;
+					await peer.closed;
+				} finally {
+					reconciliationController.abort();
+					await reconciliationObservation;
+					options.signal.removeEventListener("abort", onAbort);
+					peer.close(1000, "Remote Runtime Box connection attempt ended.");
+					if (inventoryPeer === peer) {
+						inventoryPeer = undefined;
+					}
+				}
+				if (registeredAt !== undefined && now() - registeredAt >= stableConnectionMs) {
+					attempt = 0;
+				} else {
+					attempt += 1;
+				}
+			} catch (error) {
+				if (options.signal.aborted) {
+					break;
+				}
+				if (error instanceof RemoteRuntimeUpgradeRequiredError) {
+					try {
+						await reportCompatibility(
+							fetcher,
+							identity.config,
+							identity.instanceId,
+							identity.generation,
+							now(),
+							options.signal,
+						);
+					} catch (reportError) {
+						console.error(
+							reportError instanceof Error
+								? `Remote Runtime Box compatibility report failed: ${reportError.message}`
+								: "Remote Runtime Box compatibility report failed.",
+						);
+					}
+					if (options.signal.aborted) {
+						break;
+					}
+					throw error;
+				}
+				if (isAuthenticationFailure(error)) {
+					authenticationFailures += 1;
+					if (authenticationFailures < 3) {
+						attempt += 1;
+						options.onState?.("disconnected");
+						await sleepWithAbort(
+							calculateRemoteReconnectDelayMs(Math.max(0, attempt - 1), random),
+							options.signal,
+							sleep,
+						);
+						continue;
+					}
+				}
+				if (isPermanentConnectionError(error) || authenticationFailures >= 3) {
+					throw new RemoteRuntimePermanentError("Remote Runtime Box authentication failed.", {
+						cause: error,
+					});
+				}
 				attempt += 1;
 			}
-		} catch (error) {
-			if (options.signal.aborted) {
-				return;
-			}
-			if (isAuthenticationFailure(error)) {
-				authenticationFailures += 1;
-				if (authenticationFailures < 3) {
-					attempt += 1;
-					options.onState?.("disconnected");
-					await sleepWithAbort(
-						calculateRemoteReconnectDelayMs(Math.max(0, attempt - 1), random),
-						options.signal,
-						sleep,
-					);
-					continue;
-				}
-			}
-			if (isPermanentConnectionError(error) || authenticationFailures >= 3) {
-				throw new RemoteRuntimePermanentError("Remote Runtime Box authentication failed.", {
-					cause: error,
-				});
-			}
-			attempt += 1;
+			options.onState?.("disconnected");
+			await sleepWithAbort(
+				calculateRemoteReconnectDelayMs(Math.max(0, attempt - 1), random),
+				options.signal,
+				sleep,
+			);
 		}
-		options.onState?.("disconnected");
-		await sleepWithAbort(
-			calculateRemoteReconnectDelayMs(Math.max(0, attempt - 1), random),
-			options.signal,
-			sleep,
+	} finally {
+		executionLifecycle.abort(
+			options.signal.reason ?? new Error("Remote Runtime Box client stopped."),
 		);
+		await waitForActiveExecutions(activeExecutions);
+		await mcpLifecycle.shutdown();
+		resourceStore.setInventoryChangedListener(undefined);
+		resourceStore.close();
 	}
 }
 
@@ -405,12 +523,56 @@ async function postJson(
 		throw new Error("Runtime ingress is unreachable.", { cause: error });
 	}
 	if (!response.ok) {
+		if (response.status === 426) {
+			throw new RemoteRuntimeUpgradeRequiredError();
+		}
 		if (response.status === 400 || response.status === 401 || response.status === 403) {
 			throw new RemoteRuntimePermanentError("Runtime ingress rejected the device.");
 		}
 		throw new Error(`Runtime ingress returned HTTP ${response.status}.`);
 	}
 	return response.json();
+}
+
+async function reportCompatibility(
+	fetcher: RuntimeFetch,
+	config: RemoteRuntimeBoxConfig,
+	instanceId: string,
+	generation: number,
+	nowMs: number,
+	lifecycleSignal: AbortSignal,
+): Promise<void> {
+	const unsigned = {
+		runtimeBoxId: config.runtimeBoxId,
+		deviceKeyId: config.deviceKeyId,
+		instanceId,
+		generation,
+		protocolVersion: currentRuntimeBoxProtocolVersion,
+		reportId: randomUUID(),
+		issuedAt: new Date(nowMs).toISOString(),
+	};
+	const privateKey = createPrivateKey({
+		key: Buffer.from(config.privateKey, "base64url"),
+		format: "der",
+		type: "pkcs8",
+	});
+	const signature = sign(
+		null,
+		Buffer.from(createRuntimeBoxCompatibilityReportPayload(config.agentServerId, unsigned), "utf8"),
+		privateKey,
+	).toString("base64url");
+	runtimeBoxCompatibilityReportOutputSchema.parse(
+		await postJson(
+			fetcher,
+			config.runtimeBaseUrl,
+			"/runtime-auth/compatibility",
+			{
+				...unsigned,
+				signature,
+			},
+			AbortSignal.any([lifecycleSignal, AbortSignal.timeout(5_000)]),
+		),
+	);
 }
 
 function verifyServerChallenge(
@@ -429,6 +591,9 @@ function verifyServerChallenge(
 		agentServerId: string;
 		rpcIdentity: ProcessPeerIdentity;
 		actionJournalEpoch: string;
+		negotiatedProtocolVersion: typeof currentRuntimeBoxProtocolVersion;
+		transportSecurity: "relay-tls";
+		supportedTransportSecurity: Array<"relay-tls" | "noise-xx">;
 		signature: string;
 	},
 	now: number,
@@ -451,6 +616,9 @@ function verifyServerChallenge(
 				agentServerId: challenge.agentServerId,
 				rpcIdentity: challenge.rpcIdentity,
 				actionJournalEpoch: challenge.actionJournalEpoch,
+				negotiatedProtocolVersion: challenge.negotiatedProtocolVersion,
+				transportSecurity: challenge.transportSecurity,
+				supportedTransportSecurity: challenge.supportedTransportSecurity,
 			}),
 			"utf8",
 		),
@@ -517,4 +685,11 @@ async function sleepWithAbort(
 			signal.removeEventListener("abort", onAbort);
 		}
 	}
+}
+
+async function waitForActiveExecutions(executions: Set<Promise<unknown>>): Promise<void> {
+	if (executions.size === 0) {
+		return;
+	}
+	await Promise.allSettled([...executions]);
 }

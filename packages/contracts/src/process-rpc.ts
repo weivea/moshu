@@ -69,6 +69,8 @@ import { agentsRuntimeInfoSchema, emptyParamsSchema } from "./runtime";
 import {
 	runtimeBoxToolInvokeInputSchema,
 	runtimeBoxToolInvokeOutputSchema,
+	runtimeBoxMcpToolInvokeInputSchema,
+	runtimeBoxMcpToolInvokeOutputSchema,
 	runtimeBoxToolProgressEventSchema,
 	acknowledgeRuntimeBoxInvocationsInputSchema,
 	acknowledgeRuntimeBoxInvocationsOutputSchema,
@@ -89,11 +91,41 @@ import {
 	remoteAccessAuthAttemptSchema,
 	remoteAccessMutationOutputSchema,
 	remoteAccessStatusOutputSchema,
+	runtimeDiagnosticsOutputSchema,
 	runtimeBoxDescriptorSchema,
 	runtimeBoxIdSchema,
+	currentRuntimeBoxProtocolVersion,
+	runtimeBoxTransportSecuritySchema,
 	switchRuntimeBoxInputSchema,
 	switchRuntimeBoxOutputSchema,
 } from "./runtime-box";
+import {
+	deleteRuntimeBoxMcpServerInputSchema,
+	deleteRuntimeBoxSkillInputSchema,
+	getRuntimeBoxInventoryChangesInputSchema,
+	getRuntimeBoxSkillContentInputSchema,
+	getRuntimeBoxSkillContentOutputSchema,
+	getRuntimeProfileInputSchema,
+	getRuntimeProfileOutputSchema,
+	installRuntimeBoxSkillInputSchema,
+	listRuntimeBoxInventoryInputSchema,
+	listRuntimeBoxInventoryOutputSchema,
+	listRuntimeBoxMcpServerSummariesOutputSchema,
+	listRuntimeBoxMcpServersInputSchema,
+	listRuntimeBoxMcpServersOutputSchema,
+	listRuntimeBoxSkillsInputSchema,
+	listRuntimeBoxSkillsOutputSchema,
+	runtimeBoxInventoryChangedHintSchema,
+	runtimeBoxInventoryChangesPageSchema,
+	runtimeBoxInventorySnapshotSchema,
+	runtimeBoxResourceMutationResultSchema,
+	setRuntimeBoxMcpServerEnabledInputSchema,
+	updateRuntimeProfileInputSchema,
+	updateRuntimeProfileOutputSchema,
+	upsertRuntimeBoxMcpServerInputSchema,
+	validateRuntimeBoxResourcesInputSchema,
+	validateRuntimeBoxResourcesOutputSchema,
+} from "./runtime-resources";
 
 export const productRpcMethods = {
 	runtimeGet: "moshu.v1.runtime.get",
@@ -110,12 +142,23 @@ export const productRpcMethods = {
 	remoteAccessEnable: "moshu.v1.remoteAccess.enable",
 	remoteAccessDisable: "moshu.v1.remoteAccess.disable",
 	remoteAccessRecreate: "moshu.v1.remoteAccess.recreate",
+	runtimeDiagnosticsGet: "moshu.v1.runtimeDiagnostics.get",
 	projectsCreate: "moshu.v1.projects.create",
 	projectsList: "moshu.v1.projects.list",
 	projectsGet: "moshu.v1.projects.get",
 	projectsUpdate: "moshu.v1.projects.update",
 	projectsArchive: "moshu.v1.projects.archive",
 	projectsDelete: "moshu.v1.projects.delete",
+	runtimeInventoryList: "moshu.v1.runtimeInventory.list",
+	mcpServersList: "moshu.v1.mcpServers.list",
+	mcpServersUpsert: "moshu.v1.mcpServers.upsert",
+	mcpServersSetEnabled: "moshu.v1.mcpServers.setEnabled",
+	mcpServersDelete: "moshu.v1.mcpServers.delete",
+	skillsList: "moshu.v1.skills.list",
+	skillsInstall: "moshu.v1.skills.install",
+	skillsDelete: "moshu.v1.skills.delete",
+	runtimeProfilesGet: "moshu.v1.runtimeProfiles.get",
+	runtimeProfilesUpdate: "moshu.v1.runtimeProfiles.update",
 	providersList: "moshu.v1.providers.list",
 	providersCreate: "moshu.v1.providers.create",
 	providersUpdate: "moshu.v1.providers.update",
@@ -144,9 +187,21 @@ export const productRpcMethods = {
 	runtimeBoxRegister: "moshu.v1.runtimeBox.register",
 	runtimeBoxReady: "moshu.v1.runtimeBox.ready",
 	runtimeBoxToolInvoke: "moshu.v1.runtimeBox.tool.invoke",
+	runtimeBoxMcpToolInvoke: "moshu.v1.runtimeBox.mcpTool.invoke",
 	runtimeBoxProjectValidatePath: "moshu.v1.runtimeBox.projects.validatePath",
 	runtimeBoxInvocationsReconcile: "moshu.v1.runtimeBox.invocations.reconcile",
 	runtimeBoxInvocationsAck: "moshu.v1.runtimeBox.invocations.ack",
+	runtimeBoxInventoryGetSnapshot: "moshu.v1.runtimeBox.inventory.getSnapshot",
+	runtimeBoxInventoryGetChanges: "moshu.v1.runtimeBox.inventory.getChanges",
+	runtimeBoxMcpServersList: "moshu.v1.runtimeBox.mcpServers.list",
+	runtimeBoxMcpServersUpsert: "moshu.v1.runtimeBox.mcpServers.upsert",
+	runtimeBoxMcpServersSetEnabled: "moshu.v1.runtimeBox.mcpServers.setEnabled",
+	runtimeBoxMcpServersDelete: "moshu.v1.runtimeBox.mcpServers.delete",
+	runtimeBoxSkillsList: "moshu.v1.runtimeBox.skills.list",
+	runtimeBoxSkillsInstall: "moshu.v1.runtimeBox.skills.install",
+	runtimeBoxSkillsDelete: "moshu.v1.runtimeBox.skills.delete",
+	runtimeBoxResourcesValidate: "moshu.v1.runtimeBox.resources.validate",
+	runtimeBoxSkillGetContent: "moshu.v1.runtimeBox.skills.getContent",
 } as const;
 
 export const remoteAccessMutationRpcTimeoutMs = 2 * 60_000;
@@ -160,6 +215,7 @@ export const productRpcEvents = {
 	chatEvent: "moshu.v1.chat.event",
 	runtimeBoxesChanged: "moshu.v1.runtimeBoxes.changed",
 	runtimeBoxToolProgress: "moshu.v1.runtimeBox.tool.progress",
+	runtimeBoxInventoryChanged: "moshu.v1.runtimeBox.inventory.changed",
 } as const;
 
 export const productRpcMaxFrameBytes = 4 * 1024 * 1024;
@@ -192,6 +248,8 @@ export const runtimeBoxRegisterInputSchema = z
 	.object({
 		schemaVersion: z.literal(1),
 		status: z.literal("ready"),
+		protocolVersion: z.literal(currentRuntimeBoxProtocolVersion),
+		transportSecurity: runtimeBoxTransportSecuritySchema,
 		runtimeBox: runtimeBoxDescriptorSchema,
 	})
 	.strict();
@@ -201,6 +259,10 @@ export const runtimeBoxRegisterOutputSchema = z
 		schemaVersion: z.literal(1),
 		accepted: z.literal(true),
 		runtimeBoxId: runtimeBoxIdSchema,
+		negotiatedProtocolVersion: z
+			.literal(currentRuntimeBoxProtocolVersion)
+			.default(currentRuntimeBoxProtocolVersion),
+		transportSecurity: runtimeBoxTransportSecuritySchema.default("relay-tls"),
 	})
 	.strict();
 
@@ -313,6 +375,10 @@ export const productRpcRequestSchemas = {
 		input: emptyParamsSchema,
 		output: remoteAccessMutationOutputSchema,
 	},
+	[productRpcMethods.runtimeDiagnosticsGet]: {
+		input: emptyParamsSchema,
+		output: runtimeDiagnosticsOutputSchema,
+	},
 	[productRpcMethods.projectsCreate]: {
 		input: createProjectInputSchema,
 		output: createProjectOutputSchema,
@@ -336,6 +402,46 @@ export const productRpcRequestSchemas = {
 	[productRpcMethods.projectsDelete]: {
 		input: deleteProjectInputSchema,
 		output: deleteProjectOutputSchema,
+	},
+	[productRpcMethods.runtimeInventoryList]: {
+		input: listRuntimeBoxInventoryInputSchema,
+		output: listRuntimeBoxInventoryOutputSchema,
+	},
+	[productRpcMethods.mcpServersList]: {
+		input: listRuntimeBoxMcpServersInputSchema,
+		output: listRuntimeBoxMcpServerSummariesOutputSchema,
+	},
+	[productRpcMethods.mcpServersUpsert]: {
+		input: upsertRuntimeBoxMcpServerInputSchema,
+		output: runtimeBoxResourceMutationResultSchema,
+	},
+	[productRpcMethods.mcpServersSetEnabled]: {
+		input: setRuntimeBoxMcpServerEnabledInputSchema,
+		output: runtimeBoxResourceMutationResultSchema,
+	},
+	[productRpcMethods.mcpServersDelete]: {
+		input: deleteRuntimeBoxMcpServerInputSchema,
+		output: runtimeBoxResourceMutationResultSchema,
+	},
+	[productRpcMethods.skillsList]: {
+		input: listRuntimeBoxSkillsInputSchema,
+		output: listRuntimeBoxSkillsOutputSchema,
+	},
+	[productRpcMethods.skillsInstall]: {
+		input: installRuntimeBoxSkillInputSchema,
+		output: runtimeBoxResourceMutationResultSchema,
+	},
+	[productRpcMethods.skillsDelete]: {
+		input: deleteRuntimeBoxSkillInputSchema,
+		output: runtimeBoxResourceMutationResultSchema,
+	},
+	[productRpcMethods.runtimeProfilesGet]: {
+		input: getRuntimeProfileInputSchema,
+		output: getRuntimeProfileOutputSchema,
+	},
+	[productRpcMethods.runtimeProfilesUpdate]: {
+		input: updateRuntimeProfileInputSchema,
+		output: updateRuntimeProfileOutputSchema,
 	},
 	[productRpcMethods.providersList]: {
 		input: emptyParamsSchema,
@@ -449,6 +555,10 @@ export const productRpcRequestSchemas = {
 		input: runtimeBoxToolInvokeInputSchema,
 		output: runtimeBoxToolInvokeOutputSchema,
 	},
+	[productRpcMethods.runtimeBoxMcpToolInvoke]: {
+		input: runtimeBoxMcpToolInvokeInputSchema,
+		output: runtimeBoxMcpToolInvokeOutputSchema,
+	},
 	[productRpcMethods.runtimeBoxProjectValidatePath]: {
 		input: validateRuntimeBoxProjectPathInputSchema,
 		output: validateRuntimeBoxProjectPathOutputSchema,
@@ -461,12 +571,57 @@ export const productRpcRequestSchemas = {
 		input: acknowledgeRuntimeBoxInvocationsInputSchema,
 		output: acknowledgeRuntimeBoxInvocationsOutputSchema,
 	},
+	[productRpcMethods.runtimeBoxInventoryGetSnapshot]: {
+		input: emptyParamsSchema,
+		output: runtimeBoxInventorySnapshotSchema,
+	},
+	[productRpcMethods.runtimeBoxInventoryGetChanges]: {
+		input: getRuntimeBoxInventoryChangesInputSchema,
+		output: runtimeBoxInventoryChangesPageSchema,
+	},
+	[productRpcMethods.runtimeBoxMcpServersList]: {
+		input: listRuntimeBoxMcpServersInputSchema,
+		output: listRuntimeBoxMcpServersOutputSchema,
+	},
+	[productRpcMethods.runtimeBoxMcpServersUpsert]: {
+		input: upsertRuntimeBoxMcpServerInputSchema,
+		output: runtimeBoxResourceMutationResultSchema,
+	},
+	[productRpcMethods.runtimeBoxMcpServersSetEnabled]: {
+		input: setRuntimeBoxMcpServerEnabledInputSchema,
+		output: runtimeBoxResourceMutationResultSchema,
+	},
+	[productRpcMethods.runtimeBoxMcpServersDelete]: {
+		input: deleteRuntimeBoxMcpServerInputSchema,
+		output: runtimeBoxResourceMutationResultSchema,
+	},
+	[productRpcMethods.runtimeBoxSkillsList]: {
+		input: listRuntimeBoxSkillsInputSchema,
+		output: listRuntimeBoxSkillsOutputSchema,
+	},
+	[productRpcMethods.runtimeBoxSkillsInstall]: {
+		input: installRuntimeBoxSkillInputSchema,
+		output: runtimeBoxResourceMutationResultSchema,
+	},
+	[productRpcMethods.runtimeBoxSkillsDelete]: {
+		input: deleteRuntimeBoxSkillInputSchema,
+		output: runtimeBoxResourceMutationResultSchema,
+	},
+	[productRpcMethods.runtimeBoxResourcesValidate]: {
+		input: validateRuntimeBoxResourcesInputSchema,
+		output: validateRuntimeBoxResourcesOutputSchema,
+	},
+	[productRpcMethods.runtimeBoxSkillGetContent]: {
+		input: getRuntimeBoxSkillContentInputSchema,
+		output: getRuntimeBoxSkillContentOutputSchema,
+	},
 } as const;
 
 export const productRpcEventSchemas = {
 	[productRpcEvents.chatEvent]: chatEventDeliverySchema,
 	[productRpcEvents.runtimeBoxesChanged]: listRuntimeBoxesOutputSchema,
 	[productRpcEvents.runtimeBoxToolProgress]: runtimeBoxToolProgressEventSchema,
+	[productRpcEvents.runtimeBoxInventoryChanged]: runtimeBoxInventoryChangedHintSchema,
 } as const;
 
 export const clientProductRequestMethods = [
@@ -484,12 +639,23 @@ export const clientProductRequestMethods = [
 	productRpcMethods.remoteAccessEnable,
 	productRpcMethods.remoteAccessDisable,
 	productRpcMethods.remoteAccessRecreate,
+	productRpcMethods.runtimeDiagnosticsGet,
 	productRpcMethods.projectsCreate,
 	productRpcMethods.projectsList,
 	productRpcMethods.projectsGet,
 	productRpcMethods.projectsUpdate,
 	productRpcMethods.projectsArchive,
 	productRpcMethods.projectsDelete,
+	productRpcMethods.runtimeInventoryList,
+	productRpcMethods.mcpServersList,
+	productRpcMethods.mcpServersUpsert,
+	productRpcMethods.mcpServersSetEnabled,
+	productRpcMethods.mcpServersDelete,
+	productRpcMethods.skillsList,
+	productRpcMethods.skillsInstall,
+	productRpcMethods.skillsDelete,
+	productRpcMethods.runtimeProfilesGet,
+	productRpcMethods.runtimeProfilesUpdate,
 	productRpcMethods.providersList,
 	productRpcMethods.providersCreate,
 	productRpcMethods.providersUpdate,
@@ -528,10 +694,25 @@ export const agentsProductEventMethods = [
 ] as const;
 export const agentsRuntimeBoxRequestMethods = [
 	productRpcMethods.runtimeBoxToolInvoke,
+	productRpcMethods.runtimeBoxMcpToolInvoke,
 	productRpcMethods.runtimeBoxProjectValidatePath,
 	productRpcMethods.runtimeBoxInvocationsAck,
+	productRpcMethods.runtimeBoxInventoryGetSnapshot,
+	productRpcMethods.runtimeBoxInventoryGetChanges,
+	productRpcMethods.runtimeBoxMcpServersList,
+	productRpcMethods.runtimeBoxMcpServersUpsert,
+	productRpcMethods.runtimeBoxMcpServersSetEnabled,
+	productRpcMethods.runtimeBoxMcpServersDelete,
+	productRpcMethods.runtimeBoxSkillsList,
+	productRpcMethods.runtimeBoxSkillsInstall,
+	productRpcMethods.runtimeBoxSkillsDelete,
+	productRpcMethods.runtimeBoxResourcesValidate,
+	productRpcMethods.runtimeBoxSkillGetContent,
 ] as const;
-export const runtimeBoxProductEventMethods = [productRpcEvents.runtimeBoxToolProgress] as const;
+export const runtimeBoxProductEventMethods = [
+	productRpcEvents.runtimeBoxToolProgress,
+	productRpcEvents.runtimeBoxInventoryChanged,
+] as const;
 
 export type SendAskChatMessageInput = z.infer<typeof sendAskChatMessageInputSchema>;
 export type CreateProcessChatSessionInput = z.infer<typeof createProcessChatSessionInputSchema>;

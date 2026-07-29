@@ -13,7 +13,7 @@ describe("Electrobun config", () => {
 		expect(config.scripts).toEqual({
 			preBuild: "scripts/build-companions.ts",
 			postBuild: "scripts/prepare-companion-bundle.ts",
-			postPackage: "scripts/verify-mac-package.ts",
+			postPackage: "scripts/post-package.ts",
 		});
 	});
 
@@ -56,6 +56,25 @@ describe("Electrobun config", () => {
 		);
 		expect(config.build.mac?.codesign).toBe(true);
 		expect(config.build.mac?.notarize).toBe(false);
+	});
+
+	test("enables notarization, DMG output, and the release origin only for stable builds", () => {
+		const config = createElectrobunConfig(
+			{
+				MOSHU_STABLE_RELEASE: "1",
+				MOSHU_APP_IDENTIFIER: "com.example.moshu",
+				MOSHU_RELEASE_BASE_URL: "https://updates.example.test/moshu",
+				ELECTROBUN_DEVELOPER_ID: "Developer ID Application: Moshu (TEAMID)",
+			},
+			"darwin",
+		);
+		expect(config.app.identifier).toBe("com.example.moshu");
+		expect(config.build.mac).toMatchObject({
+			codesign: true,
+			notarize: true,
+			createDmg: true,
+		});
+		expect(config.release.baseUrl).toBe("https://updates.example.test/moshu");
 	});
 
 	test("never enables macOS signing for a packaged non-mac target", () => {

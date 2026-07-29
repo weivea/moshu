@@ -1,6 +1,6 @@
 import type Database from "bun:sqlite";
 
-export const currentAppDatabaseVersion = 15;
+export const currentAppDatabaseVersion = 18;
 
 export class AppDatabaseResetRequiredError extends Error {
 	readonly currentVersion: number;
@@ -55,6 +55,9 @@ export function applyAppMigrations(client: Database): void {
 	try {
 		client.exec(`
 			DROP TABLE IF EXISTS agent_session_cleanup_outbox;
+			DROP TABLE IF EXISTS agent_runtime_profiles;
+			DROP TABLE IF EXISTS runtime_box_inventory_cache;
+			DROP TABLE IF EXISTS runtime_box_inventory_state;
 			DROP TABLE IF EXISTS execution_grants;
 			DROP TABLE IF EXISTS action_intents;
 			DROP TABLE IF EXISTS chat_run_events;
@@ -82,12 +85,52 @@ export function applyAppMigrations(client: Database): void {
 				created_at_ms INTEGER NOT NULL,
 				updated_at_ms INTEGER NOT NULL,
 				last_seen_at_ms INTEGER,
-				archived_at_ms INTEGER
+				archived_at_ms INTEGER,
+				compatibility TEXT,
+				compatibility_generation INTEGER,
+				compatibility_protocol_version INTEGER
 			);
 			CREATE INDEX runtime_boxes_kind_archived_idx
 				ON runtime_boxes(kind, archived_at_ms);
 			CREATE INDEX runtime_boxes_last_seen_idx
 				ON runtime_boxes(last_seen_at_ms);
+
+			CREATE TABLE runtime_box_inventory_state (
+				runtime_box_id TEXT PRIMARY KEY NOT NULL
+					REFERENCES runtime_boxes(id) ON DELETE CASCADE,
+				inventory_epoch TEXT,
+				inventory_revision INTEGER,
+				runtime_box_generation INTEGER,
+				capabilities_json TEXT NOT NULL,
+				stale INTEGER NOT NULL,
+				synced_at_ms INTEGER,
+				updated_at_ms INTEGER NOT NULL
+			);
+
+			CREATE TABLE runtime_box_inventory_cache (
+				runtime_box_id TEXT NOT NULL
+					REFERENCES runtime_boxes(id) ON DELETE CASCADE,
+				resource_kind TEXT NOT NULL,
+				stable_resource_id TEXT NOT NULL,
+				version TEXT NOT NULL,
+				content_hash TEXT NOT NULL,
+				descriptor_json TEXT NOT NULL,
+				updated_at_ms INTEGER NOT NULL,
+				PRIMARY KEY (runtime_box_id, resource_kind, stable_resource_id)
+			);
+			CREATE INDEX runtime_box_inventory_cache_box_kind_idx
+				ON runtime_box_inventory_cache(runtime_box_id, resource_kind);
+
+			CREATE TABLE agent_runtime_profiles (
+				agent_id TEXT NOT NULL,
+				runtime_box_id TEXT NOT NULL
+					REFERENCES runtime_boxes(id) ON DELETE CASCADE,
+				revision INTEGER NOT NULL,
+				resources_json TEXT NOT NULL,
+				created_at_ms INTEGER NOT NULL,
+				updated_at_ms INTEGER NOT NULL,
+				PRIMARY KEY (agent_id, runtime_box_id)
+			);
 
 			CREATE TABLE app_settings (
 				id INTEGER PRIMARY KEY NOT NULL CHECK (id = 1),
@@ -102,6 +145,9 @@ export function applyAppMigrations(client: Database): void {
 				tunnel_id TEXT,
 				public_url TEXT,
 				runtime_ingress_port INTEGER,
+				traffic_month TEXT NOT NULL,
+				traffic_received_bytes INTEGER NOT NULL,
+				traffic_sent_bytes INTEGER NOT NULL,
 				updated_at_ms INTEGER NOT NULL
 			);
 

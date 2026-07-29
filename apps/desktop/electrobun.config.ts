@@ -1,5 +1,6 @@
 import type { ElectrobunConfig } from "electrobun";
 
+import { moshuReleaseVersion } from "../../packages/contracts/src/companion-bootstrap";
 import { resolveCompanionCodesignIdentity } from "./scripts/companion-signing";
 import { createElectrobunCompanionCopyEntries } from "./src/shared/companion-executable-names";
 
@@ -28,14 +29,17 @@ export function createElectrobunConfig(
 ) {
 	const codesignIdentity = resolveCompanionCodesignIdentity(environment);
 	const useBuiltInMacCodesign = platform === "darwin" && codesignIdentity !== "-";
+	const stableRelease = environment.MOSHU_STABLE_RELEASE === "1";
 	return {
 		app: {
 			// Electrobun 1.18.1 cannot archive a bundle directory with non-ASCII characters.
 			name: "Moshu",
 			description: "墨枢 - Local-first desktop agent",
 			// Development placeholder; replace with the publisher's permanent reverse-DNS ID.
-			identifier: "dev.moshu.app",
-			version: "0.0.1",
+			identifier: stableRelease
+				? (environment.MOSHU_APP_IDENTIFIER ?? "dev.moshu.app")
+				: "dev.moshu.app",
+			version: moshuReleaseVersion,
 		},
 		build: {
 			copy: {
@@ -58,8 +62,8 @@ export function createElectrobunConfig(
 				bundleCEF: false,
 				// Electrobun 1.18.1 always timestamps this path; ad-hoc signing runs pre-archive instead.
 				codesign: useBuiltInMacCodesign,
-				createDmg: false,
-				notarize: false,
+				createDmg: stableRelease,
+				notarize: stableRelease && useBuiltInMacCodesign,
 			},
 			linux: {
 				bundleCEF: false,
@@ -74,9 +78,10 @@ export function createElectrobunConfig(
 		scripts: {
 			preBuild: "scripts/build-companions.ts",
 			postBuild: "scripts/prepare-companion-bundle.ts",
-			postPackage: "scripts/verify-mac-package.ts",
+			postPackage: "scripts/post-package.ts",
 		},
 		release: {
+			baseUrl: stableRelease ? environment.MOSHU_RELEASE_BASE_URL : undefined,
 			generatePatch: false,
 		},
 	} satisfies ElectrobunConfig;

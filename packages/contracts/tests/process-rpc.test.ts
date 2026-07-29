@@ -34,10 +34,22 @@ describe("product process RPC contracts", () => {
 		]);
 		expect(agentsRuntimeBoxRequestMethods).toEqual([
 			productRpcMethods.runtimeBoxToolInvoke,
+			productRpcMethods.runtimeBoxMcpToolInvoke,
 			productRpcMethods.runtimeBoxProjectValidatePath,
 			productRpcMethods.runtimeBoxInvocationsAck,
+			productRpcMethods.runtimeBoxInventoryGetSnapshot,
+			productRpcMethods.runtimeBoxInventoryGetChanges,
+			productRpcMethods.runtimeBoxMcpServersList,
+			productRpcMethods.runtimeBoxMcpServersUpsert,
+			productRpcMethods.runtimeBoxMcpServersSetEnabled,
+			productRpcMethods.runtimeBoxMcpServersDelete,
+			productRpcMethods.runtimeBoxSkillsList,
+			productRpcMethods.runtimeBoxSkillsInstall,
+			productRpcMethods.runtimeBoxSkillsDelete,
+			productRpcMethods.runtimeBoxResourcesValidate,
+			productRpcMethods.runtimeBoxSkillGetContent,
 		]);
-		expect(runtimeBoxProductEventMethods).toHaveLength(1);
+		expect(runtimeBoxProductEventMethods).toHaveLength(2);
 		expect(productRpcInternalHandlerErrorCode).toBe("INTERNAL_HANDLER_ERROR");
 		expect(maxRetainedSessionRetirements).toBe(256);
 	});
@@ -46,6 +58,8 @@ describe("product process RPC contracts", () => {
 		const registration = {
 			schemaVersion: 1 as const,
 			status: "ready" as const,
+			protocolVersion: 1 as const,
+			transportSecurity: "relay-tls" as const,
 			runtimeBox: {
 				schemaVersion: 1 as const,
 				runtimeBoxId: "moshu-local-runtime-box",

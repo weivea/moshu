@@ -1,6 +1,7 @@
 import { z } from "zod";
 
 export const companionBootstrapChannel = "moshu-companion-bootstrap" as const;
+export const moshuReleaseVersion = "0.0.1" as const;
 export const companionControlVersion = 2 as const;
 export const maxCompanionControlRecordBytes = 4096;
 

@@ -27,11 +27,61 @@ export const runtimeBoxesTable = sqliteTable(
 		updatedAtMs: integer("updated_at_ms").notNull(),
 		lastSeenAtMs: integer("last_seen_at_ms"),
 		archivedAtMs: integer("archived_at_ms"),
+		compatibility: text("compatibility", { enum: ["upgrade_required"] }),
+		compatibilityGeneration: integer("compatibility_generation"),
+		compatibilityProtocolVersion: integer("compatibility_protocol_version"),
 	},
 	(table) => [
 		index("runtime_boxes_kind_archived_idx").on(table.kind, table.archivedAtMs),
 		index("runtime_boxes_last_seen_idx").on(table.lastSeenAtMs),
 	],
+);
+
+export const runtimeBoxInventoryStateTable = sqliteTable("runtime_box_inventory_state", {
+	runtimeBoxId: text("runtime_box_id")
+		.primaryKey()
+		.references(() => runtimeBoxesTable.id, { onDelete: "cascade" }),
+	inventoryEpoch: text("inventory_epoch"),
+	inventoryRevision: integer("inventory_revision"),
+	runtimeBoxGeneration: integer("runtime_box_generation"),
+	capabilitiesJson: text("capabilities_json").notNull(),
+	stale: integer("stale", { mode: "boolean" }).notNull(),
+	syncedAtMs: integer("synced_at_ms"),
+	updatedAtMs: integer("updated_at_ms").notNull(),
+});
+
+export const runtimeBoxInventoryCacheTable = sqliteTable(
+	"runtime_box_inventory_cache",
+	{
+		runtimeBoxId: text("runtime_box_id")
+			.notNull()
+			.references(() => runtimeBoxesTable.id, { onDelete: "cascade" }),
+		resourceKind: text("resource_kind", { enum: ["mcp", "skill"] }).notNull(),
+		stableResourceId: text("stable_resource_id").notNull(),
+		version: text("version").notNull(),
+		contentHash: text("content_hash").notNull(),
+		descriptorJson: text("descriptor_json").notNull(),
+		updatedAtMs: integer("updated_at_ms").notNull(),
+	},
+	(table) => [
+		primaryKey({ columns: [table.runtimeBoxId, table.resourceKind, table.stableResourceId] }),
+		index("runtime_box_inventory_cache_box_kind_idx").on(table.runtimeBoxId, table.resourceKind),
+	],
+);
+
+export const agentRuntimeProfilesTable = sqliteTable(
+	"agent_runtime_profiles",
+	{
+		agentId: text("agent_id").notNull(),
+		runtimeBoxId: text("runtime_box_id")
+			.notNull()
+			.references(() => runtimeBoxesTable.id, { onDelete: "cascade" }),
+		revision: integer("revision").notNull(),
+		resourcesJson: text("resources_json").notNull(),
+		createdAtMs: integer("created_at_ms").notNull(),
+		updatedAtMs: integer("updated_at_ms").notNull(),
+	},
+	(table) => [primaryKey({ columns: [table.agentId, table.runtimeBoxId] })],
 );
 
 export const appSettingsTable = sqliteTable("app_settings", {
@@ -49,6 +99,9 @@ export const remoteAccessSettingsTable = sqliteTable("remote_access_settings", {
 	tunnelId: text("tunnel_id"),
 	publicUrl: text("public_url"),
 	runtimeIngressPort: integer("runtime_ingress_port"),
+	trafficMonth: text("traffic_month").notNull(),
+	trafficReceivedBytes: integer("traffic_received_bytes").notNull(),
+	trafficSentBytes: integer("traffic_sent_bytes").notNull(),
 	updatedAtMs: integer("updated_at_ms").notNull(),
 });
 
@@ -325,6 +378,7 @@ export const agentSessionCleanupOutboxTable = sqliteTable(
 );
 
 export const appSchema = {
+	agentRuntimeProfilesTable,
 	appSettingsTable,
 	remoteAccessSettingsTable,
 	projectsTable,
@@ -337,6 +391,8 @@ export const appSchema = {
 	chatSessionsTable,
 	retiredChatSessionsTable,
 	runtimeBoxGenerationFencesTable,
+	runtimeBoxInventoryCacheTable,
+	runtimeBoxInventoryStateTable,
 	runtimeBoxDeviceKeysTable,
 	runtimeBoxPairingSessionsTable,
 	runtimeBoxesTable,

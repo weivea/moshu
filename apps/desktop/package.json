@@ -9,6 +9,7 @@
 		"hmr": "vite --port 5173",
 		"build:web": "vite build",
 		"package:canary": "bun run ./scripts/package-canary.ts",
+		"package:release": "bun run ./scripts/package-release.ts",
 		"typecheck": "tsc --noEmit -p tsconfig.bun.json && tsc --noEmit -p tsconfig.web.json && tsc --noEmit -p tsconfig.config.json",
 		"test:bun": "bun test src/bun scripts",
 		"test:web": "vitest run",

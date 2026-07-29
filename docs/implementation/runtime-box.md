@@ -357,8 +357,12 @@ Box offline 时 Sessions/Projects 仍可查看，inventory 标 stale，MCP/Skill
 
 ## 10. 副作用执行与断线恢复
 
-Remote 副作用执行必须依赖完整的 durable Action intent、Policy/Approval、一次性 execution grant 和结果
-reconciliation，不能复用当前可信本地直连作为正式远程边界。
+Remote 副作用执行必须依赖 durable Action intent、一次性 execution grant 和结果 reconciliation，
+不能复用无持久记录的本地直连路径。
+
+当前 POC 在设备与 Agent Server 双向认证成功后，Remote Runtime Box 完全信任其绑定的 Agent Server，
+包括执行 `bash`。本阶段的 intent/grant/journal 用于持久调度、单次派发和结果对账，不提供用户级命令审批；
+交互式 Policy/Approval 后置到后续版本。
 
 Runtime Box 在执行前写本地 journal：
 
@@ -376,12 +380,15 @@ completed_at
 server_acked_at
 ```
 
-正常关闭由 Server drain/cancel，Box 清理进程树并回报最终状态。异常断线在 lease 到期后取消可取消动作，
-无法确认的动作记录 `outcome_unknown`。
+正常关闭由 Server drain/cancel，Box 清理进程树并回报最终状态。异常 transport loss 不会提前取消已开始
+Action：它继续到原 RPC deadline；显式 cancel、deadline 或 daemon shutdown 才立即取消。无法确认的动作记录
+`outcome_unknown`，progress 发送失败只影响实时展示，不改变执行结果。
 
 实时 RPC 始终拒绝旧 generation。重连后的独立 reconcile RPC 可以提交旧 generation 已完成结果，但结果只是
-执行证据，不是新授权。Server 使用 `actionId + grantId + invocationId` 去重并返回 ack cursor；Box 收到 ack
-后才删除 journal。非幂等 Action 永不自动重放。
+执行证据，不是新授权。Server 使用 `actionId + grantId + invocationId` 去重：先持久 evidence ack，Box 再将
+完整结果替换为 receipt tombstone，Server 在后续 reconcile 确认 receipt 后才允许最终 prune。未确认 receipt
+不按时间清理。数据库 reset 生成新的 `actionJournalEpoch`，旧 epoch journal 不会进入当前绑定。
+非幂等 Action 永不自动重放。
 
 ## 11. Remote Runtime Box 单二进制
 
@@ -434,12 +441,20 @@ inventory.getSnapshot / getChanges / changed
 resources.validate
 invocations.start / cancel / reconcile / ack / events
 projects.validatePath
-mcp.list / get / create / update / remove / test / start / stop / authorize / revoke
+mcp.list / get / create / update / setEnabled / remove / test / start / stop / authorize / revoke
 skills.list / get / install / update / remove / readPrompt / readResource
 ```
 
 Remote Box 独立更新，因此 Runtime ingress 使用独立 protocol version range 和 `upgrade_required`，不能假设
 Desktop、Agent Server 与 Box 永远锁步发布。
+
+当前 protocol v1 在 challenge、Server 签名、device 签名、WebSocket header 和 registration 中端到端绑定；
+不兼容版本在建立 WebSocket 前返回 HTTP 426。匿名 426 是无状态响应，不能降级一个健康 Box；
+Box 随后用已配对 Ed25519 key 提交带 timestamp/report ID/generation fence 的短时兼容性报告；
+只有报告验签、设备未吊销且 generation 被接受后才原子持久化并投影 `upgrade_required`、fence 旧 peer；
+状态跨 Agent Server 重启恢复，兼容版本注册后清除。best-effort 报告受 daemon lifecycle 和 5 秒 timeout
+约束，不能阻塞 Action drain 或 shutdown。当前协商安全层为
+`relay-tls`；合同保留 `noise-xx` 枚举和 supported-security 字段，但在实现完整握手前不宣称支持。
 
 ## 13. UI
 
@@ -496,11 +511,33 @@ flowchart LR
 | RB-08 | Box DB、MCP/Skill、inventory、Runtime Profile、live validation | Server 无 recoverable Secret/Skill 副本 |
 | RB-09 | 真实 Tunnel 故障矩阵、配额、版本、签名更新、Noise seam | 三平台 packaged E2E 通过 |
 
-实施状态：RB-00–RB-06 已完成；RB-07 进行中。RB-05 已实现 Microsoft device-code 登录、
+实施状态：RB-00–RB-09 的代码和自动化门已完成；真实 Dev Tunnel、macOS Developer ID/公证以及
+Windows Authenticode 仍必须在持有外部凭据的对应 release runner 上执行，不能由本地 canary 结果替代。
+RB-05 已实现 Microsoft device-code 登录、
 cluster-qualified Tunnel ID、精确单 HTTP 端口与 Anonymous ACL reconciliation、持久状态、端口冲突修复、
 有界重试/取消、并发 mutation fencing，以及随 Agent Server 父进程退出的 Tunnel Host watchdog。
 RB-06 已实现 revisioned Runtime snapshot 广播、全局切换器、Runtime/Remote Access/配对设置页、
 按 Box 过滤的 Sessions/Projects、owning Box 路径与 Git 元数据校验、离线只读和持久设备 key 吊销。
+RB-07 已实现 durable Action intent、单次 execution grant、Box fsync journal、transport-loss deadline lease、
+`outcome_unknown`、evidence/receipt 双阶段确认、reset epoch 隔离和 Remote data-directory 单实例锁。
+RB-08 已实现 Runtime Box 私有 MCP/Skill/Secret store、epoch/revision/delta inventory、Server stale projection、
+Runtime Profile、live version/hash/schema validation、Skill 内存 prompt，以及 MCP stdio/HTTP/SSE 生命周期和
+复用 Action grant/journal/reconciliation 的 Tool bridge。
+RB-09 已实现 protocol v1/HTTP 426、`online/syncing/offline/upgrade_required` 投影、Runtime RPC 月度流量估算、
+5 GiB 告警、公开 Dev Tunnels 限制、脱敏诊断、丢 hint/压缩/网络/磁盘/进程故障矩阵，以及同 release
+companion 哈希清单。stable 构建 fail closed：macOS 要求 Developer ID、公证、staple 与 Gatekeeper，
+Windows 要求 Authenticode SHA-256/RFC 3161，所有平台要求 Ed25519 签名的完整更新产物清单。
+Windows 在 postBuild 签完整应用 bundle，并在 postPackage 解开最终 installer ZIP、签名和验证
+`Setup.exe` 后重新封装，再计算 Ed25519 artifact manifest。
+
+真实 Tunnel 探针使用：
+
+```bash
+MOSHU_LIVE_RUNTIME_BASE_URL=https://<tunnel>.devtunnels.ms bun run smoke:live-tunnel
+```
+
+它验证 Product RPC 隔离、未知 challenge/pairing fail closed、协议 426 和未知 route。流量值只统计
+Runtime RPC application payload，是保守的产品侧估算，不冒充 Microsoft Relay 账单。
 
 ## 15. 验收门槛
 
@@ -515,6 +552,7 @@ RB-06 已实现 revisioned Runtime snapshot 广播、全局切换器、Runtime/R
 | 跨平台 | Linux/macOS/Windows 普通用户安装、运行、重启和卸载 |
 | Tunnel | Host 关闭、Tunnel 删除、认证过期、端口冲突都有明确状态和修复入口 |
 | 配额 | 展示估算流量并在接近每用户每月 5 GB 时告警 |
+| 发布 | 同版本/hash/protocol 清单、无系统 Bun 启动、平台签名、公证和 Ed25519 更新清单全部 fail closed |
 
 ## 16. 风险与非目标
 

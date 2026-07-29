@@ -265,6 +265,74 @@ describe("DevTunnelService", () => {
 		}
 	});
 
+	test("persists bounded Runtime traffic estimates and quota warnings", async () => {
+		const database = openAppDatabase(":memory:");
+		try {
+			const service = new DevTunnelService({
+				repository: database.remoteAccess,
+				runtimeIngressPort: 41_010,
+				adapter: new FakeDevTunnelAdapter(),
+			});
+			service.recordTraffic("inbound", 3 * 1024 * 1024 * 1024);
+			service.recordTraffic("outbound", 1024 * 1024 * 1024);
+			expect(service.getStatus()).toMatchObject({
+				trafficEstimate: {
+					receivedBytes: 3 * 1024 * 1024 * 1024,
+					sentBytes: 1024 * 1024 * 1024,
+					totalBytes: 4 * 1024 * 1024 * 1024,
+					monthlyLimitBytes: 5 * 1024 * 1024 * 1024,
+					warningLevel: "80",
+					source: "runtime-rpc-application-payload-estimate",
+				},
+				serviceLimits: {
+					maxTunnelsPerUser: 10,
+					maxPortsPerTunnel: 10,
+					maxBytesPerSecond: 20 * 1024 * 1024,
+				},
+			});
+			expect(database.remoteAccess.get()).toMatchObject({
+				trafficReceivedBytes: 3 * 1024 * 1024 * 1024,
+				trafficSentBytes: 1024 * 1024 * 1024,
+			});
+			await service.shutdown();
+		} finally {
+			database.close();
+		}
+	});
+
+	test("keeps buffered traffic in its ingestion month across UTC rollover", async () => {
+		const database = openAppDatabase(":memory:");
+		const current = new Date();
+		let now = Date.UTC(current.getUTCFullYear(), current.getUTCMonth() + 1, 1) - 1;
+		try {
+			const service = new DevTunnelService({
+				repository: database.remoteAccess,
+				runtimeIngressPort: 41_010,
+				adapter: new FakeDevTunnelAdapter(),
+				now: () => now,
+			});
+			service.recordTraffic("inbound", 100);
+			now += 2;
+			expect(service.getStatus().trafficEstimate).toMatchObject({
+				receivedBytes: 0,
+				sentBytes: 0,
+			});
+			service.recordTraffic("outbound", 200);
+			expect(service.getStatus().trafficEstimate).toMatchObject({
+				receivedBytes: 0,
+				sentBytes: 200,
+			});
+			await service.shutdown();
+			expect(database.remoteAccess.get()).toMatchObject({
+				trafficMonth: new Date(now).toISOString().slice(0, 7),
+				trafficReceivedBytes: 0,
+				trafficSentBytes: 200,
+			});
+		} finally {
+			database.close();
+		}
+	});
+
 	test("reports auth-required and recreates a persisted tunnel after authentication", async () => {
 		const database = openAppDatabase(":memory:");
 		try {

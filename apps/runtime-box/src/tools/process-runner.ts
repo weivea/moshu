@@ -71,6 +71,7 @@ export function spawnExecutorProcess(
 		cwd: string;
 		env?: NodeJS.ProcessEnv;
 		input?: string;
+		keepStdinOpen?: boolean;
 	},
 ): ChildProcessWithoutNullStreams {
 	const child = spawn(executable, args, {
@@ -100,7 +101,7 @@ export function spawnExecutorProcess(
 	}
 	if (options.input !== undefined) {
 		child.stdin.end(options.input);
-	} else {
+	} else if (options.keepStdinOpen !== true) {
 		child.stdin.end();
 	}
 	return child;
@@ -163,7 +164,9 @@ export async function killProcessTree(pid: number): Promise<void> {
 	sendUnixSignal(pid, "SIGKILL");
 }
 
-async function terminateExecutorProcess(child: ChildProcessWithoutNullStreams): Promise<void> {
+export async function terminateExecutorProcess(
+	child: ChildProcessWithoutNullStreams,
+): Promise<void> {
 	const windowsJob = windowsProcessJobs.get(child);
 	if (windowsJob) {
 		windowsProcessJobs.delete(child);

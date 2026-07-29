@@ -1,6 +1,11 @@
 import { z } from "zod";
 
 import { uuidV7Schema } from "./chat";
+import { runtimeResourceIdSchema } from "./runtime-resources";
+import {
+	runtimeResourceContentHashSchema,
+	runtimeResourceVersionSchema,
+} from "./runtime-resources";
 
 export const executorToolNames = ["read", "bash", "edit", "write", "grep", "find", "ls"] as const;
 export const executorToolNameSchema = z.enum(executorToolNames);
@@ -156,6 +161,30 @@ export const runtimeBoxToolInvokeInputSchema = z
 			context.addIssue({
 				code: "custom",
 				message: `Executor tool request exceeds the ${maxExecutorToolPayloadBytes}-byte payload limit.`,
+			});
+		}
+	});
+
+export const runtimeBoxMcpToolInvokeInputSchema = z
+	.object({
+		schemaVersion: z.literal(1),
+		invocationId: z.string().uuid(),
+		runId: uuidV7Schema,
+		toolCallId: boundedUtf8String(maxToolCallIdBytes, "Tool call ID", 1),
+		mcpServerId: runtimeResourceIdSchema,
+		mcpServerVersion: runtimeResourceVersionSchema,
+		mcpServerContentHash: runtimeResourceContentHashSchema,
+		stableToolId: runtimeResourceIdSchema,
+		toolSchemaHash: runtimeResourceContentHashSchema,
+		arguments: z.json(),
+		authorization: runtimeBoxToolAuthorizationSchema.optional(),
+	})
+	.strict()
+	.superRefine((value, context) => {
+		if (textEncoder.encode(JSON.stringify(value)).byteLength > maxExecutorToolPayloadBytes) {
+			context.addIssue({
+				code: "custom",
+				message: `MCP tool request exceeds the ${maxExecutorToolPayloadBytes}-byte payload limit.`,
 			});
 		}
 	});
@@ -326,6 +355,30 @@ export const runtimeBoxToolInvokeOutputSchema = z
 		}
 	});
 
+export const runtimeBoxMcpToolInvokeOutputSchema = z
+	.object({
+		schemaVersion: z.literal(1),
+		invocationId: z.string().uuid(),
+		mcpServerId: runtimeResourceIdSchema,
+		stableToolId: runtimeResourceIdSchema,
+		result: z.json(),
+		isError: z.boolean(),
+	})
+	.strict()
+	.superRefine((value, context) => {
+		if (textEncoder.encode(JSON.stringify(value)).byteLength > maxExecutorToolResultPayloadBytes) {
+			context.addIssue({
+				code: "custom",
+				message: `MCP tool result exceeds the ${maxExecutorToolResultPayloadBytes}-byte payload limit.`,
+			});
+		}
+	});
+
+export const runtimeBoxActionResultSchema = z.union([
+	runtimeBoxToolInvokeOutputSchema,
+	runtimeBoxMcpToolInvokeOutputSchema,
+]);
+
 export const runtimeBoxToolProgressEventSchema = z
 	.object({
 		schemaVersion: z.literal(1),
@@ -356,7 +409,7 @@ export const runtimeBoxInvocationEvidenceSchema = z
 		targetInstanceId: z.string().min(1).max(256),
 		targetGeneration: z.int().nonnegative().safe(),
 		state: runtimeBoxInvocationEvidenceStateSchema,
-		result: runtimeBoxToolInvokeOutputSchema.optional(),
+		result: runtimeBoxActionResultSchema.optional(),
 		safeError: z.string().min(1).max(1_024).optional(),
 		completedAt: z.string().datetime({ offset: true }),
 	})
@@ -413,6 +466,24 @@ export function createExecutorToolParameterPayload(
 	]);
 }
 
+export function createMcpToolParameterPayload(
+	input: Omit<RuntimeBoxMcpToolInvokeInput, "authorization">,
+): string {
+	return JSON.stringify([
+		"moshu-mcp-tool-parameters-v1",
+		input.schemaVersion,
+		input.invocationId,
+		input.runId,
+		input.toolCallId,
+		input.mcpServerId,
+		input.mcpServerVersion,
+		input.mcpServerContentHash,
+		input.stableToolId,
+		input.toolSchemaHash,
+		input.arguments,
+	]);
+}
+
 export type ExecutorToolName = z.infer<typeof executorToolNameSchema>;
 export type ExecutorReadToolArguments = z.infer<typeof executorReadToolArgumentsSchema>;
 export type ExecutorBashToolArguments = z.infer<typeof executorBashToolArgumentsSchema>;
@@ -436,6 +507,9 @@ export type ExecutorGrepToolDetails = z.infer<typeof executorGrepToolDetailsSche
 export type ExecutorFindToolDetails = z.infer<typeof executorFindToolDetailsSchema>;
 export type ExecutorLsToolDetails = z.infer<typeof executorLsToolDetailsSchema>;
 export type ExecutorToolInvokeOutput = z.infer<typeof runtimeBoxToolInvokeOutputSchema>;
+export type RuntimeBoxMcpToolInvokeInput = z.infer<typeof runtimeBoxMcpToolInvokeInputSchema>;
+export type RuntimeBoxMcpToolInvokeOutput = z.infer<typeof runtimeBoxMcpToolInvokeOutputSchema>;
+export type RuntimeBoxActionResult = z.infer<typeof runtimeBoxActionResultSchema>;
 export type ExecutorToolProgressEvent = z.infer<typeof runtimeBoxToolProgressEventSchema>;
 export type RuntimeBoxInvocationEvidence = z.infer<typeof runtimeBoxInvocationEvidenceSchema>;
 export type ReconcileRuntimeBoxInvocationsInput = z.infer<

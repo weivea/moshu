@@ -8,6 +8,9 @@ export interface RemoteAccessSettings {
 	tunnelId?: string;
 	publicUrl?: string;
 	runtimeIngressPort?: number;
+	trafficMonth: string;
+	trafficReceivedBytes: number;
+	trafficSentBytes: number;
 }
 
 export interface RemoteAccessRepository {
@@ -18,6 +21,7 @@ export interface RemoteAccessRepository {
 	setTunnel(tunnelId: string, publicUrl?: string): void;
 	setPublicUrl(publicUrl: string): void;
 	clearTunnel(): void;
+	recordTraffic(month: string, receivedBytes: number, sentBytes: number): void;
 }
 
 export class SqliteRemoteAccessRepository implements RemoteAccessRepository {
@@ -28,7 +32,14 @@ export class SqliteRemoteAccessRepository implements RemoteAccessRepository {
 		if (this.orm.select().from(remoteAccessSettingsTable).get() === undefined) {
 			this.orm
 				.insert(remoteAccessSettingsTable)
-				.values({ id: 1, enabled: false, updatedAtMs: this.now() })
+				.values({
+					id: 1,
+					enabled: false,
+					trafficMonth: currentUtcMonth(this.now()),
+					trafficReceivedBytes: 0,
+					trafficSentBytes: 0,
+					updatedAtMs: this.now(),
+				})
 				.run();
 		}
 	}
@@ -43,6 +54,9 @@ export class SqliteRemoteAccessRepository implements RemoteAccessRepository {
 			...(row.tunnelId === null ? {} : { tunnelId: row.tunnelId }),
 			...(row.publicUrl === null ? {} : { publicUrl: row.publicUrl }),
 			...(row.runtimeIngressPort === null ? {} : { runtimeIngressPort: row.runtimeIngressPort }),
+			trafficMonth: row.trafficMonth,
+			trafficReceivedBytes: row.trafficReceivedBytes,
+			trafficSentBytes: row.trafficSentBytes,
 		};
 	}
 
@@ -98,6 +112,49 @@ export class SqliteRemoteAccessRepository implements RemoteAccessRepository {
 			.run();
 	}
 
+	recordTraffic(month: string, receivedBytes: number, sentBytes: number): void {
+		if (!/^\d{4}-(0[1-9]|1[0-2])$/.test(month)) {
+			throw new TypeError("Remote Access traffic month must use YYYY-MM.");
+		}
+		if (
+			!Number.isSafeInteger(receivedBytes) ||
+			receivedBytes < 0 ||
+			!Number.isSafeInteger(sentBytes) ||
+			sentBytes < 0
+		) {
+			throw new TypeError("Remote Access traffic bytes must be nonnegative safe integers.");
+		}
+		if (receivedBytes === 0 && sentBytes === 0) {
+			return;
+		}
+		this.orm.transaction((transaction) => {
+			const row = transaction.select().from(remoteAccessSettingsTable).get();
+			if (row === undefined) {
+				throw new Error("Remote access settings are not initialized.");
+			}
+			const now = this.now();
+			if (row.trafficMonth > month) {
+				return;
+			}
+			const nextReceived =
+				(row.trafficMonth === month ? row.trafficReceivedBytes : 0) + receivedBytes;
+			const nextSent = (row.trafficMonth === month ? row.trafficSentBytes : 0) + sentBytes;
+			if (!Number.isSafeInteger(nextReceived) || !Number.isSafeInteger(nextSent)) {
+				throw new Error("Remote Access traffic counter overflow.");
+			}
+			transaction
+				.update(remoteAccessSettingsTable)
+				.set({
+					trafficMonth: month,
+					trafficReceivedBytes: nextReceived,
+					trafficSentBytes: nextSent,
+					updatedAtMs: now,
+				})
+				.where(eq(remoteAccessSettingsTable.id, 1))
+				.run();
+		});
+	}
+
 	#update(values: Partial<typeof remoteAccessSettingsTable.$inferInsert>): void {
 		this.orm
 			.update(remoteAccessSettingsTable)
@@ -105,4 +162,8 @@ export class SqliteRemoteAccessRepository implements RemoteAccessRepository {
 			.where(eq(remoteAccessSettingsTable.id, 1))
 			.run();
 	}
+}
+
+function currentUtcMonth(nowMs: number): string {
+	return new Date(nowMs).toISOString().slice(0, 7);
 }

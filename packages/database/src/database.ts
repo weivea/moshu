@@ -21,6 +21,14 @@ import {
 	SqliteRuntimeBoxPairingRepository,
 } from "./runtime-box-pairing-repository";
 import { type RuntimeBoxRepository, SqliteRuntimeBoxRepository } from "./runtime-box-repository";
+import {
+	type RuntimeBoxInventoryRepository,
+	SqliteRuntimeBoxInventoryRepository,
+} from "./runtime-box-inventory-repository";
+import {
+	type RuntimeProfileRepository,
+	SqliteRuntimeProfileRepository,
+} from "./runtime-profile-repository";
 import { appSchema } from "./schema";
 import { createSessionRepository, type SessionRepository } from "./session-repository";
 
@@ -36,6 +44,8 @@ export interface AppDatabase {
 	projects: ProjectRepository;
 	runtimeBoxPairings: RuntimeBoxPairingRepository;
 	remoteAccess: RemoteAccessRepository;
+	runtimeBoxInventory: RuntimeBoxInventoryRepository;
+	runtimeProfiles: RuntimeProfileRepository;
 	close(): void;
 }
 
@@ -121,6 +131,8 @@ export function openAppDatabase(filename: string): AppDatabase {
 		client,
 		orm,
 		runtimeBoxes,
+		runtimeBoxInventory: new SqliteRuntimeBoxInventoryRepository(orm, runtimeBoxes),
+		runtimeProfiles: new SqliteRuntimeProfileRepository(orm, runtimeBoxes),
 		projects: new SqliteProjectRepository(orm, runtimeBoxes),
 		runtimeBoxPairings: new SqliteRuntimeBoxPairingRepository(orm),
 		remoteAccess: new SqliteRemoteAccessRepository(orm),

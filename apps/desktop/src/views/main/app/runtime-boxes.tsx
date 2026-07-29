@@ -43,6 +43,10 @@ const previewSnapshot: ListRuntimeBoxesOutput = {
 			connected: true,
 			registered: true,
 			deviceKeyIds: [],
+			state: "online",
+			compatibility: "compatible",
+			negotiatedProtocolVersion: 1,
+			transportSecurity: "relay-tls",
 		},
 	],
 };

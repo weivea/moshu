@@ -13,6 +13,7 @@
 | [技术架构](./architecture.md) | 三应用角色、RPC 拓扑、生命周期、职责和安全边界 |
 | [数据与接口契约](./data-contracts.md) | 身份、注册、RPC、Run、Action grant、Agent Session 和数据所有权 |
 | [Runtime Box 技术与实施方案](./runtime-box.md) | Local/Remote Runtime Box、Agent Server Tunnel、配对、安全、数据模型和实施任务 |
+| [Remote Runtime Box 使用文档](../guides/remote-runtime-box.md) | Remote Access、设备配对、远端安装、验证、排障和解除绑定 |
 | [工程交付计划](./delivery-plan.md) | 迁移顺序、工作包、依赖和阶段出口 |
 | [质量与发布计划](./quality-release.md) | 跨进程测试、故障恢复、安全、打包和发布门槛 |
 

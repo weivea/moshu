@@ -15,6 +15,7 @@ import { DefaultModelSettingsPage } from "./settings/default-model-page";
 import { GeneralSettingsPage } from "./settings/general-page";
 import { ProvidersSettingsPage } from "./settings/providers/providers-page";
 import { RuntimeBoxesSettingsPage } from "./settings/runtime-boxes-page";
+import { McpServersSettingsPage, SkillsSettingsPage } from "./settings/runtime-resources-page";
 import { ProjectDetailPage, ProjectsPage } from "./projects-page";
 
 const lastChatSessionStorageKey = "moshu.lastChatSessionId";
@@ -254,6 +255,14 @@ export function GeneralSettingsRoutePage() {
 
 export function RuntimeBoxesSettingsRoutePage() {
 	return <RuntimeBoxesSettingsPage />;
+}
+
+export function McpServersSettingsRoutePage() {
+	return <McpServersSettingsPage />;
+}
+
+export function SkillsSettingsRoutePage() {
+	return <SkillsSettingsPage />;
 }
 
 export function ProjectsRoutePage() {

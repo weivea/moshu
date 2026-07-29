@@ -26,6 +26,10 @@ import {
 	createMacAppVerificationCommand,
 	createOuterAppCodesignCommand,
 } from "./companion-signing";
+import {
+	verifyCompanionReleaseManifest,
+	writeCompanionReleaseManifest,
+} from "./companion-release-manifest";
 
 export interface FinalizedMacCodesignPlan {
 	nested: string[][];
@@ -177,6 +181,8 @@ export function signAndVerifyFinalizedMacApp(
 		assertExecutable(command.at(-1) as string);
 		run(command);
 	}
+	writeCompanionReleaseManifest(resourcesDirectory, "darwin");
+	verifyCompanionReleaseManifest(resourcesDirectory, "darwin");
 	run(plan.outer);
 	for (const command of plan.verify) {
 		const output = run(command);

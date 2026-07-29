@@ -82,6 +82,21 @@ describe("companion READY control parsing", () => {
 			}),
 		],
 		[
+			"wrong release version",
+			JSON.stringify({
+				channel: COMPANION_BOOTSTRAP_CHANNEL,
+				controlVersion: COMPANION_CONTROL_VERSION,
+				type: "READY",
+				role: "agents-server",
+				pid: 701,
+				processVersion: "99.0.0",
+				nonce: "server-generation-1",
+				serverIdentity: TEST_SERVER_IDENTITY,
+				endpoint: { host: "127.0.0.1", port: 41_701, path: "/rpc" },
+				runtimeEndpoint: { host: "127.0.0.1", port: 41_702, path: "/runtime" },
+			}),
+		],
+		[
 			"non-loopback endpoint",
 			JSON.stringify({
 				channel: COMPANION_BOOTSTRAP_CHANNEL,

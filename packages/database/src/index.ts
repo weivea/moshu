@@ -6,6 +6,8 @@ export * from "./project-repository";
 export * from "./run-journal-repository";
 export * from "./remote-access-repository";
 export * from "./runtime-box-repository";
+export * from "./runtime-box-inventory-repository";
 export * from "./runtime-box-pairing-repository";
+export * from "./runtime-profile-repository";
 export * from "./schema";
 export * from "./session-repository";

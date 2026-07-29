@@ -4,10 +4,12 @@ import {
 	existsSync,
 	fsyncSync,
 	lstatSync,
+	linkSync,
 	mkdirSync,
 	openSync,
 	readFileSync,
 	renameSync,
+	type Stats,
 	unlinkSync,
 	writeFileSync,
 } from "node:fs";
@@ -35,8 +37,18 @@ const remoteRuntimeBoxConfigSchema = z
 		displayName: z.string().trim().min(1).max(128),
 	})
 	.strict();
+const processLockRecordSchema = z
+	.object({
+		pid: z.int().positive().safe(),
+		instanceId: z.string().uuid(),
+	})
+	.strict();
 
 export type RemoteRuntimeBoxConfig = z.infer<typeof remoteRuntimeBoxConfigSchema>;
+
+export interface RemoteRuntimeBoxProcessLock {
+	release(): void;
+}
 
 export class RemoteRuntimeBoxState {
 	readonly root: string;
@@ -106,6 +118,72 @@ export class RemoteRuntimeBoxState {
 		return { config: updated, instanceId: randomUUID(), generation };
 	}
 
+	async acquireProcessLock(): Promise<RemoteRuntimeBoxProcessLock> {
+		this.initializeDirectories();
+		const filename = join(this.root, "run.lock");
+		const instanceId = randomUUID();
+		const candidate = `${filename}.${process.pid}.${instanceId}.candidate`;
+		const descriptor = openSync(candidate, "wx", 0o600);
+		try {
+			writeFileSync(descriptor, `${JSON.stringify({ pid: process.pid, instanceId })}\n`, "utf8");
+			fsyncSync(descriptor);
+		} finally {
+			closeSync(descriptor);
+		}
+		try {
+			while (true) {
+				try {
+					linkSync(candidate, filename);
+					break;
+				} catch (error) {
+					if (!isFileSystemError(error, "EEXIST")) {
+						throw error;
+					}
+					const existing = inspectProcessLock(filename);
+					if (existing.state === "missing") {
+						continue;
+					}
+					if (existing.state === "active") {
+						throw new Error("Another Remote Runtime Box process owns this data directory.");
+					}
+					removeStaleProcessLock(filename, existing.metadata);
+				}
+			}
+		} finally {
+			if (existsSync(candidate)) {
+				unlinkSync(candidate);
+			}
+		}
+		let released = false;
+		return {
+			release() {
+				if (released) {
+					return;
+				}
+				released = true;
+				try {
+					const metadata = lstatSync(filename);
+					const owner = processLockRecordSchema.safeParse(
+						JSON.parse(readFileSync(filename, "utf8")),
+					);
+					if (
+						metadata.isFile() &&
+						!metadata.isSymbolicLink() &&
+						owner.success &&
+						owner.data.pid === process.pid &&
+						owner.data.instanceId === instanceId
+					) {
+						unlinkSync(filename);
+					}
+				} catch (error) {
+					if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) {
+						throw error;
+					}
+				}
+			},
+		};
+	}
+
 	unpair(): void {
 		if (!existsSync(this.configPath)) {
 			return;
@@ -116,6 +194,71 @@ export class RemoteRuntimeBoxState {
 		}
 		unlinkSync(this.configPath);
 	}
+}
+
+type ProcessLockInspection =
+	| { state: "missing" }
+	| { state: "active" }
+	| { state: "stale"; metadata: Stats };
+
+function inspectProcessLock(filename: string): ProcessLockInspection {
+	let metadata: Stats;
+	try {
+		metadata = lstatSync(filename);
+	} catch (error) {
+		if (isFileSystemError(error, "ENOENT")) {
+			return { state: "missing" };
+		}
+		throw error;
+	}
+	if (!metadata.isFile() || metadata.isSymbolicLink()) {
+		throw new Error("Remote Runtime Box process lock must be a regular file.");
+	}
+	try {
+		const record = processLockRecordSchema.parse(JSON.parse(readFileSync(filename, "utf8")));
+		return isProcessAlive(record.pid) ? { state: "active" } : { state: "stale", metadata };
+	} catch (error) {
+		throw new Error("Remote Runtime Box process lock is invalid.", { cause: error });
+	}
+}
+
+function removeStaleProcessLock(filename: string, expected: Stats): void {
+	try {
+		const current = lstatSync(filename);
+		if (
+			!current.isFile() ||
+			current.isSymbolicLink() ||
+			current.dev !== expected.dev ||
+			current.ino !== expected.ino ||
+			current.mtimeMs !== expected.mtimeMs
+		) {
+			return;
+		}
+		unlinkSync(filename);
+	} catch (error) {
+		if (!isFileSystemError(error, "ENOENT")) {
+			throw error;
+		}
+	}
+}
+
+function isProcessAlive(pid: number): boolean {
+	try {
+		process.kill(pid, 0);
+		return true;
+	} catch (error) {
+		if (isFileSystemError(error, "EPERM")) {
+			return true;
+		}
+		if (isFileSystemError(error, "ESRCH")) {
+			return false;
+		}
+		throw error;
+	}
+}
+
+function isFileSystemError(error: unknown, code: string): boolean {
+	return error instanceof Error && "code" in error && error.code === code;
 }
 
 export function resolveRemoteRuntimeBoxRoot(

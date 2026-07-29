@@ -6,6 +6,7 @@ import {
 	type ExecutorToolProgressEvent,
 } from "@moshu/contracts";
 import { type JsonValue, type RpcRequestOptions, rpcJsonValueSchema } from "@moshu/process-rpc";
+import { openAppDatabase } from "@moshu/database";
 import {
 	RuntimeBoxInvocationError,
 	type RuntimeBoxActionAuthorizer,
@@ -76,6 +77,92 @@ describe("RuntimeBoxRegistry routing and invocation gateway", () => {
 	test("fails closed before a Runtime Box registers", async () => {
 		const gateway = new RuntimeBoxRegistry();
 		await expect(gateway.invoke(invocation)).rejects.toBeInstanceOf(RuntimeBoxUnavailableError);
+	});
+
+	test("projects an explicit upgrade-required compatibility state", () => {
+		const gateway = new RuntimeBoxRegistry({
+			descriptors: [
+				{
+					schemaVersion: 1,
+					runtimeBoxId: "remote-old",
+					kind: "remote",
+					displayName: "Remote Old",
+					runtimeBoxVersion: "0.0.0",
+					platform: "linux",
+					arch: "x64",
+					capabilities: [],
+				},
+			],
+		});
+		gateway.markUpgradeRequired("remote-old");
+		expect(gateway.listInfo()[0]).toMatchObject({
+			state: "upgrade_required",
+			compatibility: "upgrade_required",
+			requiredProtocolMinVersion: 1,
+			requiredProtocolMaxVersion: 1,
+		});
+	});
+
+	test("hydrates persisted upgrade-required compatibility after server restart", () => {
+		const gateway = new RuntimeBoxRegistry({
+			descriptors: [
+				{
+					schemaVersion: 1,
+					runtimeBoxId: "remote-old",
+					kind: "remote",
+					displayName: "Remote Old",
+					runtimeBoxVersion: "0.0.0",
+					platform: "linux",
+					arch: "x64",
+					capabilities: [],
+				},
+			],
+			compatibilities: [
+				{
+					runtimeBoxId: "remote-old",
+					state: "upgrade_required",
+					generation: 7,
+					protocolVersion: 2,
+				},
+			],
+		});
+		expect(gateway.listInfo()[0]).toMatchObject({
+			state: "upgrade_required",
+			compatibility: "upgrade_required",
+		});
+	});
+
+	test("fences a connected peer when an authenticated newer generation requires upgrade", () => {
+		const gateway = new RuntimeBoxRegistry();
+		const peer = new FakeRuntimeBoxPeer(async () => readOutput());
+		registerRuntimeBox(gateway, peer);
+		gateway.markUpgradeRequired(peer.remoteIdentity.peerId);
+		expect(peer.isClosed).toBe(true);
+		expect(gateway.listInfo()[0]).toMatchObject({
+			state: "upgrade_required",
+			compatibility: "upgrade_required",
+		});
+	});
+
+	test("rejects transport security that was not negotiated by the ingress", () => {
+		const gateway = new RuntimeBoxRegistry();
+		const peer = new FakeRuntimeBoxPeer(async () => readOutput());
+		expect(() =>
+			gateway.register(
+				peer,
+				{
+					schemaVersion: 1,
+					runtimeBoxId: peer.remoteIdentity.peerId,
+					kind: "local",
+					displayName: "Local Runtime Box",
+					runtimeBoxVersion: "0.0.1",
+					platform: "darwin",
+					arch: "arm64",
+					capabilities: [],
+				},
+				{ protocolVersion: 1, transportSecurity: "noise-xx" },
+			),
+		).toThrow("was not negotiated");
 	});
 
 	test("does not dispatch while a registered Runtime Box is still syncing", async () => {
@@ -384,6 +471,405 @@ describe("RuntimeBoxRegistry routing and invocation gateway", () => {
 			"device key is not active",
 		);
 	});
+
+	test("full-syncs before ready, applies read-own-write deltas, and marks offline cache stale", async () => {
+		const database = openAppDatabase(":memory:");
+		const epoch = crypto.randomUUID();
+		const skillVersion = crypto.randomUUID();
+		const mcpVersion = crypto.randomUUID();
+		const skillHash = "a".repeat(64);
+		const mcpHash = "b".repeat(64);
+		let revision = 1;
+		const peer = new FakeRuntimeBoxPeer(async (method) => {
+			if (method === productRpcMethods.runtimeBoxInventoryGetSnapshot) {
+				return rpcJsonValueSchema.parse({
+					runtimeBoxId: "moshu-local-runtime-box",
+					runtimeBoxGeneration: 1,
+					inventoryEpoch: epoch,
+					inventoryRevision: revision,
+					generatedAt: new Date().toISOString(),
+					capabilities: ["inventory.v1"],
+					resources: [
+						{
+							resourceKind: "skill",
+							stableResourceId: "release-helper",
+							version: skillVersion,
+							contentHash: skillHash,
+							health: "ready",
+						},
+					],
+				});
+			}
+			if (method === productRpcMethods.runtimeBoxMcpServersUpsert) {
+				revision = 2;
+				return rpcJsonValueSchema.parse({
+					stableResourceId: "database-tools",
+					version: mcpVersion,
+					contentHash: mcpHash,
+					inventoryEpoch: epoch,
+					inventoryRevision: 2,
+					descriptor: {
+						resourceKind: "mcp",
+						stableResourceId: "database-tools",
+						version: mcpVersion,
+						contentHash: mcpHash,
+						health: "stopped",
+						credentialConfigured: false,
+						mcpTools: [],
+					},
+					deleted: false,
+				});
+			}
+			if (method === productRpcMethods.runtimeBoxInventoryGetChanges) {
+				return rpcJsonValueSchema.parse({
+					inventoryEpoch: epoch,
+					fromRevisionExclusive: 1,
+					throughRevision: 2,
+					oldestAvailableRevision: 1,
+					changes: [
+						{
+							revision: 2,
+							category: "mcp",
+							operation: "upsert",
+							stableResourceId: "database-tools",
+							descriptor: {
+								resourceKind: "mcp",
+								stableResourceId: "database-tools",
+								version: mcpVersion,
+								contentHash: mcpHash,
+								health: "stopped",
+								credentialConfigured: false,
+								mcpTools: [],
+							},
+						},
+					],
+				});
+			}
+			throw new Error(`Unexpected Runtime Box method: ${method}`);
+		});
+		const registry = new RuntimeBoxRegistry({
+			inventoryRepository: database.runtimeBoxInventory,
+			inventoryPollIntervalMs: 60_000,
+		});
+		try {
+			registry.register(peer, database.runtimeBoxes.get("moshu-local-runtime-box"));
+			expect(() => registry.markReady(peer)).toThrow("inventory");
+			await registry.synchronizeInventory(peer);
+			registry.markReady(peer);
+			expect(registry.getInventory("moshu-local-runtime-box")).toMatchObject({
+				stale: false,
+				inventoryRevision: 1,
+				resources: [{ stableResourceId: "release-helper" }],
+			});
+
+			await registry.upsertMcpServer("moshu-local-runtime-box", {
+				commandId: crypto.randomUUID(),
+				stableResourceId: "database-tools",
+				displayName: "Database Tools",
+				enabled: false,
+				transport: {
+					type: "stdio",
+					command: "/usr/bin/printf",
+					args: [],
+					startupTimeoutMs: 10_000,
+				},
+			});
+			expect(registry.getInventory("moshu-local-runtime-box")).toMatchObject({
+				stale: false,
+				inventoryRevision: 2,
+				resources: [{ stableResourceId: "database-tools" }, { stableResourceId: "release-helper" }],
+			});
+
+			registry.clear(peer);
+			expect(registry.getInventory("moshu-local-runtime-box")).toMatchObject({
+				stale: true,
+				resources: [{ stableResourceId: "database-tools" }, { stableResourceId: "release-helper" }],
+			});
+		} finally {
+			await registry.shutdown();
+			database.close();
+		}
+	});
+
+	test("does not let a replaced peer commit a late inventory delta", async () => {
+		const database = openAppDatabase(":memory:");
+		const epoch = crypto.randomUUID();
+		const version = crypto.randomUUID();
+		const changesStarted = deferred<void>();
+		const changesResponse = deferred<JsonValue>();
+		const oldPeer = new FakeRuntimeBoxPeer(async (method) => {
+			if (method === productRpcMethods.runtimeBoxInventoryGetSnapshot) {
+				return rpcJsonValueSchema.parse({
+					runtimeBoxId: "moshu-local-runtime-box",
+					runtimeBoxGeneration: 1,
+					inventoryEpoch: epoch,
+					inventoryRevision: 1,
+					generatedAt: new Date().toISOString(),
+					capabilities: ["inventory.v1"],
+					resources: [
+						{
+							resourceKind: "skill",
+							stableResourceId: "stable-skill",
+							version,
+							contentHash: "a".repeat(64),
+							health: "ready",
+						},
+					],
+				});
+			}
+			if (method === productRpcMethods.runtimeBoxInventoryGetChanges) {
+				changesStarted.resolve(undefined);
+				return changesResponse.promise;
+			}
+			throw new Error(`Unexpected method ${method}`);
+		});
+		const registry = new RuntimeBoxRegistry({
+			inventoryRepository: database.runtimeBoxInventory,
+			inventoryPollIntervalMs: 60_000,
+		});
+		try {
+			registry.register(oldPeer, database.runtimeBoxes.get("moshu-local-runtime-box"));
+			await registry.synchronizeInventory(oldPeer);
+			registry.markReady(oldPeer);
+			registry.handleInventoryChanged(oldPeer, {
+				inventoryEpoch: epoch,
+				inventoryRevision: 2,
+				categories: ["mcp"],
+			});
+			await changesStarted.promise;
+
+			const newPeer = new FakeRuntimeBoxPeer(async () => {
+				throw new Error("Replacement should not be queried in this test.");
+			});
+			registry.register(newPeer, database.runtimeBoxes.get("moshu-local-runtime-box"));
+			changesResponse.resolve(
+				rpcJsonValueSchema.parse({
+					inventoryEpoch: epoch,
+					fromRevisionExclusive: 1,
+					throughRevision: 2,
+					oldestAvailableRevision: 1,
+					changes: [
+						{
+							revision: 2,
+							category: "mcp",
+							operation: "upsert",
+							stableResourceId: "late-mcp",
+							descriptor: {
+								resourceKind: "mcp",
+								stableResourceId: "late-mcp",
+								version: crypto.randomUUID(),
+								contentHash: "b".repeat(64),
+								health: "ready",
+								credentialConfigured: false,
+								mcpTools: [],
+							},
+						},
+					],
+				}),
+			);
+			await Bun.sleep(10);
+			expect(database.runtimeBoxInventory.list("moshu-local-runtime-box")).toMatchObject({
+				inventoryRevision: 1,
+				stale: true,
+				resources: [{ stableResourceId: "stable-skill" }],
+			});
+		} finally {
+			await registry.shutdown();
+			database.close();
+		}
+	});
+
+	test("falls back to a snapshot when delta pagination cannot make progress", async () => {
+		const database = openAppDatabase(":memory:");
+		const epoch = crypto.randomUUID();
+		let snapshotCalls = 0;
+		let changeCalls = 0;
+		const peer = new FakeRuntimeBoxPeer(async (method) => {
+			if (method === productRpcMethods.runtimeBoxInventoryGetSnapshot) {
+				snapshotCalls += 1;
+				return rpcJsonValueSchema.parse({
+					runtimeBoxId: "moshu-local-runtime-box",
+					runtimeBoxGeneration: 1,
+					inventoryEpoch: epoch,
+					inventoryRevision: snapshotCalls,
+					generatedAt: new Date().toISOString(),
+					capabilities: ["inventory.v1"],
+					resources: [],
+				});
+			}
+			if (method === productRpcMethods.runtimeBoxInventoryGetChanges) {
+				changeCalls += 1;
+				return rpcJsonValueSchema.parse({
+					inventoryEpoch: epoch,
+					fromRevisionExclusive: 1,
+					throughRevision: 2,
+					oldestAvailableRevision: 1,
+					changes: [],
+					nextCursor: "no-progress",
+				});
+			}
+			throw new Error(`Unexpected method ${method}`);
+		});
+		const registry = new RuntimeBoxRegistry({
+			inventoryRepository: database.runtimeBoxInventory,
+			inventoryPollIntervalMs: 60_000,
+		});
+		try {
+			registry.register(peer, database.runtimeBoxes.get("moshu-local-runtime-box"));
+			await registry.synchronizeInventory(peer);
+			registry.markReady(peer);
+			registry.handleInventoryChanged(peer, {
+				inventoryEpoch: epoch,
+				inventoryRevision: 2,
+				categories: ["mcp"],
+			});
+			await Bun.sleep(150);
+			expect(changeCalls).toBe(1);
+			expect(snapshotCalls).toBe(2);
+			expect(database.runtimeBoxInventory.list("moshu-local-runtime-box")).toMatchObject({
+				inventoryRevision: 2,
+				stale: false,
+			});
+		} finally {
+			await registry.shutdown();
+			database.close();
+		}
+	});
+
+	test("polling recovers an inventory change when its hint is lost", async () => {
+		const database = openAppDatabase(":memory:");
+		const epoch = crypto.randomUUID();
+		const version = crypto.randomUUID();
+		let changeCalls = 0;
+		const peer = new FakeRuntimeBoxPeer(async (method, payload) => {
+			if (method === productRpcMethods.runtimeBoxInventoryGetSnapshot) {
+				return rpcJsonValueSchema.parse({
+					runtimeBoxId: "moshu-local-runtime-box",
+					runtimeBoxGeneration: 1,
+					inventoryEpoch: epoch,
+					inventoryRevision: 1,
+					generatedAt: new Date().toISOString(),
+					capabilities: ["inventory.v1"],
+					resources: [],
+				});
+			}
+			if (method === productRpcMethods.runtimeBoxInventoryGetChanges) {
+				changeCalls += 1;
+				const fromRevisionExclusive = inventoryRevisionFromPayload(payload);
+				return rpcJsonValueSchema.parse({
+					inventoryEpoch: epoch,
+					fromRevisionExclusive,
+					throughRevision: 2,
+					oldestAvailableRevision: 1,
+					changes:
+						fromRevisionExclusive === 1
+							? [
+									{
+										revision: 2,
+										category: "skill",
+										operation: "upsert",
+										stableResourceId: "hint-was-lost",
+										descriptor: {
+											resourceKind: "skill",
+											stableResourceId: "hint-was-lost",
+											version,
+											contentHash: "a".repeat(64),
+											health: "ready",
+										},
+									},
+								]
+							: [],
+				});
+			}
+			throw new Error(`Unexpected method ${method}`);
+		});
+		const registry = new RuntimeBoxRegistry({
+			inventoryRepository: database.runtimeBoxInventory,
+			inventoryPollIntervalMs: 10,
+			inventoryRandom: () => 0,
+		});
+		try {
+			registry.register(peer, database.runtimeBoxes.get("moshu-local-runtime-box"));
+			await registry.synchronizeInventory(peer);
+			registry.markReady(peer);
+			await Bun.sleep(50);
+			expect(changeCalls).toBeGreaterThan(0);
+			expect(database.runtimeBoxInventory.list("moshu-local-runtime-box")).toMatchObject({
+				inventoryRevision: 2,
+				stale: false,
+				resources: [{ stableResourceId: "hint-was-lost" }],
+			});
+		} finally {
+			await registry.shutdown();
+			database.close();
+		}
+	});
+
+	test("falls back to a full snapshot after the delta log was compacted", async () => {
+		const database = openAppDatabase(":memory:");
+		const epoch = crypto.randomUUID();
+		const version = crypto.randomUUID();
+		let snapshotCalls = 0;
+		const peer = new FakeRuntimeBoxPeer(async (method, payload) => {
+			if (method === productRpcMethods.runtimeBoxInventoryGetSnapshot) {
+				snapshotCalls += 1;
+				return rpcJsonValueSchema.parse({
+					runtimeBoxId: "moshu-local-runtime-box",
+					runtimeBoxGeneration: 1,
+					inventoryEpoch: epoch,
+					inventoryRevision: snapshotCalls === 1 ? 1 : 4,
+					generatedAt: new Date().toISOString(),
+					capabilities: ["inventory.v1"],
+					resources:
+						snapshotCalls === 1
+							? []
+							: [
+									{
+										resourceKind: "skill",
+										stableResourceId: "after-compaction",
+										version,
+										contentHash: "b".repeat(64),
+										health: "ready",
+									},
+								],
+				});
+			}
+			if (method === productRpcMethods.runtimeBoxInventoryGetChanges) {
+				return rpcJsonValueSchema.parse({
+					inventoryEpoch: epoch,
+					fromRevisionExclusive: inventoryRevisionFromPayload(payload),
+					throughRevision: 4,
+					oldestAvailableRevision: 3,
+					changes: [],
+				});
+			}
+			throw new Error(`Unexpected method ${method}`);
+		});
+		const registry = new RuntimeBoxRegistry({
+			inventoryRepository: database.runtimeBoxInventory,
+			inventoryPollIntervalMs: 60_000,
+		});
+		try {
+			registry.register(peer, database.runtimeBoxes.get("moshu-local-runtime-box"));
+			await registry.synchronizeInventory(peer);
+			registry.markReady(peer);
+			registry.handleInventoryChanged(peer, {
+				inventoryEpoch: epoch,
+				inventoryRevision: 4,
+				categories: ["skill"],
+			});
+			await Bun.sleep(150);
+			expect(snapshotCalls).toBe(2);
+			expect(database.runtimeBoxInventory.list("moshu-local-runtime-box")).toMatchObject({
+				inventoryRevision: 4,
+				stale: false,
+				resources: [{ stableResourceId: "after-compaction" }],
+			});
+		} finally {
+			await registry.shutdown();
+			database.close();
+		}
+	});
 });
 
 class FakeRuntimeBoxPeer implements RuntimeBoxGatewayPeer {
@@ -415,6 +901,18 @@ class FakeRuntimeBoxPeer implements RuntimeBoxGatewayPeer {
 	close(): void {
 		this.isClosed = true;
 	}
+}
+
+function inventoryRevisionFromPayload(payload: JsonValue): number {
+	if (
+		typeof payload !== "object" ||
+		payload === null ||
+		Array.isArray(payload) ||
+		typeof payload.fromRevisionExclusive !== "number"
+	) {
+		throw new Error("Inventory changes request is missing fromRevisionExclusive.");
+	}
+	return payload.fromRevisionExclusive;
 }
 
 function registerRuntimeBox(

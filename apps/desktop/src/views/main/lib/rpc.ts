@@ -28,6 +28,7 @@ import {
 	remoteAccessAuthAttemptInputSchema,
 	remoteAccessAuthAttemptSchema,
 	remoteAccessMutationOutputSchema,
+	runtimeDiagnosticsOutputSchema,
 	remoteAccessStatusOutputSchema,
 	type CreateProjectInput,
 	createProjectInputSchema,
@@ -45,6 +46,27 @@ import {
 	setProjectArchivedOutputSchema,
 	deleteProjectInputSchema,
 	deleteProjectOutputSchema,
+	type UpsertRuntimeBoxMcpServerInput,
+	type SetRuntimeBoxMcpServerEnabledInput,
+	type DeleteRuntimeBoxMcpServerInput,
+	type InstallRuntimeBoxSkillInput,
+	type DeleteRuntimeBoxSkillInput,
+	type UpdateRuntimeProfileInput,
+	listRuntimeBoxInventoryInputSchema,
+	listRuntimeBoxInventoryOutputSchema,
+	listRuntimeBoxMcpServersInputSchema,
+	listRuntimeBoxMcpServerSummariesOutputSchema,
+	setRuntimeBoxMcpServerEnabledInputSchema,
+	upsertRuntimeBoxMcpServerInputSchema,
+	deleteRuntimeBoxMcpServerInputSchema,
+	runtimeBoxResourceMutationResultSchema,
+	listRuntimeBoxSkillsInputSchema,
+	listRuntimeBoxSkillsOutputSchema,
+	installRuntimeBoxSkillInputSchema,
+	deleteRuntimeBoxSkillInputSchema,
+	getRuntimeProfileInputSchema,
+	getRuntimeProfileOutputSchema,
+	updateRuntimeProfileInputSchema,
 	type RevokeRuntimeBoxDeviceInput,
 	revokeRuntimeBoxDeviceInputSchema,
 	revokeRuntimeBoxDeviceOutputSchema,
@@ -240,6 +262,11 @@ export const desktopClient = {
 			await requestDesktop(() => getRequest().recreateRemoteAccess({})),
 		);
 	},
+	async getRuntimeDiagnostics() {
+		return runtimeDiagnosticsOutputSchema.parse(
+			await requestDesktop(() => getRequest().getRuntimeDiagnostics({})),
+		);
+	},
 	async createProject(input: CreateProjectInput) {
 		const parsedInput = createProjectInputSchema.parse(input);
 		return createProjectOutputSchema.parse(
@@ -272,6 +299,75 @@ export const desktopClient = {
 		const input = deleteProjectInputSchema.parse({ projectId });
 		return deleteProjectOutputSchema.parse(
 			await requestDesktop(() => getRequest().deleteProject(input)),
+		);
+	},
+	async listRuntimeInventory(runtimeBoxId?: string) {
+		const input = listRuntimeBoxInventoryInputSchema.parse({
+			...(runtimeBoxId === undefined ? {} : { runtimeBoxId }),
+		});
+		return listRuntimeBoxInventoryOutputSchema.parse(
+			await requestDesktop(() => getRequest().listRuntimeInventory(input)),
+		);
+	},
+	async listMcpServers(runtimeBoxId?: string) {
+		const input = listRuntimeBoxMcpServersInputSchema.parse({
+			...(runtimeBoxId === undefined ? {} : { runtimeBoxId }),
+		});
+		return listRuntimeBoxMcpServerSummariesOutputSchema.parse(
+			await requestDesktop(() => getRequest().listMcpServers(input)),
+		);
+	},
+	async upsertMcpServer(input: UpsertRuntimeBoxMcpServerInput) {
+		const parsed = upsertRuntimeBoxMcpServerInputSchema.parse(input);
+		return runtimeBoxResourceMutationResultSchema.parse(
+			await requestDesktop(() => getRequest().upsertMcpServer(parsed)),
+		);
+	},
+	async setMcpServerEnabled(input: SetRuntimeBoxMcpServerEnabledInput) {
+		const parsed = setRuntimeBoxMcpServerEnabledInputSchema.parse(input);
+		return runtimeBoxResourceMutationResultSchema.parse(
+			await requestDesktop(() => getRequest().setMcpServerEnabled(parsed)),
+		);
+	},
+	async deleteMcpServer(input: DeleteRuntimeBoxMcpServerInput) {
+		const parsed = deleteRuntimeBoxMcpServerInputSchema.parse(input);
+		return runtimeBoxResourceMutationResultSchema.parse(
+			await requestDesktop(() => getRequest().deleteMcpServer(parsed)),
+		);
+	},
+	async listSkills(runtimeBoxId?: string) {
+		const input = listRuntimeBoxSkillsInputSchema.parse({
+			...(runtimeBoxId === undefined ? {} : { runtimeBoxId }),
+		});
+		return listRuntimeBoxSkillsOutputSchema.parse(
+			await requestDesktop(() => getRequest().listSkills(input)),
+		);
+	},
+	async installSkill(input: InstallRuntimeBoxSkillInput) {
+		const parsed = installRuntimeBoxSkillInputSchema.parse(input);
+		return runtimeBoxResourceMutationResultSchema.parse(
+			await requestDesktop(() => getRequest().installSkill(parsed)),
+		);
+	},
+	async deleteSkill(input: DeleteRuntimeBoxSkillInput) {
+		const parsed = deleteRuntimeBoxSkillInputSchema.parse(input);
+		return runtimeBoxResourceMutationResultSchema.parse(
+			await requestDesktop(() => getRequest().deleteSkill(parsed)),
+		);
+	},
+	async getRuntimeProfile(runtimeBoxId?: string) {
+		const input = getRuntimeProfileInputSchema.parse({
+			agentId: "moshu.default",
+			...(runtimeBoxId === undefined ? {} : { runtimeBoxId }),
+		});
+		return getRuntimeProfileOutputSchema.parse(
+			await requestDesktop(() => getRequest().getRuntimeProfile(input)),
+		);
+	},
+	async updateRuntimeProfile(input: UpdateRuntimeProfileInput) {
+		const parsed = updateRuntimeProfileInputSchema.parse(input);
+		return getRuntimeProfileOutputSchema.parse(
+			await requestDesktop(() => getRequest().updateRuntimeProfile(parsed)),
 		);
 	},
 	async listProviders() {

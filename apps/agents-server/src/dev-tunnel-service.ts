@@ -7,6 +7,10 @@ import {
 } from "@moshu/contracts";
 import type { RemoteAccessRepository } from "@moshu/database";
 
+const devTunnelMonthlyLimitBytes = 5 * 1024 * 1024 * 1024;
+const devTunnelTrafficFlushBytes = 1024 * 1024;
+const devTunnelTrafficFlushMs = 1_000;
+
 export interface DevTunnelHostProcess {
 	readonly ready: Promise<{ publicUrl: string }>;
 	readonly exited: Promise<number>;
@@ -33,6 +37,7 @@ export interface DevTunnelServiceOptions {
 	adapter?: DevTunnelAdapter;
 	reportDiagnostic?: (message: string) => void;
 	portConflict?: { expectedPort: number; boundPort: number };
+	now?: () => number;
 }
 
 interface SharedMutationOperation {
@@ -55,6 +60,7 @@ export class DevTunnelService {
 	readonly #runtimeIngressPort: number;
 	readonly #adapter: DevTunnelAdapter;
 	readonly #reportDiagnostic: (message: string) => void;
+	readonly #now: () => number;
 	#portConflict: { expectedPort: number; boundPort: number } | undefined;
 	readonly #authAttempts = new Map<string, RemoteAccessAuthAttempt>();
 	readonly #authProcesses = new Set<DevTunnelAuthenticationProcess>();
@@ -72,6 +78,8 @@ export class DevTunnelService {
 	#startAbortController: AbortController | undefined;
 	#enableOperation: SharedMutationOperation | undefined;
 	#recreateOperation: SharedMutationOperation | undefined;
+	readonly #pendingTraffic = new Map<string, { receivedBytes: number; sentBytes: number }>();
+	#trafficFlushTimer: ReturnType<typeof setTimeout> | undefined;
 
 	constructor(options: DevTunnelServiceOptions) {
 		this.#repository = options.repository;
@@ -80,6 +88,7 @@ export class DevTunnelService {
 			options.adapter ??
 			new DevTunnelCliAdapter(process.env.MOSHU_DEVTUNNEL_PATH?.trim() || "devtunnel");
 		this.#reportDiagnostic = options.reportDiagnostic ?? (() => undefined);
+		this.#now = options.now ?? Date.now;
 		this.#portConflict = options.portConflict;
 		if (this.#portConflict !== undefined) {
 			this.#state = "repair_required";
@@ -107,6 +116,14 @@ export class DevTunnelService {
 
 	getStatus(): RemoteAccessStatusOutput {
 		const settings = this.#repository.get();
+		const month = currentUtcMonth(this.#now());
+		const pending = this.#pendingTraffic.get(month);
+		const receivedBytes =
+			(settings.trafficMonth === month ? settings.trafficReceivedBytes : 0) +
+			(pending?.receivedBytes ?? 0);
+		const sentBytes =
+			(settings.trafficMonth === month ? settings.trafficSentBytes : 0) + (pending?.sentBytes ?? 0);
+		const totalBytes = receivedBytes + sentBytes;
 		const state =
 			settings.enabled || this.#state === "stopping" || this.#host !== undefined
 				? this.#state
@@ -118,7 +135,48 @@ export class DevTunnelService {
 			...(settings.tunnelId === undefined ? {} : { tunnelId: settings.tunnelId }),
 			...(settings.publicUrl === undefined ? {} : { publicUrl: settings.publicUrl }),
 			...(this.#lastError === undefined ? {} : { lastError: this.#lastError }),
+			trafficEstimate: {
+				month,
+				receivedBytes,
+				sentBytes,
+				totalBytes,
+				monthlyLimitBytes: devTunnelMonthlyLimitBytes,
+				warningLevel: trafficWarningLevel(totalBytes),
+				source: "runtime-rpc-application-payload-estimate",
+			},
+			serviceLimits: {
+				maxTunnelsPerUser: 10,
+				maxPortsPerTunnel: 10,
+				maxBytesPerSecond: 20 * 1024 * 1024,
+			},
 		});
+	}
+
+	recordTraffic(direction: "inbound" | "outbound", bytes: number): void {
+		if (!Number.isSafeInteger(bytes) || bytes < 0) {
+			throw new TypeError("Runtime ingress traffic bytes must be a nonnegative safe integer.");
+		}
+		if (bytes === 0) {
+			return;
+		}
+		const month = currentUtcMonth(this.#now());
+		const pending = this.#pendingTraffic.get(month) ?? { receivedBytes: 0, sentBytes: 0 };
+		const receivedBytes = pending.receivedBytes + (direction === "inbound" ? bytes : 0);
+		const sentBytes = pending.sentBytes + (direction === "outbound" ? bytes : 0);
+		if (!Number.isSafeInteger(receivedBytes) || !Number.isSafeInteger(sentBytes)) {
+			throw new Error("Runtime ingress traffic estimate overflow.");
+		}
+		this.#pendingTraffic.set(month, { receivedBytes, sentBytes });
+		if (receivedBytes + sentBytes >= devTunnelTrafficFlushBytes) {
+			this.#flushTraffic();
+			return;
+		}
+		if (this.#trafficFlushTimer === undefined) {
+			this.#trafficFlushTimer = setTimeout(() => {
+				this.#trafficFlushTimer = undefined;
+				this.#flushTraffic();
+			}, devTunnelTrafficFlushMs);
+		}
 	}
 
 	startAuthentication(): RemoteAccessAuthAttempt {
@@ -388,6 +446,11 @@ export class DevTunnelService {
 		const epoch = ++this.#mutationEpoch;
 		this.#operationGeneration = epoch;
 		this.#cancelStart("The Agent Server is shutting down.");
+		if (this.#trafficFlushTimer !== undefined) {
+			clearTimeout(this.#trafficFlushTimer);
+			this.#trafficFlushTimer = undefined;
+		}
+		this.#flushTraffic();
 		const hostShutdown = this.#stopHost();
 		await Promise.allSettled([this.#mutationTail, this.#startPromise ?? Promise.resolve()]);
 		await hostShutdown.catch((error: unknown) =>
@@ -402,6 +465,27 @@ export class DevTunnelService {
 		).catch((error: unknown) =>
 			this.#reportDiagnostic(safeMessage(error, "Auth shutdown failed.")),
 		);
+	}
+
+	#flushTraffic(): void {
+		for (const [month, pending] of this.#pendingTraffic) {
+			this.#pendingTraffic.delete(month);
+			try {
+				this.#repository.recordTraffic(month, pending.receivedBytes, pending.sentBytes);
+			} catch (error) {
+				const retained = this.#pendingTraffic.get(month) ?? {
+					receivedBytes: 0,
+					sentBytes: 0,
+				};
+				this.#pendingTraffic.set(month, {
+					receivedBytes: retained.receivedBytes + pending.receivedBytes,
+					sentBytes: retained.sentBytes + pending.sentBytes,
+				});
+				this.#reportDiagnostic(
+					safeMessage(error, "Runtime ingress traffic estimate persistence failed."),
+				);
+			}
+		}
 	}
 
 	async #startHost(generation: number, callerSignal?: AbortSignal): Promise<void> {
@@ -1002,6 +1086,24 @@ async function terminateHost(host: DevTunnelHostProcess): Promise<void> {
 	} catch {
 		await withTimeout(host.exited, 2_000, "Dev Tunnel host forced shutdown");
 	}
+}
+
+function currentUtcMonth(nowMs = Date.now()): string {
+	return new Date(nowMs).toISOString().slice(0, 7);
+}
+
+function trafficWarningLevel(totalBytes: number): "none" | "50" | "80" | "100" {
+	const ratio = totalBytes / devTunnelMonthlyLimitBytes;
+	if (ratio >= 1) {
+		return "100";
+	}
+	if (ratio >= 0.8) {
+		return "80";
+	}
+	if (ratio >= 0.5) {
+		return "50";
+	}
+	return "none";
 }
 
 function safeMessage(error: unknown, fallback: string): string {

@@ -11,6 +11,7 @@ import {
 	runtimeBoxBootstrapRecordSchema,
 	runtimeBoxReadyRecordSchema,
 	maxCompanionControlRecordBytes,
+	moshuReleaseVersion,
 	parseCompanionControlRecord,
 	serializeCompanionControlRecord,
 } from "@moshu/contracts";
@@ -86,6 +87,7 @@ export function parseCompanionReadyRecord(
 		if (
 			ready.pid !== expectation.pid ||
 			ready.nonce !== expectation.nonce ||
+			ready.processVersion !== moshuReleaseVersion ||
 			!sameIdentity(ready.serverIdentity, expectation.serverIdentity)
 		) {
 			throw new Error("Invalid agents-server READY control record.");
@@ -96,6 +98,7 @@ export function parseCompanionReadyRecord(
 	if (
 		ready.pid !== expectation.pid ||
 		ready.nonce !== expectation.nonce ||
+		ready.processVersion !== moshuReleaseVersion ||
 		!sameIdentity(ready.identity, expectation.identity) ||
 		!sameIdentity(ready.agentsServer.identity, expectation.agentsServer.serverIdentity) ||
 		ready.agentsServer.endpoint.host !== expectation.agentsServer.runtimeEndpoint.host ||

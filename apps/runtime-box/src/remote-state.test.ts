@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, statSync } from "node:fs";
+import { mkdtempSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -56,5 +56,58 @@ describe("RemoteRuntimeBoxState", () => {
 		expect(() => normalizeRuntimeBaseUrl("https://user@runtime.example")).toThrow(
 			"cannot contain credentials",
 		);
+	});
+
+	test("allows only one Remote Runtime Box process per data directory", async () => {
+		const root = mkdtempSync(join(tmpdir(), "moshu-remote-state-"));
+		try {
+			const state = new RemoteRuntimeBoxState(root);
+			const first = await state.acquireProcessLock();
+			await expect(state.acquireProcessLock()).rejects.toThrow(
+				"Another Remote Runtime Box process",
+			);
+			first.release();
+			const next = await state.acquireProcessLock();
+			next.release();
+
+			writeFileSync(
+				join(root, "run.lock"),
+				JSON.stringify({
+					pid: 2_147_483_647,
+					instanceId: crypto.randomUUID(),
+				}),
+			);
+			const afterCrash = await state.acquireProcessLock();
+			afterCrash.release();
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("fails closed on a persistence outage and can retry after storage recovers", () => {
+		const parent = mkdtempSync(join(tmpdir(), "moshu-remote-state-outage-"));
+		const root = join(parent, "runtime-state");
+		const config = {
+			schemaVersion: 1 as const,
+			runtimeBaseUrl: "https://runtime.example",
+			runtimeBoxId: "remote-box",
+			deviceKeyId: "device-key",
+			publicKey: Buffer.alloc(32, 1).toString("base64url"),
+			privateKey: Buffer.alloc(48, 2).toString("base64url"),
+			agentServerId: "550e8400-e29b-41d4-a716-446655440000",
+			agentServerPublicKey: Buffer.alloc(32, 3).toString("base64url"),
+			generation: 0,
+			displayName: "Remote Box",
+		};
+		try {
+			writeFileSync(root, "simulated unavailable storage");
+			const state = new RemoteRuntimeBoxState(root);
+			expect(() => state.write(config)).toThrow();
+			unlinkSync(root);
+			expect(() => state.write(config)).not.toThrow();
+			expect(state.read()).toMatchObject({ runtimeBoxId: "remote-box", generation: 0 });
+		} finally {
+			rmSync(parent, { recursive: true, force: true });
+		}
 	});
 });

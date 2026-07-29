@@ -55,6 +55,7 @@ describe("Runtime Box product RPC", () => {
 				descriptors: database.runtimeBoxes.list(),
 				activeRuntimeBoxId: active.runtimeBoxId,
 			});
+
 			const handlers = createProductRpcHandlers({
 				authController,
 				chatService: {} as ChatApplicationService,
@@ -99,6 +100,136 @@ describe("Runtime Box product RPC", () => {
 		} finally {
 			database.close();
 		}
+	});
+
+	test("returns redacted version, registry, inventory, and integrity diagnostics", async () => {
+		const handler = createProductRpcHandlers({
+			authController,
+			chatService: {} as ChatApplicationService,
+			runtimeBoxRegistry: new RuntimeBoxRegistry(),
+			runtimeBoxes,
+			runtimeIngressAuth,
+			getDevTunnelService: () => devTunnelService,
+			eventRouter: new ProductEventRouter(),
+			serverVersion: "test",
+			getRuntimeDiagnostics: () => ({
+				generatedAt: new Date().toISOString(),
+				server: {
+					version: "test",
+					identity: {
+						role: "agents",
+						peerId: "agents",
+						instanceId: "agents-instance",
+						generation: 1,
+					},
+					processRpcProtocol: { major: 1, minor: 0 },
+					runtimeProtocolMinVersion: 1,
+					runtimeProtocolMaxVersion: 1,
+					transportSecurity: "relay-tls",
+					noiseUpgradeAvailable: false,
+				},
+				database: { schemaVersion: 18, integrity: "ok" },
+				runtimeBoxes: [],
+				inventories: [],
+				remoteAccess: {
+					enabled: false,
+					state: "disabled",
+					runtimeIngressPort: 41_000,
+					trafficEstimate: {
+						month: new Date().toISOString().slice(0, 7),
+						receivedBytes: 0,
+						sentBytes: 0,
+						totalBytes: 0,
+						monthlyLimitBytes: 5 * 1024 * 1024 * 1024,
+						warningLevel: "none",
+						source: "runtime-rpc-application-payload-estimate",
+					},
+					serviceLimits: {
+						maxTunnelsPerUser: 10,
+						maxPortsPerTunnel: 10,
+						maxBytesPerSecond: 20 * 1024 * 1024,
+					},
+				},
+			}),
+		}).requests?.[productRpcMethods.runtimeDiagnosticsGet];
+		if (handler === undefined) {
+			throw new Error("Runtime diagnostics handler is missing.");
+		}
+		await expect(
+			handler(
+				{},
+				createRequestContext(
+					createPeer({ emitEvent: () => "event", close() {} }),
+					productRpcMethods.runtimeDiagnosticsGet,
+				),
+			),
+		).resolves.toMatchObject({
+			server: {
+				processRpcProtocol: { major: 1, minor: 0 },
+				transportSecurity: "relay-tls",
+				noiseUpgradeAvailable: false,
+			},
+			database: { schemaVersion: 18, integrity: "ok" },
+		});
+	});
+
+	test("never projects stored MCP transport configuration to the renderer", async () => {
+		const registry = new RuntimeBoxRegistry();
+		Object.defineProperty(registry, "listMcpServers", {
+			value: async () => ({
+				runtimeBoxId: "remote-box",
+				items: [
+					{
+						stableResourceId: "private-mcp",
+						version: crypto.randomUUID(),
+						contentHash: "a".repeat(64),
+						displayName: "Private MCP",
+						enabled: true,
+						transport: {
+							type: "streamable-http",
+							url: "https://mcp.example.test/rpc?token=must-not-project",
+							timeoutMs: 30_000,
+						},
+						credentialConfigured: true,
+						health: "ready",
+						tools: [],
+						createdAt: new Date().toISOString(),
+						updatedAt: new Date().toISOString(),
+					},
+				],
+			}),
+		});
+		const handler = createProductRpcHandlers({
+			authController,
+			chatService: {} as ChatApplicationService,
+			runtimeBoxRegistry: registry,
+			runtimeBoxes,
+			runtimeIngressAuth,
+			getDevTunnelService: () => devTunnelService,
+			eventRouter: new ProductEventRouter(),
+			serverVersion: "test",
+		}).requests?.[productRpcMethods.mcpServersList];
+		if (handler === undefined) {
+			throw new Error("MCP summary handler is missing.");
+		}
+		const output = await handler(
+			{ runtimeBoxId: "remote-box" },
+			createRequestContext(
+				createPeer({ emitEvent: () => "event", close() {} }),
+				productRpcMethods.mcpServersList,
+			),
+		);
+		expect(output).toMatchObject({
+			items: [
+				{
+					stableResourceId: "private-mcp",
+					displayName: "Private MCP",
+					credentialConfigured: true,
+				},
+			],
+		});
+		expect(JSON.stringify(output)).not.toContain("must-not-project");
+		expect(JSON.stringify(output)).not.toContain("transport");
 	});
 
 	test("creates Projects only after the owning Runtime Box validates their path", async () => {
@@ -184,6 +315,135 @@ describe("Runtime Box product RPC", () => {
 				list({}, createRequestContext(peer, productRpcMethods.projectsList)),
 			).resolves.toEqual({ items: [] });
 		} finally {
+			database.close();
+		}
+	});
+
+	test("serves redacted inventory and persists only live-validated Runtime Profile refs", async () => {
+		const database = openAppDatabase(":memory:");
+		const version = crypto.randomUUID();
+		const contentHash = "a".repeat(64);
+		const runtimePeer: RuntimeBoxGatewayPeer = {
+			isClosed: false,
+			remoteIdentity: {
+				role: "runtime-box",
+				peerId: defaultLocalRuntimeBoxId,
+				instanceId: crypto.randomUUID(),
+				generation: 1,
+			},
+			close() {},
+			request(method, _payload) {
+				expect(method).toBe(productRpcMethods.runtimeBoxResourcesValidate);
+				return Promise.resolve(
+					rpcJsonValueSchema.parse({
+						valid: true,
+						resources: [
+							{
+								resourceKind: "skill",
+								stableResourceId: "release-helper",
+								version,
+								contentHash,
+								health: "ready",
+							},
+						],
+						issues: [],
+					}),
+				);
+			},
+		};
+		const registry = new RuntimeBoxRegistry({
+			descriptors: database.runtimeBoxes.list(),
+			activeRuntimeBoxId: defaultLocalRuntimeBoxId,
+		});
+		try {
+			registry.register(runtimePeer, database.runtimeBoxes.get(defaultLocalRuntimeBoxId));
+			registry.markReady(runtimePeer);
+			database.runtimeBoxInventory.replaceSnapshot({
+				runtimeBoxId: defaultLocalRuntimeBoxId,
+				runtimeBoxGeneration: 1,
+				inventoryEpoch: crypto.randomUUID(),
+				inventoryRevision: 1,
+				generatedAt: new Date().toISOString(),
+				capabilities: ["skills.store.v1"],
+				resources: [
+					{
+						resourceKind: "skill",
+						stableResourceId: "release-helper",
+						version,
+						contentHash,
+						health: "ready",
+					},
+				],
+			});
+			const handlers = createProductRpcHandlers({
+				authController,
+				chatService: {} as ChatApplicationService,
+				runtimeBoxRegistry: registry,
+				runtimeBoxes: database.runtimeBoxes,
+				runtimeBoxInventory: database.runtimeBoxInventory,
+				runtimeProfiles: database.runtimeProfiles,
+				runtimeIngressAuth,
+				getDevTunnelService: () => devTunnelService,
+				eventRouter: new ProductEventRouter(),
+				serverVersion: "test",
+			}).requests;
+			const client = createPeer({ emitEvent: () => "event", close() {} });
+			const listInventory = handlers?.[productRpcMethods.runtimeInventoryList];
+			const getProfile = handlers?.[productRpcMethods.runtimeProfilesGet];
+			const updateProfile = handlers?.[productRpcMethods.runtimeProfilesUpdate];
+			const deleteSkill = handlers?.[productRpcMethods.skillsDelete];
+			if (
+				listInventory === undefined ||
+				getProfile === undefined ||
+				updateProfile === undefined ||
+				deleteSkill === undefined
+			) {
+				throw new Error("Runtime resource handlers are missing.");
+			}
+			await expect(
+				listInventory({}, createRequestContext(client, productRpcMethods.runtimeInventoryList)),
+			).resolves.toMatchObject({
+				stale: false,
+				resources: [{ stableResourceId: "release-helper" }],
+			});
+			const initial = await getProfile(
+				{},
+				createRequestContext(client, productRpcMethods.runtimeProfilesGet),
+			);
+			const initialRevision = z
+				.object({ profile: z.object({ revision: z.number() }) })
+				.parse(initial).profile.revision;
+			await expect(
+				updateProfile(
+					{
+						expectedRevision: initialRevision,
+						resources: [
+							{
+								runtimeBoxId: defaultLocalRuntimeBoxId,
+								resourceKind: "skill",
+								stableResourceId: "release-helper",
+								version,
+								contentHash,
+							},
+						],
+					},
+					createRequestContext(client, productRpcMethods.runtimeProfilesUpdate),
+				),
+			).resolves.toMatchObject({
+				profile: { resources: [{ stableResourceId: "release-helper" }] },
+			});
+			await expect(
+				deleteSkill(
+					{
+						commandId: crypto.randomUUID(),
+						stableResourceId: "release-helper",
+						expectedVersion: version,
+					},
+					createRequestContext(client, productRpcMethods.skillsDelete),
+				),
+			).rejects.toMatchObject({ code: "RUNTIME_RESOURCE_IN_USE" });
+		} finally {
+			await registry.shutdown();
 			database.close();
 		}
 	});

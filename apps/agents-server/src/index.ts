@@ -3,6 +3,7 @@ import {
 	type AgentsServerReadyRecord,
 	companionBootstrapChannel,
 	companionControlVersion,
+	moshuReleaseVersion,
 } from "@moshu/contracts";
 
 import {
@@ -12,7 +13,7 @@ import {
 } from "./bootstrap";
 import { type CreateAgentsServerOptions, createAgentsServer } from "./create-agents-server";
 
-const PROCESS_VERSION = "0.0.1";
+const PROCESS_VERSION = moshuReleaseVersion;
 const DEV_TUNNEL_WATCHDOG_MODE = "--dev-tunnel-watchdog";
 
 export async function runAgentsServerProcess(

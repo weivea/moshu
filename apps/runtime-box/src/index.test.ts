@@ -3,12 +3,17 @@ import { describe, expect, test } from "bun:test";
 import { companionControlVersion, productRpcMethods } from "@moshu/contracts";
 import {
 	type JsonValue,
+	RpcConnectionClosedError,
 	type RpcCloseInfo,
+	type RpcPeer,
+	type RpcRequestContext,
+	type RpcRequestHandler,
 	type RpcRequestOptions,
 	rpcJsonValueSchema,
 } from "@moshu/process-rpc";
 
 import type { BootstrapControlChannel } from "./bootstrap";
+import type { RuntimeBoxInvocationJournal } from "./invocation-journal";
 import {
 	assertExpectedAgentsServerIdentity,
 	type RuntimeBoxReadyWriter,
@@ -16,6 +21,7 @@ import {
 	type RuntimeBoxSignalSource,
 	runRuntimeBoxProcess,
 } from "./index";
+import type { ExecutorToolRuntime } from "./tools";
 
 const expected = {
 	role: "agents" as const,
@@ -195,6 +201,124 @@ describe("Runtime Box lifecycle", () => {
 		);
 		expect(readyRecords).toEqual([]);
 		expect(peer.terminateCalls).toBe(1);
+		expect(signals.listenerCount).toBe(0);
+	});
+
+	test("drains a started Action after transport loss before exiting", async () => {
+		const parent = createParentChannel();
+		const signals = new FakeSignalSource();
+		const readyWritten = deferred<void>();
+		const actionStarted = deferred<void>();
+		const actionCompleted = deferred<void>();
+		let actionSignal: AbortSignal | undefined;
+		let actionSucceeded = false;
+		let invokeTool: RpcRequestHandler | undefined;
+		let closeTransport: (() => void) | undefined;
+		const contextPeer = {
+			remoteIdentity: expected,
+			localIdentity: bootstrapRecord.identity,
+			isClosed: false,
+			emitEvent() {},
+		} as unknown as RpcPeer;
+		const peer = new FakeRuntimeBoxPeer(() =>
+			rpcJsonValueSchema.parse({
+				schemaVersion: 1,
+				accepted: true,
+				runtimeBoxId: bootstrapRecord.identity.peerId,
+			}),
+		);
+		const runtime = {
+			async execute(input: { invocationId: string }, options: { signal: AbortSignal }) {
+				actionSignal = options.signal;
+				actionStarted.resolve();
+				await actionCompleted.promise;
+				return {
+					schemaVersion: 1 as const,
+					invocationId: input.invocationId,
+					tool: "read" as const,
+					content: [{ type: "text" as const, text: "completed after transport loss" }],
+				};
+			},
+		} as unknown as ExecutorToolRuntime;
+		const journal = {
+			begin() {
+				return {};
+			},
+			succeed() {
+				actionSucceeded = true;
+			},
+			fail() {},
+			cancel() {},
+			nextReconciliationBatch() {
+				return { items: [], acknowledgedInvocationIds: [] };
+			},
+			acknowledge() {
+				return [];
+			},
+		} as unknown as RuntimeBoxInvocationJournal;
+		const run = runRuntimeBoxProcess({
+			...createBaseOptions(parent, signals, []),
+			toolRuntime: runtime,
+			invocationJournal: journal,
+			connectPeer: async (options) => {
+				invokeTool = options.handlers?.requests?.[productRpcMethods.runtimeBoxToolInvoke];
+				closeTransport = () =>
+					options.onClose?.({ code: 1006, reason: "transport lost" }, contextPeer);
+				return peer;
+			},
+			readyWriter: {
+				enqueue() {
+					readyWritten.resolve();
+					return { drained: Promise.resolve() };
+				},
+			},
+		});
+		let runSettled = false;
+		void run.then(
+			() => {
+				runSettled = true;
+			},
+			() => {
+				runSettled = true;
+			},
+		);
+		await readyWritten.promise;
+		if (invokeTool === undefined || closeTransport === undefined) {
+			throw new Error("Runtime Box transport handlers were not installed.");
+		}
+		const requestController = new AbortController();
+		const context: RpcRequestContext = {
+			peer: contextPeer,
+			remoteIdentity: expected,
+			signal: requestController.signal,
+			traceId: "transport-loss",
+			requestId: "transport-loss",
+			method: productRpcMethods.runtimeBoxToolInvoke,
+			deadlineAt: Date.now() + 1_000,
+		};
+		const action = invokeTool(
+			{
+				schemaVersion: 1,
+				invocationId: crypto.randomUUID(),
+				runId: "018f47a2-9bcd-7def-8abc-1234567890ab",
+				toolCallId: "transport-loss",
+				cwd: process.cwd(),
+				call: { tool: "read", arguments: { path: "README.md" } },
+			},
+			context,
+		);
+		await actionStarted.promise;
+
+		requestController.abort(new RpcConnectionClosedError(1006, "transport lost"));
+		closeTransport();
+		await Bun.sleep(0);
+		expect(actionSignal?.aborted).toBe(false);
+		expect(runSettled).toBe(false);
+
+		actionCompleted.resolve();
+		await expect(action).resolves.toMatchObject({ tool: "read" });
+		await expect(within(run)).rejects.toThrow("Agents-server RPC connection closed.");
+		expect(actionSucceeded).toBe(true);
 		expect(signals.listenerCount).toBe(0);
 	});
 
@@ -466,11 +590,13 @@ function createBaseOptions(
 	) => Promise<BootstrapControlChannel>;
 	readonly signalSource: FakeSignalSource;
 	readonly readyWriter: RuntimeBoxReadyWriter;
+	readonly resourceStore: null;
 } {
 	return {
 		stdin: new ReadableStream<Uint8Array>(),
 		openControlChannel: async () => parent.channel,
 		signalSource: signals,
+		resourceStore: null,
 		readyWriter: {
 			enqueue(record) {
 				readyRecords.push(record);

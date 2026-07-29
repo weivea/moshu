@@ -97,6 +97,9 @@ describe("DurableActionAuthorizationService", () => {
 				safeError: "write failed on device",
 				serverAckedAtMs: expect.any(Number),
 			});
+			expect(() =>
+				service.reconcile("different-runtime-box", [], [invocation.invocationId]),
+			).toThrow("did not match the Runtime Box");
 			expect(service.reconcile(defaultLocalRuntimeBoxId, [], [invocation.invocationId])).toEqual({
 				ackedInvocationIds: [],
 				confirmedAcknowledgementIds: [invocation.invocationId],
@@ -169,6 +172,72 @@ describe("DurableActionAuthorizationService", () => {
 					"request-cwd",
 				),
 			).rejects.toBeInstanceOf(ActionPolicyDeniedError);
+		} finally {
+			database.close();
+		}
+	});
+
+	test("uses the same durable one-time grant boundary for MCP Tools", async () => {
+		const database = openAppDatabase(":memory:");
+		try {
+			const session = database.sessions.create({ title: "MCP Action" }).session;
+			const run = database.runs.create({
+				clientRequestId: crypto.randomUUID(),
+				sessionId: session.id,
+				mode: "agent",
+				provider: {
+					schemaVersion: 1,
+					providerId: createUuidV7(),
+					name: "Provider",
+					source: "custom",
+					api: "openai-responses",
+					model: "model",
+					thinkingLevel: "medium",
+				},
+				userMessageId: createUuidV7(),
+				userContent: "run",
+				assistantMessageId: createUuidV7(),
+			}).run;
+			const service = new DurableActionAuthorizationService(database.actions, {
+				role: "agents",
+				peerId: "agents",
+				instanceId: "agents-instance",
+				generation: 2,
+			});
+			const input = {
+				schemaVersion: 1 as const,
+				invocationId: crypto.randomUUID(),
+				runId: run.id,
+				toolCallId: "mcp-tool-call",
+				mcpServerId: "database-tools",
+				mcpServerVersion: "550e8400-e29b-41d4-a716-446655440010",
+				mcpServerContentHash: "a".repeat(64),
+				stableToolId: "tool-query",
+				toolSchemaHash: "b".repeat(64),
+				arguments: { sql: "select 1" },
+			};
+			const authorized = await service.authorizeMcp(defaultLocalRuntimeBoxId, input, {
+				role: "runtime-box",
+				peerId: defaultLocalRuntimeBoxId,
+				instanceId: "runtime-instance",
+				generation: 3,
+			});
+			service.complete(defaultLocalRuntimeBoxId, authorized, {
+				schemaVersion: 1,
+				invocationId: input.invocationId,
+				mcpServerId: input.mcpServerId,
+				stableToolId: input.stableToolId,
+				result: { content: [{ type: "text", text: "row" }] },
+				isError: false,
+			});
+			expect(database.actions.get(input.invocationId)).toMatchObject({
+				tool: "mcp:database-tools:tool-query",
+				state: "succeeded",
+				result: {
+					mcpServerId: "database-tools",
+					stableToolId: "tool-query",
+				},
+			});
 		} finally {
 			database.close();
 		}

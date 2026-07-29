@@ -16,10 +16,14 @@ import { dirname, join, resolve } from "node:path";
 import {
 	actionParameterDigestSchema,
 	createExecutorToolParameterPayload,
+	createMcpToolParameterPayload,
 	type ExecutorToolInvokeInput,
 	type ExecutorToolInvokeOutput,
+	type RuntimeBoxMcpToolInvokeInput,
+	type RuntimeBoxMcpToolInvokeOutput,
+	type RuntimeBoxActionResult,
+	runtimeBoxActionResultSchema,
 	runtimeBoxInvocationEvidenceSchema,
-	runtimeBoxToolInvokeOutputSchema,
 	type RuntimeBoxInvocationEvidence,
 	productRpcMaxFrameBytes,
 	productRpcMethods,
@@ -36,7 +40,6 @@ import { z } from "zod";
 
 const maxInvocationJournalRecords = 1_024;
 const maxConsumedGrantTombstones = 4_096;
-const unconfirmedReceiptRetentionMs = 30 * 24 * 60 * 60 * 1_000;
 
 const consumedGrantSchema = z
 	.object({
@@ -44,8 +47,12 @@ const consumedGrantSchema = z
 		invocationId: z.string().uuid(),
 		parameterDigest: actionParameterDigestSchema,
 		expiresAt: z.string().datetime({ offset: true }),
-		recoveryExpiresAt: z.string().datetime({ offset: true }),
 		serverConfirmed: z.boolean().default(false),
+	})
+	.strict();
+const consumedGrantFileSchema = consumedGrantSchema
+	.extend({
+		recoveryExpiresAt: z.string().datetime({ offset: true }).optional(),
 	})
 	.strict();
 
@@ -64,7 +71,7 @@ const journalRecordSchema = z
 		executionScope: z.enum(["request-cwd", "runtime-box-workspace"]),
 		grantExpiresAt: z.string().datetime({ offset: true }),
 		state: z.enum(["prepared", "running", "succeeded", "failed", "cancelled", "outcome_unknown"]),
-		result: runtimeBoxToolInvokeOutputSchema.optional(),
+		result: runtimeBoxActionResultSchema.optional(),
 		safeError: z.string().min(1).max(1_024).optional(),
 		startedAt: z.string().datetime({ offset: true }),
 		completedAt: z.string().datetime({ offset: true }).optional(),
@@ -75,7 +82,7 @@ const journalFileSchema = z
 	.object({
 		schemaVersion: z.literal(1),
 		records: z.array(journalRecordSchema).max(maxInvocationJournalRecords),
-		consumedGrants: z.array(consumedGrantSchema).max(maxConsumedGrantTombstones).default([]),
+		consumedGrants: z.array(consumedGrantFileSchema).max(maxConsumedGrantTombstones).default([]),
 	})
 	.strict();
 
@@ -86,6 +93,30 @@ export class InvocationGrantRejectedError extends Error {
 	constructor(message: string) {
 		super(message);
 		this.name = "InvocationGrantRejectedError";
+	}
+}
+
+export class InvocationJournalPrepareFailedError extends Error {
+	constructor(message: string, options?: ErrorOptions) {
+		super(message, options);
+		this.name = "InvocationJournalPrepareFailedError";
+	}
+}
+
+export class InvocationJournalPrepareUncertainError extends Error {
+	constructor(message: string, options?: ErrorOptions) {
+		super(message, options);
+		this.name = "InvocationJournalPrepareUncertainError";
+	}
+}
+
+class InvocationJournalPersistenceError extends Error {
+	constructor(
+		readonly committed: boolean,
+		options: ErrorOptions,
+	) {
+		super("Runtime Box invocation journal persistence failed.", options);
+		this.name = "InvocationJournalPersistenceError";
 	}
 }
 
@@ -106,8 +137,20 @@ export class RuntimeBoxInvocationJournal {
 		input: ExecutorToolInvokeInput,
 		authority: RpcPeerIdentity,
 		target: RpcPeerIdentity,
-		executionCwdOverride?: string,
-	): { replayResult?: ExecutorToolInvokeOutput } {
+		executionScope?: "request-cwd" | "runtime-box-workspace",
+	): { replayResult?: ExecutorToolInvokeOutput };
+	begin(
+		input: RuntimeBoxMcpToolInvokeInput,
+		authority: RpcPeerIdentity,
+		target: RpcPeerIdentity,
+		executionScope: "runtime-box-workspace",
+	): { replayResult?: RuntimeBoxMcpToolInvokeOutput };
+	begin(
+		input: ExecutorToolInvokeInput | RuntimeBoxMcpToolInvokeInput,
+		authority: RpcPeerIdentity,
+		target: RpcPeerIdentity,
+		executionScope: "request-cwd" | "runtime-box-workspace" = "request-cwd",
+	): { replayResult?: RuntimeBoxActionResult } {
 		const authorization = input.authorization;
 		if (authorization === undefined) {
 			throw new InvocationGrantRejectedError("Tool invocation is missing an execution grant.");
@@ -121,10 +164,7 @@ export class RuntimeBoxInvocationJournal {
 				"Execution grant origin did not match the authenticated Agent Server.",
 			);
 		}
-		if (
-			(authorization.executionScope === "runtime-box-workspace") !==
-			(executionCwdOverride !== undefined)
-		) {
+		if (authorization.executionScope !== executionScope) {
 			throw new InvocationGrantRejectedError(
 				"Execution grant scope did not match Runtime Box workspace policy.",
 			);
@@ -143,7 +183,11 @@ export class RuntimeBoxInvocationJournal {
 			throw new InvocationGrantRejectedError("Execution grant expired before execution.");
 		}
 		const { authorization: _authorization, ...parameters } = input;
-		const parameterDigest = sha256(createExecutorToolParameterPayload(parameters));
+		const parameterDigest = sha256(
+			"call" in parameters
+				? createExecutorToolParameterPayload(parameters)
+				: createMcpToolParameterPayload(parameters),
+		);
 		if (parameterDigest !== authorization.parameterDigest) {
 			throw new InvocationGrantRejectedError("Execution grant parameter digest did not match.");
 		}
@@ -191,18 +235,66 @@ export class RuntimeBoxInvocationJournal {
 			startedAt: new Date().toISOString(),
 		};
 		this.#records.set(record.invocationId, record);
-		this.#persist();
+		try {
+			this.#persist();
+		} catch (error) {
+			if (!(error instanceof InvocationJournalPersistenceError) || !error.committed) {
+				this.#records.delete(record.invocationId);
+				throw new InvocationJournalPrepareFailedError(
+					"Runtime Box could not persist the Action before execution.",
+					{ cause: error },
+				);
+			}
+			this.#markPrepareOutcomeUnknown(record);
+			try {
+				this.#persist();
+			} catch (recoveryError) {
+				throw new InvocationJournalPrepareUncertainError(
+					"Runtime Box journal committed but outcome recovery persistence failed.",
+					{ cause: new AggregateError([error, recoveryError]) },
+				);
+			}
+			throw new InvocationJournalPrepareUncertainError(
+				"Runtime Box journal commit could not be fully confirmed.",
+				{ cause: error },
+			);
+		}
 		record.state = "running";
-		this.#persist();
+		try {
+			this.#persist();
+		} catch (error) {
+			this.#markPrepareOutcomeUnknown(record);
+			try {
+				this.#persist();
+			} catch (recoveryError) {
+				throw new InvocationJournalPrepareUncertainError(
+					"Runtime Box journal preparation and recovery persistence both failed.",
+					{ cause: new AggregateError([error, recoveryError]) },
+				);
+			}
+			throw new InvocationJournalPrepareUncertainError(
+				"Runtime Box could not persist the running state; outcome is unknown.",
+				{ cause: error },
+			);
+		}
 		return {};
 	}
 
-	succeed(invocationId: string, resultValue: ExecutorToolInvokeOutput): void {
+	succeed(invocationId: string, resultValue: RuntimeBoxActionResult): void {
 		const record = this.#requireRunning(invocationId);
+		const previous = { ...record };
 		record.state = "succeeded";
-		record.result = runtimeBoxToolInvokeOutputSchema.parse(resultValue);
+		record.result = runtimeBoxActionResultSchema.parse(resultValue);
+		delete record.safeError;
 		record.completedAt = new Date().toISOString();
-		this.#persist();
+		try {
+			this.#persist();
+		} catch (error) {
+			if (!(error instanceof InvocationJournalPersistenceError) || !error.committed) {
+				this.#records.set(invocationId, previous);
+			}
+			throw error;
+		}
 	}
 
 	fail(invocationId: string, safeError: string): void {
@@ -211,6 +303,10 @@ export class RuntimeBoxInvocationJournal {
 
 	cancel(invocationId: string, safeError: string): void {
 		this.#finishWithoutResult(invocationId, "cancelled", safeError);
+	}
+
+	outcomeUnknown(invocationId: string, safeError: string): void {
+		this.#finishWithoutResult(invocationId, "outcome_unknown", safeError);
 	}
 
 	listEvidence(): RuntimeBoxInvocationEvidence[] {
@@ -291,7 +387,17 @@ export class RuntimeBoxInvocationJournal {
 		const previousConsumed = new Map<string, ConsumedGrant | undefined>();
 		for (const invocationId of new Set(invocationIds)) {
 			const record = this.#records.get(invocationId);
-			if (record === undefined || record.state === "prepared" || record.state === "running") {
+			if (record === undefined) {
+				if (
+					[...this.#consumedGrants.values()].some(
+						(consumed) => consumed.invocationId === invocationId,
+					)
+				) {
+					acknowledged.push(invocationId);
+				}
+				continue;
+			}
+			if (record.state === "prepared" || record.state === "running") {
 				continue;
 			}
 			if (
@@ -308,7 +414,6 @@ export class RuntimeBoxInvocationJournal {
 				invocationId: record.invocationId,
 				parameterDigest: record.parameterDigest,
 				expiresAt: record.grantExpiresAt,
-				recoveryExpiresAt: new Date(Date.now() + unconfirmedReceiptRetentionMs).toISOString(),
 				serverConfirmed: false,
 			});
 			acknowledged.push(invocationId);
@@ -317,13 +422,15 @@ export class RuntimeBoxInvocationJournal {
 			try {
 				this.#persist();
 			} catch (error) {
-				for (const record of removedRecords) {
-					this.#records.set(record.invocationId, record);
-					const previous = previousConsumed.get(record.grantId);
-					if (previous === undefined) {
-						this.#consumedGrants.delete(record.grantId);
-					} else {
-						this.#consumedGrants.set(record.grantId, previous);
+				if (!(error instanceof InvocationJournalPersistenceError) || !error.committed) {
+					for (const record of removedRecords) {
+						this.#records.set(record.invocationId, record);
+						const previous = previousConsumed.get(record.grantId);
+						if (previous === undefined) {
+							this.#consumedGrants.delete(record.grantId);
+						} else {
+							this.#consumedGrants.set(record.grantId, previous);
+						}
 					}
 				}
 				throw error;
@@ -348,8 +455,10 @@ export class RuntimeBoxInvocationJournal {
 			try {
 				this.#persist();
 			} catch (error) {
-				for (const consumed of changed) {
-					consumed.serverConfirmed = false;
+				if (!(error instanceof InvocationJournalPersistenceError) || !error.committed) {
+					for (const consumed of changed) {
+						consumed.serverConfirmed = false;
+					}
 				}
 				throw error;
 			}
@@ -359,14 +468,23 @@ export class RuntimeBoxInvocationJournal {
 
 	#finishWithoutResult(
 		invocationId: string,
-		state: "failed" | "cancelled",
+		state: "failed" | "cancelled" | "outcome_unknown",
 		safeError: string,
 	): void {
 		const record = this.#requireRunning(invocationId);
+		const previous = { ...record };
 		record.state = state;
+		delete record.result;
 		record.safeError = boundSafeError(safeError);
 		record.completedAt = new Date().toISOString();
-		this.#persist();
+		try {
+			this.#persist();
+		} catch (error) {
+			if (!(error instanceof InvocationJournalPersistenceError) || !error.committed) {
+				this.#records.set(invocationId, previous);
+			}
+			throw error;
+		}
 	}
 
 	#requireRunning(invocationId: string): JournalRecord {
@@ -375,6 +493,12 @@ export class RuntimeBoxInvocationJournal {
 			throw new InvocationGrantRejectedError("Invocation is not running in the Box journal.");
 		}
 		return record;
+	}
+
+	#markPrepareOutcomeUnknown(record: JournalRecord): void {
+		record.state = "outcome_unknown";
+		record.safeError = "Runtime Box could not confirm journal preparation before execution.";
+		record.completedAt = new Date().toISOString();
 	}
 
 	#load(): void {
@@ -398,7 +522,13 @@ export class RuntimeBoxInvocationJournal {
 			this.#records.set(record.invocationId, record);
 		}
 		for (const consumed of parsed.consumedGrants) {
-			this.#consumedGrants.set(consumed.grantId, consumed);
+			this.#consumedGrants.set(consumed.grantId, {
+				grantId: consumed.grantId,
+				invocationId: consumed.invocationId,
+				parameterDigest: consumed.parameterDigest,
+				expiresAt: consumed.expiresAt,
+				serverConfirmed: consumed.serverConfirmed,
+			});
 		}
 		this.#pruneExpiredGrantTombstones();
 		if (recovered) {
@@ -414,6 +544,7 @@ export class RuntimeBoxInvocationJournal {
 			consumedGrants: [...this.#consumedGrants.values()],
 		})}\n`;
 		let fileDescriptor: number | undefined;
+		let committed = false;
 		try {
 			fileDescriptor = openSync(temporary, "wx", 0o600);
 			writeFileSync(fileDescriptor, content, "utf8");
@@ -421,6 +552,7 @@ export class RuntimeBoxInvocationJournal {
 			closeSync(fileDescriptor);
 			fileDescriptor = undefined;
 			renameSync(temporary, this.#filename);
+			committed = true;
 			chmodSync(this.#filename, 0o600);
 			if (process.platform !== "win32") {
 				const directoryDescriptor = openSync(dirname(this.#filename), "r");
@@ -437,17 +569,14 @@ export class RuntimeBoxInvocationJournal {
 			if (existsSync(temporary)) {
 				unlinkSync(temporary);
 			}
-			throw error;
+			throw new InvocationJournalPersistenceError(committed, { cause: error });
 		}
 	}
 
 	#pruneExpiredGrantTombstones(): void {
 		const now = Date.now();
 		for (const [grantId, consumed] of this.#consumedGrants) {
-			const expiry = consumed.serverConfirmed
-				? Date.parse(consumed.expiresAt)
-				: Date.parse(consumed.recoveryExpiresAt);
-			if (expiry <= now) {
+			if (consumed.serverConfirmed && Date.parse(consumed.expiresAt) <= now) {
 				this.#consumedGrants.delete(grantId);
 			}
 		}
@@ -472,10 +601,35 @@ export async function reconcileInvocationJournal(
 			{ signal },
 		);
 		const output = reconcileRuntimeBoxInvocationsOutputSchema.parse(response);
-		const acknowledged = journal.acknowledge(output.ackedInvocationIds);
+		assertResponseSubset(
+			output.ackedInvocationIds,
+			batch.items.map((item) => item.invocationId),
+			"evidence acknowledgement",
+		);
+		assertResponseSubset(
+			output.confirmedAcknowledgementIds,
+			batch.acknowledgedInvocationIds,
+			"receipt confirmation",
+		);
 		const confirmed = journal.confirmAcknowledgements(output.confirmedAcknowledgementIds);
+		const acknowledged = journal.acknowledge(output.ackedInvocationIds);
 		if (acknowledged.length === 0 && confirmed.length === 0) {
 			throw new Error("Agent Server did not acknowledge Runtime Box invocation evidence.");
+		}
+
+		function assertResponseSubset(
+			responseIds: readonly string[],
+			requestIds: readonly string[],
+			label: string,
+		): void {
+			const allowed = new Set(requestIds);
+			const seen = new Set<string>();
+			for (const id of responseIds) {
+				if (!allowed.has(id) || seen.has(id)) {
+					throw new Error(`Agent Server returned an invalid ${label}.`);
+				}
+				seen.add(id);
+			}
 		}
 	}
 }

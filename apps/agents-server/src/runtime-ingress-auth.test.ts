@@ -6,8 +6,11 @@ import { join } from "node:path";
 import {
 	claimRuntimeBoxPairingOutputSchema,
 	createRuntimeBoxAuthenticationPayload,
+	createRuntimeBoxCompatibilityReportPayload,
 	createRuntimeBoxServerChallengePayload,
+	defaultLocalRuntimeBoxId,
 	runtimeBoxChallengeOutputSchema,
+	runtimeBoxCompatibilityReportOutputSchema,
 	runtimeBoxPairingStatusOutputSchema,
 	type ProcessPeerIdentity,
 } from "@moshu/contracts";
@@ -26,11 +29,50 @@ const rpcIdentity = {
 const actionJournalEpoch = "550e8400-e29b-41d4-a716-446655440099";
 
 describe("RuntimeIngressAuth", () => {
+	test("returns stateless upgrade-required before issuing an incompatible challenge", async () => {
+		const directory = mkdtempSync(join(tmpdir(), "moshu-runtime-upgrade-required-"));
+		const database = openAppDatabase(":memory:");
+		try {
+			const upgrades: string[] = [];
+			const auth = new RuntimeIngressAuth({
+				pairings: database.runtimeBoxPairings,
+				runtimeBoxes: database.runtimeBoxes,
+				identity: AgentServerIdentity.open(join(directory, "identity.json")),
+				rpcIdentity,
+				actionJournalEpoch,
+				localAuthenticator: async () => null,
+				onUpgradeRequired: (runtimeBoxId) => upgrades.push(runtimeBoxId),
+			});
+			const response = requireResponse(
+				await auth.handleHttpRequest(
+					jsonRequest("/runtime-auth/challenge", {
+						runtimeBoxId: defaultLocalRuntimeBoxId,
+						deviceKeyId: "old-device",
+						instanceId: "old-runtime",
+						generation: 1,
+						protocolVersion: 2,
+					}),
+				),
+			);
+			expect(response.status).toBe(426);
+			expect(await response.json()).toEqual({
+				error: "RUNTIME_BOX_UPGRADE_REQUIRED",
+				minProtocolVersion: 1,
+				maxProtocolVersion: 1,
+			});
+			expect(upgrades).toEqual([]);
+		} finally {
+			database.close();
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+
 	test("pairs, mutually authenticates, rejects replay, and honors revocation", async () => {
 		const directory = mkdtempSync(join(tmpdir(), "moshu-runtime-ingress-auth-"));
 		const database = openAppDatabase(":memory:");
 		let server: RpcServer | undefined;
 		try {
+			const upgrades: string[] = [];
 			const identity = AgentServerIdentity.open(join(directory, "identity.json"));
 			const auth = new RuntimeIngressAuth({
 				pairings: database.runtimeBoxPairings,
@@ -39,6 +81,7 @@ describe("RuntimeIngressAuth", () => {
 				rpcIdentity,
 				actionJournalEpoch,
 				localAuthenticator: async () => null,
+				onUpgradeRequired: (runtimeBoxId) => upgrades.push(runtimeBoxId),
 			});
 			const device = generateKeyPairSync("ed25519");
 			const publicKey = device.publicKey
@@ -94,6 +137,68 @@ describe("RuntimeIngressAuth", () => {
 			expect(status.runtimeBoxId).toBe(approved.runtimeBox.runtimeBoxId);
 			expect(status.agentServerId).toBe(identity.agentServerId);
 
+			const compatibility = {
+				runtimeBoxId: status.runtimeBoxId,
+				deviceKeyId: "device-key-1",
+				instanceId: "remote-instance-1",
+				generation: 1,
+				protocolVersion: 2,
+				reportId: crypto.randomUUID(),
+				issuedAt: new Date().toISOString(),
+			};
+			const compatibilityResponse = requireResponse(
+				await auth.handleHttpRequest(
+					jsonRequest("/runtime-auth/compatibility", {
+						...compatibility,
+						signature: sign(
+							null,
+							Buffer.from(
+								createRuntimeBoxCompatibilityReportPayload(identity.agentServerId, compatibility),
+								"utf8",
+							),
+							device.privateKey,
+						).toString("base64url"),
+					}),
+				),
+			);
+			expect(compatibilityResponse.status).toBe(200);
+			expect(
+				runtimeBoxCompatibilityReportOutputSchema.parse(await compatibilityResponse.json()),
+			).toEqual({
+				accepted: true,
+				requiredProtocolMinVersion: 1,
+				requiredProtocolMaxVersion: 1,
+			});
+			expect(upgrades).toEqual([status.runtimeBoxId]);
+			expect(database.runtimeBoxes.listCompatibility()).toEqual([
+				{
+					runtimeBoxId: status.runtimeBoxId,
+					state: "upgrade_required",
+					generation: 1,
+					protocolVersion: 2,
+				},
+			]);
+			await expect(
+				auth.handleHttpRequest(
+					jsonRequest("/runtime-auth/compatibility", {
+						...compatibility,
+						signature: sign(
+							null,
+							Buffer.from(
+								createRuntimeBoxCompatibilityReportPayload(identity.agentServerId, compatibility),
+								"utf8",
+							),
+							device.privateKey,
+						).toString("base64url"),
+					}),
+				),
+			).resolves.toMatchObject({ status: 400 });
+			database.runtimeBoxes.upsertRegistration({
+				...approved.runtimeBox,
+				runtimeBoxVersion: "2.0.0",
+			});
+			expect(database.runtimeBoxes.listCompatibility()).toEqual([]);
+
 			const challengeInput = {
 				runtimeBoxId: status.runtimeBoxId,
 				deviceKeyId: "device-key-1",
@@ -134,6 +239,9 @@ describe("RuntimeIngressAuth", () => {
 							agentServerId: challenge.agentServerId,
 							rpcIdentity: challenge.rpcIdentity,
 							actionJournalEpoch: challenge.actionJournalEpoch,
+							negotiatedProtocolVersion: challenge.negotiatedProtocolVersion,
+							transportSecurity: challenge.transportSecurity,
+							supportedTransportSecurity: challenge.supportedTransportSecurity,
 						}),
 						"utf8",
 					),
@@ -301,6 +409,9 @@ function signedUpgradeRequest(
 		agentServerId: string;
 		rpcIdentity: ProcessPeerIdentity;
 		actionJournalEpoch: string;
+		negotiatedProtocolVersion: 1;
+		transportSecurity: "relay-tls";
+		supportedTransportSecurity: Array<"relay-tls" | "noise-xx">;
 	},
 	privateKey: KeyObject,
 ): Request {
@@ -314,6 +425,9 @@ function signedUpgradeRequest(
 				agentServerId: challenge.agentServerId,
 				rpcIdentity: challenge.rpcIdentity,
 				actionJournalEpoch: challenge.actionJournalEpoch,
+				negotiatedProtocolVersion: challenge.negotiatedProtocolVersion,
+				transportSecurity: challenge.transportSecurity,
+				supportedTransportSecurity: challenge.supportedTransportSecurity,
 			}),
 			"utf8",
 		),

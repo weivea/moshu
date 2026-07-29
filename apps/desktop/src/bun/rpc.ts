@@ -32,6 +32,7 @@ import {
 	remoteAccessAuthAttemptInputSchema,
 	remoteAccessAuthAttemptSchema,
 	remoteAccessMutationOutputSchema,
+	runtimeDiagnosticsOutputSchema,
 	createProjectInputSchema,
 	createProjectOutputSchema,
 	listProjectsInputSchema,
@@ -44,6 +45,21 @@ import {
 	setProjectArchivedOutputSchema,
 	deleteProjectInputSchema,
 	deleteProjectOutputSchema,
+	listRuntimeBoxInventoryInputSchema,
+	listRuntimeBoxInventoryOutputSchema,
+	listRuntimeBoxMcpServersInputSchema,
+	listRuntimeBoxMcpServerSummariesOutputSchema,
+	setRuntimeBoxMcpServerEnabledInputSchema,
+	upsertRuntimeBoxMcpServerInputSchema,
+	deleteRuntimeBoxMcpServerInputSchema,
+	runtimeBoxResourceMutationResultSchema,
+	listRuntimeBoxSkillsInputSchema,
+	listRuntimeBoxSkillsOutputSchema,
+	installRuntimeBoxSkillInputSchema,
+	deleteRuntimeBoxSkillInputSchema,
+	getRuntimeProfileInputSchema,
+	getRuntimeProfileOutputSchema,
+	updateRuntimeProfileInputSchema,
 	listAvailableModelsOutputSchema,
 	listChatSessionsInputSchema,
 	listChatSessionsOutputSchema,
@@ -202,6 +218,13 @@ export function createDesktopRpc({ agentsClient }: DesktopRpcDependencies) {
 						emptyParamsSchema,
 						remoteAccessMutationOutputSchema,
 					),
+				getRuntimeDiagnostics: (params) =>
+					agentsClient.request(
+						productRpcMethods.runtimeDiagnosticsGet,
+						params,
+						emptyParamsSchema,
+						runtimeDiagnosticsOutputSchema,
+					),
 				createProject: (params) =>
 					agentsClient.request(
 						productRpcMethods.projectsCreate,
@@ -243,6 +266,76 @@ export function createDesktopRpc({ agentsClient }: DesktopRpcDependencies) {
 						params,
 						deleteProjectInputSchema,
 						deleteProjectOutputSchema,
+					),
+				listRuntimeInventory: (params) =>
+					agentsClient.request(
+						productRpcMethods.runtimeInventoryList,
+						params,
+						listRuntimeBoxInventoryInputSchema,
+						listRuntimeBoxInventoryOutputSchema,
+					),
+				listMcpServers: (params) =>
+					agentsClient.request(
+						productRpcMethods.mcpServersList,
+						params,
+						listRuntimeBoxMcpServersInputSchema,
+						listRuntimeBoxMcpServerSummariesOutputSchema,
+					),
+				upsertMcpServer: (params) =>
+					agentsClient.request(
+						productRpcMethods.mcpServersUpsert,
+						params,
+						upsertRuntimeBoxMcpServerInputSchema,
+						runtimeBoxResourceMutationResultSchema,
+					),
+				setMcpServerEnabled: (params) =>
+					agentsClient.request(
+						productRpcMethods.mcpServersSetEnabled,
+						params,
+						setRuntimeBoxMcpServerEnabledInputSchema,
+						runtimeBoxResourceMutationResultSchema,
+					),
+				deleteMcpServer: (params) =>
+					agentsClient.request(
+						productRpcMethods.mcpServersDelete,
+						params,
+						deleteRuntimeBoxMcpServerInputSchema,
+						runtimeBoxResourceMutationResultSchema,
+					),
+				listSkills: (params) =>
+					agentsClient.request(
+						productRpcMethods.skillsList,
+						params,
+						listRuntimeBoxSkillsInputSchema,
+						listRuntimeBoxSkillsOutputSchema,
+					),
+				installSkill: (params) =>
+					agentsClient.request(
+						productRpcMethods.skillsInstall,
+						params,
+						installRuntimeBoxSkillInputSchema,
+						runtimeBoxResourceMutationResultSchema,
+					),
+				deleteSkill: (params) =>
+					agentsClient.request(
+						productRpcMethods.skillsDelete,
+						params,
+						deleteRuntimeBoxSkillInputSchema,
+						runtimeBoxResourceMutationResultSchema,
+					),
+				getRuntimeProfile: (params) =>
+					agentsClient.request(
+						productRpcMethods.runtimeProfilesGet,
+						params,
+						getRuntimeProfileInputSchema,
+						getRuntimeProfileOutputSchema,
+					),
+				updateRuntimeProfile: (params) =>
+					agentsClient.request(
+						productRpcMethods.runtimeProfilesUpdate,
+						params,
+						updateRuntimeProfileInputSchema,
+						getRuntimeProfileOutputSchema,
 					),
 				listProviders: (params) =>
 					agentsClient.request(

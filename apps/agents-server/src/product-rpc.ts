@@ -28,10 +28,20 @@ import {
 	setProjectArchivedOutputSchema,
 	switchRuntimeBoxOutputSchema,
 	runtimeBoxToolProgressEventSchema,
+	runtimeBoxInventoryChangedHintSchema,
+	listRuntimeBoxInventoryOutputSchema,
+	listRuntimeBoxMcpServerSummariesOutputSchema,
+	listRuntimeBoxSkillsOutputSchema,
+	runtimeBoxResourceMutationResultSchema,
+	getRuntimeProfileOutputSchema,
+	updateRuntimeProfileOutputSchema,
 	productRpcInternalHandlerErrorCode,
 	productRpcEvents,
 	productRpcMethods,
 	productRpcRequestSchemas,
+	currentRuntimeBoxProtocolVersion,
+	runtimeDiagnosticsOutputSchema,
+	type RuntimeDiagnosticsOutput,
 } from "@moshu/contracts";
 import {
 	ChatSessionNotFoundError,
@@ -43,6 +53,9 @@ import {
 	PairingSessionStateError,
 	type RuntimeBoxRepository,
 	type RuntimeBoxPairingRepository,
+	type RuntimeBoxInventoryRepository,
+	type RuntimeProfileRepository,
+	RuntimeProfileRevisionConflictError,
 	type ProjectRepository,
 	ProjectNotFoundError,
 	ProjectPathConflictError,
@@ -53,6 +66,7 @@ import {
 	isSameRpcPeerIdentity,
 	type JsonValue,
 	RpcHandlerError,
+	RpcRemoteError,
 	type RpcHandlers,
 	type RpcMethodAllowlist,
 	type RpcPeer,
@@ -73,11 +87,14 @@ export interface ProductRpcDependencies {
 	runtimeBoxes: RuntimeBoxRepository;
 	runtimeBoxPairings?: RuntimeBoxPairingRepository;
 	projects?: ProjectRepository;
+	runtimeBoxInventory?: RuntimeBoxInventoryRepository;
+	runtimeProfiles?: RuntimeProfileRepository;
 	runtimeIngressAuth: RuntimeIngressAuth;
 	getDevTunnelService: () => DevTunnelService;
 	eventRouter: ProductEventRouter;
 	serverVersion: string;
 	authController: HeadlessAuthController;
+	getRuntimeDiagnostics?: () => RuntimeDiagnosticsOutput;
 }
 
 interface ProductEventRouteBinding {
@@ -203,16 +220,65 @@ export function createProductRpcHandlers(dependencies: ProductRpcDependencies): 
 		runtimeBoxes,
 		runtimeBoxPairings,
 		projects,
+		runtimeBoxInventory,
+		runtimeProfiles,
 		runtimeIngressAuth,
 		getDevTunnelService,
 		eventRouter,
 		authController,
+		getRuntimeDiagnostics,
 	} = dependencies;
 	const getProjects = (): ProjectRepository => {
 		if (projects === undefined) {
 			throw new Error("Project repository is not initialized.");
 		}
 		return projects;
+	};
+	const getRuntimeBoxInventory = (): RuntimeBoxInventoryRepository => {
+		if (runtimeBoxInventory === undefined) {
+			throw new Error("Runtime Box inventory repository is not initialized.");
+		}
+		return runtimeBoxInventory;
+	};
+	const getRuntimeProfiles = (): RuntimeProfileRepository => {
+		if (runtimeProfiles === undefined) {
+			throw new Error("Runtime Profile repository is not initialized.");
+		}
+		return runtimeProfiles;
+	};
+	const resolveRuntimeBoxId = (runtimeBoxId: string | undefined): string =>
+		runtimeBoxId ?? runtimeBoxes.getActive().runtimeBoxId;
+	const assertResourceNotReferenced = (
+		runtimeBoxId: string,
+		resourceKind: "mcp" | "skill",
+		stableResourceId: string,
+	): void => {
+		if (getRuntimeProfiles().isResourceReferenced(runtimeBoxId, resourceKind, stableResourceId)) {
+			throw new RpcHandlerError(
+				"RUNTIME_RESOURCE_IN_USE",
+				"Remove the resource from every Runtime Profile before deleting it.",
+			);
+		}
+	};
+	const runtimeResourceMutationTails = new Map<string, Promise<void>>();
+	const serializeRuntimeResourceMutation = async <T>(
+		runtimeBoxId: string,
+		operation: () => Promise<T>,
+	): Promise<T> => {
+		const previous = runtimeResourceMutationTails.get(runtimeBoxId) ?? Promise.resolve();
+		const execution = previous.then(operation, operation);
+		const tail = execution.then(
+			() => undefined,
+			() => undefined,
+		);
+		runtimeResourceMutationTails.set(runtimeBoxId, tail);
+		try {
+			return await execution;
+		} finally {
+			if (runtimeResourceMutationTails.get(runtimeBoxId) === tail) {
+				runtimeResourceMutationTails.delete(runtimeBoxId);
+			}
+		}
 	};
 	const requireProjectRuntimeReady = (projectId: string): void => {
 		const project = getProjects().get({ projectId }).project;
@@ -322,6 +388,15 @@ export function createProductRpcHandlers(dependencies: ProductRpcDependencies): 
 						status: await getDevTunnelService().recreate(context.signal),
 					}),
 			),
+			[productRpcMethods.runtimeDiagnosticsGet]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.runtimeDiagnosticsGet],
+				() => {
+					if (getRuntimeDiagnostics === undefined) {
+						throw new Error("Runtime diagnostics are not initialized.");
+					}
+					return runtimeDiagnosticsOutputSchema.parse(getRuntimeDiagnostics());
+				},
+			),
 			[productRpcMethods.projectsCreate]: createRequestHandler(
 				productRpcRequestSchemas[productRpcMethods.projectsCreate],
 				async (input, _peer, context) => {
@@ -372,6 +447,139 @@ export function createProductRpcHandlers(dependencies: ProductRpcDependencies): 
 				(input) => {
 					requireProjectRuntimeReady(input.projectId);
 					return deleteProjectOutputSchema.parse(getProjects().delete(input));
+				},
+			),
+			[productRpcMethods.runtimeInventoryList]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.runtimeInventoryList],
+				(input) =>
+					listRuntimeBoxInventoryOutputSchema.parse(
+						getRuntimeBoxInventory().list(resolveRuntimeBoxId(input.runtimeBoxId)),
+					),
+			),
+			[productRpcMethods.mcpServersList]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.mcpServersList],
+				async (input, _peer, context) => {
+					const output = await runtimeBoxRegistry.listMcpServers(
+						resolveRuntimeBoxId(input.runtimeBoxId),
+						context.signal,
+					);
+					return listRuntimeBoxMcpServerSummariesOutputSchema.parse({
+						runtimeBoxId: output.runtimeBoxId,
+						items: output.items.map((server) => ({
+							stableResourceId: server.stableResourceId,
+							version: server.version,
+							contentHash: server.contentHash,
+							displayName: server.displayName,
+							enabled: server.enabled,
+							credentialConfigured: server.credentialConfigured,
+							health: server.health,
+							tools: server.tools,
+						})),
+					});
+				},
+			),
+			[productRpcMethods.mcpServersUpsert]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.mcpServersUpsert],
+				async (input, _peer, context) => {
+					const runtimeBoxId = resolveRuntimeBoxId(input.runtimeBoxId);
+					return serializeRuntimeResourceMutation(runtimeBoxId, async () =>
+						runtimeBoxResourceMutationResultSchema.parse(
+							await runtimeBoxRegistry.upsertMcpServer(runtimeBoxId, input, context.signal),
+						),
+					);
+				},
+			),
+			[productRpcMethods.mcpServersSetEnabled]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.mcpServersSetEnabled],
+				async (input, _peer, context) => {
+					const runtimeBoxId = resolveRuntimeBoxId(input.runtimeBoxId);
+					return serializeRuntimeResourceMutation(runtimeBoxId, async () =>
+						runtimeBoxResourceMutationResultSchema.parse(
+							await runtimeBoxRegistry.setMcpServerEnabled(runtimeBoxId, input, context.signal),
+						),
+					);
+				},
+			),
+			[productRpcMethods.mcpServersDelete]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.mcpServersDelete],
+				async (input, _peer, context) => {
+					const runtimeBoxId = resolveRuntimeBoxId(input.runtimeBoxId);
+					return serializeRuntimeResourceMutation(runtimeBoxId, async () => {
+						assertResourceNotReferenced(runtimeBoxId, "mcp", input.stableResourceId);
+						return runtimeBoxResourceMutationResultSchema.parse(
+							await runtimeBoxRegistry.deleteMcpServer(runtimeBoxId, input, context.signal),
+						);
+					});
+				},
+			),
+			[productRpcMethods.skillsList]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.skillsList],
+				async (input, _peer, context) =>
+					listRuntimeBoxSkillsOutputSchema.parse(
+						await runtimeBoxRegistry.listSkills(
+							resolveRuntimeBoxId(input.runtimeBoxId),
+							context.signal,
+						),
+					),
+			),
+			[productRpcMethods.skillsInstall]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.skillsInstall],
+				async (input, _peer, context) => {
+					const runtimeBoxId = resolveRuntimeBoxId(input.runtimeBoxId);
+					return serializeRuntimeResourceMutation(runtimeBoxId, async () =>
+						runtimeBoxResourceMutationResultSchema.parse(
+							await runtimeBoxRegistry.installSkill(runtimeBoxId, input, context.signal),
+						),
+					);
+				},
+			),
+			[productRpcMethods.skillsDelete]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.skillsDelete],
+				async (input, _peer, context) => {
+					const runtimeBoxId = resolveRuntimeBoxId(input.runtimeBoxId);
+					return serializeRuntimeResourceMutation(runtimeBoxId, async () => {
+						assertResourceNotReferenced(runtimeBoxId, "skill", input.stableResourceId);
+						return runtimeBoxResourceMutationResultSchema.parse(
+							await runtimeBoxRegistry.deleteSkill(runtimeBoxId, input, context.signal),
+						);
+					});
+				},
+			),
+			[productRpcMethods.runtimeProfilesGet]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.runtimeProfilesGet],
+				(input) =>
+					getRuntimeProfileOutputSchema.parse({
+						profile: getRuntimeProfiles().getOrCreate(
+							input.agentId,
+							resolveRuntimeBoxId(input.runtimeBoxId),
+						),
+					}),
+			),
+			[productRpcMethods.runtimeProfilesUpdate]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.runtimeProfilesUpdate],
+				async (input, _peer, context) => {
+					const runtimeBoxId = resolveRuntimeBoxId(input.runtimeBoxId);
+					return serializeRuntimeResourceMutation(runtimeBoxId, async () => {
+						const validation = await runtimeBoxRegistry.validateResources(
+							runtimeBoxId,
+							{ refs: input.resources },
+							context.signal,
+						);
+						if (!validation.valid) {
+							throw new RpcHandlerError(
+								"RUNTIME_RESOURCE_VALIDATION_FAILED",
+								validation.issues[0]?.message ?? "Runtime Profile resource validation failed.",
+							);
+						}
+						return updateRuntimeProfileOutputSchema.parse({
+							profile: getRuntimeProfiles().update({
+								agentId: input.agentId,
+								runtimeBoxId,
+								expectedRevision: input.expectedRevision,
+								resources: input.resources,
+							}),
+						});
+					});
 				},
 			),
 			[productRpcMethods.providersList]: createRequestHandler(
@@ -494,12 +702,23 @@ export function createProductRpcHandlers(dependencies: ProductRpcDependencies): 
 			),
 			[productRpcMethods.runtimeBoxRegister]: createRequestHandler(
 				productRpcRequestSchemas[productRpcMethods.runtimeBoxRegister],
-				(input, peer) => {
-					runtimeBoxRegistry.register(peer, input.runtimeBox);
+				async (input, peer) => {
+					runtimeBoxRegistry.register(peer, input.runtimeBox, {
+						protocolVersion: input.protocolVersion,
+						transportSecurity: input.transportSecurity,
+					});
+					try {
+						await runtimeBoxRegistry.synchronizeInventory(peer);
+					} catch (error) {
+						runtimeBoxRegistry.clear(peer);
+						throw error;
+					}
 					return runtimeBoxRegisterOutputSchema.parse({
 						schemaVersion: 1,
 						accepted: true,
 						runtimeBoxId: input.runtimeBox.runtimeBoxId,
+						negotiatedProtocolVersion: currentRuntimeBoxProtocolVersion,
+						transportSecurity: input.transportSecurity,
 					});
 				},
 			),
@@ -511,6 +730,8 @@ export function createProductRpcHandlers(dependencies: ProductRpcDependencies): 
 						schemaVersion: 1,
 						accepted: true,
 						runtimeBoxId: peer.remoteIdentity.peerId,
+						negotiatedProtocolVersion: currentRuntimeBoxProtocolVersion,
+						transportSecurity: "relay-tls",
 					});
 				},
 			),
@@ -546,6 +767,10 @@ export function createProductRpcHandlers(dependencies: ProductRpcDependencies): 
 					throw error;
 				}
 				runtimeBoxRegistry.handleProgress(context.peer, event);
+			},
+			[productRpcEvents.runtimeBoxInventoryChanged]: (payload, context) => {
+				const hint = runtimeBoxInventoryChangedHintSchema.parse(payload);
+				runtimeBoxRegistry.handleInventoryChanged(context.peer, hint);
 			},
 		},
 	};
@@ -674,6 +899,27 @@ function rethrowProductHandlerError(error: unknown): never {
 	}
 	if (error instanceof RuntimeBoxUnavailableError) {
 		throw new RpcHandlerError("RUNTIME_BOX_NOT_READY", error.message);
+	}
+	if (error instanceof RuntimeProfileRevisionConflictError) {
+		throw new RpcHandlerError("RUNTIME_PROFILE_REVISION_CONFLICT", error.message, {
+			actualRevision: error.actualRevision,
+		});
+	}
+	if (error instanceof RpcRemoteError) {
+		if (
+			[
+				"RUNTIME_RESOURCE_VERSION_CONFLICT",
+				"RUNTIME_RESOURCE_NOT_FOUND",
+				"RUNTIME_RESOURCE_WRONG_BOX",
+				"INVENTORY_RESYNC_REQUIRED",
+			].includes(error.code)
+		) {
+			throw new RpcHandlerError(error.code, error.message);
+		}
+		throw new RpcHandlerError(
+			"RUNTIME_RESOURCE_COMMAND_FAILED",
+			"Runtime Box resource command failed.",
+		);
 	}
 	if (error instanceof ProjectNotFoundError) {
 		throw new RpcHandlerError("PROJECT_NOT_FOUND", "The Project was not found.");
