@@ -138,8 +138,10 @@ export class DevTunnelService {
 	#recreateOperation: SharedMutationOperation | undefined;
 	readonly #pendingTraffic = new Map<string, { receivedBytes: number; sentBytes: number }>();
 	#trafficFlushTimer: ReturnType<typeof setTimeout> | undefined;
-	// Live per-port readiness/URL for the currently online host, keyed by ingress port. Populated when
-	// the host publishes each expected ingress URL and cleared whenever the host stops or exits.
+	// Live per-port readiness/URL for the currently online host, keyed by ingress port. Populated as the
+	// host publishes each expected ingress URL and cleared whenever the owning host stops, exits, or its
+	// startup fails/cancels/is superseded — always guarded by host identity so a replacement host's
+	// readiness is never wiped.
 	#ingressReadiness = new Map<number, { publicUrl: string }>();
 
 	constructor(options: DevTunnelServiceOptions) {
@@ -749,6 +751,11 @@ export class DevTunnelService {
 					await terminateHost(ownedHost);
 					if (this.#host === ownedHost) {
 						this.#host = undefined;
+						// This superseded host owned every incremental readiness entry we published; clear
+						// it so a partially-ready ingress never lingers as ready. Guarded by host identity
+						// (this.#host === ownedHost) so a replacement host — which resets readiness on its
+						// own start — is never wiped.
+						this.#ingressReadiness = new Map();
 					}
 				}
 				return;
@@ -789,6 +796,11 @@ export class DevTunnelService {
 					await terminateHost(ownedHost);
 					if (this.#host === ownedHost) {
 						this.#host = undefined;
+						// A partial-startup failure or cancellation leaves the incremental readiness entries
+						// this dead host published; clear them so an already-resolved ingress port never
+						// reports ready after its host is gone. Guarded by host identity so a replacement
+						// host's freshly-reset readiness is never clobbered.
+						this.#ingressReadiness = new Map();
 					}
 				} catch (stopError) {
 					failure = stopError;

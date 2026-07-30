@@ -123,7 +123,9 @@ lastError。Microsoft 登录 token 只能写入 Agent Server Secret Vault。
 收集 public URL / readiness / traffic。单个 host 进程转发全部期望端口，`waitForPort(port)` 按端口解析各自的
 public URL；每个端口一旦 ready 就**增量**发布自己的 `publicUrl`（逐端口可观测：一个 ready、另一个 pending 时状态如实反映），
 但**只有当所有 required ingress 都 ready 后 Service 才进入 `online`**，任一端口迟迟不 ready 会让整个 Service 保持非
-online。**对外 status 线协议保持 v1**：`getStatus()` 仍是既有 v1 形状（scalar `runtimeIngressPort` + 顶层
+online。逐端口 readiness 绑定**拥有该 host 的身份/generation**：当 owning host 因失败、取消、detach、disable 或被
+replace 而终止时，按 host 身份清空对应 ingress readiness（`ready=false`、不留陈旧 URL），因此 partial-startup 失败不会让
+已 ready 的死端口继续显示 online；清理只针对被终止的 host，**不会误清**接管的 replacement host readiness。**对外 status 线协议保持 v1**：`getStatus()` 仍是既有 v1 形状（scalar `runtimeIngressPort` + 顶层
 `publicUrl`），**不**在严格的 `remoteAccessStatusOutputSchema` 上新增 `ingresses` 字段——旧 Client 继续无改动解析。
 per-ingress readiness 只经**内部（非线协议）** getter `DevTunnelService.getIngressReadiness()` 暴露，返回 typed
 descriptor（`kind`/`port`/`ready`/仅在 live 时携带的 `publicUrl`，pending 端口不回退到陈旧/持久 URL）。顶层 `publicUrl`

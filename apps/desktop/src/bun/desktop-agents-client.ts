@@ -387,13 +387,22 @@ export class DesktopAgentsClient {
 			this.#deleteCommittedTerminalCursors();
 			await this.#reconcileUnboundReservations(peer, recoveryDeadline, connectionGeneration);
 			await this.#reconcilePendingSessionCreates(peer, recoveryDeadline);
-			await this.#flushProvisionalEvents(provisionalQueue, recoveryDeadline, deliver);
 			await this.#retryPendingSessionRetirements(recoveryDeadline, connectionGeneration);
-			this.#deleteCommittedTerminalCursors();
 			if (this.#shutdown || connectionClosed) {
 				throw new AgentsUnavailableError("The local agents service disconnected during recovery.");
 			}
 			this.#assertRecoveryDeadline(recoveryDeadline);
+			// Atomic drain-and-activate fence. This is the LAST await before the connection is marked
+			// active: because no await follows it, no live event handler can interleave between the queue
+			// draining empty and the synchronous flip below. Any event that arrives while connectionActive
+			// is still false is therefore either drained here (the while-loop re-checks the queue after
+			// every delivery) or delivered live after the flip — never enqueued-then-stranded. Events that
+			// straddle the boundary still commit exactly once via the per-run cursor in #deliverThenCommit.
+			await this.#flushProvisionalEvents(provisionalQueue, recoveryDeadline, deliver);
+			this.#deleteCommittedTerminalCursors();
+			if (this.#shutdown || connectionClosed) {
+				throw new AgentsUnavailableError("The local agents service disconnected during recovery.");
+			}
 			this.#provisionalPeer = null;
 			this.#peer = peer;
 			this.#closeActiveConnection = () => closeExactPeer("Desktop agents client closed.");
@@ -534,9 +543,16 @@ export class DesktopAgentsClient {
 					? { timeoutMs: remoteAccessMutationRpcTimeoutMs }
 					: undefined,
 			);
+			// A successful sessionDelete response is authoritative: the delete completed, and the server
+			// broadcasts the resulting retirement to every peer — including this initiating peer, which may
+			// observe it before the response settles. The delete operation therefore owns its own Session's
+			// retirement and must not be rejected by it. Every other in-flight operation still fails closed
+			// when its Session retires concurrently.
 			if (
-				sessionOperation?.retired ||
-				(sessionOperation !== undefined && this.#sessionRetirements.has(sessionOperation.sessionId))
+				method !== productRpcMethods.sessionDelete &&
+				(sessionOperation?.retired ||
+					(sessionOperation !== undefined &&
+						this.#sessionRetirements.has(sessionOperation.sessionId)))
 			) {
 				throw new ChatSessionNotFoundError();
 			}
