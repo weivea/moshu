@@ -881,6 +881,88 @@ describe("DesktopAgentsClient", () => {
 		client.close();
 	});
 
+	test("resolves a direct delete for the initiating peer while a second peer still observes the retirement", async () => {
+		const targetSessionId = createRetirementSessionId(2);
+
+		// Observer peer B: a second authenticated Desktop client that only watches the shared Session.
+		let observerOptions: ConnectRpcClientOptions | undefined;
+		const observerInvalidations: string[] = [];
+		const observer = new DesktopAgentsClient(async (options) => {
+			observerOptions = options;
+			return new FakePeer(() => ({ events: [] }));
+		});
+		observer.subscribeChatSessionInvalidations((invalidation) => {
+			observerInvalidations.push(`${invalidation.reason}:${invalidation.sessionId}`);
+			observer.acknowledgeChatSessionInvalidation({
+				schemaVersion: 1,
+				invalidationId: invalidation.invalidationId,
+				sessionId: invalidation.sessionId,
+				accepted: true,
+			});
+		});
+
+		// Initiator peer A: issues session.delete. The delete handler models the server fanning the
+		// resulting retirement out to EVERY connected peer (A and B) BEFORE A's success response settles.
+		let initiatorOptions: ConnectRpcClientOptions | undefined;
+		let deleteCalls = 0;
+		const initiator = new DesktopAgentsClient(async (options) => {
+			initiatorOptions = options;
+			return new FakePeer(async (method, payload) => {
+				if (method === productRpcMethods.sessionDelete) {
+					deleteCalls += 1;
+					const sessionId = deleteChatSessionInputSchema.parse(payload).sessionId;
+					const observerRetire =
+						observerOptions?.handlers?.events?.[productRpcEvents.chatSessionsRetired];
+					const initiatorRetire =
+						initiatorOptions?.handlers?.events?.[productRpcEvents.chatSessionsRetired];
+					if (observerRetire === undefined || initiatorRetire === undefined) {
+						throw new Error("Session retirement event handler was not installed.");
+					}
+					await observerRetire(
+						{ schemaVersion: 1, sessionIds: [sessionId] },
+						{} as RpcEventContext,
+					);
+					await initiatorRetire(
+						{ schemaVersion: 1, sessionIds: [sessionId] },
+						{} as RpcEventContext,
+					);
+					return { sessionId };
+				}
+				return { events: [] };
+			});
+		});
+		const initiatorInvalidations: string[] = [];
+		initiator.subscribeChatSessionInvalidations((invalidation) => {
+			initiatorInvalidations.push(`${invalidation.reason}:${invalidation.sessionId}`);
+			initiator.acknowledgeChatSessionInvalidation({
+				schemaVersion: 1,
+				invalidationId: invalidation.invalidationId,
+				sessionId: invalidation.sessionId,
+				accepted: true,
+			});
+		});
+
+		await observer.connect(createConnectOptions());
+		await initiator.connect(createConnectOptions());
+
+		// The initiating peer's delete succeeds despite its own concurrent self-retirement...
+		const output = await initiator.request(
+			productRpcMethods.sessionDelete,
+			{ sessionId: targetSessionId },
+			deleteChatSessionInputSchema,
+			deleteChatSessionOutputSchema,
+		);
+		expect(output).toEqual({ sessionId: targetSessionId });
+		expect(deleteCalls).toBe(1);
+
+		// ...and the second peer still observes the retirement for the same Session.
+		expect(observerInvalidations).toContain(`session_retired:${targetSessionId}`);
+		expect(initiatorInvalidations).toContain(`session_retired:${targetSessionId}`);
+
+		observer.close();
+		initiator.close();
+	});
+
 	test("rejects a pending create that binds to a retired Session without releasing newer state", async () => {
 		const createKey = crypto.randomUUID();
 		const retiredOutput = createChatSessionOutputSchema.parse(createSessionPayload(1));
