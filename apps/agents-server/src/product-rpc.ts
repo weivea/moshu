@@ -936,6 +936,7 @@ export function createProductRpcHandlers(dependencies: ProductRpcDependencies): 
 			[productRpcMethods.chatSubscribe]: createRequestHandler(
 				productRpcRequestSchemas[productRpcMethods.chatSubscribe],
 				(input, peer) => {
+					chatService.assertSessionVisible(input.sessionId);
 					eventRouter.subscribe(peer, input.sessionId);
 					return {
 						schemaVersion: 1 as const,

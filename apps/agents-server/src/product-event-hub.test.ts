@@ -266,6 +266,94 @@ describe("ProductEventRouter Session subscription", () => {
 	});
 });
 
+describe("ProductEventRouter subscription lifecycle and bounds", () => {
+	test("bounds per-peer subscriptions and reclaims capacity on unsubscribe", () => {
+		const router = new ProductEventRouter();
+		const peer = createRecordingPeer("client-a");
+		for (let index = 0; index < 256; index += 1) {
+			router.subscribe(peer.peer, `session-${index}`);
+		}
+		expect(() => router.subscribe(peer.peer, "session-over")).toThrow(
+			"too many active Session subscriptions",
+		);
+		router.unsubscribe(peer.peer, "session-0");
+		expect(() => router.subscribe(peer.peer, "session-over")).not.toThrow();
+	});
+
+	test("bounds total subscriptions across peers and reclaims on retirement", () => {
+		const router = new ProductEventRouter();
+		let created = 0;
+		for (let peerIndex = 0; created < 8_192; peerIndex += 1) {
+			const peer = createRecordingPeer(`client-${peerIndex}`);
+			for (let slot = 0; slot < 256 && created < 8_192; slot += 1) {
+				router.subscribe(peer.peer, `session-${created}`);
+				created += 1;
+			}
+		}
+		const overflow = createRecordingPeer("client-overflow");
+		expect(() => router.subscribe(overflow.peer, "session-overflow")).toThrow(
+			"Too many active Session subscriptions",
+		);
+		router.retireSessions(["session-0", "session-1"]);
+		expect(() => router.subscribe(overflow.peer, "session-overflow")).not.toThrow();
+	});
+
+	test("keeps a re-subscribed newer generation when the old connection closes late", () => {
+		const gen1 = createRecordingPeer("stable-client", { instanceId: "gen1", generation: 1 });
+		const gen2 = createRecordingPeer("stable-client", { instanceId: "gen2", generation: 2 });
+		const router = new ProductEventRouter();
+		router.subscribe(gen1.peer, sessionA);
+		// Reconnect: the new generation re-subscribes before the old socket's close is processed.
+		router.subscribe(gen2.peer, sessionA);
+		router.releasePeer(gen1.peer);
+
+		router.publish([gen2.peer], createEvent({ sessionId: sessionA }));
+		expect(gen2.deliveries).toBe(1);
+	});
+
+	test("reclaims a subscription the reconnecting generation did not renew", () => {
+		const gen1 = createRecordingPeer("stable-client", { instanceId: "gen1", generation: 1 });
+		const gen2 = createRecordingPeer("stable-client", { instanceId: "gen2", generation: 2 });
+		const router = new ProductEventRouter();
+		router.subscribe(gen1.peer, sessionA);
+		router.subscribe(gen1.peer, sessionB);
+		// The reconnecting generation renews only Session A.
+		router.subscribe(gen2.peer, sessionA);
+		router.releasePeer(gen1.peer);
+
+		router.publish([gen2.peer], createEvent({ sessionId: sessionA, seq: 1 }));
+		router.publish([gen2.peer], createEvent({ sessionId: sessionB, seq: 1 }));
+		expect(gen2.deliveries).toBe(1);
+	});
+
+	test("resumes delivery after a reconnect re-subscribe with no stale delivery in between", () => {
+		const gen1 = createRecordingPeer("stable-client", { instanceId: "gen1", generation: 1 });
+		const gen2 = createRecordingPeer("stable-client", { instanceId: "gen2", generation: 2 });
+		const router = new ProductEventRouter();
+		router.subscribe(gen1.peer, sessionA);
+		router.releasePeer(gen1.peer);
+
+		// After the disconnect the subscription is gone: nothing is delivered until the client
+		// re-subscribes on its fresh connection.
+		router.publish([gen2.peer], createEvent({ sessionId: sessionA, seq: 1 }));
+		expect(gen2.deliveries).toBe(0);
+
+		router.subscribe(gen2.peer, sessionA);
+		router.publish([gen2.peer], createEvent({ sessionId: sessionA, seq: 2 }));
+		expect(gen2.deliveries).toBe(1);
+	});
+
+	test("drops subscriptions when their Session is retired", () => {
+		const observer = createRecordingPeer("client-b");
+		const router = new ProductEventRouter();
+		router.subscribe(observer.peer, sessionA);
+
+		router.retireSessions([sessionA]);
+		router.publish([observer.peer], createEvent({ sessionId: sessionA }));
+		expect(observer.deliveries).toBe(0);
+	});
+});
+
 describe("ProductEventRouter publication helpers", () => {
 	test("isolates a failed client peer and continues broadcasting", () => {
 		let failedCloseCalls = 0;

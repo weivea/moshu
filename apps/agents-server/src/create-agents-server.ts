@@ -286,6 +286,7 @@ export async function createAgentsServer(
 			runtimeBoxes: database.runtimeBoxes,
 			pathInspector: runtimeBoxRegistry,
 			onSessionsRetired: (sessionIds) => {
+				eventRouter.retireSessions(sessionIds);
 				const server = productRpcServer;
 				if (server !== undefined) {
 					try {

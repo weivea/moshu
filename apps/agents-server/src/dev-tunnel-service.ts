@@ -14,7 +14,12 @@ const devTunnelTrafficFlushMs = 1_000;
 const devTunnelAuthenticationRefreshMs = 5_000;
 
 export interface DevTunnelHostProcess {
-	readonly ready: Promise<{ publicUrl: string }>;
+	/**
+	 * Resolves with the public URL for a single expected ingress `port` once the host publishes it.
+	 * A host forwards every expected port from one process, so the service awaits `waitForPort` for
+	 * each ingress and only comes online after they all resolve.
+	 */
+	waitForPort(port: number): Promise<{ publicUrl: string }>;
 	readonly exited: Promise<number>;
 	stop(force?: boolean): void;
 }
@@ -31,7 +36,7 @@ export interface DevTunnelAuthenticationProcess {
  * typed descriptors — rather than a single scalar port — is what lets the tunnel reconcile against
  * an expected port set instead of destroying every other forwarded port.
  */
-export type DevTunnelIngressKind = "runtime";
+export type DevTunnelIngressKind = "runtime" | "mobile";
 
 export interface DevTunnelIngress {
 	readonly kind: DevTunnelIngressKind;
@@ -49,12 +54,22 @@ export interface DevTunnelAdapter {
 	 */
 	ensureTunnel(tunnelId: string, ports: readonly number[], signal: AbortSignal): Promise<string>;
 	deleteTunnel(tunnelId: string, signal: AbortSignal): Promise<void>;
-	startHost(tunnelId: string, port: number): DevTunnelHostProcess;
+	/**
+	 * Starts a single host process that forwards every expected ingress `port`. The returned process
+	 * exposes per-port readiness via {@link DevTunnelHostProcess.waitForPort}.
+	 */
+	startHost(tunnelId: string, ports: readonly number[]): DevTunnelHostProcess;
 }
 
 export interface DevTunnelServiceOptions {
 	repository: RemoteAccessRepository;
 	runtimeIngressPort: number;
+	/**
+	 * Forward-looking second ingress port (a future Mobile ingress, Layer 3). When set, the tunnel
+	 * forwards and waits for this port in addition to the Runtime port. No Mobile listener/pairing is
+	 * created here; it only exercises the multi-ingress reconcile/readiness path.
+	 */
+	mobileIngressPort?: number;
 	adapter?: DevTunnelAdapter;
 	reportDiagnostic?: (message: string) => void;
 	portConflict?: { expectedPort: number; boundPort: number };
@@ -110,11 +125,19 @@ export class DevTunnelService {
 	#recreateOperation: SharedMutationOperation | undefined;
 	readonly #pendingTraffic = new Map<string, { receivedBytes: number; sentBytes: number }>();
 	#trafficFlushTimer: ReturnType<typeof setTimeout> | undefined;
+	// Live per-port readiness/URL for the currently online host, keyed by ingress port. Populated when
+	// the host publishes each expected ingress URL and cleared whenever the host stops or exits.
+	#ingressReadiness = new Map<number, { publicUrl: string }>();
 
 	constructor(options: DevTunnelServiceOptions) {
 		this.#repository = options.repository;
 		this.#runtimeIngressPort = options.runtimeIngressPort;
-		this.#ingresses = [{ kind: "runtime", port: options.runtimeIngressPort }];
+		this.#ingresses = [
+			{ kind: "runtime", port: options.runtimeIngressPort },
+			...(options.mobileIngressPort === undefined
+				? []
+				: [{ kind: "mobile" as const, port: options.mobileIngressPort }]),
+		];
 		this.#adapter =
 			options.adapter ??
 			new DevTunnelCliAdapter(process.env.MOSHU_DEVTUNNEL_PATH?.trim() || "devtunnel");
@@ -159,13 +182,17 @@ export class DevTunnelService {
 			settings.enabled || this.#state === "stopping" || this.#host !== undefined
 				? this.#state
 				: "disabled";
-		const ingresses: RemoteAccessIngress[] = this.#ingresses.map((ingress) => ({
-			kind: ingress.kind,
-			port: ingress.port,
-			...(ingress.kind === "runtime" && settings.publicUrl !== undefined
-				? { publicUrl: settings.publicUrl }
-				: {}),
-		}));
+		const ingresses: RemoteAccessIngress[] = this.#ingresses.map((ingress) => {
+			const readiness = this.#ingressReadiness.get(ingress.port);
+			const publicUrl =
+				readiness?.publicUrl ?? (ingress.kind === "runtime" ? settings.publicUrl : undefined);
+			return {
+				kind: ingress.kind,
+				port: ingress.port,
+				ready: readiness !== undefined,
+				...(publicUrl === undefined ? {} : { publicUrl }),
+			};
+		});
 		return remoteAccessStatusOutputSchema.parse({
 			enabled: settings.enabled,
 			authenticated: this.#authenticated,
@@ -608,6 +635,7 @@ export class DevTunnelService {
 		}
 		this.#state = "starting";
 		this.#lastError = undefined;
+		this.#ingressReadiness = new Map();
 		const startAbortController = new AbortController();
 		let callerCancelled = false;
 		const cancelFromCaller = () => {
@@ -664,10 +692,20 @@ export class DevTunnelService {
 			if (qualifiedTunnelId !== tunnelId) {
 				this.#repository.setTunnel(qualifiedTunnelId);
 			}
-			ownedHost = this.#adapter.startHost(qualifiedTunnelId, this.#runtimeIngressPort);
+			ownedHost = this.#adapter.startHost(
+				qualifiedTunnelId,
+				this.#ingresses.map((ingress) => ingress.port),
+			);
 			this.#host = ownedHost;
-			const ready = await withAbortTimeout(
-				withAbortSignal(ownedHost.ready, startAbortController.signal),
+			const host = ownedHost;
+			const ingresses = this.#ingresses;
+			// Every required ingress must publish its public URL before Remote Access is online. A single
+			// laggard or never-ready port keeps the whole service out of the "online" state.
+			const ingressUrls = await withAbortTimeout(
+				withAbortSignal(
+					Promise.all(ingresses.map((ingress) => host.waitForPort(ingress.port))),
+					startAbortController.signal,
+				),
 				15_000,
 				"Dev Tunnel host readiness",
 				startAbortController,
@@ -682,7 +720,25 @@ export class DevTunnelService {
 				}
 				return;
 			}
-			this.#repository.setPublicUrl(ready.publicUrl);
+			const readiness = ingresses.map((ingress, index) => ({
+				ingress,
+				publicUrl: ingressUrls[index]?.publicUrl,
+			}));
+			const runtimeReadiness = readiness.find((entry) => entry.ingress.kind === "runtime");
+			if (runtimeReadiness?.publicUrl === undefined) {
+				throw new Error("Dev Tunnel runtime ingress did not report a public URL.");
+			}
+			this.#ingressReadiness = new Map(
+				readiness.flatMap((entry) =>
+					entry.publicUrl === undefined
+						? []
+						: [[entry.ingress.port, { publicUrl: entry.publicUrl }] as const],
+				),
+			);
+			// Persist the Runtime public URL for backward compatibility (top-level status.publicUrl and
+			// the persisted Remote Runtime Box URL). Additional ingress URLs are surfaced per-port in
+			// status.ingresses.
+			this.#repository.setPublicUrl(runtimeReadiness.publicUrl);
 			this.#state = "online";
 			this.#stableTimer = setTimeout(() => {
 				if (this.#host === ownedHost && this.#isCurrent(generation)) {
@@ -735,6 +791,7 @@ export class DevTunnelService {
 			return;
 		}
 		this.#host = undefined;
+		this.#ingressReadiness = new Map();
 		if (!this.#isCurrent(generation) || !this.#repository.get().enabled) {
 			return;
 		}
@@ -781,6 +838,7 @@ export class DevTunnelService {
 
 	async #stopHost(): Promise<void> {
 		this.#clearRestartTimers(true);
+		this.#ingressReadiness = new Map();
 		const host = this.#host;
 		if (host !== undefined) {
 			await terminateHost(host);
@@ -978,12 +1036,13 @@ export class DevTunnelCliAdapter implements DevTunnelAdapter {
 		await this.commandRunner(this.executable, ["delete", tunnelId, "--force"], false, signal);
 	}
 
-	startHost(tunnelId: string, port: number): DevTunnelHostProcess {
+	startHost(tunnelId: string, ports: readonly number[]): DevTunnelHostProcess {
 		const child = spawnWatchdogCommand(this.executable, ["host", tunnelId]);
 		let stopRequested = false;
 		void drainStream(child.stderr);
+		const monitor = monitorHostPorts(child.stdout, ports);
 		return {
-			ready: monitorHostOutput(child.stdout, port),
+			waitForPort: (port) => monitor.waitForPort(port),
 			exited: child.exited,
 			stop(force = false) {
 				if (!stopRequested) {
@@ -1142,46 +1201,78 @@ function createStreamingAuthenticationProcess(child: CommandChild): DevTunnelAut
 	};
 }
 
-function monitorHostOutput(
+/**
+ * Watches a single host stdout stream that forwards one or more expected ingress ports and resolves a
+ * per-port public URL. A devtunnel URL embeds its forwarded port as a `-${port}.` segment, so each
+ * expected port is matched to its own URL; when exactly one port is expected we fall back to the first
+ * URL seen (older CLI output does not always tag single-port hosts). Pending ports are rejected if the
+ * stream ends or errors before their URL is published.
+ */
+export function monitorHostPorts(
 	stream: ReadableStream<Uint8Array>,
-	port: number,
-): Promise<{ publicUrl: string }> {
-	const completion = Promise.withResolvers<{ publicUrl: string }>();
+	ports: readonly number[],
+): { waitForPort(port: number): Promise<{ publicUrl: string }> } {
+	const resolvers = new Map<
+		number,
+		ReturnType<typeof Promise.withResolvers<{ publicUrl: string }>>
+	>();
+	for (const port of ports) {
+		resolvers.set(port, Promise.withResolvers<{ publicUrl: string }>());
+	}
+	const singlePort = ports.length === 1 ? ports[0] : undefined;
 	void (async () => {
 		const reader = stream.getReader();
 		const decoder = new TextDecoder();
 		let buffered = "";
-		let resolved = false;
+		const pending = new Set(ports);
 		try {
 			while (true) {
 				const next = await reader.read();
 				if (next.done) {
-					if (!resolved) {
-						completion.reject(
-							new Error("Dev Tunnel host exited before publishing its public URL."),
-						);
+					if (pending.size > 0) {
+						const error = new Error("Dev Tunnel host exited before publishing its public URL.");
+						for (const port of pending) {
+							resolvers.get(port)?.reject(error);
+						}
 					}
 					return;
 				}
 				buffered = `${buffered}${decoder.decode(next.value, { stream: true })}`.slice(-16_384);
-				if (!resolved) {
-					const urls = buffered.match(/https:\/\/[A-Za-z0-9.-]+\.devtunnels\.ms(?::\d+)?\/?/g);
-					const preferred = urls?.find((url) => url.includes(`-${port}.`)) ?? urls?.[0];
-					if (preferred !== undefined) {
-						resolved = true;
-						completion.resolve({ publicUrl: preferred.replace(/\/$/, "") });
+				if (pending.size === 0) {
+					continue;
+				}
+				const urls = buffered.match(/https:\/\/[A-Za-z0-9.-]+\.devtunnels\.ms(?::\d+)?\/?/g);
+				if (urls === null) {
+					continue;
+				}
+				for (const port of [...pending]) {
+					let match = urls.find((url) => url.includes(`-${port}.`));
+					if (match === undefined && singlePort === port) {
+						match = urls[0];
+					}
+					if (match !== undefined) {
+						pending.delete(port);
+						resolvers.get(port)?.resolve({ publicUrl: match.replace(/\/$/, "") });
 					}
 				}
 			}
 		} catch (error) {
-			if (!resolved) {
-				completion.reject(error);
+			for (const port of pending) {
+				resolvers.get(port)?.reject(error);
 			}
 		} finally {
 			reader.releaseLock();
 		}
 	})();
-	return completion.promise;
+	return {
+		waitForPort(port) {
+			const entry = resolvers.get(port);
+			if (entry === undefined) {
+				return Promise.reject(new Error(`Dev Tunnel host is not forwarding port ${port}.`));
+			}
+			return entry.promise;
+		},
+	};
 }
 
 async function drainStream(stream: ReadableStream<Uint8Array>): Promise<void> {

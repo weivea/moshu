@@ -8,6 +8,7 @@ import {
 	type DevTunnelHostProcess,
 	DevTunnelService,
 	findListedTunnelId,
+	monitorHostPorts,
 	parseDevTunnelLoginStatus,
 	parseQualifiedTunnelId,
 	parseTunnelPortProtocol,
@@ -24,10 +25,13 @@ function commandResult(stdout = "", exitCode = 0) {
 }
 
 class FakeHost implements DevTunnelHostProcess {
-	readonly ready = Promise.resolve({ publicUrl: "https://moshu-41000.test.devtunnels.ms" });
 	readonly exit = Promise.withResolvers<number>();
 	readonly exited = this.exit.promise;
 	stopped = false;
+
+	waitForPort(port: number): Promise<{ publicUrl: string }> {
+		return Promise.resolve({ publicUrl: `https://moshu-${port}.test.devtunnels.ms` });
+	}
 
 	stop(): void {
 		this.stopped = true;
@@ -66,7 +70,7 @@ class FakeDevTunnelAdapter implements DevTunnelAdapter {
 		return Promise.resolve();
 	}
 
-	startHost(tunnelId: string): DevTunnelHostProcess {
+	startHost(tunnelId: string, _ports: readonly number[]): DevTunnelHostProcess {
 		this.hostedTunnelIds.push(tunnelId);
 		const host = new FakeHost();
 		this.hosts.push(host);
@@ -172,7 +176,7 @@ class DelayedStopHost extends FakeHost {
 }
 
 class DelayedStopAdapter extends FakeDevTunnelAdapter {
-	override startHost(tunnelId: string): DevTunnelHostProcess {
+	override startHost(tunnelId: string, _ports: readonly number[]): DevTunnelHostProcess {
 		this.hostedTunnelIds.push(tunnelId);
 		const host = new DelayedStopHost();
 		this.hosts.push(host);
@@ -194,10 +198,13 @@ class RejectedAuthenticationAdapter extends FakeDevTunnelAdapter {
 
 class PendingReadyHost implements DevTunnelHostProcess {
 	readonly readyGate = Promise.withResolvers<{ publicUrl: string }>();
-	readonly ready = this.readyGate.promise;
 	readonly exit = Promise.withResolvers<number>();
 	readonly exited = this.exit.promise;
 	stopped = false;
+
+	waitForPort(_port: number): Promise<{ publicUrl: string }> {
+		return this.readyGate.promise;
+	}
 
 	stop(): void {
 		this.stopped = true;
@@ -208,7 +215,7 @@ class PendingReadyHost implements DevTunnelHostProcess {
 class PendingReadyAdapter extends FakeDevTunnelAdapter {
 	readonly pendingHosts: PendingReadyHost[] = [];
 
-	override startHost(tunnelId: string): DevTunnelHostProcess {
+	override startHost(tunnelId: string, _ports: readonly number[]): DevTunnelHostProcess {
 		this.hostedTunnelIds.push(tunnelId);
 		const host = new PendingReadyHost();
 		this.pendingHosts.push(host);
@@ -225,7 +232,7 @@ class DelayedPendingReadyHost extends PendingReadyHost {
 class CancelledRecreateAdapter extends FakeDevTunnelAdapter {
 	readonly replacementHost = new DelayedPendingReadyHost();
 
-	override startHost(tunnelId: string): DevTunnelHostProcess {
+	override startHost(tunnelId: string, _ports: readonly number[]): DevTunnelHostProcess {
 		this.hostedTunnelIds.push(tunnelId);
 		if (this.hostedTunnelIds.length === 2) {
 			return this.replacementHost;
@@ -476,6 +483,131 @@ describe("DevTunnelService", () => {
 		} finally {
 			database.close();
 		}
+	});
+
+	test("stays offline until every expected ingress port is ready, then reports per-port URLs", async () => {
+		const database = openAppDatabase(":memory:");
+
+		class GatedHost implements DevTunnelHostProcess {
+			readonly gates = new Map<
+				number,
+				ReturnType<typeof Promise.withResolvers<{ publicUrl: string }>>
+			>();
+			readonly exit = Promise.withResolvers<number>();
+			readonly exited = this.exit.promise;
+			stopped = false;
+
+			constructor(ports: readonly number[]) {
+				for (const port of ports) {
+					this.gates.set(port, Promise.withResolvers<{ publicUrl: string }>());
+				}
+			}
+
+			waitForPort(port: number): Promise<{ publicUrl: string }> {
+				const gate = this.gates.get(port);
+				return gate?.promise ?? Promise.reject(new Error(`Unexpected port ${port}.`));
+			}
+
+			stop(): void {
+				this.stopped = true;
+				this.exit.resolve(0);
+			}
+		}
+
+		class GatedAdapter extends FakeDevTunnelAdapter {
+			host: GatedHost | undefined;
+
+			override startHost(tunnelId: string, ports: readonly number[]): DevTunnelHostProcess {
+				this.hostedTunnelIds.push(tunnelId);
+				this.host = new GatedHost(ports);
+				return this.host;
+			}
+		}
+
+		try {
+			const adapter = new GatedAdapter();
+			const service = new DevTunnelService({
+				repository: database.remoteAccess,
+				runtimeIngressPort: 41_000,
+				mobileIngressPort: 42_000,
+				adapter,
+			});
+			const enabling = service.enable();
+			while (adapter.host === undefined) {
+				await Bun.sleep(0);
+			}
+			// Only the Runtime port is ready; the Mobile ingress is still pending, so we must not come online.
+			adapter.host.gates
+				.get(41_000)
+				?.resolve({ publicUrl: "https://moshu-41000.test.devtunnels.ms" });
+			await Bun.sleep(0);
+			expect(service.getStatus().state).toBe("starting");
+			// Once every expected ingress publishes its URL, the service comes online.
+			adapter.host.gates
+				.get(42_000)
+				?.resolve({ publicUrl: "https://moshu-42000.test.devtunnels.ms" });
+			const enabled = await enabling;
+			expect(enabled.state).toBe("online");
+			// Top-level publicUrl stays backward compatible with the Runtime ingress URL.
+			expect(enabled.publicUrl).toBe("https://moshu-41000.test.devtunnels.ms");
+			expect(service.getStatus().ingresses).toEqual([
+				{
+					kind: "runtime",
+					port: 41_000,
+					ready: true,
+					publicUrl: "https://moshu-41000.test.devtunnels.ms",
+				},
+				{
+					kind: "mobile",
+					port: 42_000,
+					ready: true,
+					publicUrl: "https://moshu-42000.test.devtunnels.ms",
+				},
+			]);
+			await service.shutdown();
+		} finally {
+			database.close();
+		}
+	});
+
+	test("monitorHostPorts resolves a per-port public URL from a single host stream", async () => {
+		const stream = new ReadableStream<Uint8Array>({
+			start(controller) {
+				const encoder = new TextEncoder();
+				controller.enqueue(
+					encoder.encode("Connect via browser: https://moshu-41000.euw.devtunnels.ms/\n"),
+				);
+				controller.enqueue(
+					encoder.encode("Connect via browser: https://moshu-42000.euw.devtunnels.ms/\n"),
+				);
+				controller.close();
+			},
+		});
+		const monitor = monitorHostPorts(stream, [41_000, 42_000]);
+		expect((await monitor.waitForPort(41_000)).publicUrl).toBe(
+			"https://moshu-41000.euw.devtunnels.ms",
+		);
+		expect((await monitor.waitForPort(42_000)).publicUrl).toBe(
+			"https://moshu-42000.euw.devtunnels.ms",
+		);
+	});
+
+	test("monitorHostPorts rejects ports whose URL never arrives before the stream ends", async () => {
+		const stream = new ReadableStream<Uint8Array>({
+			start(controller) {
+				controller.enqueue(
+					new TextEncoder().encode("Connect via browser: https://moshu-41000.euw.devtunnels.ms/\n"),
+				);
+				controller.close();
+			},
+		});
+		const monitor = monitorHostPorts(stream, [41_000, 42_000]);
+		expect((await monitor.waitForPort(41_000)).publicUrl).toBe(
+			"https://moshu-41000.euw.devtunnels.ms",
+		);
+		await expect(monitor.waitForPort(42_000)).rejects.toThrow(
+			"exited before publishing its public URL",
+		);
 	});
 
 	test("reuses the persisted tunnel identity after disable and enable", async () => {

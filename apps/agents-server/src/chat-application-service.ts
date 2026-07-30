@@ -576,6 +576,17 @@ export class ChatApplicationService {
 		return this.#sessions.list(listChatSessionsInputSchema.parse(input));
 	}
 
+	// Validates that a Session exists and is currently visible, so callers (e.g. the event-hub
+	// subscribe handler) never register interest in a missing, deleting, or retired Session. Throws
+	// ChatSessionNotFoundError (mapped to a stable SESSION_NOT_FOUND handler error) when it is not.
+	assertSessionVisible(sessionId: string): void {
+		this.#assertDataPlaneAvailable();
+		if (this.#deletingSessions.has(sessionId) || this.#runs.isSessionRetired(sessionId)) {
+			throw new ChatSessionNotFoundError(sessionId);
+		}
+		this.#sessions.get({ sessionId });
+	}
+
 	listRetiredSessions(input: ListRetiredChatSessionsInput): ListRetiredChatSessionsOutput {
 		this.#assertDataPlaneAvailable();
 		const parsedInput = listRetiredChatSessionsInputSchema.parse(input);

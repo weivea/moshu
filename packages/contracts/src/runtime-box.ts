@@ -297,12 +297,18 @@ export const remoteAccessStateSchema = z.enum([
 	"repair_required",
 ]);
 
-export const remoteAccessIngressKindSchema = z.enum(["runtime"]);
+// "runtime" is the only ingress instantiated today. "mobile" is a forward-looking descriptor kind
+// for a future Mobile ingress port (Layer 3); modelling it here lets the tunnel service manage and
+// report a second expected ingress without implying any Mobile listener/pairing exists yet.
+export const remoteAccessIngressKindSchema = z.enum(["runtime", "mobile"]);
 
 export const remoteAccessIngressSchema = z
 	.object({
 		kind: remoteAccessIngressKindSchema,
 		port: z.int().min(1).max(65_535),
+		// Whether this ingress is currently forwarded and has published its public URL. Remote Access
+		// only reaches "online" once every required ingress is ready.
+		ready: z.boolean(),
 		publicUrl: z.string().url().optional(),
 	})
 	.strict();

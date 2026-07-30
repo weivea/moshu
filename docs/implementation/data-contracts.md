@@ -423,7 +423,8 @@ Live delivery 从「单 request-owner」模型演进为 Session/Run/seq scoped �
 - `chat.event` delivery 的 `clientRequestId` 现为**可选 origin echo**（`chatEventDeliverySchema.clientRequestId` optional）。接收 Client 不再需要持有原始 `clientRequestId` 即可观察其订阅的 Session；发起 Client 仍会收到自身 request id 回显用于本地关联。
 - 新增 `moshu.v1.chat.subscribe` / `moshu.v1.chat.unsubscribe`（input `{ sessionId }`）。二者是 **authorization-aware** 合同：handler 从 authenticated peer 解析 client identity（`role === "client"`），不信任调用方传入任意身份；非 client 角色被拒绝。
 - 发起 Client 通过 `chat.send` 的 request-owner 绑定接收自身 Run 的 live event（保持幂等/恢复与 generation fencing 语义不变）；其他已认证 Client 通过显式 `chat.subscribe` 观察同一 Session。实际投递是「request-owner ∪ 显式 subscriber」的并集，按连接去重。
-- 订阅按稳定 `peerId` 记录，重连（新连接 generation）后订阅保持；连接断开时按精确身份清理，不影响其他 Client。
+- 订阅是**连接作用域**的，按稳定 `peerId` 记录并携带 authenticated peer 的精确身份（`instanceId`/generation/deviceKeyId）。恢复模型：Client 在连接恢复后按已知 `sessionId` 重新 `chat.subscribe`，在 replay→live 衔接完成前不标记 ready；旧连接（gen N）迟到的断开清理用精确身份逐 Session 比对，只回收 gen N 自己且未被 gen N+1 重新订阅的条目，不会误删新连接已接管的订阅（transport fence 保证 per-`peerId` 单一 live 连接与单调 generation）。不保留陈旧 socket 订阅。
+- 订阅在 handler 层做**存在性/可见性校验**：`chat.subscribe` 先经 Chat Session repository 确认 `sessionId` 存在且未在删除/退休中，否则以稳定 `RpcHandlerError`（`SESSION_NOT_FOUND`）拒绝。容量有 **per-peer（256）与 global（8192）上限**，越界返回稳定 `RpcHandlerError`（`SESSION_SUBSCRIPTION_PEER_LIMIT` / `SESSION_SUBSCRIPTION_LIMIT`）。Session **retirement** 时 hub 主动清理相关订阅（`retireSessions`）。
 - 单用户 MVP 下授权边界按 Session **结构化**，不做全局裸 broadcast 调试事件。Desktop 当前不主动 subscribe（其自身 Run 仍走 request-owner 路径），投递行为与既有实现完全一致。
 - 本层不实现 Mobile ingress/pairing 与 approvals（属于后续层）。
 

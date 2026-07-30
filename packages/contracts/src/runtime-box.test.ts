@@ -26,7 +26,7 @@ const diagnostics: RuntimeDiagnosticsOutput = {
 		authenticated: false,
 		state: "disabled" as const,
 		runtimeIngressPort: 41_000,
-		ingresses: [{ kind: "runtime" as const, port: 41_000 }],
+		ingresses: [{ kind: "runtime" as const, port: 41_000, ready: false }],
 		trafficEstimate: {
 			month: new Date().toISOString().slice(0, 7),
 			receivedBytes: 0,

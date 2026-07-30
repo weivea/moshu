@@ -20,8 +20,8 @@ import {
 //   1. Request-owner routing (unchanged from the original single-owner model): the client that
 //      issued a chat.send owns the resulting Run's live stream via its `clientRequestId`. This
 //      preserves chat.send idempotency, generation fencing, and reconnect recovery exactly.
-//   2. Session subscription (new): any authenticated product client may explicitly subscribe to a
-//      Session to observe its Runs without holding the originating `clientRequestId`. This is the
+//   2. Session subscription: any authenticated product client may explicitly subscribe to a Session
+//      to observe its Runs without holding the originating `clientRequestId`. This is the
 //      forward-looking, multi-client path a future Mobile client uses; `clientRequestId` becomes an
 //      optional origin echo rather than a routing key.
 //
@@ -29,8 +29,28 @@ import {
 // so today's Desktop client keeps receiving its own Runs byte-for-byte while additional subscribers
 // observe the same Session. Authorization is structured, not a naked broadcast: only authenticated
 // `client` peers are eligible, and subscribers only receive events for Sessions they subscribed to.
+//
+// Subscription lifecycle (connection-scoped, client re-subscribes on reconnect):
+//   Subscriptions are dropped when a connection closes (`releasePeer`). They are NOT a durable
+//   server-side registration that outlives the socket, so the hub never delivers to a stale/closed
+//   connection. A client that wants to keep observing a Session across a reconnect owns the recovery
+//   loop: on the fresh connection it (a) replays from its per-Run cursors (chat.replay), then
+//   (b) re-subscribes (chat.subscribe), and only marks itself "live" once the replay -> live handoff
+//   is complete (it de-duplicates the small overlap by monotonic `(runId, seq)`), so there is no gap
+//   and no duplicate. The transport generation fence guarantees at most one live connection per
+//   client identity (peerId); subscriptions are keyed by that stable `peerId` but each records the
+//   full identity (including `generation`). This makes cleanup reconnect-safe: a late close of an
+//   older generation cannot remove a newer generation's re-subscription (the identity/generation
+//   guard in `releasePeer` skips it), and a subscription the newer generation did not renew is still
+//   reclaimed when its owning generation finally closes.
 
 const maxActiveRequestOwners = 1_024;
+// Structured authorization bounds for session subscriptions. A single client cannot pin an unbounded
+// number of Sessions, and the hub as a whole cannot accumulate unbounded subscription state, even
+// under a buggy or hostile client. These are generous for the single-user MVP while still capping
+// worst-case memory.
+const maxSubscriptionsPerPeer = 256;
+const maxTotalSubscriptions = 8_192;
 
 interface ProductEventRouteBinding {
 	readonly peerId: string;
@@ -50,9 +70,13 @@ interface SessionSubscription {
 
 export class ProductEventRouter {
 	readonly #bindingsByRequestId = new Map<string, ProductEventRouteBinding>();
-	// sessionId -> peerId -> subscription. Keyed by the stable client `peerId` so an explicit
-	// subscription survives a reconnect (new connection generation, same identity).
+	// sessionId -> peerId -> subscription. Delivery source of truth. Keyed by the stable client
+	// `peerId`; each entry records the full identity so cleanup can be generation-guarded.
 	readonly #subscriptionsBySession = new Map<string, Map<string, SessionSubscription>>();
+	// peerId -> set of subscribed sessionIds. Reverse index for O(1) per-peer bounds and efficient
+	// connection-close cleanup without scanning every Session.
+	readonly #sessionsByPeer = new Map<string, Set<string>>();
+	#totalSubscriptions = 0;
 
 	bind(requestId: string, peer: RpcPeer): ProductEventRouteLease {
 		const existing = this.#bindingsByRequestId.get(requestId);
@@ -103,7 +127,9 @@ export class ProductEventRouter {
 	}
 
 	// Registers an authorization-scoped interest in a Session. Only authenticated product clients may
-	// subscribe; the caller identity is taken from the peer, never trusted from request input.
+	// subscribe; the caller identity is taken from the peer, never trusted from request input. The
+	// handler layer validates that the Session exists/is visible before calling this. Bounds are
+	// enforced so a client cannot pin unbounded Sessions and the hub cannot grow without limit.
 	subscribe(peer: RpcPeer, sessionId: string): void {
 		if (peer.remoteIdentity.role !== "client") {
 			throw new RpcHandlerError(
@@ -111,20 +137,57 @@ export class ProductEventRouter {
 				"Session event subscription is only available to authenticated product clients.",
 			);
 		}
+		const peerId = peer.remoteIdentity.peerId;
 		let subscriptions = this.#subscriptionsBySession.get(sessionId);
+		const alreadySubscribed = subscriptions?.has(peerId) ?? false;
+		if (alreadySubscribed) {
+			// Idempotent re-subscribe (e.g. after a reconnect): refresh the recorded identity to the
+			// current connection generation without changing counts.
+			subscriptions?.set(peerId, { identity: peer.remoteIdentity });
+			return;
+		}
+		const peerSessions = this.#sessionsByPeer.get(peerId);
+		if ((peerSessions?.size ?? 0) >= maxSubscriptionsPerPeer) {
+			throw new RpcHandlerError(
+				"SESSION_SUBSCRIPTION_PEER_LIMIT",
+				"This client has too many active Session subscriptions.",
+			);
+		}
+		if (this.#totalSubscriptions >= maxTotalSubscriptions) {
+			throw new RpcHandlerError(
+				"SESSION_SUBSCRIPTION_LIMIT",
+				"Too many active Session subscriptions.",
+			);
+		}
 		if (subscriptions === undefined) {
 			subscriptions = new Map<string, SessionSubscription>();
 			this.#subscriptionsBySession.set(sessionId, subscriptions);
 		}
-		subscriptions.set(peer.remoteIdentity.peerId, { identity: peer.remoteIdentity });
+		subscriptions.set(peerId, { identity: peer.remoteIdentity });
+		if (peerSessions === undefined) {
+			this.#sessionsByPeer.set(peerId, new Set([sessionId]));
+		} else {
+			peerSessions.add(sessionId);
+		}
+		this.#totalSubscriptions += 1;
 	}
 
 	unsubscribe(peer: RpcPeer, sessionId: string): void {
-		const subscriptions = this.#subscriptionsBySession.get(sessionId);
-		if (subscriptions === undefined) {
-			return;
-		}
-		if (subscriptions.delete(peer.remoteIdentity.peerId) && subscriptions.size === 0) {
+		this.#removeSubscription(peer.remoteIdentity.peerId, sessionId);
+	}
+
+	// Removes every subscription for the given Sessions regardless of subscriber. Used when Sessions
+	// are retired/deleted so the hub does not retain interest in Sessions that no longer exist.
+	retireSessions(sessionIds: readonly string[]): void {
+		for (const sessionId of sessionIds) {
+			const subscriptions = this.#subscriptionsBySession.get(sessionId);
+			if (subscriptions === undefined) {
+				continue;
+			}
+			for (const peerId of subscriptions.keys()) {
+				this.#detachPeerSession(peerId, sessionId);
+			}
+			this.#totalSubscriptions -= subscriptions.size;
 			this.#subscriptionsBySession.delete(sessionId);
 		}
 	}
@@ -135,17 +198,46 @@ export class ProductEventRouter {
 				this.#bindingsByRequestId.delete(requestId);
 			}
 		}
-		for (const [sessionId, subscriptions] of this.#subscriptionsBySession) {
-			const subscription = subscriptions.get(peer.remoteIdentity.peerId);
+		const peerId = peer.remoteIdentity.peerId;
+		const peerSessions = this.#sessionsByPeer.get(peerId);
+		if (peerSessions === undefined) {
+			return;
+		}
+		for (const sessionId of [...peerSessions]) {
+			const subscriptions = this.#subscriptionsBySession.get(sessionId);
+			const subscription = subscriptions?.get(peerId);
+			// Generation guard: only reclaim subscriptions that still belong to this exact connection.
+			// A newer generation that already re-subscribed (same peerId, higher generation) owns the
+			// entry now and must not be evicted by this older connection's close.
 			if (
 				subscription !== undefined &&
 				isSameRpcPeerIdentity(subscription.identity, peer.remoteIdentity)
 			) {
-				subscriptions.delete(peer.remoteIdentity.peerId);
-				if (subscriptions.size === 0) {
-					this.#subscriptionsBySession.delete(sessionId);
-				}
+				this.#removeSubscription(peerId, sessionId);
 			}
+		}
+	}
+
+	#removeSubscription(peerId: string, sessionId: string): void {
+		const subscriptions = this.#subscriptionsBySession.get(sessionId);
+		if (subscriptions === undefined || !subscriptions.delete(peerId)) {
+			return;
+		}
+		this.#totalSubscriptions -= 1;
+		if (subscriptions.size === 0) {
+			this.#subscriptionsBySession.delete(sessionId);
+		}
+		this.#detachPeerSession(peerId, sessionId);
+	}
+
+	#detachPeerSession(peerId: string, sessionId: string): void {
+		const peerSessions = this.#sessionsByPeer.get(peerId);
+		if (peerSessions === undefined) {
+			return;
+		}
+		peerSessions.delete(sessionId);
+		if (peerSessions.size === 0) {
+			this.#sessionsByPeer.delete(peerId);
 		}
 	}
 

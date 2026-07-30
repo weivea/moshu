@@ -120,9 +120,13 @@ lastError。Microsoft 登录 token 只能写入 Agent Server Secret Vault。
 `DevTunnelService`/`DevTunnelAdapter` 管理一个**期望端口集合（typed ingress descriptors）**而非单一 scalar 端口：
 `ensureTunnel` 按期望端口集合 reconcile，只增删属于本 Service 期望之外的端口，**不再删除同属 Moshu 的其他 ingress**
 （历史根因：旧 `ensureTunnel(tunnelId, port)` 会删除所有其他端口）。每个端口按需单独配置 anonymous access，并各自
-收集 public URL / readiness / traffic。`getStatus` 暴露 `ingresses` 列表（typed descriptor）。当前仍只有 Runtime
-ingress 一个实例；未来 Mobile ingress 作为**第二个端口**接入时无需再改根因逻辑。本层不实际新增 Mobile listener
-或 pairing（属于后续层）。
+收集 public URL / readiness / traffic。单个 host 进程转发全部期望端口，`waitForPort(port)` 按端口解析各自的
+public URL；**只有当所有 required ingress 都 ready 后 Service 才进入 `online`**，任一端口迟迟不 ready 会让整个
+Service 保持非 online。`getStatus` 暴露 `ingresses` 列表（typed descriptor），每个条目携带 `kind`、`port`、
+`ready` 和该端口自己的 `publicUrl`；顶层 `publicUrl` 继续向后兼容地映射到 Runtime ingress URL。当前仍只有 Runtime
+ingress 一个实例；契约已建模一个前瞻性的 `mobile` ingress descriptor（`remoteAccessIngressKindSchema` 含
+`"mobile"`），并可通过 `mobileIngressPort` 选项演练多 ingress reconcile/readiness 路径，但本层**不实际实例化**
+Mobile ingress、listener 或 pairing（属于后续层）。未来 Mobile ingress 作为**第二个端口**接入时无需再改根因逻辑。
 
 启动顺序：
 

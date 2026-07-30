@@ -105,7 +105,7 @@ function remoteAccessStatus(authenticated: boolean): RemoteAccessStatusOutput {
 		authenticated,
 		state: "disabled",
 		runtimeIngressPort: 41_000,
-		ingresses: [{ kind: "runtime", port: 41_000 }],
+		ingresses: [{ kind: "runtime", port: 41_000, ready: false }],
 		trafficEstimate: {
 			month: "2026-07",
 			receivedBytes: 0,
