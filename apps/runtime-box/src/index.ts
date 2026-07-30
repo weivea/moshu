@@ -170,6 +170,7 @@ export async function runRuntimeBoxProcess(
 			"mcp.config.v1",
 			"mcp.tools.v1",
 			"skills.store.v1",
+			"skills.config.v2",
 		] as const;
 		const runtimeCapabilities = [
 			...executorToolNames.map((tool) => `tool.${tool}`),

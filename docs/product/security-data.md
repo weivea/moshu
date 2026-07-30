@@ -170,16 +170,16 @@ default tools 和 TUI 全部禁用；意外 Tool activity 直接失败。未来�
 ### 8.2 Skills
 
 - 安装前扫描脚本和可执行文件清单。
-- Runtime Box 独占 Skill installation、immutable versions/content/hash、metadata、resources 和 scripts；server 只保存 assigned Runtime Box stable resource ref。
-- server 构建/恢复 Agent 时按 ref 获取 metadata/`SKILL.md` 并验证 owner/version/hash；offline、missing 或 mismatch 时 fail closed。
+- Skill authority 由显式 owner 决定：Agent Server-owned Skill 只允许单个非 executable `SKILL.md`；Runtime Box-owned Skill 才可拥有完整 package、resources 和 scripts。
+- server 构建/恢复 Agent 时从各自 owner 获取 metadata/`SKILL.md`，验证 owner/version/hash/readiness、name 冲突和 aggregate prompt 大小；任何失败均 fail closed。
 - fetched Skill content 只用于内存 prompt assembly，不进入 server DB/Pi Session JSONL/Run snapshot/event/
   backup/diagnostic/export。
-- Skill install/update/delete 只以 redacted descriptor/change/tombstone 同步；inventory 不复制 Skill body。
+- Server-owned Skill 正文只在 server private content store；Box inventory 仍只同步 redacted descriptor/change/tombstone，不复制 Box Skill body。
 - 依赖、网络和工具要求可见。
 - Skill 的 `allowed-tools` 不构成应用授权。
 - 更新后内容哈希变化时重新提示权限与脚本差异。
 - 未签名或来源不明不等于禁止安装，但必须明确风险。
-- Skill resources/scripts 通过 Runtime Box grant 使用，不能形成服务器或 client 的本地执行旁路。
+- Server-owned Skill 不提供 resource/script 执行；Box Skill resources/scripts 只能通过 Runtime Box grant 使用。
 
 ## 9. 密钥与凭证
 
@@ -209,9 +209,10 @@ default tools 和 TUI 全部禁用；意外 Tool activity 直接失败。未来�
 | Conversation context | `agentDataDirectory/sessions` 下的 Pi `SessionManager` JSONL |
 | Provider/model config、Agent definitions/versions、resource refs | agents server 本地业务数据；resource ref 不含 Runtime Box config/content |
 | redacted Runtime Box inventory cache | agents server disposable projection；offline 时标 stale，可删除后从 Runtime Box 重建 |
-| Server-owned MCP config/inventory | agents server Product DB metadata；secret 独立存储 |
+| Server-owned MCP config/inventory、prompt-only Skill metadata/version | agents server Product DB metadata；MCP secret 与 Skill 正文分别独立存储 |
 | Box-owned MCP config/inventory、Skill metadata/versions | Runtime Box-owned DB |
-| Skill immutable content/resources/scripts | Runtime Box-private Skills 目录 |
+| Server-owned prompt-only `SKILL.md` | Agent Server private Skills 目录 |
+| Box-owned Skill immutable content/resources/scripts | Runtime Box-private Skills 目录 |
 | 密钥与 Token | Provider/model credential 在 server `SecretVaultCredentialStore`；MCP credential 在显式 owner 的 MCP SecretStore |
 | Canvas 与版本 | 本地应用数据目录 |
 | 知识原文元数据、切分和向量 | 本地索引目录 |

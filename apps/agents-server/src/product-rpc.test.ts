@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import {
 	type HeadlessAuthController,
@@ -13,6 +16,7 @@ import {
 	defaultLocalRuntimeBoxId,
 	getAgentGlobalProfileOutputSchema,
 	mcpServerMutationResultSchema,
+	skillMutationResultSchema,
 	productRpcInternalHandlerErrorCode,
 	productRpcMethods,
 	runtimeBoxProductRequestMethods,
@@ -23,6 +27,7 @@ import {
 	type RuntimeBoxRepository,
 } from "@moshu/database";
 import { RpcHandlerError, type RpcPeer, rpcJsonValueSchema } from "@moshu/process-rpc";
+import { FileSkillContentStore } from "@moshu/skill-runtime";
 import { z } from "zod";
 
 import type { ChatApplicationService } from "./chat-application-service";
@@ -125,8 +130,8 @@ describe("Runtime Box product RPC", () => {
 						generation: 1,
 					},
 					processRpcProtocol: { major: 1, minor: 0 },
-					runtimeProtocolMinVersion: 2,
-					runtimeProtocolMaxVersion: 2,
+					runtimeProtocolMinVersion: 3,
+					runtimeProtocolMaxVersion: 3,
 					transportSecurity: "relay-tls",
 					noiseUpgradeAvailable: false,
 				},
@@ -297,6 +302,7 @@ describe("Runtime Box product RPC", () => {
 				owner: { kind: "agent-server" },
 				items: [{ displayName: "Global MCP", health: "ready", stale: false }],
 			});
+
 			expect(JSON.stringify(listed)).not.toContain("mcp.example.test");
 			const currentProfile = await getProfile(
 				{ agentId: "moshu.default" },
@@ -319,6 +325,7 @@ describe("Runtime Box product RPC", () => {
 							contentHash: live.contentHash,
 						},
 					],
+					serverSkillRefs: [],
 				},
 				createRequestContext(peer, productRpcMethods.agentGlobalProfileUpdate),
 			);
@@ -336,6 +343,132 @@ describe("Runtime Box product RPC", () => {
 			).rejects.toMatchObject({ code: "MCP_RESOURCE_IN_USE" });
 		} finally {
 			database.close();
+		}
+	});
+
+	test("manages prompt-only Agent Server Skills and protects global refs", async () => {
+		const directory = mkdtempSync(join(tmpdir(), "moshu-product-skill-"));
+		const database = openAppDatabase(join(directory, "app.db"), {
+			agentServerSkillContent: new FileSkillContentStore(join(directory, "skills")),
+		});
+		try {
+			const handlers = createProductRpcHandlers({
+				authController,
+				chatService: {} as ChatApplicationService,
+				runtimeBoxRegistry: new RuntimeBoxRegistry(),
+				runtimeBoxes: database.runtimeBoxes,
+				agentServerMcps: database.agentServerMcps,
+				agentServerSkills: database.agentServerSkills,
+				agentGlobalProfiles: database.agentGlobalProfiles,
+				runtimeIngressAuth,
+				getDevTunnelService: () => devTunnelService,
+				eventRouter: new ProductEventRouter(),
+				serverVersion: "test",
+			}).requests;
+			const upsert = handlers?.[productRpcMethods.skillUpsert];
+			const list = handlers?.[productRpcMethods.skillList];
+			const getProfile = handlers?.[productRpcMethods.agentGlobalProfileGet];
+			const updateProfile = handlers?.[productRpcMethods.agentGlobalProfileUpdate];
+			const remove = handlers?.[productRpcMethods.skillDelete];
+			if (
+				upsert === undefined ||
+				list === undefined ||
+				getProfile === undefined ||
+				updateProfile === undefined ||
+				remove === undefined
+			) {
+				throw new Error("Agent Server Skill handlers are missing.");
+			}
+			const peer = createPeer({ emitEvent: () => "event", close() {} });
+			const owner = { kind: "agent-server" as const };
+			const created = skillMutationResultSchema.parse(
+				await upsert(
+					{
+						owner,
+						commandId: crypto.randomUUID(),
+						source: { kind: "inline-editor" },
+						enabled: true,
+						files: [
+							{
+								path: "SKILL.md",
+								encoding: "utf8",
+								content:
+									"---\nname: release-helper\ndescription: Prepare releases\n---\n\nFollow the checklist.",
+								executable: false,
+							},
+						],
+					},
+					createRequestContext(peer, productRpcMethods.skillUpsert),
+				),
+			);
+			expect(
+				await list({ owner }, createRequestContext(peer, productRpcMethods.skillList)),
+			).toMatchObject({
+				owner,
+				items: [{ packageKind: "prompt-only", metadata: { name: "release-helper" } }],
+			});
+			const profile = getAgentGlobalProfileOutputSchema.parse(
+				await getProfile(
+					{ agentId: "moshu.default" },
+					createRequestContext(peer, productRpcMethods.agentGlobalProfileGet),
+				),
+			).profile;
+			await updateProfile(
+				{
+					agentId: profile.agentId,
+					expectedRevision: profile.revision,
+					serverMcpRefs: profile.serverMcpRefs,
+					serverSkillRefs: [
+						{
+							owner,
+							stableResourceId: created.stableResourceId,
+							version: created.version,
+							contentHash: created.contentHash,
+						},
+					],
+				},
+				createRequestContext(peer, productRpcMethods.agentGlobalProfileUpdate),
+			);
+			await expect(
+				remove(
+					{
+						owner,
+						commandId: crypto.randomUUID(),
+						stableResourceId: created.stableResourceId,
+						expectedConfigRevision: created.configRevision,
+						expectedVersion: created.version,
+					},
+					createRequestContext(peer, productRpcMethods.skillDelete),
+				),
+			).rejects.toMatchObject({ code: "SKILL_RESOURCE_IN_USE" });
+			await expect(
+				upsert(
+					{
+						owner,
+						commandId: crypto.randomUUID(),
+						source: { kind: "local-upload" },
+						enabled: true,
+						files: [
+							{
+								path: "SKILL.md",
+								encoding: "utf8",
+								content: "---\nname: bundle\ndescription: Invalid server bundle\n---\n",
+								executable: false,
+							},
+							{
+								path: "scripts/run.sh",
+								encoding: "utf8",
+								content: "exit 0",
+								executable: true,
+							},
+						],
+					},
+					createRequestContext(peer, productRpcMethods.skillUpsert),
+				),
+			).rejects.toMatchObject({ code: "SKILL_OWNER_CAPABILITY_MISMATCH" });
+		} finally {
+			database.close();
+			rmSync(directory, { recursive: true, force: true });
 		}
 	});
 
@@ -448,6 +581,7 @@ describe("Runtime Box product RPC", () => {
 							{
 								resourceKind: "skill",
 								stableResourceId: "release-helper",
+								configRevision: 1,
 								version,
 								contentHash,
 								health: "ready",
@@ -476,6 +610,7 @@ describe("Runtime Box product RPC", () => {
 					{
 						resourceKind: "skill",
 						stableResourceId: "release-helper",
+						configRevision: 1,
 						version,
 						contentHash,
 						health: "ready",
@@ -544,6 +679,7 @@ describe("Runtime Box product RPC", () => {
 					{
 						commandId: crypto.randomUUID(),
 						stableResourceId: "release-helper",
+						expectedConfigRevision: 1,
 						expectedVersion: version,
 					},
 					createRequestContext(client, productRpcMethods.skillsDelete),

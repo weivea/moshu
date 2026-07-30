@@ -1,9 +1,9 @@
 # 实施进度
 
-> 更新日期：2026-07-28
+> 更新日期：2026-07-30
 > 当前产品阶段：Phase 0
 > 当前架构里程碑：RB-09 发布加固
-> 当前代码基线：Local/Remote Runtime Box、强认证 ingress、Dev Tunnel、durable Action recovery、双 owner MCP、Box-owned Skills
+> 当前代码基线：Local/Remote Runtime Box、强认证 ingress、Dev Tunnel、durable Action recovery、双 owner MCP/Skills
 
 本文只记录代码或自动化测试已经证明的能力。批准的目标见[技术架构](./architecture.md)，后续顺序见[工程交付计划](./delivery-plan.md)。
 
@@ -78,6 +78,8 @@ Agent Server
   语义；Server 本地调用不伪装成 Runtime Box target，Box 调用继续使用 journal/evidence。
 - Skills 使用 YAML 规范校验、内容 hash、不可变版本、filesystem-safe 目录和 fsync commit；Run 启动时 live
   验证并只在内存加载 `SKILL.md`，不会写入 Product DB、事件或 Pi Session JSONL。
+- Agent Server-owned Skill 使用 Product DB metadata、private immutable content store 和 Agent global profile，
+  首期只接受单个非 executable `SKILL.md`；Box-owned Skill 保留完整 package。两类 owner 同名时 Run fail closed。
 - 产品数据库只有 agents server 写入，保存 SessionCatalog、RunJournal、durable events、retirement tombstone 和
   agent-session cleanup outbox。
 - 每个 Chat Session 拥有稳定 Pi session ID；conversation context 由显式
@@ -149,7 +151,7 @@ Agent Server
 | A1 agents-server extraction | 已完成 | Pi Agent、Provider/auth、产品 DB、Session JSONL 和 cleanup 全部归 agents server |
 | A2 Runtime Box / Agent registry | 部分完成 | Runtime Box 注册/readiness/inventory 已有；自定义 Agent N:1 binding 尚未实现 |
 | A3 Tool Bridge / Action Broker | 已完成（POC trust policy） | durable intent、单次 grant、journal、transport-loss lease、evidence/receipt reconciliation |
-| A4 MCP / Skills | 已完成（POC） | Box-owned secret/lifecycle/store、inventory reconciliation、Runtime Profile、live Tool/Skill resolution |
+| A4 MCP / Skills | 已完成（POC） | 双 owner MCP/Skills、global/Runtime Profile、inventory reconciliation 与 live Tool/Skill resolution |
 | A5 Recovery / release hardening | 已完成（外部 release gate 待执行） | restart/fault/package/update-signing 自动化完成；正式凭据与三平台 runner 不在仓库内 |
 | RB-01 Runtime Box domain/local | 已完成 | Runtime Box contract、注册 descriptor、Local stable ID 和 keyed registry |
 | RB-02 Persistence/routing | 已完成 | Box catalog、active CAS、Session/Run 归属、显式 Gateway 路由和 generation fence |

@@ -11,6 +11,7 @@ import {
 	type McpSecretInput,
 	retiredSessionTombstoneTtlMs,
 } from "@moshu/contracts";
+import { FileSkillContentStore } from "@moshu/skill-runtime";
 
 import {
 	applyAppMigrations,
@@ -267,6 +268,7 @@ describe("application database", () => {
 					{
 						resourceKind: "skill",
 						stableResourceId: "release-helper",
+						configRevision: 1,
 						version,
 						contentHash,
 						health: "ready",
@@ -282,6 +284,7 @@ describe("application database", () => {
 					{
 						resourceKind: "skill",
 						stableResourceId: "release-helper",
+						configRevision: 1,
 						version,
 						contentHash,
 						health: "ready",
@@ -1581,6 +1584,7 @@ describe("application database", () => {
 		const database = openAppDatabase(":memory:", {
 			agentServerMcpSecrets: secretStore,
 		});
+
 		try {
 			const owner = { kind: "agent-server" as const };
 			const transport = {
@@ -1627,8 +1631,11 @@ describe("application database", () => {
 						contentHash: ready.contentHash,
 					},
 				],
+				serverSkillRefs: [],
 			});
-			expect(database.agentGlobalProfiles.isResourceReferenced(ready.stableResourceId)).toBe(true);
+			expect(database.agentGlobalProfiles.isResourceReferenced("mcp", ready.stableResourceId)).toBe(
+				true,
+			);
 			expect(database.agentServerMcps.resolveRefs(updatedProfile.serverMcpRefs)).toHaveLength(1);
 
 			const rotationInput = {
@@ -1696,6 +1703,96 @@ describe("application database", () => {
 			).not.toContain("server-secret");
 		} finally {
 			database.close();
+		}
+	});
+
+	test("stores prompt-only Agent Server Skills with stable refs and independent enable revisions", () => {
+		const directory = mkdtempSync(join(tmpdir(), "moshu-server-skills-"));
+		const content = new FileSkillContentStore(join(directory, "skills"));
+		const database = openAppDatabase(join(directory, "app.db"), {
+			agentServerSkillContent: content,
+		});
+		try {
+			const owner = { kind: "agent-server" as const };
+			const files = [
+				{
+					path: "SKILL.md",
+					encoding: "utf8" as const,
+					content:
+						"---\nname: release-helper\ndescription: Prepare releases safely\n---\n\nFollow the checklist.",
+					executable: false,
+				},
+			];
+			const created = database.agentServerSkills.upsert({
+				owner,
+				commandId: crypto.randomUUID(),
+				source: { kind: "inline-editor" },
+				enabled: true,
+				files,
+			});
+			expect(created.summary).toMatchObject({
+				owner,
+				configRevision: 1,
+				packageKind: "prompt-only",
+				metadata: { name: "release-helper" },
+			});
+			const unchanged = database.agentServerSkills.upsert({
+				owner,
+				commandId: crypto.randomUUID(),
+				stableResourceId: created.stableResourceId,
+				expectedConfigRevision: created.configRevision,
+				expectedVersion: created.version,
+				source: { kind: "inline-editor" },
+				enabled: true,
+				files,
+			});
+			expect(unchanged.version).toBe(created.version);
+			expect(unchanged.contentHash).toBe(created.contentHash);
+			const disabled = database.agentServerSkills.setEnabled({
+				owner,
+				commandId: crypto.randomUUID(),
+				stableResourceId: created.stableResourceId,
+				expectedConfigRevision: unchanged.configRevision,
+				enabled: false,
+			});
+			expect(disabled).toMatchObject({
+				configRevision: unchanged.configRevision + 1,
+				version: created.version,
+				contentHash: created.contentHash,
+			});
+			const enabled = database.agentServerSkills.setEnabled({
+				owner,
+				commandId: crypto.randomUUID(),
+				stableResourceId: created.stableResourceId,
+				expectedConfigRevision: disabled.configRevision,
+				enabled: true,
+			});
+			const profile = database.agentGlobalProfiles.getOrCreate("moshu.default");
+			const updatedProfile = database.agentGlobalProfiles.update({
+				agentId: profile.agentId,
+				expectedRevision: profile.revision,
+				serverMcpRefs: [],
+				serverSkillRefs: [
+					{
+						owner,
+						stableResourceId: enabled.stableResourceId,
+						version: enabled.version,
+						contentHash: enabled.contentHash,
+					},
+				],
+			});
+			expect(
+				database.agentGlobalProfiles.isResourceReferenced("skill", enabled.stableResourceId),
+			).toBe(true);
+			expect(
+				database.agentServerSkills.resolveRefs(updatedProfile.serverSkillRefs)[0],
+			).toMatchObject({
+				summary: { metadata: { name: "release-helper" } },
+				skillMarkdown: expect.stringContaining("Follow the checklist."),
+			});
+		} finally {
+			database.close();
+			rmSync(directory, { recursive: true, force: true });
 		}
 	});
 });

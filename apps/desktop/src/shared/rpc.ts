@@ -84,6 +84,12 @@ import {
 	type ListRuntimeBoxSkillsOutput,
 	type InstallRuntimeBoxSkillInput,
 	type DeleteRuntimeBoxSkillInput,
+	type ListSkillsInput,
+	type ListSkillsOutput,
+	type UpsertSkillInput,
+	type SetSkillEnabledInput,
+	type DeleteSkillInput,
+	type SkillMutationResult,
 	type GetRuntimeProfileInput,
 	type GetRuntimeProfileOutput,
 	type UpdateRuntimeProfileInput,
@@ -276,6 +282,22 @@ export type DesktopRpc = {
 			deleteSkill: {
 				params: DeleteRuntimeBoxSkillInput;
 				response: RuntimeBoxResourceMutationResult;
+			};
+			listOwnedSkills: {
+				params: ListSkillsInput;
+				response: ListSkillsOutput;
+			};
+			upsertOwnedSkill: {
+				params: UpsertSkillInput;
+				response: SkillMutationResult;
+			};
+			setOwnedSkillEnabled: {
+				params: SetSkillEnabledInput;
+				response: SkillMutationResult;
+			};
+			deleteOwnedSkill: {
+				params: DeleteSkillInput;
+				response: SkillMutationResult;
 			};
 			getRuntimeProfile: {
 				params: GetRuntimeProfileInput;

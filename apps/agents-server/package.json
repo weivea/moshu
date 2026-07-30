@@ -16,6 +16,7 @@
 		"@moshu/database": "workspace:*",
 		"@moshu/mcp-runtime": "workspace:*",
 		"@moshu/process-rpc": "workspace:*",
+		"@moshu/skill-runtime": "workspace:*",
 		"zod": "4.4.3"
 	}
 }

@@ -218,10 +218,43 @@ const messages = {
 			"Connections and stdio processes run on the Agent Server host and remain active when Runtime Box changes.",
 		"runtimeResources.runtimeBoxScopeDescription":
 			"Connections and stdio processes run only inside the selected Runtime Box.",
-		"runtimeResources.skillsEyebrow": "Runtime Box extensions",
+		"runtimeResources.skillsEyebrow": "Agent extensions",
 		"runtimeResources.skillsTitle": "Skills",
 		"runtimeResources.skillsDescription":
-			"Install immutable Agent Skills on the active Runtime Box and assign them to the default Agent profile.",
+			"Manage Agent Server prompt-only Skills and full Skill packages owned by the active Runtime Box.",
+		"runtimeResources.agentServerSkillScopeDescription":
+			"Prompt-only Skills remain available when you switch Runtime Boxes.",
+		"runtimeResources.runtimeBoxSkillScopeDescription":
+			"Full Skill packages belong to the selected Runtime Box and are read only while it is offline.",
+		"runtimeResources.skillScope": "Skill owner",
+		"runtimeResources.agentServerSkillScopeNote":
+			"Best for reusable instructions. This scope accepts one non-executable SKILL.md and is available to every Runtime Box.",
+		"runtimeResources.runtimeBoxSkillScopeNote":
+			"Skills in this scope belong to {0}. Package resources and future scripts stay on that device.",
+		"runtimeResources.installServerSkillDescription":
+			"Create a prompt-only Skill stored privately by Agent Server.",
+		"runtimeResources.installRuntimeSkillDescription":
+			"Install the Skill instructions into the selected Runtime Box.",
+		"runtimeResources.skillSourceLabel": "Source label",
+		"runtimeResources.skillSourcePlaceholder": "Optional origin or collection name",
+		"runtimeResources.skillSourceDescription":
+			"Shown only as provenance metadata; it does not grant trust or permissions.",
+		"runtimeResources.skillMarkdownDescription":
+			"Include YAML frontmatter with a kebab-case name and a clear description.",
+		"runtimeResources.markdownBytes": "{0} bytes",
+		"runtimeResources.promptOnly": "Prompt only",
+		"runtimeResources.runtimePackage": "Runtime package",
+		"runtimeResources.noExecutableFiles": "No executable files",
+		"runtimeResources.installedSkills": "Installed Skills",
+		"runtimeResources.installedSkillsDescription":
+			"Readiness, Agent assignment, package type, and lifecycle controls.",
+		"runtimeResources.skillCount": "{0} Skills",
+		"runtimeResources.noSkillsDescription":
+			"Install a SKILL.md above to make reusable guidance available to the Agent.",
+		"runtimeResources.skillUnavailable": "Skill metadata is unavailable from the owner.",
+		"runtimeResources.assignmentUpdateRequired": "Assignment update required",
+		"runtimeResources.allowedToolCount": "{0} suggested tools",
+		"runtimeResources.updateAssignment": "Update Agent assignment",
 		"runtimeResources.stale": "Offline cache · read only",
 		"runtimeResources.refresh": "Refresh",
 		"runtimeResources.loadFailed": "Unable to load Runtime Box resources.",
@@ -281,7 +314,7 @@ const messages = {
 		"runtimeResources.add": "Add Server",
 		"runtimeResources.install": "Install",
 		"runtimeResources.noMcp": "No MCP Servers are configured in this scope.",
-		"runtimeResources.noSkills": "No Skills are installed on this Runtime Box.",
+		"runtimeResources.noSkills": "No Skills are installed in this scope.",
 		"runtimeResources.addToProfile": "Use in Agent",
 		"runtimeResources.removeFromProfile": "Remove from Agent",
 		"runtimeResources.start": "Start",
@@ -681,10 +714,42 @@ const messages = {
 		"runtimeResources.agentServerScopeDescription":
 			"连接与 stdio 进程运行在 Agent Server 主机，切换 Runtime Box 后仍保持生效。",
 		"runtimeResources.runtimeBoxScopeDescription": "连接与 stdio 进程只在所选 Runtime Box 内运行。",
-		"runtimeResources.skillsEyebrow": "Runtime Box 扩展",
+		"runtimeResources.skillsEyebrow": "Agent 扩展",
 		"runtimeResources.skillsTitle": "Skills",
 		"runtimeResources.skillsDescription":
-			"在当前 Runtime Box 安装不可变 Agent Skill，并分配给默认 Agent Profile。",
+			"管理 Agent Server 的纯提示词 Skill，以及当前 Runtime Box 拥有的完整 Skill 包。",
+		"runtimeResources.agentServerSkillScopeDescription":
+			"纯提示词 Skill 在切换 Runtime Box 后仍可使用。",
+		"runtimeResources.runtimeBoxSkillScopeDescription":
+			"完整 Skill 包归当前 Runtime Box；Box 离线时只能读取缓存。",
+		"runtimeResources.skillScope": "Skill 所有者",
+		"runtimeResources.agentServerSkillScopeNote":
+			"适合可复用的通用指令。该作用域只接受一个不可执行的 SKILL.md，并可用于所有 Runtime Box。",
+		"runtimeResources.runtimeBoxSkillScopeNote":
+			"该作用域中的 Skill 归 {0} 所有；包资源和后续脚本始终保留在该设备。",
+		"runtimeResources.installServerSkillDescription":
+			"创建由 Agent Server 私有保存的纯提示词 Skill。",
+		"runtimeResources.installRuntimeSkillDescription":
+			"将 Skill 指令安装到当前选中的 Runtime Box。",
+		"runtimeResources.skillSourceLabel": "来源标签",
+		"runtimeResources.skillSourcePlaceholder": "可选，填写来源或集合名称",
+		"runtimeResources.skillSourceDescription":
+			"仅作为来源元数据展示，不代表信任，也不会授予任何权限。",
+		"runtimeResources.skillMarkdownDescription":
+			"需要包含 YAML frontmatter，并提供 kebab-case 名称和清晰描述。",
+		"runtimeResources.markdownBytes": "{0} 字节",
+		"runtimeResources.promptOnly": "纯提示词",
+		"runtimeResources.runtimePackage": "Runtime 完整包",
+		"runtimeResources.noExecutableFiles": "不允许可执行文件",
+		"runtimeResources.installedSkills": "已安装的 Skills",
+		"runtimeResources.installedSkillsDescription":
+			"查看就绪状态、Agent 分配、包类型和生命周期操作。",
+		"runtimeResources.skillCount": "{0} 个 Skills",
+		"runtimeResources.noSkillsDescription": "在上方安装 SKILL.md，为 Agent 提供可复用的工作指引。",
+		"runtimeResources.skillUnavailable": "无法从所有者读取 Skill 元数据。",
+		"runtimeResources.assignmentUpdateRequired": "需要更新 Agent 分配",
+		"runtimeResources.allowedToolCount": "{0} 个建议工具",
+		"runtimeResources.updateAssignment": "更新 Agent 分配",
 		"runtimeResources.stale": "离线缓存 · 只读",
 		"runtimeResources.refresh": "刷新",
 		"runtimeResources.loadFailed": "无法加载 Runtime Box 资源。",
@@ -740,7 +805,7 @@ const messages = {
 		"runtimeResources.add": "添加服务",
 		"runtimeResources.install": "安装",
 		"runtimeResources.noMcp": "当前作用域尚未配置 MCP 服务。",
-		"runtimeResources.noSkills": "当前 Runtime Box 尚未安装 Skills。",
+		"runtimeResources.noSkills": "当前作用域尚未安装 Skills。",
 		"runtimeResources.addToProfile": "用于 Agent",
 		"runtimeResources.removeFromProfile": "从 Agent 移除",
 		"runtimeResources.start": "启动",

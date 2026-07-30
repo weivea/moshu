@@ -45,6 +45,7 @@ describe("product process RPC contracts", () => {
 			productRpcMethods.runtimeBoxMcpServersDelete,
 			productRpcMethods.runtimeBoxSkillsList,
 			productRpcMethods.runtimeBoxSkillsInstall,
+			productRpcMethods.runtimeBoxSkillsSetEnabled,
 			productRpcMethods.runtimeBoxSkillsDelete,
 			productRpcMethods.runtimeBoxResourcesValidate,
 			productRpcMethods.runtimeBoxSkillGetContent,
@@ -58,7 +59,7 @@ describe("product process RPC contracts", () => {
 		const registration = {
 			schemaVersion: 1 as const,
 			status: "ready" as const,
-			protocolVersion: 2 as const,
+			protocolVersion: 3 as const,
 			transportSecurity: "relay-tls" as const,
 			runtimeBox: {
 				schemaVersion: 1 as const,

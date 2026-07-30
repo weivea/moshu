@@ -73,6 +73,12 @@ import {
 	listRuntimeBoxSkillsOutputSchema,
 	installRuntimeBoxSkillInputSchema,
 	deleteRuntimeBoxSkillInputSchema,
+	listSkillsInputSchema,
+	listSkillsOutputSchema,
+	upsertSkillInputSchema,
+	setSkillEnabledInputSchema,
+	deleteSkillInputSchema,
+	skillMutationResultSchema,
 	getRuntimeProfileInputSchema,
 	getRuntimeProfileOutputSchema,
 	updateRuntimeProfileInputSchema,
@@ -402,6 +408,30 @@ export const desktopClient = {
 		const parsed = deleteRuntimeBoxSkillInputSchema.parse(input);
 		return runtimeBoxResourceMutationResultSchema.parse(
 			await requestDesktop(() => getRequest().deleteSkill(parsed)),
+		);
+	},
+	async listOwnedSkills(input: Parameters<typeof listSkillsInputSchema.parse>[0]) {
+		const parsed = listSkillsInputSchema.parse(input);
+		return listSkillsOutputSchema.parse(
+			await requestDesktop(() => getRequest().listOwnedSkills(parsed)),
+		);
+	},
+	async upsertOwnedSkill(input: Parameters<typeof upsertSkillInputSchema.parse>[0]) {
+		const parsed = upsertSkillInputSchema.parse(input);
+		return skillMutationResultSchema.parse(
+			await requestDesktop(() => getRequest().upsertOwnedSkill(parsed)),
+		);
+	},
+	async setOwnedSkillEnabled(input: Parameters<typeof setSkillEnabledInputSchema.parse>[0]) {
+		const parsed = setSkillEnabledInputSchema.parse(input);
+		return skillMutationResultSchema.parse(
+			await requestDesktop(() => getRequest().setOwnedSkillEnabled(parsed)),
+		);
+	},
+	async deleteOwnedSkill(input: Parameters<typeof deleteSkillInputSchema.parse>[0]) {
+		const parsed = deleteSkillInputSchema.parse(input);
+		return skillMutationResultSchema.parse(
+			await requestDesktop(() => getRequest().deleteOwnedSkill(parsed)),
 		);
 	},
 	async getRuntimeProfile(runtimeBoxId?: string) {

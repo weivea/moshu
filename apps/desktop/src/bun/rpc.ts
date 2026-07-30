@@ -66,6 +66,12 @@ import {
 	listRuntimeBoxSkillsOutputSchema,
 	installRuntimeBoxSkillInputSchema,
 	deleteRuntimeBoxSkillInputSchema,
+	listSkillsInputSchema,
+	listSkillsOutputSchema,
+	upsertSkillInputSchema,
+	setSkillEnabledInputSchema,
+	deleteSkillInputSchema,
+	skillMutationResultSchema,
 	getRuntimeProfileInputSchema,
 	getRuntimeProfileOutputSchema,
 	updateRuntimeProfileInputSchema,
@@ -373,6 +379,34 @@ export function createDesktopRpc({ agentsClient }: DesktopRpcDependencies) {
 						params,
 						deleteRuntimeBoxSkillInputSchema,
 						runtimeBoxResourceMutationResultSchema,
+					),
+				listOwnedSkills: (params) =>
+					agentsClient.request(
+						productRpcMethods.skillList,
+						params,
+						listSkillsInputSchema,
+						listSkillsOutputSchema,
+					),
+				upsertOwnedSkill: (params) =>
+					agentsClient.request(
+						productRpcMethods.skillUpsert,
+						params,
+						upsertSkillInputSchema,
+						skillMutationResultSchema,
+					),
+				setOwnedSkillEnabled: (params) =>
+					agentsClient.request(
+						productRpcMethods.skillSetEnabled,
+						params,
+						setSkillEnabledInputSchema,
+						skillMutationResultSchema,
+					),
+				deleteOwnedSkill: (params) =>
+					agentsClient.request(
+						productRpcMethods.skillDelete,
+						params,
+						deleteSkillInputSchema,
+						skillMutationResultSchema,
 					),
 				getRuntimeProfile: (params) =>
 					agentsClient.request(

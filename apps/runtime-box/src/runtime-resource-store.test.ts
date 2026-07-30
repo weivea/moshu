@@ -307,7 +307,7 @@ describe("RuntimeResourceStore", () => {
 			).toBe(1);
 			expect(
 				inspected.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version,
-			).toBe(4);
+			).toBe(5);
 			inspected.close();
 		} finally {
 			rmSync(directory, { recursive: true, force: true });
@@ -493,10 +493,46 @@ describe("RuntimeResourceStore", () => {
 				valid: false,
 				issues: [{ code: "HASH_MISMATCH" }],
 			});
+			const repaired = store.installSkill({
+				commandId: crypto.randomUUID(),
+				stableResourceId: installed.stableResourceId,
+				expectedConfigRevision: installed.configRevision,
+				expectedVersion: installed.version,
+				source: "local-upload",
+				enabled: true,
+				files: [
+					{
+						path: "SKILL.md",
+						encoding: "utf8",
+						executable: false,
+						content:
+							"---\nname: release-helper\ndescription: Prepare a release safely\nallowed-tools: [read, bash]\nmetadata:\n  owner: moshu\n---\n\nFollow the release checklist.",
+					},
+					{
+						path: "scripts/check.sh",
+						encoding: "utf8",
+						executable: true,
+						content: "#!/bin/sh\nexit 0\n",
+					},
+				],
+			});
+			expect(repaired.version).not.toBe(installed.version);
+			expect(
+				store.validateResources(runtimeBoxId, {
+					refs: [
+						{
+							...ref,
+							version: repaired.version,
+							contentHash: repaired.contentHash,
+						},
+					],
+				}),
+			).toMatchObject({ valid: true });
 			store.deleteSkill({
 				commandId: crypto.randomUUID(),
 				stableResourceId: installed.stableResourceId,
-				expectedVersion: installed.version,
+				expectedConfigRevision: repaired.configRevision,
+				expectedVersion: repaired.version,
 			});
 			expect(
 				existsSync(
@@ -509,6 +545,49 @@ describe("RuntimeResourceStore", () => {
 					),
 				),
 			).toBe(false);
+			store.close();
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+
+	test("toggles Skills without rotating immutable content versions", () => {
+		const directory = mkdtempSync(join(tmpdir(), "moshu-resource-store-skill-enable-"));
+		try {
+			const store = new RuntimeResourceStore(join(directory, "resources"));
+			const installed = store.installSkill({
+				commandId: crypto.randomUUID(),
+				source: "test",
+				enabled: true,
+				files: [
+					{
+						path: "SKILL.md",
+						encoding: "utf8",
+						executable: false,
+						content: "---\nname: toggle-skill\ndescription: Toggle safely\n---\n",
+					},
+				],
+			});
+			const disabled = store.setSkillEnabled({
+				commandId: crypto.randomUUID(),
+				stableResourceId: installed.stableResourceId,
+				expectedConfigRevision: installed.configRevision,
+				enabled: false,
+			});
+			expect(disabled).toMatchObject({
+				configRevision: installed.configRevision + 1,
+				version: installed.version,
+				contentHash: installed.contentHash,
+				descriptor: { health: "stopped" },
+			});
+			expect(() =>
+				store.setSkillEnabled({
+					commandId: crypto.randomUUID(),
+					stableResourceId: installed.stableResourceId,
+					expectedConfigRevision: installed.configRevision,
+					enabled: true,
+				}),
+			).toThrow("configuration changed");
 			store.close();
 		} finally {
 			rmSync(directory, { recursive: true, force: true });
@@ -546,6 +625,7 @@ describe("RuntimeResourceStore", () => {
 			store.deleteSkill({
 				commandId: crypto.randomUUID(),
 				stableResourceId: upper.stableResourceId,
+				expectedConfigRevision: upper.configRevision,
 				expectedVersion: upper.version,
 			});
 			expect(store.validateResources(runtimeBoxId, { refs: [lowerRef] })).toMatchObject({

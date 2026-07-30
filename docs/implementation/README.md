@@ -14,6 +14,7 @@
 | [数据与接口契约](./data-contracts.md) | 身份、注册、RPC、Run、Action grant、Agent Session 和数据所有权 |
 | [Runtime Box 技术与实施方案](./runtime-box.md) | Local/Remote Runtime Box、Agent Server Tunnel、配对、安全、数据模型和实施任务 |
 | [MCP 双归属接入技术设计](./mcp-integration.md) | Agent Server-owned 与 Runtime Box-owned MCP 的所有权、生命周期、Agent 绑定和调用链路 |
+| [Skill 双归属管理技术设计](./skill-integration.md) | Agent Server-owned prompt-only Skill 与 Runtime Box-owned 完整 Skill package 的所有权、绑定和 Run 装配 |
 | [Remote Runtime Box 使用文档](../guides/remote-runtime-box.md) | Remote Access、设备配对、远端安装、验证、排障和解除绑定 |
 | [工程交付计划](./delivery-plan.md) | 迁移顺序、工作包、依赖和阶段出口 |
 | [质量与发布计划](./quality-release.md) | 跨进程测试、故障恢复、安全、打包和发布门槛 |
@@ -63,15 +64,15 @@ RPC / companion binary POC
 | DEC-014 | 目标运行时固定为 Electrobun client、agents server、Runtime Box 三个应用角色；两个 companion 均为 TypeScript + Bun 编译二进制并随桌面应用打包 |
 | DEC-015 | 应用 RPC 固定为 `client <-> agents server <-> Runtime Box`，使用 WebSocket 和版本化 JSON RPC；client 不直接调用 Runtime Box |
 | DEC-016 | `clientId`、`runtimeBoxId` 为可持久稳定身份；每次进程启动/连接注册使用新的 `instanceId` 和递增 `generation`，迟到连接不得覆盖新实例 |
-| DEC-017 | agents server 独占产品 DB、Pi Session JSONL、Provider/model credential、Agent definitions/versions、Session/Run/event、Policy/approval、Action intent/result，以及 Agent Server-owned MCP config/credential/lifecycle |
-| DEC-018 | 每个 Runtime Box 独占其 Box-owned MCP config/credential/OAuth/lifecycle、Skill installation/immutable version/content/hash/resource、Tool execution、取消、进程树和 Runtime Box-private local data |
+| DEC-017 | agents server 独占产品 DB、Pi Session JSONL、Provider/model credential、Agent definitions/versions、Session/Run/event、Policy/approval、Action intent/result，以及 Agent Server-owned MCP 和 prompt-only Skill authority |
+| DEC-018 | 每个 Runtime Box 独占其 Box-owned MCP config/credential/OAuth/lifecycle、完整 Skill package/immutable version/content/hash/resource、Tool execution、取消、进程树和 Runtime Box-private local data |
 | DEC-019 | server 先决定并持久化策略/审批，再签发一次性 execution grant；Runtime Box 验证 grant 后才执行 |
 | DEC-022 | Provider/model credential 永不发送 Runtime Box；MCP credential 由显式 owner 的独立 SecretStore 持久化和加载，连接已认证仍不代表后续 Tool 已获授权 |
 | DEC-023 | client 提供 owner-explicit MCP UI；Server-owned command 在 agents server 持久化，Box-owned command 经 server 校验后路由到目标 Runtime Box |
 | DEC-024 | 每次 Runtime Box 注册/重连先 full inventory sync；运行期使用 persisted epoch/revision、hint + 60 秒 ±20% poll、delta/tombstone 和 snapshot fallback，对 server disposable cache 做对账 |
 | DEC-020 | 当前开发阶段允许重置现有本地数据，不为本次架构重构实现旧数据迁移 |
 | DEC-021 | **已修订**：Remote Runtime Box 进入当前实施范围；Mobile Client、Docker、云 VM 和云端 agents server 仍后置 |
-| DEC-025 | Session/Project 永久绑定 `runtimeBoxId`；MCP recoverable state 归显式 owner，Skill recoverable state 归 owning Runtime Box |
+| DEC-025 | Session/Project 永久绑定 `runtimeBoxId`；MCP 与 Skill recoverable state 均归显式 owner；Server Skill 仅允许 prompt-only `SKILL.md` |
 | DEC-026 | Agent Server 管理持久 Anonymous Dev Tunnel 和独立 Runtime ingress；Desktop 只提供 UI 和进程 supervisor |
 | DEC-027 | Remote Box 使用一次性配对码、Ed25519 双向设备身份、Upgrade challenge、防重放和持久 generation fence |
 | DEC-028 | active Runtime 是 Agent Server 全局 revisioned 状态；只影响列表和新建默认值，既有 Run 永远按 Session Box 路由 |
@@ -95,7 +96,8 @@ RPC / companion binary POC
 | Tool、命令、文件、Git 实际执行 | Runtime Box 内部 Executor | 仅接受 server 授权的 invocation |
 | Agent Server-owned MCP config、credential、连接/进程、Tool inventory | agents server | 与 active Runtime Box 无关；Agent 通过全局 profile 显式选择 |
 | Runtime Box-owned MCP config、credential/OAuth、连接/进程、Tool inventory | owning Runtime Box | client command 经 server 路由；server 只同步可替换、非权威、可丢弃 inventory cache |
-| Skill install、immutable version/content/hash/resources/scripts | owning Runtime Box | Agent 只保存稳定 resource ref；server 按 ref 获取 metadata/`SKILL.md` |
+| Agent Server-owned prompt-only Skill | agents server | `SKILL.md` 位于 server private content store；Agent 通过 global profile 显式选择 |
+| Runtime Box-owned Skill package/version/content/resources/scripts | owning Runtime Box | Agent 通过 Runtime Profile 引用；server 按 ref 获取 metadata/`SKILL.md` |
 | Provider/model Secret | agents server `SecretVault` | 永不发送 Runtime Box |
 | MCP Secret | 显式 owner 的 MCP SecretStore | 不跨 owner 复制；不通过 query/UI/prompt/log/diagnostic/export 返回 |
 
@@ -103,9 +105,10 @@ RPC / companion binary POC
 Box。Agent 与 Provider 全局共享，每个 `agentId + runtimeBoxId` 使用独立 Runtime Profile。完整迁移见
 [Runtime Box 技术与实施方案](./runtime-box.md)。
 
-Agent 与 Provider 全局共享。Agent global profile 只引用 Server-owned MCP；每个 `agentId + runtimeBoxId` 的
-Runtime Profile 只能引用该 Box 拥有的 MCP/Skill。server 构建或恢复 Agent 时合并两类 MCP ref，并按 Box ref
-获取 Skill metadata/`SKILL.md`；缺失、hash/version 不匹配或 Box offline 都 fail closed。
+Agent 与 Provider 全局共享。Agent global profile 引用 Server-owned MCP/Skill；每个
+`agentId + runtimeBoxId` 的 Runtime Profile 只能引用该 Box 拥有的 MCP/Skill。server 构建或恢复 Agent 时
+合并两类 owner，并从各自 authority 获取 Skill metadata/`SKILL.md`；缺失、冲突、hash/version 不匹配或
+Box offline 都 fail closed。
 
 每次 Runtime Box connection/registration/reconnect 后，server 必须先 full sync redacted inventory，成功前状态为 syncing、Agent 不 runnable。之后 Runtime Box 用 revision/category-only hint 提醒，server 去抖增量拉取，并每 60 秒 ±20% jitter 主动对账；gap、compaction、epoch reset 或 invalid cursor 回退 full snapshot。cache 离线时只标 stale，失败 poll 不代表删除，Run 仍 live 验证 resource/version/hash。
 

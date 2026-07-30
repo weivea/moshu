@@ -29,6 +29,7 @@ import {
 } from "@moshu/database";
 import { PairingSessionNotFoundError } from "@moshu/database";
 import { FileMcpSecretStore, McpLifecycleManager } from "@moshu/mcp-runtime";
+import { FileSkillContentStore } from "@moshu/skill-runtime";
 import {
 	createRpcBearerAuthenticator,
 	createRpcServer,
@@ -41,6 +42,7 @@ import { ChatApplicationService } from "./chat-application-service";
 import { DurableActionAuthorizationService } from "./action-authorization-service";
 import { AgentServerIdentity } from "./agent-server-identity";
 import { DevTunnelService } from "./dev-tunnel-service";
+import { resolveEffectiveSkills } from "./effective-skill-resolver";
 import { RuntimeBoxRegistry } from "./runtime-box-registry";
 import { RuntimeBoxGenerationFence } from "./runtime-box-generation-fence";
 import { RuntimeIngressAuth } from "./runtime-ingress-auth";
@@ -117,8 +119,12 @@ export async function createAgentsServer(
 	);
 	mkdirSync(agentServerMcpWorkspaces, { recursive: true, mode: 0o700 });
 	chmodSync(agentServerMcpWorkspaces, 0o700);
+	const agentServerSkillContent = new FileSkillContentStore(
+		join(options.bootstrap.paths.agentDataDirectory, "server-skills"),
+	);
 	const database = openAppDatabase(options.bootstrap.paths.productDatabase, {
 		agentServerMcpSecrets,
+		agentServerSkillContent,
 		prepareAgentServerMcpStdioCwd(stableResourceId) {
 			const directory = join(agentServerMcpWorkspaces, stableResourceId);
 			mkdirSync(directory, { recursive: true, mode: 0o700 });
@@ -128,6 +134,7 @@ export async function createAgentsServer(
 	});
 	agentServerMcpSecrets.cleanupOrphans(new Set(database.agentServerMcps.listSecretLocators()));
 	database.agentServerMcps.drainPendingSecretDeletions();
+	database.agentServerSkills.reconcileContent();
 	const recoveredActions = database.actions.recoverOnStartup();
 	if (recoveredActions.cancelled > 0 || recoveredActions.outcomeUnknown > 0) {
 		reportDiagnostic(
@@ -279,23 +286,14 @@ export async function createAgentsServer(
 						retryable: true,
 					});
 				}
-				const skills = await Promise.all(
-					profile.resources
-						.filter((ref) => ref.resourceKind === "skill")
-						.map(async (ref) => {
-							const content = await runtimeBoxRegistry.getSkillContent(
-								runtimeBoxId,
-								{ ref },
-								signal,
-							);
-							return {
-								stableResourceId: ref.stableResourceId,
-								version: ref.version,
-								contentHash: ref.contentHash,
-								skillMarkdown: content.skillMarkdown,
-							};
-						}),
-				);
+				const skills = await resolveEffectiveSkills({
+					runtimeBoxId,
+					serverRefs: globalProfile.serverSkillRefs,
+					boxRefs: profile.resources,
+					serverSkills: database.agentServerSkills,
+					runtimeBoxes: runtimeBoxRegistry,
+					signal,
+				});
 				const serverMcpResources = database.agentServerMcps
 					.resolveRefs(globalProfile.serverMcpRefs)
 					.map((resource) => ({
@@ -366,6 +364,7 @@ export async function createAgentsServer(
 			runtimeProfiles: database.runtimeProfiles,
 			agentGlobalProfiles: database.agentGlobalProfiles,
 			agentServerMcps: database.agentServerMcps,
+			agentServerSkills: database.agentServerSkills,
 			runtimeIngressAuth,
 			getDevTunnelService: requireDevTunnelService,
 			eventRouter,

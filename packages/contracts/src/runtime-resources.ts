@@ -10,6 +10,7 @@ const maxSkillFiles = 256;
 const maxSkillPackageBytes = 2 * 1024 * 1024;
 export const maxRuntimeBoxSkillMarkdownBytes = 512 * 1024;
 export const maxRuntimeBoxSkillFileBytes = 1024 * 1024;
+export const maxEffectiveSkillMarkdownBytes = 2 * 1024 * 1024;
 export const maxRuntimeBoxMcpSecretFileBytes = 2 * 1024 * 1024;
 export const maxRuntimeBoxInventoryPayloadBytes = 7 * 512 * 1024;
 const maxMcpToolSchemaBytes = 256 * 1024;
@@ -72,6 +73,7 @@ export const runtimeBoxSkillInventoryResourceSchema = z
 	.object({
 		resourceKind: z.literal("skill"),
 		stableResourceId: runtimeResourceIdSchema,
+		configRevision: z.int().positive().safe(),
 		version: runtimeResourceVersionSchema,
 		contentHash: runtimeResourceContentHashSchema,
 		health: runtimeResourceHealthSchema,
@@ -388,7 +390,7 @@ export const deleteRuntimeBoxMcpServerInputSchema = z
 export const runtimeBoxResourceMutationResultSchema = z
 	.object({
 		stableResourceId: runtimeResourceIdSchema,
-		configRevision: z.int().positive().safe().optional(),
+		configRevision: z.int().positive().safe(),
 		version: runtimeResourceVersionSchema,
 		contentHash: runtimeResourceContentHashSchema,
 		inventoryEpoch: runtimeInventoryEpochSchema,
@@ -416,6 +418,7 @@ export const skillMetadataSchema = z
 export const runtimeBoxSkillSchema = z
 	.object({
 		stableResourceId: runtimeResourceIdSchema,
+		configRevision: z.int().positive().safe(),
 		version: runtimeResourceVersionSchema,
 		contentHash: runtimeResourceContentHashSchema,
 		metadata: skillMetadataSchema,
@@ -452,6 +455,7 @@ export const installRuntimeBoxSkillInputSchema = z
 		runtimeBoxId: runtimeBoxIdSchema.optional(),
 		commandId: z.string().uuid(),
 		stableResourceId: runtimeResourceIdSchema.optional(),
+		expectedConfigRevision: z.int().positive().safe().optional(),
 		expectedVersion: runtimeResourceVersionSchema.optional(),
 		source: z.string().trim().min(1).max(2_048),
 		enabled: z.boolean(),
@@ -507,6 +511,16 @@ export const installRuntimeBoxSkillInputSchema = z
 	})
 	.strict();
 
+export const setRuntimeBoxSkillEnabledInputSchema = z
+	.object({
+		runtimeBoxId: runtimeBoxIdSchema.optional(),
+		commandId: z.string().uuid(),
+		stableResourceId: runtimeResourceIdSchema,
+		expectedConfigRevision: z.int().positive().safe(),
+		enabled: z.boolean(),
+	})
+	.strict();
+
 export const listRuntimeBoxSkillsInputSchema = z
 	.object({ runtimeBoxId: runtimeBoxIdSchema.optional() })
 	.strict();
@@ -530,6 +544,7 @@ export const deleteRuntimeBoxSkillInputSchema = z
 		runtimeBoxId: runtimeBoxIdSchema.optional(),
 		commandId: z.string().uuid(),
 		stableResourceId: runtimeResourceIdSchema,
+		expectedConfigRevision: z.int().positive().safe().optional(),
 		expectedVersion: runtimeResourceVersionSchema,
 	})
 	.strict();
@@ -682,17 +697,25 @@ export const listRuntimeBoxInventoryOutputSchema = z
 	})
 	.strict();
 
-export const agentServerMcpOwnerSchema = z.object({ kind: z.literal("agent-server") }).strict();
-export const runtimeBoxMcpOwnerSchema = z
+export const agentServerResourceOwnerSchema = z
+	.object({ kind: z.literal("agent-server") })
+	.strict();
+export const runtimeBoxResourceOwnerSchema = z
 	.object({
 		kind: z.literal("runtime-box"),
 		runtimeBoxId: runtimeBoxIdSchema,
 	})
 	.strict();
-export const mcpOwnerSchema = z.discriminatedUnion("kind", [
-	agentServerMcpOwnerSchema,
-	runtimeBoxMcpOwnerSchema,
+export const resourceOwnerSchema = z.discriminatedUnion("kind", [
+	agentServerResourceOwnerSchema,
+	runtimeBoxResourceOwnerSchema,
 ]);
+export const agentServerMcpOwnerSchema = agentServerResourceOwnerSchema;
+export const runtimeBoxMcpOwnerSchema = runtimeBoxResourceOwnerSchema;
+export const mcpOwnerSchema = resourceOwnerSchema;
+export const agentServerSkillOwnerSchema = agentServerResourceOwnerSchema;
+export const runtimeBoxSkillOwnerSchema = runtimeBoxResourceOwnerSchema;
+export const skillOwnerSchema = resourceOwnerSchema;
 
 export const mcpServerSummarySchema = z
 	.object({
@@ -779,6 +802,107 @@ export const mcpServerMutationResultSchema = z
 	})
 	.strict();
 
+export const skillSourceKindSchema = z.enum(["inline-editor", "local-upload", "import"]);
+export const skillSourceInputSchema = z
+	.object({
+		kind: skillSourceKindSchema,
+		label: z.string().trim().min(1).max(256).optional(),
+	})
+	.strict();
+export const skillPackageKindSchema = z.enum(["prompt-only", "runtime-package"]);
+export const skillSummarySchema = z
+	.object({
+		owner: skillOwnerSchema,
+		stableResourceId: runtimeResourceIdSchema,
+		configRevision: z.int().positive().safe(),
+		version: runtimeResourceVersionSchema,
+		contentHash: runtimeResourceContentHashSchema,
+		metadata: skillMetadataSchema.optional(),
+		enabled: z.boolean(),
+		health: runtimeResourceHealthSchema,
+		packageKind: skillPackageKindSchema,
+		sourceKind: skillSourceKindSchema,
+		sourceLabel: z.string().trim().min(1).max(256).optional(),
+		stale: z.boolean(),
+		installedAt: z.string().datetime({ offset: true }),
+		updatedAt: z.string().datetime({ offset: true }),
+		lastErrorCode: z.string().trim().min(1).max(128).optional(),
+	})
+	.strict();
+
+export const listSkillsInputSchema = z.object({ owner: skillOwnerSchema }).strict();
+export const listSkillsOutputSchema = z
+	.object({
+		owner: skillOwnerSchema,
+		items: z.array(skillSummarySchema).max(maxRuntimeBoxInventoryResources),
+	})
+	.strict()
+	.superRefine((value, context) => {
+		for (const [index, item] of value.items.entries()) {
+			if (resourceOwnerKey(item.owner) !== resourceOwnerKey(value.owner)) {
+				context.addIssue({
+					code: "custom",
+					message: "Skill summary owner does not match the requested owner.",
+					path: ["items", index, "owner"],
+				});
+			}
+		}
+	});
+
+export const upsertSkillInputSchema = z
+	.object({
+		owner: skillOwnerSchema,
+		commandId: z.string().uuid(),
+		stableResourceId: runtimeResourceIdSchema.optional(),
+		expectedConfigRevision: z.int().positive().safe().optional(),
+		expectedVersion: runtimeResourceVersionSchema.optional(),
+		source: skillSourceInputSchema,
+		enabled: z.boolean(),
+		files: installRuntimeBoxSkillInputSchema.shape.files,
+	})
+	.strict()
+	.superRefine((input, context) => {
+		if ((input.expectedConfigRevision === undefined) !== (input.expectedVersion === undefined)) {
+			context.addIssue({
+				code: "custom",
+				message: "Skill updates require both expectedConfigRevision and expectedVersion.",
+				path: ["expectedVersion"],
+			});
+		}
+	});
+
+export const setSkillEnabledInputSchema = z
+	.object({
+		owner: skillOwnerSchema,
+		commandId: z.string().uuid(),
+		stableResourceId: runtimeResourceIdSchema,
+		expectedConfigRevision: z.int().positive().safe(),
+		enabled: z.boolean(),
+	})
+	.strict();
+
+export const deleteSkillInputSchema = z
+	.object({
+		owner: skillOwnerSchema,
+		commandId: z.string().uuid(),
+		stableResourceId: runtimeResourceIdSchema,
+		expectedConfigRevision: z.int().positive().safe(),
+		expectedVersion: runtimeResourceVersionSchema,
+	})
+	.strict();
+
+export const skillMutationResultSchema = z
+	.object({
+		owner: skillOwnerSchema,
+		stableResourceId: runtimeResourceIdSchema,
+		configRevision: z.int().positive().safe(),
+		version: runtimeResourceVersionSchema,
+		contentHash: runtimeResourceContentHashSchema,
+		deleted: z.boolean(),
+		summary: skillSummarySchema.optional(),
+	})
+	.strict();
+
 export const agentServerMcpResourceRefSchema = z
 	.object({
 		owner: agentServerMcpOwnerSchema,
@@ -788,11 +912,40 @@ export const agentServerMcpResourceRefSchema = z
 	})
 	.strict();
 
+export const agentServerSkillResourceRefSchema = z
+	.object({
+		owner: agentServerSkillOwnerSchema,
+		stableResourceId: runtimeResourceIdSchema,
+		version: runtimeResourceVersionSchema,
+		contentHash: runtimeResourceContentHashSchema,
+	})
+	.strict();
+
+export const skillResourceRefSchema = z.union([
+	z
+		.object({
+			owner: agentServerSkillOwnerSchema,
+			stableResourceId: runtimeResourceIdSchema,
+			version: runtimeResourceVersionSchema,
+			contentHash: runtimeResourceContentHashSchema,
+		})
+		.strict(),
+	z
+		.object({
+			owner: runtimeBoxSkillOwnerSchema,
+			stableResourceId: runtimeResourceIdSchema,
+			version: runtimeResourceVersionSchema,
+			contentHash: runtimeResourceContentHashSchema,
+		})
+		.strict(),
+]);
+
 export const agentGlobalProfileSchema = z
 	.object({
 		agentId: runtimeProfileSchema.shape.agentId,
 		revision: z.int().positive().safe(),
 		serverMcpRefs: z.array(agentServerMcpResourceRefSchema).max(256),
+		serverSkillRefs: z.array(agentServerSkillResourceRefSchema).max(256),
 		createdAt: z.string().datetime({ offset: true }),
 		updatedAt: z.string().datetime({ offset: true }),
 	})
@@ -809,6 +962,17 @@ export const agentGlobalProfileSchema = z
 			}
 			ids.add(ref.stableResourceId);
 		}
+		const skillIds = new Set<string>();
+		for (const [index, ref] of profile.serverSkillRefs.entries()) {
+			if (skillIds.has(ref.stableResourceId)) {
+				context.addIssue({
+					code: "custom",
+					message: "Agent global Skill refs must be unique.",
+					path: ["serverSkillRefs", index],
+				});
+			}
+			skillIds.add(ref.stableResourceId);
+		}
 	});
 
 export const getAgentGlobalProfileInputSchema = z
@@ -822,6 +986,7 @@ export const updateAgentGlobalProfileInputSchema = z
 		agentId: runtimeProfileSchema.shape.agentId.default("moshu.default"),
 		expectedRevision: z.int().positive().safe(),
 		serverMcpRefs: z.array(agentServerMcpResourceRefSchema).max(256),
+		serverSkillRefs: z.array(agentServerSkillResourceRefSchema).max(256),
 	})
 	.strict()
 	.superRefine((input, context) => {
@@ -836,12 +1001,25 @@ export const updateAgentGlobalProfileInputSchema = z
 			}
 			ids.add(ref.stableResourceId);
 		}
+		const skillIds = new Set<string>();
+		for (const [index, ref] of input.serverSkillRefs.entries()) {
+			if (skillIds.has(ref.stableResourceId)) {
+				context.addIssue({
+					code: "custom",
+					message: "Agent global Skill refs must be unique.",
+					path: ["serverSkillRefs", index],
+				});
+			}
+			skillIds.add(ref.stableResourceId);
+		}
 	});
 export const updateAgentGlobalProfileOutputSchema = getAgentGlobalProfileOutputSchema;
 
-function mcpOwnerKey(owner: z.infer<typeof mcpOwnerSchema>): string {
+export function resourceOwnerKey(owner: z.infer<typeof resourceOwnerSchema>): string {
 	return owner.kind === "agent-server" ? owner.kind : `${owner.kind}:${owner.runtimeBoxId}`;
 }
+
+const mcpOwnerKey = resourceOwnerKey;
 
 export type RuntimeResourceKind = z.infer<typeof runtimeResourceKindSchema>;
 export type McpToolDescriptor = z.infer<typeof mcpToolDescriptorSchema>;
@@ -871,9 +1049,12 @@ export type RuntimeBoxResourceMutationResult = z.infer<
 	typeof runtimeBoxResourceMutationResultSchema
 >;
 export type RuntimeBoxSkill = z.infer<typeof runtimeBoxSkillSchema>;
+export type SkillMetadata = z.infer<typeof skillMetadataSchema>;
+export type SkillPackageFile = z.infer<typeof skillPackageFileSchema>;
 export type ListRuntimeBoxSkillsInput = z.infer<typeof listRuntimeBoxSkillsInputSchema>;
 export type ListRuntimeBoxSkillsOutput = z.infer<typeof listRuntimeBoxSkillsOutputSchema>;
 export type InstallRuntimeBoxSkillInput = z.infer<typeof installRuntimeBoxSkillInputSchema>;
+export type SetRuntimeBoxSkillEnabledInput = z.infer<typeof setRuntimeBoxSkillEnabledInputSchema>;
 export type DeleteRuntimeBoxSkillInput = z.infer<typeof deleteRuntimeBoxSkillInputSchema>;
 export type RuntimeBoxResourceRef = z.infer<typeof runtimeBoxResourceRefSchema>;
 export type ValidateRuntimeBoxResourcesInput = z.infer<
@@ -890,6 +1071,19 @@ export type GetRuntimeProfileOutput = z.infer<typeof getRuntimeProfileOutputSche
 export type UpdateRuntimeProfileInput = z.infer<typeof updateRuntimeProfileInputSchema>;
 export type ListRuntimeBoxInventoryOutput = z.infer<typeof listRuntimeBoxInventoryOutputSchema>;
 export type McpOwner = z.infer<typeof mcpOwnerSchema>;
+export type ResourceOwner = z.infer<typeof resourceOwnerSchema>;
+export type SkillOwner = z.infer<typeof skillOwnerSchema>;
+export type SkillSourceInput = z.infer<typeof skillSourceInputSchema>;
+export type SkillPackageKind = z.infer<typeof skillPackageKindSchema>;
+export type SkillSummary = z.infer<typeof skillSummarySchema>;
+export type ListSkillsInput = z.infer<typeof listSkillsInputSchema>;
+export type ListSkillsOutput = z.infer<typeof listSkillsOutputSchema>;
+export type UpsertSkillInput = z.infer<typeof upsertSkillInputSchema>;
+export type SetSkillEnabledInput = z.infer<typeof setSkillEnabledInputSchema>;
+export type DeleteSkillInput = z.infer<typeof deleteSkillInputSchema>;
+export type SkillMutationResult = z.infer<typeof skillMutationResultSchema>;
+export type AgentServerSkillResourceRef = z.infer<typeof agentServerSkillResourceRefSchema>;
+export type SkillResourceRef = z.infer<typeof skillResourceRefSchema>;
 export type McpServerSummary = z.infer<typeof mcpServerSummarySchema>;
 export type ListMcpServersInput = z.infer<typeof listMcpServersInputSchema>;
 export type ListMcpServersOutput = z.infer<typeof listMcpServersOutputSchema>;

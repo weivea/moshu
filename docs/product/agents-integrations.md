@@ -25,10 +25,10 @@ Agent
 
 ### 1.1 三角色映射
 
-- agents server 保存 Provider/model、Agent/Run/Policy/Action，以及 Agent Server-owned MCP config/credential/lifecycle 和 Agent global refs；对 Box-owned MCP/Skill 只保存 stable ref 与非权威 inventory cache。
+- agents server 保存 Provider/model、Agent/Run/Policy/Action、Agent Server-owned MCP、prompt-only Skill 和 Agent global refs；对 Box-owned MCP/Skill 只保存 stable ref 与非权威 inventory cache。
 - 每个 Runtime Box 是自身 Box-owned MCP config/credential/OAuth/lifecycle、Skill installation/immutable version/content/hash/resources 和相关 private local data 的唯一 source of truth。
 - 每次 Runtime Box 注册/重连时 server 先 full sync redacted inventory；运行期以 revision hint + 60 秒 ±20% jitter poll 拉取 delta，cache 可丢弃且不构成授权。
-- Agent global profile 可引用 Server-owned MCP；Runtime Profile 只可引用 assigned Runtime Box 的资源。server 合并两类 MCP ref，并按 Box ref 获取 Skill metadata 与 `SKILL.md`。
+- Agent global profile 可引用 Server-owned MCP/Skill；Runtime Profile 只可引用 assigned Runtime Box 的资源。server 合并两类 owner，并从各自 authority 获取 Skill metadata 与 `SKILL.md`。
 - server 决定并持久化 Policy/approval，随后签发一次性 execution grant；Runtime Box 验证后才执行。
 - 当前 desktop 由 client 监管一个 host-backed Local Runtime Box；Agent 全局共享，并为每个 Box 建立 Runtime Profile。
 
@@ -282,13 +282,13 @@ skill-name/
 - 展示来源、版本、内容哈希和最近使用时间。
 - 后续支持从 Git URL 安装与更新。
 
-Skill installation、immutable versions/content/hash、metadata、实际目录、校验、读取和卸载都由 selected Runtime
-Box 管理。client 管理 UI 使用与 MCP 相同的 server-routed command；server 只在 Runtime Profile 中保存该 Box
-的 stable Skill ref，并可缓存 replaceable inventory descriptor。
+Skill 使用与 MCP 一致的显式双归属管理。Agent Server-owned Skill 只允许单个非 executable `SKILL.md`，
+由 Product DB metadata 与 server private content store 管理；Runtime Box-owned Skill 继续拥有完整 package、
+immutable versions、资源和脚本。安装/启用与 Agent assignment 分离。
 
 ### 5.3 渐进加载
 
-- Agent 构建或恢复前，agents server 按 `runtimeBoxId + stableSkillId + version + contentHash` 通过 Runtime Box RPC 获取 Skill metadata 和 `SKILL.md`。
+- Agent 构建或恢复前，agents server 从 global profile 与 Session Box Runtime Profile 合并 Skill refs，并从各自 owner 获取 metadata 和 `SKILL.md`。
 - server 验证 owner、version 与 hash 后构造有效 Agent prompt；offline、missing 或 mismatch 时 fail closed，不使用 snapshot/旧内容。
 - fetched content 只用于当次内存 prompt assembly，不写入 Agent/Run snapshot、Pi Session JSONL、event、
   backup、diagnostic 或 export；恢复时重新按 ref 获取。
@@ -297,11 +297,8 @@ Box 管理。client 管理 UI 使用与 MCP 相同的 server-routed command；se
 
 ### 5.4 作用域与冲突
 
-作用域从低到高为：
-
-`全局 → Project → Agent`
-
-同名 Skill 由更具体作用域覆盖；同作用域冲突要求用户处理。有效来源顺序在 Agent 详情中可见。
+当前作用域为 Agent global Server-owned Skill 与当前 Runtime Box-owned Skill。任何有效 Skill 集出现相同
+`metadata.name` 时 Run fail closed，不进行 owner 优先级覆盖。Project 级覆盖层后置。
 
 ### 5.5 安全
 

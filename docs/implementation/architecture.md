@@ -118,6 +118,7 @@ agents server 是业务事实来源，独占：
 - execution grant 的签发、使用状态和审计。
 - Agent 对 Runtime Box resource 的稳定引用，以及从 Runtime Box 同步得到的可替换、非权威、可丢弃 inventory/capability cache。
 - Agent Server-owned MCP config、credential、Tool inventory、连接/子进程生命周期和 Agent global refs。
+- Agent Server-owned prompt-only Skill installation、immutable `SKILL.md`、metadata 和 Agent global refs。
 
 agents server 不保存可恢复的 **Runtime Box-owned** MCP/Skill config、credential/OAuth state 或 Skill 内容副本，也不直接执行文件、命令、Git 或 Skill 脚本。Server-owned MCP Tool 只能通过本地 Action dispatcher 调用。
 
@@ -127,7 +128,7 @@ Runtime Box 是其安装设备上的执行与扩展资源事实来源，内部 E
 
 - 内置 Tool 的实际文件、命令、Git、网络或其他 host 操作。
 - Box-owned MCP config、credential/token/OAuth state、stdio/HTTP/SSE 连接和子进程生命周期。
-- Skill installation、immutable versions、content/hash、metadata、资源和脚本。
+- Box-owned Skill installation、immutable versions、content/hash、metadata、资源和脚本。
 - Runtime Box private DB、Skill data root、`ExecutorSecretStore` 和相关设备数据。
 - 持久化 `inventoryEpoch`、单调递增 `inventoryRevision`，以及带 deletion tombstone 的有界 inventory change log。
 - invocation 取消、超时、输出限制、子进程组和进程树清理。
@@ -224,7 +225,7 @@ client 注册声明 UI/API capability；Runtime Box 注册声明 host platform�
 
 ### 6.4 Inventory 同步与对账
 
-Runtime Box 仍是 MCP/Skill/config/credential 的唯一 source of truth；server inventory 只是 discovery/reconciliation cache：
+Runtime Box 仍是其 Box-owned MCP/Skill/config/credential 的唯一 source of truth；server inventory 只是 discovery/reconciliation cache：
 
 1. Runtime Box 在自己的 DB 中持久化 opaque `inventoryEpoch` 和该 epoch 内单调递增的 `inventoryRevision`。普通进程重启保留 epoch/revision；inventory store reset/recreate 才生成新 epoch。
 2. 每次 MCP/Skill config、lifecycle descriptor、Tool schema 或 Runtime Box capability 变化时，Runtime Box 在同一持久化 transaction 中更新权威状态、递增 revision，并追加 change record；删除使用 tombstone。有界 log 可压缩，并公开最早可增量读取的 revision。
@@ -426,13 +427,13 @@ Runtime Box 必须拒绝过期、重复、目标不匹配、参数摘要变化�
 
 ### 10.2 Skills
 
-- Runtime Box 是 Skill installation、immutable version、content/hash、metadata、resources/scripts 和本地数据的唯一 source of truth。
-- client 提供完整 Skill UI；command 经 server 校验 client/Runtime Box identity 与产品授权后路由到 Runtime Box，只有 Runtime Box 持久化成功后才返回 redacted result/inventory epoch/revision，并触发 server read-own-write reconciliation。
-- Runtime Profile 只保存 owning `runtimeBoxId + stableSkillId + version + contentHash`；不能引用其他 Box 的 MCP/Skill。
-- server 构建或恢复 Agent 时，按稳定 ref 从 Runtime Box 获取 metadata 与 `SKILL.md` 并验证 version/hash；offline、missing 或 mismatch 均 fail closed。
+- Skill 使用显式双 owner：Agent Server-owned Skill 只允许单个非 executable `SKILL.md`；Runtime Box-owned Skill 拥有完整 package/resources/scripts。
+- client 使用 owner-explicit command。Server mutation 写 Product DB metadata 与 server private content store；Box mutation 路由到 owning Box 并执行 read-own-write reconciliation。
+- Agent global profile 保存 Server-owned Skill ref；Runtime Profile 只保存 owning `runtimeBoxId + stableSkillId + version + contentHash`。
+- server 构建或恢复 Agent 时从各自 owner 获取 metadata 与 `SKILL.md`，验证 owner/version/hash/readiness、总 prompt 大小和 metadata name 唯一性；任何冲突、missing 或 mismatch 均 fail closed。
 - fetched Skill content 只用于内存中的 prompt assembly；Agent version、Run config snapshot、Pi Session JSONL、
   event、backup、inventory 和 diagnostics 都不保存可恢复正文，恢复时重新按 ref 获取。
-- server 可缓存 replaceable inventory/descriptor snapshot，但不能把它当作 Skill 恢复副本。
+- server 可缓存 Box inventory/descriptor snapshot，但不能把它当作 Box-owned Skill 恢复副本；Server-owned 正文只存在 server private content store。
 - references/assets/scripts 的读取或执行继续通过 Runtime Box；Skill 不能借 `allowed-tools` 绕过 Policy 或 grant。
 - Runtime Box offline 时，依赖其 Skill 的 Agent 不得以缺失内容的方式静默启动。
 

@@ -183,8 +183,8 @@ A4 先交付 backend ownership、协议和安全 gate，默认保持 feature fla
 
 ### 7.2 A4 出口
 
-- [ ] MCP config/credential/lifecycle 归显式 owner；每个 Runtime Box 是自身 Box-owned MCP 与 Skill immutable content/resources 的唯一 source of truth。
-- [ ] server 对 Box-owned MCP/Skill 只保存 Agent resource refs 和 disposable redacted inventory cache；Server-owned MCP 使用独立 authority/SecretStore。
+- [x] MCP/Skill 归显式 owner；每个 Runtime Box 是自身 Box-owned MCP 与完整 Skill package 的唯一 source of truth。
+- [x] server 对 Box-owned MCP/Skill 只保存 refs 与 disposable inventory；Server-owned MCP 和 prompt-only Skill 使用独立 authority。
 - [ ] Runtime Box 持久化 epoch/revision 与有界 change log/deletion tombstone；每次注册/重连 full sync 成功前 Agent 不 runnable。
 - [ ] `inventory.changed` 只含 revision/category；server 去抖增量拉取，并每 60 秒 ±20% jitter 独立 polling。
 - [ ] gap、compaction、epoch reset 或 invalid cursor 触发 full snapshot atomic replace；offline/failed poll 只标 stale，不解释为 deletion。

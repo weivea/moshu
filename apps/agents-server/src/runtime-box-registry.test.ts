@@ -98,8 +98,8 @@ describe("RuntimeBoxRegistry routing and invocation gateway", () => {
 		expect(gateway.listInfo()[0]).toMatchObject({
 			state: "upgrade_required",
 			compatibility: "upgrade_required",
-			requiredProtocolMinVersion: 2,
-			requiredProtocolMaxVersion: 2,
+			requiredProtocolMinVersion: 3,
+			requiredProtocolMaxVersion: 3,
 		});
 	});
 
@@ -160,7 +160,7 @@ describe("RuntimeBoxRegistry routing and invocation gateway", () => {
 					arch: "arm64",
 					capabilities: [],
 				},
-				{ protocolVersion: 2, transportSecurity: "noise-xx" },
+				{ protocolVersion: 3, transportSecurity: "noise-xx" },
 			),
 		).toThrow("was not negotiated");
 	});
@@ -493,6 +493,7 @@ describe("RuntimeBoxRegistry routing and invocation gateway", () => {
 						{
 							resourceKind: "skill",
 							stableResourceId: "release-helper",
+							configRevision: 1,
 							version: skillVersion,
 							contentHash: skillHash,
 							health: "ready",
@@ -504,6 +505,7 @@ describe("RuntimeBoxRegistry routing and invocation gateway", () => {
 				revision = 2;
 				return rpcJsonValueSchema.parse({
 					stableResourceId: "database-tools",
+					configRevision: 1,
 					version: mcpVersion,
 					contentHash: mcpHash,
 					inventoryEpoch: epoch,
@@ -610,6 +612,7 @@ describe("RuntimeBoxRegistry routing and invocation gateway", () => {
 						{
 							resourceKind: "skill",
 							stableResourceId: "stable-skill",
+							configRevision: 1,
 							version,
 							contentHash: "a".repeat(64),
 							health: "ready",
@@ -772,6 +775,7 @@ describe("RuntimeBoxRegistry routing and invocation gateway", () => {
 										descriptor: {
 											resourceKind: "skill",
 											stableResourceId: "hint-was-lost",
+											configRevision: 1,
 											version,
 											contentHash: "a".repeat(64),
 											health: "ready",
@@ -827,6 +831,7 @@ describe("RuntimeBoxRegistry routing and invocation gateway", () => {
 									{
 										resourceKind: "skill",
 										stableResourceId: "after-compaction",
+										configRevision: 1,
 										version,
 										contentHash: "b".repeat(64),
 										health: "ready",

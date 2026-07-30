@@ -13,6 +13,7 @@
 		"@moshu/contracts": "workspace:*",
 		"@moshu/mcp-runtime": "workspace:*",
 		"@moshu/process-rpc": "workspace:*",
+		"@moshu/skill-runtime": "workspace:*",
 		"diff": "8.0.4",
 		"yaml": "2.9.0",
 		"zod": "4.4.3"

@@ -19,8 +19,9 @@ import type {
 	McpOwner,
 	McpServerSummary,
 	RuntimeBoxResourceRef,
-	RuntimeBoxSkill,
 	RuntimeProfile,
+	SkillOwner,
+	SkillSummary,
 } from "@moshu/contracts";
 import { useCallback, useEffect, useRef, useState } from "react";
 
@@ -43,10 +44,11 @@ interface McpView {
 
 interface SkillView {
 	stableResourceId: string;
+	configRevision: number;
 	version: string;
 	contentHash: string;
 	health: "ready" | "stopped" | "error";
-	skill?: RuntimeBoxSkill;
+	skill?: SkillSummary;
 }
 
 export function McpServersSettingsPage() {
@@ -431,6 +433,7 @@ export function McpServersSettingsPage() {
 					agentId: globalProfile.agentId,
 					expectedRevision: globalProfile.revision,
 					serverMcpRefs,
+					serverSkillRefs: globalProfile.serverSkillRefs,
 				}),
 			);
 			return;
@@ -902,54 +905,78 @@ export function SkillsSettingsPage() {
 	const { t } = useI18n();
 	const runtimeBoxes = useRuntimeBoxes();
 	const runtimeBoxId = runtimeBoxes.snapshot.active.runtimeBoxId;
+	const [scope, setScope] = useState<"agent-server" | "runtime-box">("agent-server");
 	const [items, setItems] = useState<SkillView[]>([]);
 	const [profile, setProfile] = useState<RuntimeProfile>();
+	const [globalProfile, setGlobalProfile] = useState<AgentGlobalProfile>();
 	const [stale, setStale] = useState(false);
 	const [error, setError] = useState<string>();
 	const [pending, setPending] = useState(false);
-	const [source, setSource] = useState("local-upload");
+	const [source, setSource] = useState("");
 	const [skillMarkdown, setSkillMarkdown] = useState(
 		"---\nname: my-skill\ndescription: Describe when this Skill should be used\n---\n\nAdd Skill instructions here.",
 	);
 	const loadGeneration = useRef(0);
 	const createCommandId = useRef<string | undefined>(undefined);
 	const activeRuntimeBoxId = useRef(runtimeBoxId);
+	const activeScope = useRef(scope);
 	const mutationGeneration = useRef(0);
-	activeRuntimeBoxId.current = runtimeBoxId;
+	const owner: SkillOwner =
+		scope === "agent-server" ? { kind: "agent-server" } : { kind: "runtime-box", runtimeBoxId };
+	const ownerReady = scope === "agent-server" || runtimeBoxes.isActiveReady;
 
 	const load = useCallback(async () => {
-		if (activeRuntimeBoxId.current !== runtimeBoxId) {
+		if (
+			activeScope.current !== scope ||
+			(scope === "runtime-box" && activeRuntimeBoxId.current !== runtimeBoxId)
+		) {
 			return;
 		}
 		const generation = ++loadGeneration.current;
 		setError(undefined);
 		try {
+			if (scope === "agent-server") {
+				const [live, globalOutput] = await Promise.all([
+					desktopClient.listOwnedSkills({ owner: { kind: "agent-server" } }),
+					desktopClient.getAgentGlobalProfile(),
+				]);
+				if (generation !== loadGeneration.current || activeScope.current !== scope) {
+					return;
+				}
+				setStale(false);
+				setProfile(undefined);
+				setGlobalProfile(globalOutput.profile);
+				setItems(
+					appendMissingAgentServerSkillRefs(live.items.map(toSkillView), globalOutput.profile),
+				);
+				return;
+			}
 			const [inventory, profileOutput] = await Promise.all([
 				desktopClient.listRuntimeInventory(runtimeBoxId),
 				desktopClient.getRuntimeProfile(runtimeBoxId),
 			]);
-			if (generation !== loadGeneration.current || activeRuntimeBoxId.current !== runtimeBoxId) {
+			if (
+				generation !== loadGeneration.current ||
+				activeScope.current !== scope ||
+				activeRuntimeBoxId.current !== runtimeBoxId
+			) {
 				return;
 			}
 			setStale(inventory.stale);
 			setProfile(profileOutput.profile);
+			setGlobalProfile(undefined);
 			if (runtimeBoxes.isActiveReady) {
-				const live = await desktopClient.listSkills(runtimeBoxId);
-				if (generation !== loadGeneration.current || activeRuntimeBoxId.current !== runtimeBoxId) {
+				const live = await desktopClient.listOwnedSkills({
+					owner: { kind: "runtime-box", runtimeBoxId },
+				});
+				if (
+					generation !== loadGeneration.current ||
+					activeScope.current !== scope ||
+					activeRuntimeBoxId.current !== runtimeBoxId
+				) {
 					return;
 				}
-				setItems(
-					appendMissingSkillRefs(
-						live.items.map((skill) => ({
-							stableResourceId: skill.stableResourceId,
-							version: skill.version,
-							contentHash: skill.contentHash,
-							health: skill.enabled ? "ready" : "stopped",
-							skill,
-						})),
-						profileOutput.profile,
-					),
-				);
+				setItems(appendMissingSkillRefs(live.items.map(toSkillView), profileOutput.profile));
 			} else {
 				setItems(
 					appendMissingSkillRefs(
@@ -957,6 +984,7 @@ export function SkillsSettingsPage() {
 							.filter((resource) => resource.resourceKind === "skill")
 							.map((resource) => ({
 								stableResourceId: resource.stableResourceId,
+								configRevision: resource.configRevision,
 								version: resource.version,
 								contentHash: resource.contentHash,
 								health: resource.health,
@@ -966,19 +994,30 @@ export function SkillsSettingsPage() {
 				);
 			}
 		} catch (loadError) {
-			if (generation !== loadGeneration.current || activeRuntimeBoxId.current !== runtimeBoxId) {
+			if (
+				generation !== loadGeneration.current ||
+				activeScope.current !== scope ||
+				(scope === "runtime-box" && activeRuntimeBoxId.current !== runtimeBoxId)
+			) {
 				return;
 			}
 			setError(loadError instanceof Error ? loadError.message : t("runtimeResources.loadFailed"));
 		}
-	}, [runtimeBoxId, runtimeBoxes.isActiveReady, t]);
+	}, [runtimeBoxId, runtimeBoxes.isActiveReady, scope, t]);
 
 	useEffect(() => {
+		activeRuntimeBoxId.current = runtimeBoxId;
+		activeScope.current = scope;
 		setItems([]);
 		setProfile(undefined);
+		setGlobalProfile(undefined);
 		setPending(false);
 		mutationGeneration.current += 1;
 		createCommandId.current = undefined;
+		setSource("");
+	}, [runtimeBoxId, scope]);
+
+	useEffect(() => {
 		void load();
 		const timer = setInterval(() => void load(), 2_000);
 		return () => {
@@ -993,14 +1032,17 @@ export function SkillsSettingsPage() {
 		setError(undefined);
 		try {
 			await operation();
-			const stillSelected = activeRuntimeBoxId.current === runtimeBoxId;
+			const stillSelected =
+				activeScope.current === scope &&
+				(scope === "agent-server" || activeRuntimeBoxId.current === runtimeBoxId);
 			if (stillSelected) {
 				await load();
 			}
 			return stillSelected;
 		} catch (mutationError) {
 			if (
-				activeRuntimeBoxId.current === runtimeBoxId &&
+				activeScope.current === scope &&
+				(scope === "agent-server" || activeRuntimeBoxId.current === runtimeBoxId) &&
 				mutationGeneration.current === generation
 			) {
 				setError(
@@ -1017,7 +1059,41 @@ export function SkillsSettingsPage() {
 		}
 	};
 
-	const toggleProfile = async (item: SkillView) => {
+	const toggleAssignment = async (item: SkillView) => {
+		if (scope === "agent-server") {
+			if (globalProfile === undefined) {
+				return;
+			}
+			const existing = globalProfile.serverSkillRefs.find(
+				(ref) => ref.stableResourceId === item.stableResourceId,
+			);
+			const assigned =
+				existing?.version === item.version && existing.contentHash === item.contentHash;
+			const serverSkillRefs = assigned
+				? globalProfile.serverSkillRefs.filter(
+						(ref) => ref.stableResourceId !== item.stableResourceId,
+					)
+				: [
+						...globalProfile.serverSkillRefs.filter(
+							(ref) => ref.stableResourceId !== item.stableResourceId,
+						),
+						{
+							owner: { kind: "agent-server" as const },
+							stableResourceId: item.stableResourceId,
+							version: item.version,
+							contentHash: item.contentHash,
+						},
+					];
+			await mutate(() =>
+				desktopClient.updateAgentGlobalProfile({
+					agentId: globalProfile.agentId,
+					expectedRevision: globalProfile.revision,
+					serverMcpRefs: globalProfile.serverMcpRefs,
+					serverSkillRefs,
+				}),
+			);
+			return;
+		}
 		if (profile === undefined) {
 			return;
 		}
@@ -1048,118 +1124,323 @@ export function SkillsSettingsPage() {
 		});
 	};
 
+	const installSkill = async () => {
+		const commandId = createCommandId.current ?? crypto.randomUUID();
+		createCommandId.current = commandId;
+		const succeeded = await mutate(() =>
+			desktopClient.upsertOwnedSkill({
+				owner,
+				commandId,
+				stableResourceId: `skill-${commandId}`,
+				source: {
+					kind: scope === "agent-server" ? "inline-editor" : "local-upload",
+					...(source.trim().length === 0 ? {} : { label: source.trim() }),
+				},
+				enabled: true,
+				files: [
+					{
+						path: "SKILL.md",
+						encoding: "utf8",
+						content: skillMarkdown,
+						executable: false,
+					},
+				],
+			}),
+		);
+		if (succeeded) {
+			createCommandId.current = undefined;
+		}
+	};
+
 	return (
 		<RuntimeResourceSection
 			eyebrow={t("runtimeResources.skillsEyebrow")}
 			title={t("runtimeResources.skillsTitle")}
 			description={t("runtimeResources.skillsDescription")}
-			runtimeBoxId={runtimeBoxId}
+			runtimeBoxId={scope === "agent-server" ? "agent-server" : runtimeBoxId}
 			stale={stale}
 			error={error}
 			onRefresh={() => void load()}
 		>
-			<section className="chat-card provider-form">
-				<h2>{t("runtimeResources.installSkill")}</h2>
-				<label>
-					<span>{t("runtimeResources.source")}</span>
-					<input value={source} onChange={(event) => setSource(event.target.value)} />
-				</label>
-				<label>
-					<span>SKILL.md</span>
-					<textarea
-						rows={12}
-						value={skillMarkdown}
-						onChange={(event) => setSkillMarkdown(event.target.value)}
-					/>
-				</label>
-				<Button
-					className="chat-button chat-button--primary"
-					isDisabled={pending || !runtimeBoxes.isActiveReady || skillMarkdown.trim().length === 0}
-					onPress={() => {
-						const commandId = createCommandId.current ?? crypto.randomUUID();
-						createCommandId.current = commandId;
-						void mutate(() =>
-							desktopClient.installSkill({
-								runtimeBoxId,
-								commandId,
-								stableResourceId: `skill-${commandId}`,
-								source,
-								enabled: true,
-								files: [
-									{
-										path: "SKILL.md",
-										encoding: "utf8",
-										content: skillMarkdown,
-										executable: false,
-									},
-								],
-							}),
-						).then((succeeded) => {
-							if (succeeded) {
-								createCommandId.current = undefined;
-							}
-						});
-					}}
-				>
-					{t("runtimeResources.install")}
-				</Button>
-			</section>
+			<div className="skill-settings">
+				<Card className="skill-settings__owner" variant="secondary">
+					<Card.Header>
+						<div className="skill-settings__card-title">
+							<div>
+								<Card.Title>{t("runtimeResources.skillScope")}</Card.Title>
+								<Card.Description>
+									{scope === "agent-server"
+										? t("runtimeResources.agentServerSkillScopeDescription")
+										: t("runtimeResources.runtimeBoxSkillScopeDescription")}
+								</Card.Description>
+							</div>
+							<Chip
+								color={scope === "agent-server" ? "accent" : "default"}
+								size="sm"
+								variant="soft"
+							>
+								{scope === "agent-server"
+									? t("runtimeResources.promptOnly")
+									: t("runtimeResources.runtimePackage")}
+							</Chip>
+						</div>
+					</Card.Header>
+					<Card.Content>
+						<Tabs
+							selectedKey={scope}
+							onSelectionChange={(key) => setScope(String(key) as "agent-server" | "runtime-box")}
+						>
+							<Tabs.ListContainer>
+								<Tabs.List aria-label={t("runtimeResources.skillScope")}>
+									<Tabs.Tab id="agent-server">{t("runtimeResources.agentServerScope")}</Tabs.Tab>
+									<Tabs.Tab id="runtime-box">{t("runtimeResources.runtimeBoxScope")}</Tabs.Tab>
+								</Tabs.List>
+							</Tabs.ListContainer>
+							<Tabs.Panel id="agent-server">
+								<p className="skill-settings__scope-note">
+									{t("runtimeResources.agentServerSkillScopeNote")}
+								</p>
+							</Tabs.Panel>
+							<Tabs.Panel id="runtime-box">
+								<p className="skill-settings__scope-note">
+									{t("runtimeResources.runtimeBoxSkillScopeNote", runtimeBoxId)}
+								</p>
+							</Tabs.Panel>
+						</Tabs>
+					</Card.Content>
+				</Card>
 
-			<ResourceCards
-				emptyLabel={t("runtimeResources.noSkills")}
-				items={items.map((item) => {
-					const assigned = profile?.resources.some(
-						(ref) =>
-							ref.resourceKind === "skill" &&
-							ref.stableResourceId === item.stableResourceId &&
-							ref.version === item.version &&
-							ref.contentHash === item.contentHash,
-					);
-					const referenced = profile?.resources.some(
-						(ref) => ref.resourceKind === "skill" && ref.stableResourceId === item.stableResourceId,
-					);
-					return {
-						key: item.stableResourceId,
-						title: item.skill?.metadata.name ?? item.stableResourceId,
-						subtitle: `${item.health} · ${
-							item.skill?.metadata.description ?? item.contentHash.slice(0, 12)
-						}`,
-						actions: (
-							<>
+				<Card className="skill-settings__create" variant="secondary">
+					<Card.Header>
+						<div className="skill-settings__card-title">
+							<div>
+								<Card.Title>{t("runtimeResources.installSkill")}</Card.Title>
+								<Card.Description>
+									{scope === "agent-server"
+										? t("runtimeResources.installServerSkillDescription")
+										: t("runtimeResources.installRuntimeSkillDescription")}
+								</Card.Description>
+							</div>
+							<Chip color="default" size="sm" variant="soft">
+								SKILL.md
+							</Chip>
+						</div>
+					</Card.Header>
+					<Card.Content>
+						<Form
+							className="skill-settings__form"
+							onSubmit={(event) => {
+								event.preventDefault();
+								void installSkill();
+							}}
+						>
+							<TextField fullWidth value={source} onChange={setSource}>
+								<Label>{t("runtimeResources.skillSourceLabel")}</Label>
+								<Input placeholder={t("runtimeResources.skillSourcePlaceholder")} />
+								<Description>{t("runtimeResources.skillSourceDescription")}</Description>
+							</TextField>
+							<TextField fullWidth isRequired value={skillMarkdown} onChange={setSkillMarkdown}>
+								<Label>SKILL.md</Label>
+								<TextArea className="skill-settings__editor" rows={16} spellCheck={false} />
+								<Description>{t("runtimeResources.skillMarkdownDescription")}</Description>
+							</TextField>
+							<div className="skill-settings__form-footer">
+								<div className="skill-settings__form-meta">
+									<Chip color="default" size="sm" variant="soft">
+										{t(
+											"runtimeResources.markdownBytes",
+											String(new TextEncoder().encode(skillMarkdown).byteLength),
+										)}
+									</Chip>
+									{scope === "agent-server" ? (
+										<Chip color="accent" size="sm" variant="soft">
+											{t("runtimeResources.noExecutableFiles")}
+										</Chip>
+									) : null}
+								</div>
 								<Button
-									className="chat-button"
-									isDisabled={
-										pending || !runtimeBoxes.isActiveReady || (!assigned && item.health !== "ready")
-									}
-									onPress={() => void toggleProfile(item)}
+									type="submit"
+									variant="primary"
+									isDisabled={pending || !ownerReady || skillMarkdown.trim().length === 0}
 								>
-									{assigned
-										? t("runtimeResources.removeFromProfile")
-										: t("runtimeResources.addToProfile")}
+									{t("runtimeResources.install")}
 								</Button>
-								<Button
-									className="chat-button chat-button--danger"
-									isDisabled={
-										pending || !runtimeBoxes.isActiveReady || item.skill === undefined || referenced
-									}
-									onPress={() =>
-										void mutate(() =>
-											desktopClient.deleteSkill({
-												runtimeBoxId,
-												commandId: crypto.randomUUID(),
-												stableResourceId: item.stableResourceId,
-												expectedVersion: item.version,
-											}),
-										)
-									}
-								>
-									{t("runtimeResources.delete")}
-								</Button>
-							</>
-						),
-					};
-				})}
-			/>
+							</div>
+						</Form>
+					</Card.Content>
+				</Card>
+
+				<section className="skill-settings__installed">
+					<div className="skill-settings__section-heading">
+						<div>
+							<h2>{t("runtimeResources.installedSkills")}</h2>
+							<p>{t("runtimeResources.installedSkillsDescription")}</p>
+						</div>
+						<Chip color="default" variant="soft">
+							{t("runtimeResources.skillCount", String(items.length))}
+						</Chip>
+					</div>
+					{items.length === 0 ? (
+						<Card className="skill-settings__empty" variant="secondary">
+							<Card.Content>
+								<div className="skill-settings__empty-content">
+									<strong>{t("runtimeResources.noSkills")}</strong>
+									<span>{t("runtimeResources.noSkillsDescription")}</span>
+								</div>
+							</Card.Content>
+						</Card>
+					) : (
+						<div className="skill-settings__grid">
+							{items.map((item) => {
+								const assigned =
+									scope === "agent-server"
+										? globalProfile?.serverSkillRefs.some(
+												(ref) =>
+													ref.stableResourceId === item.stableResourceId &&
+													ref.version === item.version &&
+													ref.contentHash === item.contentHash,
+											)
+										: profile?.resources.some(
+												(ref) =>
+													ref.resourceKind === "skill" &&
+													ref.stableResourceId === item.stableResourceId &&
+													ref.version === item.version &&
+													ref.contentHash === item.contentHash,
+											);
+								const referenced =
+									scope === "agent-server"
+										? globalProfile?.serverSkillRefs.some(
+												(ref) => ref.stableResourceId === item.stableResourceId,
+											)
+										: profile?.resources.some(
+												(ref) =>
+													ref.resourceKind === "skill" &&
+													ref.stableResourceId === item.stableResourceId,
+											);
+								const removeReference =
+									referenced === true && (assigned === true || item.health !== "ready");
+								const metadata = item.skill?.metadata;
+								return (
+									<Card className="skill-card" key={item.stableResourceId} variant="secondary">
+										<Card.Header>
+											<div className="skill-card__title">
+												<div>
+													<Card.Title>{metadata?.name ?? item.stableResourceId}</Card.Title>
+													<Card.Description>
+														{metadata?.description ?? t("runtimeResources.skillUnavailable")}
+													</Card.Description>
+												</div>
+												<Chip color={mcpHealthColor(item.health)} size="sm" variant="soft">
+													{item.health === "ready"
+														? t("runtimeResources.health.ready")
+														: item.health === "stopped"
+															? t("runtimeResources.health.stopped")
+															: t("runtimeResources.health.error")}
+												</Chip>
+											</div>
+										</Card.Header>
+										<Card.Content className="skill-card__content">
+											<div className="skill-card__chips">
+												<Chip color="default" size="sm" variant="soft">
+													{item.skill?.packageKind === "prompt-only" ||
+													(item.skill === undefined && scope === "agent-server")
+														? t("runtimeResources.promptOnly")
+														: t("runtimeResources.runtimePackage")}
+												</Chip>
+												{assigned ? (
+													<Chip color="accent" size="sm" variant="soft">
+														{t("runtimeResources.usedByAgent")}
+													</Chip>
+												) : referenced ? (
+													<Chip color="warning" size="sm" variant="soft">
+														{t("runtimeResources.assignmentUpdateRequired")}
+													</Chip>
+												) : null}
+												{metadata?.allowedTools.length ? (
+													<Chip color="default" size="sm" variant="soft">
+														{t(
+															"runtimeResources.allowedToolCount",
+															String(metadata.allowedTools.length),
+														)}
+													</Chip>
+												) : null}
+											</div>
+											<div className="skill-card__identity">
+												<code>{item.stableResourceId}</code>
+												<span>
+													v{item.version.slice(0, 8)} · {item.contentHash.slice(0, 12)}
+												</span>
+											</div>
+										</Card.Content>
+										<Card.Footer className="skill-card__actions">
+											<Button
+												size="sm"
+												variant="secondary"
+												isDisabled={
+													pending ||
+													!ownerReady ||
+													(removeReference !== true && item.health !== "ready")
+												}
+												onPress={() => void toggleAssignment(item)}
+											>
+												{removeReference
+													? t("runtimeResources.removeFromProfile")
+													: assigned
+														? t("runtimeResources.removeFromProfile")
+														: referenced
+															? t("runtimeResources.updateAssignment")
+															: t("runtimeResources.addToProfile")}
+											</Button>
+											{item.skill ? (
+												<Button
+													size="sm"
+													variant="tertiary"
+													isDisabled={pending || !ownerReady}
+													onPress={() =>
+														void mutate(() =>
+															desktopClient.setOwnedSkillEnabled({
+																owner,
+																commandId: crypto.randomUUID(),
+																stableResourceId: item.stableResourceId,
+																expectedConfigRevision: item.configRevision,
+																enabled: item.health !== "ready",
+															}),
+														)
+													}
+												>
+													{item.health === "ready"
+														? t("runtimeResources.stop")
+														: t("runtimeResources.start")}
+												</Button>
+											) : null}
+											{item.skill ? (
+												<Button
+													size="sm"
+													variant="danger-soft"
+													isDisabled={pending || !ownerReady || referenced === true}
+													onPress={() =>
+														void mutate(() =>
+															desktopClient.deleteOwnedSkill({
+																owner,
+																commandId: crypto.randomUUID(),
+																stableResourceId: item.stableResourceId,
+																expectedConfigRevision: item.configRevision,
+																expectedVersion: item.version,
+															}),
+														)
+													}
+												>
+													{t("runtimeResources.delete")}
+												</Button>
+											) : null}
+										</Card.Footer>
+									</Card>
+								);
+							})}
+						</div>
+					)}
+				</section>
+			</div>
 		</RuntimeResourceSection>
 	);
 }
@@ -1177,15 +1458,25 @@ function RuntimeResourceSection(props: {
 	const { t } = useI18n();
 	return (
 		<section className="settings-section runtime-resources-settings">
-			<header className="settings-section__header">
-				<span className="chat-page__eyebrow">{props.eyebrow}</span>
-				<h1>{props.title}</h1>
-				<p>{props.description}</p>
-				<code>{props.runtimeBoxId}</code>
-				{props.stale ? <strong>{t("runtimeResources.stale")}</strong> : null}
-				<Button className="chat-button" onPress={props.onRefresh}>
-					{t("runtimeResources.refresh")}
-				</Button>
+			<header className="settings-section__header runtime-resources-settings__header">
+				<div>
+					<span className="chat-page__eyebrow">{props.eyebrow}</span>
+					<h1>{props.title}</h1>
+					<p>{props.description}</p>
+				</div>
+				<div className="runtime-resources-settings__header-actions">
+					<Chip color="default" size="sm" variant="soft">
+						{props.runtimeBoxId}
+					</Chip>
+					{props.stale ? (
+						<Chip color="warning" size="sm" variant="soft">
+							{t("runtimeResources.stale")}
+						</Chip>
+					) : null}
+					<Button size="sm" variant="secondary" onPress={props.onRefresh}>
+						{t("runtimeResources.refresh")}
+					</Button>
+				</div>
 			</header>
 			{props.error ? (
 				<p className="session-sidebar__error" role="alert">
@@ -1193,36 +1484,6 @@ function RuntimeResourceSection(props: {
 				</p>
 			) : null}
 			{props.children}
-		</section>
-	);
-}
-
-function ResourceCards(props: {
-	emptyLabel: string;
-	items: readonly {
-		key: string;
-		title: string;
-		subtitle: string;
-		actions: React.ReactNode;
-	}[];
-}) {
-	if (props.items.length === 0) {
-		return <p className="chat-card">{props.emptyLabel}</p>;
-	}
-	return (
-		<section className="runtime-boxes-list">
-			{props.items.map((item) => (
-				<article className="runtime-box-card" key={item.key}>
-					<div className="runtime-box-card__identity">
-						<div>
-							<strong>{item.title}</strong>
-							<span>{item.subtitle}</span>
-							<code>{item.key}</code>
-						</div>
-					</div>
-					<div className="runtime-box-card__actions">{item.actions}</div>
-				</article>
-			))}
 		</section>
 	);
 }
@@ -1307,10 +1568,42 @@ function appendMissingSkillRefs(items: SkillView[], profile: RuntimeProfile): Sk
 		}
 		items.push({
 			stableResourceId: ref.stableResourceId,
+			configRevision: 1,
 			version: ref.version,
 			contentHash: ref.contentHash,
 			health: "error",
 		});
 	}
 	return items;
+}
+
+function appendMissingAgentServerSkillRefs(
+	items: SkillView[],
+	profile: AgentGlobalProfile,
+): SkillView[] {
+	const installed = new Set(items.map((item) => item.stableResourceId));
+	for (const ref of profile.serverSkillRefs) {
+		if (installed.has(ref.stableResourceId)) {
+			continue;
+		}
+		items.push({
+			stableResourceId: ref.stableResourceId,
+			configRevision: 1,
+			version: ref.version,
+			contentHash: ref.contentHash,
+			health: "error",
+		});
+	}
+	return items;
+}
+
+function toSkillView(skill: SkillSummary): SkillView {
+	return {
+		stableResourceId: skill.stableResourceId,
+		configRevision: skill.configRevision,
+		version: skill.version,
+		contentHash: skill.contentHash,
+		health: skill.health,
+		skill,
+	};
 }

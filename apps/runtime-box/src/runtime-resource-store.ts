@@ -36,7 +36,7 @@ import {
 	runtimeBoxResourceMutationResultSchema,
 	runtimeBoxSkillSchema,
 	setRuntimeBoxMcpServerEnabledInputSchema,
-	skillMetadataSchema,
+	setRuntimeBoxSkillEnabledInputSchema,
 	upsertRuntimeBoxMcpServerInputSchema,
 	validateRuntimeBoxResourcesInputSchema,
 	validateRuntimeBoxResourcesOutputSchema,
@@ -59,6 +59,7 @@ import {
 	type RuntimeBoxResourceRef,
 	type RuntimeBoxSkill,
 	type SetRuntimeBoxMcpServerEnabledInput,
+	type SetRuntimeBoxSkillEnabledInput,
 	type UpsertRuntimeBoxMcpServerInput,
 	type ValidateRuntimeBoxResourcesInput,
 	type ValidateRuntimeBoxResourcesOutput,
@@ -67,11 +68,16 @@ import {
 	maxRuntimeBoxSkillMarkdownBytes,
 	maxRuntimeBoxSkillFileBytes,
 } from "@moshu/contracts";
-import { parseDocument } from "yaml";
+import {
+	hashSkillFiles,
+	prepareSkillPackage,
+	skillDirectoryKey,
+	type DecodedSkillFile,
+} from "@moshu/skill-runtime";
 
 import { ExecutorSecretStore } from "./executor-secret-store";
 
-const runtimeResourceDatabaseVersion = 4;
+const runtimeResourceDatabaseVersion = 5;
 const maxInventoryChangeRecords = 2_048;
 const maxCommandResults = 1_024;
 const inventoryPageSize = 64;
@@ -118,6 +124,7 @@ interface McpConfigRow {
 
 interface SkillRow {
 	id: string;
+	config_revision: number;
 	current_version: string;
 	enabled: number;
 	source: string;
@@ -728,27 +735,34 @@ export class RuntimeResourceStore {
 		if (replay !== undefined) {
 			return replay;
 		}
-		const decodedFiles = input.files.map((file) => ({
-			...file,
-			bytes: decodeSkillFile(file.encoding, file.content),
-		}));
-		const skillMarkdownFile = decodedFiles.find((file) => file.path === "SKILL.md");
-		if (skillMarkdownFile === undefined) {
-			throw new Error("Skill package is missing SKILL.md.");
-		}
-		const skillMarkdown = new TextDecoder("utf-8", { fatal: true }).decode(skillMarkdownFile.bytes);
-		const metadata = parseSkillMetadata(skillMarkdown);
-		const stableResourceId = input.stableResourceId ?? metadata.name;
+		const prepared = prepareSkillPackage(input.files, {
+			ownerKind: "runtime-box",
+			allowBundleFiles: true,
+			allowExecutableFiles: true,
+		});
+		const stableResourceId = input.stableResourceId ?? prepared.metadata.name;
 		const existing = this.#selectSkill(stableResourceId);
-		assertExpectedVersion(existing?.current_version, input.expectedVersion, "Skill");
-		const contentHash = hashSkillFiles(decodedFiles);
-		const version = crypto.randomUUID();
+		assertExpectedSkillConfig(existing, input.expectedConfigRevision, input.expectedVersion);
+		let contentChanged = existing?.content_hash !== prepared.contentHash;
+		if (!contentChanged && existing !== undefined) {
+			try {
+				contentChanged =
+					this.#hashStoredSkill(existing.id, existing.current_version) !== existing.content_hash;
+			} catch {
+				contentChanged = true;
+			}
+		}
+		const configRevision = (existing?.config_revision ?? 0) + 1;
+		const version =
+			!contentChanged && existing !== undefined ? existing.current_version : crypto.randomUUID();
+		const contentHash = prepared.contentHash;
 		const directoryName = `${skillDirectoryKey(stableResourceId)}/${version}`;
 		const targetDirectory = join(this.#skillsRoot, directoryName);
 		const now = this.#now();
 		const descriptor = runtimeBoxInventoryResourceSchema.parse({
 			resourceKind: "skill",
 			stableResourceId,
+			configRevision,
 			version,
 			contentHash,
 			health: input.enabled ? "ready" : "stopped",
@@ -757,39 +771,45 @@ export class RuntimeResourceStore {
 		this.#assertSkillQueryCapacity(
 			runtimeBoxSkillSchema.parse({
 				stableResourceId,
+				configRevision,
 				version,
 				contentHash,
-				metadata,
+				metadata: prepared.metadata,
 				enabled: input.enabled,
 				source: input.source,
 				installedAt: new Date(now).toISOString(),
 				updatedAt: new Date(now).toISOString(),
 			}),
 		);
-		this.#writeSkillVersion(targetDirectory, decodedFiles);
+		if (contentChanged) {
+			this.#writeSkillVersion(targetDirectory, prepared.files);
+		}
 		let result: RuntimeBoxResourceMutationResult;
 		try {
 			result = this.#database.transaction(() => {
-				this.#database
-					.query(
-						`INSERT INTO skill_versions (
-							skill_id, version, content_hash, metadata_json, directory_name, installed_at_ms
-						) VALUES (?, ?, ?, ?, ?, ?)`,
-					)
-					.run(
-						stableResourceId,
-						version,
-						contentHash,
-						JSON.stringify(metadata),
-						directoryName,
-						now,
-					);
+				if (contentChanged) {
+					this.#database
+						.query(
+							`INSERT INTO skill_versions (
+								skill_id, version, content_hash, metadata_json, directory_name, installed_at_ms
+							) VALUES (?, ?, ?, ?, ?, ?)`,
+						)
+						.run(
+							stableResourceId,
+							version,
+							contentHash,
+							JSON.stringify(prepared.metadata),
+							directoryName,
+							now,
+						);
+				}
 				this.#database
 					.query(
 						`INSERT INTO skill_installations (
-							id, current_version, enabled, source, created_at_ms, updated_at_ms
-						) VALUES (?, ?, ?, ?, ?, ?)
+							id, config_revision, current_version, enabled, source, created_at_ms, updated_at_ms
+						) VALUES (?, ?, ?, ?, ?, ?, ?)
 						ON CONFLICT(id) DO UPDATE SET
+							config_revision = excluded.config_revision,
 							current_version = excluded.current_version,
 							enabled = excluded.enabled,
 							source = excluded.source,
@@ -797,6 +817,7 @@ export class RuntimeResourceStore {
 					)
 					.run(
 						stableResourceId,
+						configRevision,
 						version,
 						input.enabled ? 1 : 0,
 						input.source,
@@ -812,6 +833,7 @@ export class RuntimeResourceStore {
 				const state = this.#getInventoryState();
 				const mutation = runtimeBoxResourceMutationResultSchema.parse({
 					stableResourceId,
+					configRevision,
 					version,
 					contentHash,
 					inventoryEpoch: state.epoch,
@@ -823,9 +845,66 @@ export class RuntimeResourceStore {
 				return mutation;
 			})();
 		} catch (error) {
-			rmSync(targetDirectory, { recursive: true, force: true });
+			if (contentChanged) {
+				rmSync(targetDirectory, { recursive: true, force: true });
+			}
 			throw error;
 		}
+		this.#publishChange(result, ["skill"]);
+		return result;
+	}
+
+	setSkillEnabled(inputValue: SetRuntimeBoxSkillEnabledInput): RuntimeBoxResourceMutationResult {
+		const input = setRuntimeBoxSkillEnabledInputSchema.parse(inputValue);
+		const digest = commandDigest(input);
+		const replay = this.#getCommandResult(input.commandId, "skill.setEnabled", digest);
+		if (replay !== undefined) {
+			return replay;
+		}
+		const existing = this.#selectSkill(input.stableResourceId);
+		if (existing === undefined) {
+			throw new RuntimeResourceNotFoundError("Skill was not found.");
+		}
+		if (existing.config_revision !== input.expectedConfigRevision) {
+			throw new RuntimeResourceVersionConflictError("Skill configuration changed.");
+		}
+		const configRevision = existing.config_revision + 1;
+		const descriptor = runtimeBoxInventoryResourceSchema.parse({
+			resourceKind: "skill",
+			stableResourceId: existing.id,
+			configRevision,
+			version: existing.current_version,
+			contentHash: existing.content_hash,
+			health: input.enabled ? "ready" : "stopped",
+		});
+		const result = this.#database.transaction(() => {
+			this.#database
+				.query(
+					`UPDATE skill_installations
+					 SET config_revision = ?, enabled = ?, updated_at_ms = ?
+					 WHERE id = ?`,
+				)
+				.run(configRevision, input.enabled ? 1 : 0, this.#now(), input.stableResourceId);
+			const revision = this.#appendChange({
+				category: "skill",
+				operation: "upsert",
+				stableResourceId: input.stableResourceId,
+				descriptor,
+			});
+			const state = this.#getInventoryState();
+			const mutation = runtimeBoxResourceMutationResultSchema.parse({
+				stableResourceId: input.stableResourceId,
+				configRevision,
+				version: existing.current_version,
+				contentHash: existing.content_hash,
+				inventoryEpoch: state.epoch,
+				inventoryRevision: revision,
+				descriptor,
+				deleted: false,
+			});
+			this.#saveCommandResult(input.commandId, "skill.setEnabled", digest, mutation);
+			return mutation;
+		})();
 		this.#publishChange(result, ["skill"]);
 		return result;
 	}
@@ -840,6 +919,12 @@ export class RuntimeResourceStore {
 		const existing = this.#selectSkill(input.stableResourceId);
 		if (existing === undefined) {
 			throw new RuntimeResourceNotFoundError("Skill was not found.");
+		}
+		if (
+			input.expectedConfigRevision !== undefined &&
+			existing.config_revision !== input.expectedConfigRevision
+		) {
+			throw new RuntimeResourceVersionConflictError("Skill configuration changed.");
 		}
 		assertExpectedVersion(existing.current_version, input.expectedVersion, "Skill");
 		const contentRoots = this.#listSkillContentRoots(input.stableResourceId);
@@ -863,6 +948,7 @@ export class RuntimeResourceStore {
 			const state = this.#getInventoryState();
 			const mutation = runtimeBoxResourceMutationResultSchema.parse({
 				stableResourceId: input.stableResourceId,
+				configRevision: existing.config_revision,
 				version: existing.current_version,
 				contentHash: existing.content_hash,
 				inventoryEpoch: state.epoch,
@@ -1004,7 +1090,7 @@ export class RuntimeResourceStore {
 		if (version === runtimeResourceDatabaseVersion) {
 			return;
 		}
-		if (version === 1 || version === 2 || version === 3) {
+		if (version === 1 || version === 2 || version === 3 || version === 4) {
 			this.#database.exec("BEGIN IMMEDIATE");
 			try {
 				if (version === 1) {
@@ -1020,12 +1106,23 @@ export class RuntimeResourceStore {
 						"ALTER TABLE mcp_configs ADD COLUMN config_revision INTEGER NOT NULL DEFAULT 1;",
 					);
 				}
+				if (version <= 3) {
+					this.#database.exec(`
+						CREATE TABLE mcp_pending_secret_deletions (
+							secret_locator TEXT PRIMARY KEY NOT NULL,
+							created_at_ms INTEGER NOT NULL
+						);
+						DELETE FROM command_results WHERE operation = 'mcp.upsert';
+					`);
+				}
+				if (!databaseColumnExists(this.#database, "skill_installations", "config_revision")) {
+					this.#database.exec(`
+						ALTER TABLE skill_installations
+						ADD COLUMN config_revision INTEGER NOT NULL DEFAULT 1;
+					`);
+				}
 				this.#database.exec(`
-					CREATE TABLE mcp_pending_secret_deletions (
-						secret_locator TEXT PRIMARY KEY NOT NULL,
-						created_at_ms INTEGER NOT NULL
-					);
-					DELETE FROM command_results WHERE operation = 'mcp.upsert';
+					DELETE FROM command_results WHERE operation LIKE 'skill.%';
 					PRAGMA user_version = ${runtimeResourceDatabaseVersion};
 				`);
 				this.#database.exec("COMMIT");
@@ -1071,6 +1168,7 @@ export class RuntimeResourceStore {
 				);
 				CREATE TABLE skill_installations (
 					id TEXT PRIMARY KEY NOT NULL,
+					config_revision INTEGER NOT NULL,
 					current_version TEXT NOT NULL,
 					enabled INTEGER NOT NULL,
 					source TEXT NOT NULL,
@@ -1244,7 +1342,8 @@ export class RuntimeResourceStore {
 		return this.#database
 			.query<SkillRow, []>(
 				`SELECT
-					i.id, i.current_version, i.enabled, i.source, i.created_at_ms, i.updated_at_ms,
+					i.id, i.config_revision, i.current_version, i.enabled, i.source,
+					i.created_at_ms, i.updated_at_ms,
 					v.content_hash, v.metadata_json, v.installed_at_ms
 				 FROM skill_installations i
 				 JOIN skill_versions v
@@ -1259,7 +1358,8 @@ export class RuntimeResourceStore {
 			this.#database
 				.query<SkillRow, [string]>(
 					`SELECT
-						i.id, i.current_version, i.enabled, i.source, i.created_at_ms, i.updated_at_ms,
+						i.id, i.config_revision, i.current_version, i.enabled, i.source,
+						i.created_at_ms, i.updated_at_ms,
 						v.content_hash, v.metadata_json, v.installed_at_ms
 					 FROM skill_installations i
 					 JOIN skill_versions v
@@ -1557,12 +1657,6 @@ interface InventoryCursor {
 	nextRevision: number;
 }
 
-interface DecodedSkillFile {
-	path: string;
-	executable: boolean;
-	bytes: Buffer;
-}
-
 function buildMcpServer(row: McpConfigRow): RuntimeBoxMcpServer {
 	return runtimeBoxMcpServerSchema.parse({
 		stableResourceId: row.id,
@@ -1596,6 +1690,7 @@ function buildMcpInventoryResource(row: McpConfigRow): RuntimeBoxInventoryResour
 function buildSkill(row: SkillRow): RuntimeBoxSkill {
 	return runtimeBoxSkillSchema.parse({
 		stableResourceId: row.id,
+		configRevision: row.config_revision,
 		version: row.current_version,
 		contentHash: row.content_hash,
 		metadata: JSON.parse(row.metadata_json),
@@ -1611,6 +1706,7 @@ function buildSkillInventoryResource(row: SkillRow): RuntimeBoxInventoryResource
 	return runtimeBoxInventoryResourceSchema.parse({
 		resourceKind: "skill",
 		stableResourceId: skill.stableResourceId,
+		configRevision: skill.configRevision,
 		version: skill.version,
 		contentHash: skill.contentHash,
 		health: skill.enabled ? "ready" : "stopped",
@@ -1651,6 +1747,23 @@ function assertExpectedMcpConfig(
 		return;
 	}
 	assertExpectedVersion(row.version, expectedVersion, "MCP Server");
+}
+
+function assertExpectedSkillConfig(
+	row: SkillRow | undefined,
+	expectedConfigRevision: number | undefined,
+	expectedVersion: string | undefined,
+): void {
+	if (row === undefined) {
+		if (expectedConfigRevision !== undefined || expectedVersion !== undefined) {
+			throw new RuntimeResourceVersionConflictError("Skill does not exist.");
+		}
+		return;
+	}
+	if (expectedConfigRevision !== undefined && row.config_revision !== expectedConfigRevision) {
+		throw new RuntimeResourceVersionConflictError("Skill configuration changed.");
+	}
+	assertExpectedVersion(row.current_version, expectedVersion, "Skill");
 }
 
 function commandDigest(value: unknown, secretFingerprint?: string): string {
@@ -1725,98 +1838,6 @@ function canonicalJson(value: unknown): string {
 			.join(",")}}`;
 	}
 	throw new TypeError("Value is not canonical JSON.");
-}
-
-function decodeSkillFile(encoding: "utf8" | "base64", content: string): Buffer {
-	if (encoding === "utf8") {
-		return Buffer.from(content, "utf8");
-	}
-	if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(content)) {
-		throw new Error("Skill file contains invalid base64.");
-	}
-	return Buffer.from(content, "base64");
-}
-
-function hashSkillFiles(files: readonly DecodedSkillFile[]): string {
-	const hash = createHash("sha256");
-	for (const file of [...files].sort((left, right) => left.path.localeCompare(right.path))) {
-		hash.update(
-			`${file.path.length}:${file.path}:${file.executable ? 1 : 0}:${file.bytes.length}:`,
-		);
-		hash.update(file.bytes);
-	}
-	return hash.digest("hex");
-}
-
-function skillDirectoryKey(stableResourceId: string): string {
-	return createHash("sha256").update(`moshu-skill-directory-v1:${stableResourceId}`).digest("hex");
-}
-
-function parseSkillMetadata(skillMarkdown: string) {
-	const lines = skillMarkdown.replace(/\r\n/g, "\n").split("\n");
-	if (lines[0] !== "---") {
-		throw new Error("SKILL.md must start with YAML frontmatter.");
-	}
-	const closingIndex = lines.indexOf("---", 1);
-	if (closingIndex < 0) {
-		throw new Error("SKILL.md frontmatter is not terminated.");
-	}
-	const document = parseDocument(lines.slice(1, closingIndex).join("\n"), {
-		schema: "core",
-		uniqueKeys: true,
-	});
-	if (document.errors.length > 0) {
-		throw new Error("SKILL.md frontmatter is invalid YAML.", {
-			cause: new AggregateError(document.errors),
-		});
-	}
-	const raw: unknown = document.toJS({ maxAliasCount: 0 });
-	if (!isPlainRecord(raw)) {
-		throw new Error("SKILL.md frontmatter must be a mapping.");
-	}
-	const name = raw.name;
-	const description = raw.description;
-	if (typeof name !== "string" || typeof description !== "string") {
-		throw new Error("SKILL.md frontmatter requires name and description.");
-	}
-	const metadata: Record<string, string> = {};
-	if (raw.metadata !== undefined) {
-		if (!isPlainRecord(raw.metadata)) {
-			throw new Error("SKILL.md metadata must be a mapping.");
-		}
-		for (const [key, value] of Object.entries(raw.metadata)) {
-			if (typeof value !== "string" && typeof value !== "number" && typeof value !== "boolean") {
-				throw new Error("SKILL.md metadata values must be scalar.");
-			}
-			metadata[key] = String(value);
-		}
-	}
-	const allowedTools = parseAllowedTools(raw["allowed-tools"]);
-	return skillMetadataSchema.parse({
-		name,
-		description,
-		...(typeof raw.license === "string" ? { license: raw.license } : {}),
-		...(typeof raw.compatibility === "string" ? { compatibility: raw.compatibility } : {}),
-		allowedTools,
-		metadata,
-	});
-}
-
-function parseAllowedTools(value: unknown): string[] {
-	if (value === undefined || value === null) {
-		return [];
-	}
-	if (typeof value === "string") {
-		return value.split(/[\s,]+/).filter((entry) => entry.length > 0);
-	}
-	if (Array.isArray(value) && value.every((entry) => typeof entry === "string")) {
-		return value;
-	}
-	throw new Error("SKILL.md allowed-tools must be a string or string array.");
-}
-
-function isPlainRecord(value: unknown): value is Record<string, unknown> {
-	return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 function listStoredSkillFiles(root: string, relativeRoot = ""): string[] {
@@ -1902,4 +1923,11 @@ function fsyncDirectory(path: string): void {
 	} finally {
 		closeSync(descriptor);
 	}
+}
+
+function databaseColumnExists(database: Database, table: string, column: string): boolean {
+	return database
+		.query<{ name: string }, []>(`PRAGMA table_info(${table})`)
+		.all()
+		.some((entry) => entry.name === column);
 }

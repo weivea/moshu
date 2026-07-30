@@ -3,6 +3,7 @@ import {
 	updateAgentGlobalProfileInputSchema,
 	type AgentGlobalProfile,
 	type AgentServerMcpResourceRef,
+	type AgentServerSkillResourceRef,
 } from "@moshu/contracts";
 import { eq } from "drizzle-orm";
 
@@ -27,8 +28,9 @@ export interface AgentGlobalProfileRepository {
 		agentId: string;
 		expectedRevision: number;
 		serverMcpRefs: readonly AgentServerMcpResourceRef[];
+		serverSkillRefs: readonly AgentServerSkillResourceRef[];
 	}): AgentGlobalProfile;
-	isResourceReferenced(stableResourceId: string): boolean;
+	isResourceReferenced(resourceKind: "mcp" | "skill", stableResourceId: string): boolean;
 }
 
 export class SqliteAgentGlobalProfileRepository implements AgentGlobalProfileRepository {
@@ -49,6 +51,7 @@ export class SqliteAgentGlobalProfileRepository implements AgentGlobalProfileRep
 				agentId,
 				revision: 1,
 				serverMcpRefsJson: "[]",
+				serverSkillRefsJson: "[]",
 				createdAtMs: now,
 				updatedAtMs: now,
 			})
@@ -65,6 +68,7 @@ export class SqliteAgentGlobalProfileRepository implements AgentGlobalProfileRep
 		agentId: string;
 		expectedRevision: number;
 		serverMcpRefs: readonly AgentServerMcpResourceRef[];
+		serverSkillRefs: readonly AgentServerSkillResourceRef[];
 	}): AgentGlobalProfile {
 		const input = updateAgentGlobalProfileInputSchema.parse(inputValue);
 		const current = this.getOrCreate(input.agentId);
@@ -77,6 +81,7 @@ export class SqliteAgentGlobalProfileRepository implements AgentGlobalProfileRep
 			.set({
 				revision: current.revision + 1,
 				serverMcpRefsJson: JSON.stringify(input.serverMcpRefs),
+				serverSkillRefsJson: JSON.stringify(input.serverSkillRefs),
 				updatedAtMs: now,
 			})
 			.where(eq(agentGlobalProfilesTable.agentId, input.agentId))
@@ -88,15 +93,21 @@ export class SqliteAgentGlobalProfileRepository implements AgentGlobalProfileRep
 		return buildProfile(updated);
 	}
 
-	isResourceReferenced(stableResourceId: string): boolean {
+	isResourceReferenced(resourceKind: "mcp" | "skill", stableResourceId: string): boolean {
+		const column =
+			resourceKind === "mcp"
+				? agentGlobalProfilesTable.serverMcpRefsJson
+				: agentGlobalProfilesTable.serverSkillRefsJson;
+		const schema =
+			resourceKind === "mcp"
+				? agentGlobalProfileSchema.shape.serverMcpRefs
+				: agentGlobalProfileSchema.shape.serverSkillRefs;
 		return this.orm
-			.select({ refs: agentGlobalProfilesTable.serverMcpRefsJson })
+			.select({ refs: column })
 			.from(agentGlobalProfilesTable)
 			.all()
 			.some((row) =>
-				agentGlobalProfileSchema.shape.serverMcpRefs
-					.parse(JSON.parse(row.refs))
-					.some((ref) => ref.stableResourceId === stableResourceId),
+				schema.parse(JSON.parse(row.refs)).some((ref) => ref.stableResourceId === stableResourceId),
 			);
 	}
 
@@ -114,6 +125,7 @@ function buildProfile(row: typeof agentGlobalProfilesTable.$inferSelect): AgentG
 		agentId: row.agentId,
 		revision: row.revision,
 		serverMcpRefs: JSON.parse(row.serverMcpRefsJson),
+		serverSkillRefs: JSON.parse(row.serverSkillRefsJson),
 		createdAt: new Date(row.createdAtMs).toISOString(),
 		updatedAt: new Date(row.updatedAtMs).toISOString(),
 	});

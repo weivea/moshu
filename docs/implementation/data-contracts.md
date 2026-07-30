@@ -85,7 +85,8 @@ interface AppError {
 | Session/Run/event、Provider access、Agent runtime | agents server | client/Runtime Box 直接调用 Provider/Pi runtime |
 | Policy、approval、Action intent/result、grant audit | agents server | Runtime Box 自行批准 Action |
 | Agent Server-owned MCP config/credential/lifecycle | agents server | client 绕过 server API 或 credential 进入普通 query/event |
-| Runtime Box-owned MCP config/credential/OAuth/lifecycle、Skill install/version/content/resource | owning Runtime Box | server 保存 recoverable copy 或 client 绕过 server 路由 |
+| Agent Server-owned prompt-only Skill install/version/`SKILL.md` | agents server | executable/bundle file、Agent Tool mutation 或正文进入普通事件 |
+| Runtime Box-owned MCP config/credential/OAuth/lifecycle、完整 Skill package/version/content/resource | owning Runtime Box | server 保存 recoverable copy 或 client 绕过 server 路由 |
 | redacted Runtime Box inventory cache | agents server projection | 当作 MCP/Skill 恢复源、授权依据或权威状态 |
 | Tool/Box-owned MCP invocation、Skill scripts、进程树 | Runtime Box | server/client 直接执行 |
 | Server-owned MCP invocation/进程树 | agents server MCP dispatcher | Agent runtime/Product RPC 绕过 Action dispatcher |
@@ -104,8 +105,9 @@ interface AppError {
 | `agent_versions` | id, agent_id, version, config_json, config_hash | 不可变配置快照 |
 | `agent_runtime_profiles` | id, agent_id, runtime_box_id, revision, disabled_at | 每个 `agentId + runtimeBoxId` 一份 Box-specific profile |
 | `agent_resource_refs` | runtime_profile_id, kind, resource_id, resource_version, content_hash | 只保存 profile 所属 Box 的稳定 MCP/Skill 引用 |
-| `agent_global_profiles` | agent_id, revision, server_mcp_refs_json | Agent 全局 Server-owned MCP refs |
+| `agent_global_profiles` | agent_id, revision, server_mcp_refs_json, server_skill_refs_json | Agent 全局 Server-owned MCP/Skill refs |
 | `agent_server_mcp_servers` | id, config_revision, version, content_hash, transport_json, health, tools_json | Agent Server-owned MCP authority；transport 不含 secret value |
+| `agent_server_skill_installations`、`agent_server_skill_versions` | id, config_revision, current_version, content_hash, metadata_json, content_locator | Agent Server-owned prompt-only Skill authority；正文不进入 Product DB |
 | `provider_connections` | id, type, endpoint, secret_ref, status | 规划中的正式产品表；当前 Provider metadata/preference 存于 app-owned schema v5 registry，secret 独立存入 vault |
 | `runtime_box_inventory_snapshots` | runtime_box_id, generation, inventory_epoch, inventory_revision, stale, redacted_json, observed_at | 原子替换、可丢弃、非权威的 capability/inventory cache |
 | `projects` | id, runtime_box_id, name, path, availability, revision | Box 上的目录实体 |
@@ -118,11 +120,11 @@ interface AppError {
 | `execution_grants` | id, action_id, invocation_id, target_kind, target_id, instance_id, generation, digest, state, expires_at | 只存 grant 元数据/使用状态 |
 | `invocation_results` | invocation_id, action_id, state, result_json, received_at | Runtime Box typed result 的 server 投影 |
 
-agents server 不保存 recoverable **Runtime Box-owned** MCP/Skill config、credential/OAuth state、Skill content/resource 或 Runtime Box secret handle。Server-owned MCP state 是 server authority；Box inventory cache 仍可随时丢弃，不能作为 Runtime Box 恢复输入。
+agents server 不保存 recoverable **Runtime Box-owned** MCP/Skill config、credential/OAuth state、Skill content/resource 或 Runtime Box secret handle。Server-owned MCP 与 prompt-only Skill 是 server authority；Box inventory cache 仍可随时丢弃，不能作为 Runtime Box 恢复输入。
 
 ### 4.3 Runtime Box-owned local data
 
-每个 Runtime Box 是自身 MCP/Skill 数据的唯一 source of truth。local desktop Runtime Box 建议使用：
+每个 Runtime Box 是自身 Box-owned MCP/Skill 数据的唯一 source of truth。local desktop Runtime Box 建议使用：
 
 | 存储 | 权威内容 |
 | --- | --- |
@@ -141,7 +143,7 @@ agents server 不保存 recoverable **Runtime Box-owned** MCP/Skill config、cre
 ### 5.1 Runtime Profile 关系
 
 - Agent definitions/versions 和 Provider 全局共享，不直接绑定 Runtime Box。
-- Agent global profile 保存 Server-owned MCP stable refs，不带 `runtimeBoxId`。
+- Agent global profile 保存 Server-owned MCP/Skill stable refs，不带 `runtimeBoxId`。
 - 每个 `agentId + runtimeBoxId` 最多有一份 active Runtime Profile。
 - Session/Project 永久保存 `runtimeBoxId`；启动 Run 时解析该 Agent 在同一 Box 上的 Runtime Profile。
 - Profile 的每个 MCP/Skill ref 都必须属于 profile 的 `runtimeBoxId`，并包含 stable resource ID、version 与 hash。

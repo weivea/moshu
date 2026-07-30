@@ -33,6 +33,9 @@ import {
 	listRuntimeBoxMcpServerSummariesOutputSchema,
 	listMcpServersOutputSchema,
 	mcpServerMutationResultSchema,
+	listSkillsOutputSchema,
+	skillMutationResultSchema,
+	skillSummarySchema,
 	listRuntimeBoxSkillsOutputSchema,
 	runtimeBoxResourceMutationResultSchema,
 	getRuntimeProfileOutputSchema,
@@ -63,8 +66,13 @@ import {
 	type AgentGlobalProfileRepository,
 	AgentGlobalProfileRevisionConflictError,
 	type AgentServerMcpRepository,
+	type AgentServerSkillRepository,
 	McpResourceNotFoundError,
 	McpResourceVersionConflictError,
+	SkillResourceNotFoundError,
+	SkillResourceVersionConflictError,
+	SkillOwnerCapabilityError,
+	SkillPackageValidationError,
 	type ProjectRepository,
 	ProjectNotFoundError,
 	ProjectPathConflictError,
@@ -86,7 +94,11 @@ import { ZodError, type ZodType, type z } from "zod";
 
 import type { ChatApplicationService } from "./chat-application-service";
 import { ProviderCatalogError } from "./provider-catalog";
-import { type RuntimeBoxRegistry, RuntimeBoxUnavailableError } from "./runtime-box-registry";
+import {
+	type RuntimeBoxRegistry,
+	RuntimeBoxCapabilityError,
+	RuntimeBoxUnavailableError,
+} from "./runtime-box-registry";
 import type { RuntimeIngressAuth } from "./runtime-ingress-auth";
 import type { DevTunnelService } from "./dev-tunnel-service";
 
@@ -100,6 +112,7 @@ export interface ProductRpcDependencies {
 	runtimeProfiles?: RuntimeProfileRepository;
 	agentGlobalProfiles?: AgentGlobalProfileRepository;
 	agentServerMcps?: AgentServerMcpRepository;
+	agentServerSkills?: AgentServerSkillRepository;
 	runtimeIngressAuth: RuntimeIngressAuth;
 	getDevTunnelService: () => DevTunnelService;
 	eventRouter: ProductEventRouter;
@@ -235,6 +248,7 @@ export function createProductRpcHandlers(dependencies: ProductRpcDependencies): 
 		runtimeProfiles,
 		agentGlobalProfiles,
 		agentServerMcps,
+		agentServerSkills,
 		runtimeIngressAuth,
 		getDevTunnelService,
 		eventRouter,
@@ -270,6 +284,12 @@ export function createProductRpcHandlers(dependencies: ProductRpcDependencies): 
 			throw new Error("Agent Server MCP repository is not initialized.");
 		}
 		return agentServerMcps;
+	};
+	const getAgentServerSkills = (): AgentServerSkillRepository => {
+		if (agentServerSkills === undefined) {
+			throw new Error("Agent Server Skill repository is not initialized.");
+		}
+		return agentServerSkills;
 	};
 	const resolveRuntimeBoxId = (runtimeBoxId: string | undefined): string =>
 		runtimeBoxId ?? runtimeBoxes.getActive().runtimeBoxId;
@@ -628,7 +648,7 @@ export function createProductRpcHandlers(dependencies: ProductRpcDependencies): 
 				async (input, _peer, context) => {
 					if (input.owner.kind === "agent-server") {
 						return serializeRuntimeResourceMutation("agent-server", async () => {
-							if (getAgentGlobalProfiles().isResourceReferenced(input.stableResourceId)) {
+							if (getAgentGlobalProfiles().isResourceReferenced("mcp", input.stableResourceId)) {
 								throw new RpcHandlerError(
 									"MCP_RESOURCE_IN_USE",
 									"Remove the MCP Server from every Agent before deleting it.",
@@ -669,6 +689,21 @@ export function createProductRpcHandlers(dependencies: ProductRpcDependencies): 
 				(input) =>
 					serializeRuntimeResourceMutation("agent-server", async () => {
 						getAgentServerMcps().resolveRefs(input.serverMcpRefs);
+						if (input.serverSkillRefs.length > 0) {
+							const names = new Set<string>();
+							for (const resolved of getAgentServerSkills().resolveRefs(input.serverSkillRefs)) {
+								const name = resolved.summary.metadata?.name;
+								if (name !== undefined && names.has(name)) {
+									throw new RpcHandlerError(
+										"SKILL_NAME_CONFLICT",
+										`Skill name ${name} is assigned more than once.`,
+									);
+								}
+								if (name !== undefined) {
+									names.add(name);
+								}
+							}
+						}
 						return updateAgentGlobalProfileOutputSchema.parse({
 							profile: getAgentGlobalProfiles().update(input),
 						});
@@ -704,6 +739,133 @@ export function createProductRpcHandlers(dependencies: ProductRpcDependencies): 
 						return runtimeBoxResourceMutationResultSchema.parse(
 							await runtimeBoxRegistry.deleteSkill(runtimeBoxId, input, context.signal),
 						);
+					});
+				},
+			),
+			[productRpcMethods.skillList]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.skillList],
+				async (input, _peer, context) => {
+					if (input.owner.kind === "agent-server") {
+						return listSkillsOutputSchema.parse(getAgentServerSkills().list());
+					}
+					const output = await runtimeBoxRegistry.listSkills(
+						input.owner.runtimeBoxId,
+						context.signal,
+					);
+					return listSkillsOutputSchema.parse({
+						owner: input.owner,
+						items: output.items.map((skill) =>
+							skillSummarySchema.parse({
+								owner: input.owner,
+								stableResourceId: skill.stableResourceId,
+								configRevision: skill.configRevision,
+								version: skill.version,
+								contentHash: skill.contentHash,
+								metadata: skill.metadata,
+								enabled: skill.enabled,
+								health: skill.enabled ? "ready" : "stopped",
+								packageKind: "runtime-package",
+								sourceKind: toSkillSourceKind(skill.source),
+								stale: false,
+								installedAt: skill.installedAt,
+								updatedAt: skill.updatedAt,
+							}),
+						),
+					});
+				},
+			),
+			[productRpcMethods.skillUpsert]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.skillUpsert],
+				async (input, _peer, context) => {
+					if (input.owner.kind === "agent-server") {
+						return serializeRuntimeResourceMutation("agent-server", async () =>
+							skillMutationResultSchema.parse(getAgentServerSkills().upsert(input)),
+						);
+					}
+					const runtimeBoxId = input.owner.runtimeBoxId;
+					runtimeBoxRegistry.requireCapability(runtimeBoxId, "skills.config.v2");
+					const { owner: _owner, source, ...command } = input;
+					return serializeRuntimeResourceMutation(runtimeBoxId, async () => {
+						const result = await runtimeBoxRegistry.installSkill(
+							runtimeBoxId,
+							{
+								...command,
+								runtimeBoxId,
+								source: source.label ?? source.kind,
+							},
+							context.signal,
+						);
+						return skillMutationResultSchema.parse({
+							owner: input.owner,
+							stableResourceId: result.stableResourceId,
+							configRevision: result.configRevision,
+							version: result.version,
+							contentHash: result.contentHash,
+							deleted: result.deleted,
+						});
+					});
+				},
+			),
+			[productRpcMethods.skillSetEnabled]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.skillSetEnabled],
+				async (input, _peer, context) => {
+					if (input.owner.kind === "agent-server") {
+						return serializeRuntimeResourceMutation("agent-server", async () =>
+							skillMutationResultSchema.parse(getAgentServerSkills().setEnabled(input)),
+						);
+					}
+					const runtimeBoxId = input.owner.runtimeBoxId;
+					runtimeBoxRegistry.requireCapability(runtimeBoxId, "skills.config.v2");
+					const { owner: _owner, ...command } = input;
+					return serializeRuntimeResourceMutation(runtimeBoxId, async () => {
+						const result = await runtimeBoxRegistry.setSkillEnabled(
+							runtimeBoxId,
+							{ ...command, runtimeBoxId },
+							context.signal,
+						);
+						return skillMutationResultSchema.parse({
+							owner: input.owner,
+							stableResourceId: result.stableResourceId,
+							configRevision: result.configRevision,
+							version: result.version,
+							contentHash: result.contentHash,
+							deleted: result.deleted,
+						});
+					});
+				},
+			),
+			[productRpcMethods.skillDelete]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.skillDelete],
+				async (input, _peer, context) => {
+					if (input.owner.kind === "agent-server") {
+						return serializeRuntimeResourceMutation("agent-server", async () => {
+							if (getAgentGlobalProfiles().isResourceReferenced("skill", input.stableResourceId)) {
+								throw new RpcHandlerError(
+									"SKILL_RESOURCE_IN_USE",
+									"Remove the Skill from every Agent before deleting it.",
+								);
+							}
+							return skillMutationResultSchema.parse(getAgentServerSkills().delete(input));
+						});
+					}
+					const runtimeBoxId = input.owner.runtimeBoxId;
+					runtimeBoxRegistry.requireCapability(runtimeBoxId, "skills.config.v2");
+					const { owner: _owner, ...command } = input;
+					return serializeRuntimeResourceMutation(runtimeBoxId, async () => {
+						assertResourceNotReferenced(runtimeBoxId, "skill", input.stableResourceId);
+						const result = await runtimeBoxRegistry.deleteSkill(
+							runtimeBoxId,
+							{ ...command, runtimeBoxId },
+							context.signal,
+						);
+						return skillMutationResultSchema.parse({
+							owner: input.owner,
+							stableResourceId: result.stableResourceId,
+							configRevision: result.configRevision,
+							version: result.version,
+							contentHash: result.contentHash,
+							deleted: result.deleted,
+						});
 					});
 				},
 			),
@@ -1017,6 +1179,13 @@ function createRequestHandler<TInputSchema extends ZodType, TOutputSchema extend
 	};
 }
 
+function toSkillSourceKind(source: string): "inline-editor" | "local-upload" | "import" {
+	if (source === "inline-editor" || source === "import") {
+		return source;
+	}
+	return "local-upload";
+}
+
 function rethrowProductHandlerError(error: unknown): never {
 	if (error instanceof RpcHandlerError) {
 		throw error;
@@ -1062,6 +1231,12 @@ function rethrowProductHandlerError(error: unknown): never {
 	if (error instanceof RuntimeBoxUnavailableError) {
 		throw new RpcHandlerError("RUNTIME_BOX_NOT_READY", error.message);
 	}
+	if (error instanceof RuntimeBoxCapabilityError) {
+		throw new RpcHandlerError("RUNTIME_BOX_CAPABILITY_MISSING", error.message, {
+			runtimeBoxId: error.runtimeBoxId,
+			capability: error.capability,
+		});
+	}
 	if (error instanceof RuntimeProfileRevisionConflictError) {
 		throw new RpcHandlerError("RUNTIME_PROFILE_REVISION_CONFLICT", error.message, {
 			actualRevision: error.actualRevision,
@@ -1077,6 +1252,18 @@ function rethrowProductHandlerError(error: unknown): never {
 	}
 	if (error instanceof McpResourceVersionConflictError) {
 		throw new RpcHandlerError("MCP_RESOURCE_VERSION_CONFLICT", error.message);
+	}
+	if (error instanceof SkillResourceNotFoundError) {
+		throw new RpcHandlerError("SKILL_NOT_READY", error.message);
+	}
+	if (error instanceof SkillResourceVersionConflictError) {
+		throw new RpcHandlerError("SKILL_VERSION_MISMATCH", error.message);
+	}
+	if (error instanceof SkillOwnerCapabilityError) {
+		throw new RpcHandlerError("SKILL_OWNER_CAPABILITY_MISMATCH", error.message);
+	}
+	if (error instanceof SkillPackageValidationError) {
+		throw new RpcHandlerError("SKILL_PACKAGE_INVALID", error.message);
 	}
 	if (error instanceof RpcRemoteError) {
 		if (

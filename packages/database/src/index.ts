@@ -13,3 +13,4 @@ export * from "./schema";
 export * from "./session-repository";
 export * from "./agent-global-profile-repository";
 export * from "./agent-server-mcp-repository";
+export * from "./agent-server-skill-repository";

@@ -216,9 +216,19 @@ describe("Pi Agent runtime", () => {
 					messages: [{ role: "user", content: "Use the database Skill." }],
 					skills: [
 						{
+							owner: {
+								kind: "runtime-box",
+								runtimeBoxId: defaultLocalRuntimeBoxId,
+							},
 							stableResourceId: "database-skill",
 							version: "550e8400-e29b-41d4-a716-446655440000",
 							contentHash: "b".repeat(64),
+							metadata: {
+								name: "database-skill",
+								description: "Query data",
+								allowedTools: [],
+								metadata: {},
+							},
 							skillMarkdown: `---\nname: database-skill\ndescription: Query data\n---\n${skillMarker}`,
 						},
 					],

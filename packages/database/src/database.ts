@@ -19,6 +19,11 @@ import {
 	type AgentServerMcpSecretStorePort,
 	SqliteAgentServerMcpRepository,
 } from "./agent-server-mcp-repository";
+import {
+	type AgentServerSkillContentStorePort,
+	type AgentServerSkillRepository,
+	SqliteAgentServerSkillRepository,
+} from "./agent-server-skill-repository";
 import { createRunJournalRepository, type RunJournalRepository } from "./run-journal-repository";
 import { type ProjectRepository, SqliteProjectRepository } from "./project-repository";
 import {
@@ -57,6 +62,7 @@ export interface AppDatabase {
 	runtimeProfiles: RuntimeProfileRepository;
 	agentGlobalProfiles: AgentGlobalProfileRepository;
 	agentServerMcps: AgentServerMcpRepository;
+	agentServerSkills: AgentServerSkillRepository;
 	close(): void;
 }
 
@@ -118,6 +124,7 @@ export function openAppDatabase(
 	options: {
 		agentServerMcpSecrets?: AgentServerMcpSecretStorePort;
 		prepareAgentServerMcpStdioCwd?: (stableResourceId: string) => string;
+		agentServerSkillContent?: AgentServerSkillContentStorePort;
 	} = {},
 ): AppDatabase {
 	const normalized = requireDatabaseFilename(filename);
@@ -134,6 +141,8 @@ export function openAppDatabase(
 	const orm = drizzle(client, { schema: appSchema });
 	const runtimeBoxes = new SqliteRuntimeBoxRepository(orm);
 	const agentServerMcpSecrets = options.agentServerMcpSecrets ?? createUnavailableMcpSecretStore();
+	const agentServerSkillContent =
+		options.agentServerSkillContent ?? createUnavailableSkillContentStore();
 	const platform = requireSupportedPlatform(process.platform);
 	runtimeBoxes.initializeDefault({
 		schemaVersion: 1,
@@ -158,6 +167,7 @@ export function openAppDatabase(
 			{ now: Date.now },
 			options.prepareAgentServerMcpStdioCwd,
 		),
+		agentServerSkills: new SqliteAgentServerSkillRepository(orm, agentServerSkillContent),
 		projects: new SqliteProjectRepository(orm, runtimeBoxes),
 		runtimeBoxPairings: new SqliteRuntimeBoxPairingRepository(orm),
 		remoteAccess: new SqliteRemoteAccessRepository(orm),
@@ -165,6 +175,26 @@ export function openAppDatabase(
 		runs: createRunJournalRepository({ client, orm }),
 		actions: new SqliteActionRepository(orm),
 		close: () => client.close(),
+	};
+}
+
+function createUnavailableSkillContentStore(): AgentServerSkillContentStorePort {
+	return {
+		writeVersion() {
+			throw new Error("Agent Server Skill content store is not configured.");
+		},
+		readSkillMarkdown() {
+			throw new Error("Agent Server Skill content store is not configured.");
+		},
+		verifyVersion() {
+			throw new Error("Agent Server Skill content store is not configured.");
+		},
+		deleteVersion() {
+			throw new Error("Agent Server Skill content store is not configured.");
+		},
+		cleanupOrphans() {
+			throw new Error("Agent Server Skill content store is not configured.");
+		},
 	};
 }
 

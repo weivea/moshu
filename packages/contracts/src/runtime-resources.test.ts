@@ -4,6 +4,7 @@ import {
 	agentGlobalProfileSchema,
 	listMcpServersOutputSchema,
 	listRuntimeBoxMcpServerSummariesOutputSchema,
+	listSkillsOutputSchema,
 } from "./runtime-resources";
 
 describe("Runtime resource renderer projections", () => {
@@ -80,9 +81,45 @@ describe("Runtime resource renderer projections", () => {
 						contentHash: "a".repeat(64),
 					},
 				],
+				serverSkillRefs: [],
 				createdAt: new Date().toISOString(),
 				updatedAt: new Date().toISOString(),
 			}),
 		).toThrow();
+	});
+
+	test("keeps Agent Server and Runtime Box Skill ownership explicit", () => {
+		const item = {
+			owner: { kind: "agent-server" as const },
+			stableResourceId: "release-helper",
+			configRevision: 1,
+			version: crypto.randomUUID(),
+			contentHash: "a".repeat(64),
+			metadata: {
+				name: "release-helper",
+				description: "Prepare releases",
+				allowedTools: [],
+				metadata: {},
+			},
+			enabled: true,
+			health: "ready" as const,
+			packageKind: "prompt-only" as const,
+			sourceKind: "inline-editor" as const,
+			stale: false,
+			installedAt: new Date().toISOString(),
+			updatedAt: new Date().toISOString(),
+		};
+		expect(
+			listSkillsOutputSchema.parse({
+				owner: { kind: "agent-server" },
+				items: [item],
+			}),
+		).toEqual({ owner: { kind: "agent-server" }, items: [item] });
+		expect(() =>
+			listSkillsOutputSchema.parse({
+				owner: { kind: "runtime-box", runtimeBoxId: "runtime-box" },
+				items: [item],
+			}),
+		).toThrow("owner");
 	});
 });

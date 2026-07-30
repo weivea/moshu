@@ -1,6 +1,6 @@
 import type Database from "bun:sqlite";
 
-export const currentAppDatabaseVersion = 19;
+export const currentAppDatabaseVersion = 20;
 
 export class AppDatabaseResetRequiredError extends Error {
 	readonly currentVersion: number;
@@ -56,6 +56,10 @@ export function applyAppMigrations(client: Database): void {
 		client.exec(`
 			DROP TABLE IF EXISTS agent_session_cleanup_outbox;
 			DROP TABLE IF EXISTS agent_global_profiles;
+			DROP TABLE IF EXISTS agent_server_skill_command_results;
+			DROP TABLE IF EXISTS agent_server_skill_pending_content_deletions;
+			DROP TABLE IF EXISTS agent_server_skill_versions;
+			DROP TABLE IF EXISTS agent_server_skill_installations;
 			DROP TABLE IF EXISTS agent_server_mcp_command_results;
 			DROP TABLE IF EXISTS agent_server_mcp_pending_secret_deletions;
 			DROP TABLE IF EXISTS agent_server_mcp_retained_secrets;
@@ -173,10 +177,49 @@ export function applyAppMigrations(client: Database): void {
 			CREATE INDEX agent_server_mcp_command_results_created_idx
 				ON agent_server_mcp_command_results(created_at_ms);
 
+			CREATE TABLE agent_server_skill_installations (
+				id TEXT PRIMARY KEY NOT NULL,
+				config_revision INTEGER NOT NULL,
+				current_version TEXT NOT NULL,
+				enabled INTEGER NOT NULL,
+				source_kind TEXT NOT NULL,
+				source_label TEXT,
+				health TEXT NOT NULL,
+				last_error_code TEXT,
+				created_at_ms INTEGER NOT NULL,
+				updated_at_ms INTEGER NOT NULL
+			);
+
+			CREATE TABLE agent_server_skill_versions (
+				skill_id TEXT NOT NULL,
+				version TEXT NOT NULL,
+				content_hash TEXT NOT NULL,
+				metadata_json TEXT NOT NULL,
+				content_locator TEXT NOT NULL,
+				installed_at_ms INTEGER NOT NULL,
+				PRIMARY KEY (skill_id, version)
+			);
+
+			CREATE TABLE agent_server_skill_pending_content_deletions (
+				content_locator TEXT PRIMARY KEY NOT NULL,
+				created_at_ms INTEGER NOT NULL
+			);
+
+			CREATE TABLE agent_server_skill_command_results (
+				command_id TEXT PRIMARY KEY NOT NULL,
+				operation TEXT NOT NULL,
+				request_digest TEXT NOT NULL,
+				result_json TEXT NOT NULL,
+				created_at_ms INTEGER NOT NULL
+			);
+			CREATE INDEX agent_server_skill_command_results_created_idx
+				ON agent_server_skill_command_results(created_at_ms);
+
 			CREATE TABLE agent_global_profiles (
 				agent_id TEXT PRIMARY KEY NOT NULL,
 				revision INTEGER NOT NULL,
 				server_mcp_refs_json TEXT NOT NULL,
+				server_skill_refs_json TEXT NOT NULL,
 				created_at_ms INTEGER NOT NULL,
 				updated_at_ms INTEGER NOT NULL
 			);

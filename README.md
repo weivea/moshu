@@ -5,11 +5,11 @@
 ## 当前能力
 
 - **Desktop Client**：Electrobun + React 桌面界面，负责窗口、设置、Runtime Box 切换和本地 companion 监管。
-- **Agent Server**：独占 Provider、Agent runtime、Session、Project、Run/event、Policy/Action、产品数据库和 Pi Session JSONL。
-- **Runtime Box**：在本机或远程设备执行 `read`、`bash`、`edit`、`write`、`grep`、`find`、`ls`，并拥有自己的 MCP、Skills、credential、journal 和 workspace。
+- **Agent Server**：独占 Provider、Agent runtime、Session、Project、Run/event、Policy/Action、产品数据库、Pi Session JSONL，以及 Server-owned MCP 和 prompt-only Skills。
+- **Runtime Box**：在本机或远程设备执行 `read`、`bash`、`edit`、`write`、`grep`、`find`、`ls`，并拥有自己的 MCP、完整 Skill packages、credential、journal 和 workspace。
 - **Remote Runtime Box**：通过 Agent Server 管理的 Anonymous Microsoft Dev Tunnel 主动连接，使用一次性配对码、Ed25519 双向身份、generation fence 和版本协商。
-- **多 Box 路由**：切换 Runtime Box 后，界面切换到该 Box 对应的 Session、Project、MCP 和 Skills；既有 Session/Run 永远按持久归属路由，不随全局选择迁移。
-- **MCP 与 Skills**：支持 MCP stdio、Streamable HTTP、兼容 SSE、Box 私有 SecretStore、immutable Skills、Runtime Profile 和 inventory full/delta reconciliation。
+- **多 Box 路由**：切换 Runtime Box 后，界面切换 Box-owned Session、Project、MCP 和 Skills；Server-owned MCP/Skills 保持不变，既有 Session/Run 永远按持久归属路由。
+- **MCP 与 Skills**：支持 MCP 与 Skills 双归属、MCP stdio/Streamable HTTP/SSE、prompt-only Server Skills、Box immutable Skill packages、global/Runtime Profile 和 inventory reconciliation。
 - **恢复与发布门**：durable Action intent、单次 grant、fsync journal、未知结果对账、进程树清理、协议升级状态、脱敏诊断、流量估算及签名 package/update gate。
 
 ## 架构
@@ -36,7 +36,8 @@ Remote Runtime Box
 | 领域 | 所有者 |
 | --- | --- |
 | Provider、Agent、Session、Project、Run/event、Policy/Action | Agent Server |
-| MCP config/credential/lifecycle、Skills、Tool 执行、workspace | owning Runtime Box |
+| Server-owned MCP、prompt-only Skills、Agent global refs | Agent Server |
+| Box-owned MCP、完整 Skill packages、Tool 执行、workspace | owning Runtime Box |
 | UI、窗口、Updater、本地 companion supervisor | Desktop Client |
 
 Remote Tunnel 只公开 Runtime ingress，不公开 Product RPC、Provider 或数据库接口。

@@ -57,8 +57,8 @@ describe("RuntimeIngressAuth", () => {
 			expect(response.status).toBe(426);
 			expect(await response.json()).toEqual({
 				error: "RUNTIME_BOX_UPGRADE_REQUIRED",
-				minProtocolVersion: 2,
-				maxProtocolVersion: 2,
+				minProtocolVersion: 3,
+				maxProtocolVersion: 3,
 			});
 			expect(upgrades).toEqual([]);
 		} finally {
@@ -166,8 +166,8 @@ describe("RuntimeIngressAuth", () => {
 				runtimeBoxCompatibilityReportOutputSchema.parse(await compatibilityResponse.json()),
 			).toEqual({
 				accepted: true,
-				requiredProtocolMinVersion: 2,
-				requiredProtocolMaxVersion: 2,
+				requiredProtocolMinVersion: 3,
+				requiredProtocolMaxVersion: 3,
 			});
 			expect(upgrades).toEqual([status.runtimeBoxId]);
 			expect(database.runtimeBoxes.listCompatibility()).toEqual([
@@ -204,7 +204,7 @@ describe("RuntimeIngressAuth", () => {
 				deviceKeyId: "device-key-1",
 				instanceId: "remote-instance-1",
 				generation: 1,
-				protocolVersion: 2 as const,
+				protocolVersion: 3 as const,
 			};
 			const serverIdentity = rpcIdentity;
 			server = createRpcServer({
@@ -400,7 +400,7 @@ function signedUpgradeRequest(
 		deviceKeyId: string;
 		instanceId: string;
 		generation: number;
-		protocolVersion: 2;
+		protocolVersion: 3;
 	},
 	challenge: {
 		challengeId: string;
@@ -409,7 +409,7 @@ function signedUpgradeRequest(
 		agentServerId: string;
 		rpcIdentity: ProcessPeerIdentity;
 		actionJournalEpoch: string;
-		negotiatedProtocolVersion: 2;
+		negotiatedProtocolVersion: 3;
 		transportSecurity: "relay-tls";
 		supportedTransportSecurity: Array<"relay-tls" | "noise-xx">;
 	},

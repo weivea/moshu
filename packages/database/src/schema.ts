@@ -125,10 +125,59 @@ export const agentServerMcpCommandResultsTable = sqliteTable(
 	(table) => [index("agent_server_mcp_command_results_created_idx").on(table.createdAtMs)],
 );
 
+export const agentServerSkillInstallationsTable = sqliteTable("agent_server_skill_installations", {
+	id: text("id").primaryKey(),
+	configRevision: integer("config_revision").notNull(),
+	currentVersion: text("current_version").notNull(),
+	enabled: integer("enabled", { mode: "boolean" }).notNull(),
+	sourceKind: text("source_kind", {
+		enum: ["inline-editor", "local-upload", "import"],
+	}).notNull(),
+	sourceLabel: text("source_label"),
+	health: text("health", { enum: ["ready", "stopped", "error"] }).notNull(),
+	lastErrorCode: text("last_error_code"),
+	createdAtMs: integer("created_at_ms").notNull(),
+	updatedAtMs: integer("updated_at_ms").notNull(),
+});
+
+export const agentServerSkillVersionsTable = sqliteTable(
+	"agent_server_skill_versions",
+	{
+		skillId: text("skill_id").notNull(),
+		version: text("version").notNull(),
+		contentHash: text("content_hash").notNull(),
+		metadataJson: text("metadata_json").notNull(),
+		contentLocator: text("content_locator").notNull(),
+		installedAtMs: integer("installed_at_ms").notNull(),
+	},
+	(table) => [primaryKey({ columns: [table.skillId, table.version] })],
+);
+
+export const agentServerSkillPendingContentDeletionsTable = sqliteTable(
+	"agent_server_skill_pending_content_deletions",
+	{
+		contentLocator: text("content_locator").primaryKey(),
+		createdAtMs: integer("created_at_ms").notNull(),
+	},
+);
+
+export const agentServerSkillCommandResultsTable = sqliteTable(
+	"agent_server_skill_command_results",
+	{
+		commandId: text("command_id").primaryKey(),
+		operation: text("operation").notNull(),
+		requestDigest: text("request_digest").notNull(),
+		resultJson: text("result_json").notNull(),
+		createdAtMs: integer("created_at_ms").notNull(),
+	},
+	(table) => [index("agent_server_skill_command_results_created_idx").on(table.createdAtMs)],
+);
+
 export const agentGlobalProfilesTable = sqliteTable("agent_global_profiles", {
 	agentId: text("agent_id").primaryKey(),
 	revision: integer("revision").notNull(),
 	serverMcpRefsJson: text("server_mcp_refs_json").notNull(),
+	serverSkillRefsJson: text("server_skill_refs_json").notNull(),
 	createdAtMs: integer("created_at_ms").notNull(),
 	updatedAtMs: integer("updated_at_ms").notNull(),
 });
@@ -432,6 +481,10 @@ export const appSchema = {
 	agentServerMcpPendingSecretDeletionsTable,
 	agentServerMcpRetainedSecretsTable,
 	agentServerMcpServersTable,
+	agentServerSkillCommandResultsTable,
+	agentServerSkillInstallationsTable,
+	agentServerSkillPendingContentDeletionsTable,
+	agentServerSkillVersionsTable,
 	appSettingsTable,
 	remoteAccessSettingsTable,
 	projectsTable,

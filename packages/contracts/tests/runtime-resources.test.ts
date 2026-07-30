@@ -61,6 +61,7 @@ describe("Runtime Box resource contracts", () => {
 		const resource = {
 			resourceKind: "skill" as const,
 			stableResourceId: "skill",
+			configRevision: 1,
 			version: crypto.randomUUID(),
 			contentHash: "a".repeat(64),
 			health: "ready" as const,
@@ -76,6 +77,7 @@ describe("Runtime Box resource contracts", () => {
 				resources: Array.from({ length: maxRuntimeBoxInventoryResources + 1 }, (_value, index) => ({
 					...resource,
 					stableResourceId: `skill-${index}`,
+					configRevision: 1,
 				})),
 			}),
 		).toThrow();
@@ -123,6 +125,7 @@ describe("Runtime Box resource contracts", () => {
 				runtimeBoxId: "runtime-box",
 				items: Array.from({ length: 16 }, (_value, index) => ({
 					stableResourceId: `skill-${index}`,
+					configRevision: 1,
 					version: crypto.randomUUID(),
 					contentHash: "a".repeat(64),
 					metadata: {

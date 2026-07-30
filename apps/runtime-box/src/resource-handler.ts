@@ -9,6 +9,7 @@ import {
 	listRuntimeBoxSkillsInputSchema,
 	productRpcMethods,
 	setRuntimeBoxMcpServerEnabledInputSchema,
+	setRuntimeBoxSkillEnabledInputSchema,
 	upsertRuntimeBoxMcpServerInputSchema,
 	validateRuntimeBoxResourcesInputSchema,
 } from "@moshu/contracts";
@@ -106,6 +107,13 @@ export function createRuntimeResourceRequestHandlers(
 			(input) => {
 				targetRuntimeBox(input.runtimeBoxId);
 				return store.installSkill(input);
+			},
+		),
+		[productRpcMethods.runtimeBoxSkillsSetEnabled]: handle(
+			(payload) => setRuntimeBoxSkillEnabledInputSchema.parse(payload),
+			(input) => {
+				targetRuntimeBox(input.runtimeBoxId);
+				return store.setSkillEnabled(input);
 			},
 		),
 		[productRpcMethods.runtimeBoxSkillsDelete]: handle(

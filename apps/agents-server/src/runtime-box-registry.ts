@@ -31,6 +31,7 @@ import {
 	runtimeBoxInventorySnapshotSchema,
 	runtimeBoxResourceMutationResultSchema,
 	setRuntimeBoxMcpServerEnabledInputSchema,
+	setRuntimeBoxSkillEnabledInputSchema,
 	upsertRuntimeBoxMcpServerInputSchema,
 	validateRuntimeBoxResourcesInputSchema,
 	validateRuntimeBoxResourcesOutputSchema,
@@ -45,6 +46,7 @@ import {
 	type RuntimeBoxResourceMutationResult,
 	type RuntimeBoxSkill,
 	type SetRuntimeBoxMcpServerEnabledInput,
+	type SetRuntimeBoxSkillEnabledInput,
 	type UpsertRuntimeBoxMcpServerInput,
 	type ValidateRuntimeBoxResourcesInput,
 	type ValidateRuntimeBoxResourcesOutput,
@@ -167,6 +169,16 @@ export class RuntimeBoxUnavailableError extends Error {
 	constructor(message = "The selected Runtime Box is not connected and registered.") {
 		super(message);
 		this.name = "RuntimeBoxUnavailableError";
+	}
+}
+
+export class RuntimeBoxCapabilityError extends Error {
+	constructor(
+		readonly runtimeBoxId: string,
+		readonly capability: string,
+	) {
+		super(`Runtime Box ${runtimeBoxId} does not support ${capability}.`);
+		this.name = "RuntimeBoxCapabilityError";
 	}
 }
 
@@ -592,7 +604,15 @@ export class RuntimeBoxRegistry {
 		if (output.runtimeBoxId !== runtimeBoxId || this.#entries.get(runtimeBoxId)?.peer !== peer) {
 			throw new RuntimeBoxUnavailableError("Runtime Box changed during Skill query.");
 		}
+
 		return output;
+	}
+
+	requireCapability(runtimeBoxId: string, capability: string): void {
+		const entry = this.#entries.get(runtimeBoxId);
+		if (entry === undefined || !entry.descriptor.capabilities.includes(capability)) {
+			throw new RuntimeBoxCapabilityError(runtimeBoxId, capability);
+		}
 	}
 
 	async installSkill(
@@ -608,6 +628,24 @@ export class RuntimeBoxRegistry {
 		return this.#mutateResource(
 			runtimeBoxId,
 			productRpcMethods.runtimeBoxSkillsInstall,
+			input,
+			"skill",
+			signal,
+		);
+	}
+
+	async setSkillEnabled(
+		runtimeBoxId: string,
+		inputValue: SetRuntimeBoxSkillEnabledInput,
+		signal?: AbortSignal,
+	): Promise<RuntimeBoxResourceMutationResult> {
+		const input = setRuntimeBoxSkillEnabledInputSchema.parse({
+			...inputValue,
+			runtimeBoxId,
+		});
+		return this.#mutateResource(
+			runtimeBoxId,
+			productRpcMethods.runtimeBoxSkillsSetEnabled,
 			input,
 			"skill",
 			signal,

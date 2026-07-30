@@ -80,7 +80,7 @@ credential、公开 URL、Runtime ingress 端口和 Remote Box 状态不能由 D
 | Agent、Provider、Policy、Approval、Action intent/result | Agent Server | Provider Secret 永不发送 Box |
 | 全局 `activeRuntimeBoxId` | Agent Server | revision/CAS 更新并广播 |
 | MCP config/credential/OAuth/lifecycle | owning Runtime Box | Agent Server 只有脱敏投影与稳定引用 |
-| Skill installation/version/content/resources/scripts | owning Runtime Box | Agent Server 不保存可恢复正文 |
+| Box-owned Skill installation/version/content/resources/scripts | owning Runtime Box | Agent Server 不保存可恢复正文 |
 | 文件、命令、Git、MCP Tool、Skill script | Runtime Box 内部 Executor | 每次副作用需要 Server grant |
 | Invocation journal 与进程树 | Runtime Box | 重连后提交结果证据并等待 Server ack |
 
@@ -349,14 +349,16 @@ logs/
 cache/
 ```
 
-Agent Server 只保存作用域绑定、稳定 resource ref、Runtime Profile 和可丢弃 inventory projection：
+对 Box-owned 资源，Agent Server 只保存作用域绑定、稳定 resource ref、Runtime Profile 和可丢弃 inventory
+projection。Server-owned prompt-only Skill 另由 Agent Server private content store 管理，不进入本目录：
 
 ```text
 agentId + runtimeBoxId
 resourceKind + stableResourceId + version + contentHash
 ```
 
-Box offline 时 Sessions/Projects 仍可查看，inventory 标 stale，MCP/Skill UI 只读，不自动切回 Local Box。
+Box offline 时 Sessions/Projects 仍可查看，inventory 标 stale，Box-owned MCP/Skill UI 只读，不自动切回 Local
+Box；Agent Server-owned Skill 仍可管理，但当前 Run gate 仍要求 Session Box online。
 
 ## 10. 副作用执行与断线恢复
 
