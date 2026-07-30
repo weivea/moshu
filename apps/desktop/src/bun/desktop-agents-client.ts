@@ -387,18 +387,25 @@ export class DesktopAgentsClient {
 			this.#deleteCommittedTerminalCursors();
 			await this.#reconcileUnboundReservations(peer, recoveryDeadline, connectionGeneration);
 			await this.#reconcilePendingSessionCreates(peer, recoveryDeadline);
-			await this.#retryPendingSessionRetirements(recoveryDeadline, connectionGeneration);
 			if (this.#shutdown || connectionClosed) {
 				throw new AgentsUnavailableError("The local agents service disconnected during recovery.");
 			}
 			this.#assertRecoveryDeadline(recoveryDeadline);
-			// Atomic drain-and-activate fence. This is the LAST await before the connection is marked
-			// active: because no await follows it, no live event handler can interleave between the queue
-			// draining empty and the synchronous flip below. Any event that arrives while connectionActive
-			// is still false is therefore either drained here (the while-loop re-checks the queue after
-			// every delivery) or delivered live after the flip — never enqueued-then-stranded. Events that
-			// straddle the boundary still commit exactly once via the per-run cursor in #deliverThenCommit.
-			await this.#flushProvisionalEvents(provisionalQueue, recoveryDeadline, deliver);
+			// Atomic drain-and-activate fence. Drain provisional chat events AND pending Session
+			// retirements together until BOTH are quiescent, because either can be produced during the
+			// other's renderer await (a retirement staged mid chat-event flush; a chat event enqueued mid
+			// retirement finalization). This unified loop is the LAST await before the connection is
+			// marked active: because no await follows it, nothing can be enqueued-then-stranded between
+			// reaching quiescence and the synchronous flip below. Any event that arrives while
+			// connectionActive is still false is therefore drained here or delivered live after the flip;
+			// events that straddle the boundary still commit exactly once via the per-run cursor in
+			// #deliverThenCommit.
+			await this.#drainRecoveryUntilQuiescent(
+				provisionalQueue,
+				recoveryDeadline,
+				connectionGeneration,
+				deliver,
+			);
 			this.#deleteCommittedTerminalCursors();
 			if (this.#shutdown || connectionClosed) {
 				throw new AgentsUnavailableError("The local agents service disconnected during recovery.");
@@ -1567,6 +1574,49 @@ export class DesktopAgentsClient {
 			}
 			this.#recoveredSessionCreates.delete(reservation.createKey);
 			this.#releaseSessionCreateReservation(reservation, true);
+		}
+	}
+
+	#hasPendingSessionRetirements(): boolean {
+		return (
+			this.#sessionRetirements.entries().find((entry) => entry.value.status === "pending") !==
+			undefined
+		);
+	}
+
+	/**
+	 * Drains provisional chat events and pending Session retirements together until BOTH are quiescent.
+	 *
+	 * The two recovery queues feed each other: delivering a provisional chat event awaits a renderer chat
+	 * listener, during which a `chatSessionsRetired` notification can be staged as a new pending
+	 * retirement; and finalizing a retirement awaits a renderer acknowledgement, during which a live chat
+	 * event can be enqueued into the provisional buffer. Flushing one queue and then the other exactly
+	 * once therefore leaves a tail race — e.g. a retirement staged during the final chat-event flush is
+	 * never retried, so the connection is marked ready without invalidating the renderer. Looping until a
+	 * full pass leaves both queues empty closes that race. The caller flips `connectionActive = true`
+	 * synchronously immediately after this resolves, with no interleaving await, so any later arrival is
+	 * routed through active delivery instead of the provisional buffers.
+	 */
+	async #drainRecoveryUntilQuiescent(
+		queue: ProvisionalEventQueue,
+		deadline: number,
+		connectionGeneration: number,
+		deliver: (event: ChatRunEvent, deadline?: number) => Promise<void>,
+	): Promise<void> {
+		// Each round after the first drains at least one item that was staged during the previous round's
+		// awaits. Distinct items are bounded by the provisional event and retention caps, so this is a
+		// finite backstop to the recovery deadline both inner drains already enforce.
+		const maxRounds = this.#recoveryLimits.maxProvisionalEvents + maxRetainedSessionRetirements + 1;
+		let rounds = 0;
+		while (queue.events.length > 0 || this.#hasPendingSessionRetirements()) {
+			if (rounds >= maxRounds) {
+				throw new AgentsUnavailableError(
+					"The recovery drain did not reach a quiescent state within its bounded rounds.",
+				);
+			}
+			await this.#flushProvisionalEvents(queue, deadline, deliver);
+			await this.#retryPendingSessionRetirements(deadline, connectionGeneration);
+			rounds += 1;
 		}
 	}
 

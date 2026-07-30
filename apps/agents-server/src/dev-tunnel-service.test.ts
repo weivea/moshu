@@ -669,6 +669,94 @@ describe("DevTunnelService", () => {
 		}
 	});
 
+	test("keeps every ingress unready when a partially-ready host's termination rejects", async () => {
+		const database = openAppDatabase(":memory:");
+
+		class RejectingStopHost implements DevTunnelHostProcess {
+			readonly gates = new Map<
+				number,
+				ReturnType<typeof Promise.withResolvers<{ publicUrl: string }>>
+			>();
+			readonly exit = Promise.withResolvers<number>();
+			readonly exited = this.exit.promise;
+			stopCalls = 0;
+
+			constructor(ports: readonly number[]) {
+				for (const port of ports) {
+					this.gates.set(port, Promise.withResolvers<{ publicUrl: string }>());
+				}
+			}
+
+			waitForPort(port: number): Promise<{ publicUrl: string }> {
+				const gate = this.gates.get(port);
+				return gate?.promise ?? Promise.reject(new Error(`Unexpected port ${port}.`));
+			}
+
+			stop(): void {
+				this.stopCalls += 1;
+				// The owning host refuses to terminate — its shutdown rejects. Readiness must still clear.
+				throw new Error("Dev Tunnel host refused to stop.");
+			}
+		}
+
+		class GatedAdapter extends FakeDevTunnelAdapter {
+			host: RejectingStopHost | undefined;
+
+			override startHost(tunnelId: string, ports: readonly number[]): DevTunnelHostProcess {
+				this.hostedTunnelIds.push(tunnelId);
+				this.host = new RejectingStopHost(ports);
+				return this.host;
+			}
+		}
+
+		try {
+			const adapter = new GatedAdapter();
+			const service = new DevTunnelService({
+				repository: database.remoteAccess,
+				runtimeIngressPort: 41_000,
+				mobileIngressPort: 42_000,
+				adapter,
+			});
+			const outcome = service.enable().then(
+				(status) => ({ status, error: undefined }),
+				(error: unknown) => ({ status: undefined, error }),
+			);
+			while (adapter.host === undefined) {
+				await Bun.sleep(0);
+			}
+			const failingHost = adapter.host;
+			// The Runtime ingress publishes first, so its per-port readiness goes live while Mobile pends.
+			failingHost.gates
+				.get(41_000)
+				?.resolve({ publicUrl: "https://moshu-41000.test.devtunnels.ms" });
+			await Bun.sleep(0);
+			expect(service.getIngressReadiness()).toEqual([
+				{
+					kind: "runtime",
+					port: 41_000,
+					ready: true,
+					publicUrl: "https://moshu-41000.test.devtunnels.ms",
+				},
+				{ kind: "mobile", port: 42_000, ready: false },
+			]);
+			// The Mobile ingress never binds; the start aborts and the host's stop() rejects.
+			failingHost.gates.get(42_000)?.reject(new Error("Mobile ingress failed to bind."));
+			await outcome;
+			await Bun.sleep(0);
+			// Even though termination rejected, the dead host's Runtime readiness is cleared — the clear is
+			// synchronous and precedes the awaited terminate, so no ingress reports ready or a stale URL.
+			expect(service.getIngressReadiness()).toEqual([
+				{ kind: "runtime", port: 41_000, ready: false },
+				{ kind: "mobile", port: 42_000, ready: false },
+			]);
+			expect(service.getStatus().state).not.toBe("online");
+			expect(failingHost.stopCalls).toBeGreaterThan(0);
+			await service.shutdown();
+		} finally {
+			database.close();
+		}
+	});
+
 	test("monitorHostPorts resolves a per-port public URL from a single host stream", async () => {
 		const stream = new ReadableStream<Uint8Array>({
 			start(controller) {

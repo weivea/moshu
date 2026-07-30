@@ -748,15 +748,13 @@ export class DevTunnelService {
 			throwIfAborted(startAbortController.signal);
 			if (this.#host !== ownedHost || !this.#isCurrent(generation)) {
 				if (this.#host === ownedHost) {
+					// Clear the incremental readiness this superseded host published SYNCHRONOUSLY, before
+					// awaiting terminate: if terminate rejects or times out, a partially-ready ingress must
+					// not linger as ready. Guarded by host identity (this.#host === ownedHost) so a
+					// replacement host — which resets readiness on its own start — is never wiped.
+					this.#host = undefined;
+					this.#ingressReadiness = new Map();
 					await terminateHost(ownedHost);
-					if (this.#host === ownedHost) {
-						this.#host = undefined;
-						// This superseded host owned every incremental readiness entry we published; clear
-						// it so a partially-ready ingress never lingers as ready. Guarded by host identity
-						// (this.#host === ownedHost) so a replacement host — which resets readiness on its
-						// own start — is never wiped.
-						this.#ingressReadiness = new Map();
-					}
 				}
 				return;
 			}
@@ -792,16 +790,14 @@ export class DevTunnelService {
 		} catch (error) {
 			let failure = error;
 			if (ownedHost !== undefined && this.#host === ownedHost) {
+				// Clear the incremental readiness this dead host published SYNCHRONOUSLY, before awaiting
+				// terminate: a partial-startup failure or cancellation whose stop then rejects/times out
+				// must not leave an already-resolved ingress port reporting ready. Guarded by host identity
+				// so a replacement host's freshly-reset readiness is never clobbered.
+				this.#host = undefined;
+				this.#ingressReadiness = new Map();
 				try {
 					await terminateHost(ownedHost);
-					if (this.#host === ownedHost) {
-						this.#host = undefined;
-						// A partial-startup failure or cancellation leaves the incremental readiness entries
-						// this dead host published; clear them so an already-resolved ingress port never
-						// reports ready after its host is gone. Guarded by host identity so a replacement
-						// host's freshly-reset readiness is never clobbered.
-						this.#ingressReadiness = new Map();
-					}
 				} catch (stopError) {
 					failure = stopError;
 				}

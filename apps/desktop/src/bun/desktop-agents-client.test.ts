@@ -2862,6 +2862,98 @@ describe("DesktopAgentsClient", () => {
 		client.close();
 	});
 
+	test("invalidates a retirement staged during the final chat-event flush before readiness", async () => {
+		// Regression guard for the unified drain fence. A retirement notification can be staged while the
+		// final provisional chat-event flush is awaiting a renderer chat listener. Draining events and
+		// retirements as two separate single passes would leave that late-staged retirement un-invalidated
+		// before the connection is marked ready. The drain-until-quiescent loop must finalize it first.
+		const secondRetiringSessionId = createRetirementSessionId(3);
+		const firstPeer = new FakePeer((method) =>
+			method === productRpcMethods.chatSend ? createAcceptedPayload() : { events: [] },
+		);
+		const recoveredPeer = new FakePeer(() => ({ events: [] }));
+		const peers = [firstPeer, recoveredPeer];
+		let index = 0;
+		let recoveredOptions: ConnectRpcClientOptions | undefined;
+		const client = new DesktopAgentsClient(async (options) => {
+			recoveredOptions = options;
+			const peer = peers[index];
+			index += 1;
+			return peer ?? Promise.reject(new Error("No fake peer available."));
+		});
+
+		const order: string[] = [];
+
+		// Delivering the injected chat event stages a SECOND retirement mid-flush — the exact tail window
+		// the fence must cover.
+		client.subscribeChatEvents((event) => {
+			order.push(`event:${event.seq}`);
+			const retire = recoveredOptions?.handlers?.events?.[productRpcEvents.chatSessionsRetired];
+			if (retire === undefined) {
+				throw new Error("Session retirement event handler was not installed.");
+			}
+			return retire(
+				{ schemaVersion: 1, sessionIds: [secondRetiringSessionId] },
+				{} as RpcEventContext,
+			);
+		});
+
+		let chatEventInjected = false;
+		client.subscribeChatSessionInvalidations((invalidation) => {
+			order.push(`invalidated:${invalidation.sessionId}`);
+			// While finalizing the FIRST staged retirement, enqueue a live chat event so it is flushed by
+			// a later drain round — the flush during which the second retirement is staged.
+			if (invalidation.sessionId === otherSessionId && !chatEventInjected) {
+				chatEventInjected = true;
+				const eventHandler = recoveredOptions?.handlers?.events?.[agentsProductEventMethods[0]];
+				if (eventHandler === undefined) {
+					throw new Error("Provisional chat event handler was not installed.");
+				}
+				void eventHandler(createDeliveryPayload(1, "flushed during drain"), {} as RpcEventContext);
+			}
+			client.acknowledgeChatSessionInvalidation({
+				schemaVersion: 1,
+				invalidationId: invalidation.invalidationId,
+				sessionId: invalidation.sessionId,
+				accepted: true,
+			});
+		});
+
+		// Stage the FIRST retirement during the live subscription install (after the early retry) so it is
+		// only processed by the final unified drain.
+		recoveredPeer.chatSubscribeHandler = async (payload) => {
+			const parsed = chatSubscribeInputSchema.parse(payload);
+			const retire = recoveredOptions?.handlers?.events?.[productRpcEvents.chatSessionsRetired];
+			if (retire === undefined) {
+				throw new Error("Provisional retirement handler was not installed.");
+			}
+			await retire({ schemaVersion: 1, sessionIds: [otherSessionId] }, {} as RpcEventContext);
+			return { schemaVersion: 1, sessionId: parsed.sessionId, subscribed: true };
+		};
+
+		const firstConnection = await client.connect(createConnectOptions());
+		await client.request(
+			productRpcMethods.chatSend,
+			{ requestId: clientRequestId, sessionId, content: "hello" },
+			sendAskChatMessageInputSchema,
+			chatSendAcceptedOutputSchema,
+		);
+		firstConnection.close();
+
+		// Track readiness only for the recovery connection under test (the first connection also fires it).
+		client.subscribeReady(() => order.push("ready"));
+		await client.connect(createConnectOptions());
+
+		// The retirement staged mid chat-event flush is invalidated BEFORE readiness.
+		expect(order).toContain("event:1");
+		const secondInvalidationIndex = order.indexOf(`invalidated:${secondRetiringSessionId}`);
+		const readyIndex = order.indexOf("ready");
+		expect(secondInvalidationIndex).toBeGreaterThanOrEqual(0);
+		expect(readyIndex).toBeGreaterThanOrEqual(0);
+		expect(secondInvalidationIndex).toBeLessThan(readyIndex);
+		client.close();
+	});
+
 	test.each([
 		["event count", { maxProvisionalEvents: 1, maxProvisionalBytes: 1_000_000 }],
 		["encoded bytes", { maxProvisionalEvents: 10, maxProvisionalBytes: 10 }],
