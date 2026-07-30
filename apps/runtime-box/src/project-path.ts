@@ -1,7 +1,15 @@
-import { constants } from "node:fs";
-import { access, readFile, realpath, stat } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import { constants, type Stats } from "node:fs";
+import { access, lstat, open, readFile, realpath, stat } from "node:fs/promises";
 import { basename, dirname, isAbsolute, parse, resolve } from "node:path";
 import {
+	maxProjectRootAgentsBytes,
+	type ProjectPathIssueCode,
+	type ProjectRootAgentsStatus,
+	type ReadRuntimeBoxProjectRootAgentsInput,
+	type ReadRuntimeBoxProjectRootAgentsOutput,
+	readRuntimeBoxProjectRootAgentsInputSchema,
+	readRuntimeBoxProjectRootAgentsOutputSchema,
 	type ValidateRuntimeBoxProjectPathInput,
 	type ValidateRuntimeBoxProjectPathOutput,
 	validateRuntimeBoxProjectPathInputSchema,
@@ -15,25 +23,169 @@ export const validateProjectPathRequestHandler: RpcRequestHandler = async (paylo
 	);
 };
 
+export const readProjectRootAgentsRequestHandler: RpcRequestHandler = async (payload, context) => {
+	return rpcJsonValueSchema.parse(
+		await readProjectRootAgents(
+			readRuntimeBoxProjectRootAgentsInputSchema.parse(payload),
+			context.signal,
+		),
+	);
+};
+
+export async function readProjectRootAgents(
+	inputValue: ReadRuntimeBoxProjectRootAgentsInput,
+	signal?: AbortSignal,
+): Promise<ReadRuntimeBoxProjectRootAgentsOutput> {
+	const input = readRuntimeBoxProjectRootAgentsInputSchema.parse(inputValue);
+	return readBoundedRootAgents(input.projectPath, "body", signal);
+}
+
+async function readBoundedRootAgents(
+	projectPath: string,
+	mode: "body",
+	signal?: AbortSignal,
+): Promise<ReadRuntimeBoxProjectRootAgentsOutput>;
+async function readBoundedRootAgents(
+	projectPath: string,
+	mode: "metadata",
+	signal?: AbortSignal,
+): Promise<ProjectRootAgentsStatus>;
+async function readBoundedRootAgents(
+	projectPath: string,
+	mode: "body" | "metadata",
+	signal?: AbortSignal,
+): Promise<ReadRuntimeBoxProjectRootAgentsOutput | ProjectRootAgentsStatus> {
+	signal?.throwIfAborted();
+	const agentsPath = resolve(projectPath, "AGENTS.md");
+	let metadata: Stats;
+	try {
+		metadata = await lstat(agentsPath);
+	} catch (error) {
+		signal?.throwIfAborted();
+		return readAgentsFailure(error);
+	}
+	signal?.throwIfAborted();
+	if (!metadata.isFile() || metadata.isSymbolicLink()) {
+		return { status: "warning", issueCode: "not_regular_file" };
+	}
+	if (metadata.size > maxProjectRootAgentsBytes) {
+		return { status: "warning", issueCode: "too_large" };
+	}
+
+	let file: Awaited<ReturnType<typeof open>> | undefined;
+	try {
+		file = await open(agentsPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+		signal?.throwIfAborted();
+		const openedMetadata = await file.stat();
+		if (!openedMetadata.isFile()) {
+			return { status: "warning", issueCode: "not_regular_file" };
+		}
+		if (openedMetadata.size > maxProjectRootAgentsBytes) {
+			return { status: "warning", issueCode: "too_large" };
+		}
+		const bytes = Buffer.allocUnsafe(maxProjectRootAgentsBytes + 1);
+		const { bytesRead } = await file.read(bytes, 0, bytes.byteLength, 0);
+		signal?.throwIfAborted();
+		if (bytesRead > maxProjectRootAgentsBytes) {
+			return { status: "warning", issueCode: "too_large" };
+		}
+		let body: string;
+		try {
+			body = new TextDecoder("utf-8", { fatal: true }).decode(bytes.subarray(0, bytesRead));
+		} catch {
+			return { status: "warning", issueCode: "invalid_utf8" };
+		}
+		if (mode === "metadata") {
+			return {
+				status: "available",
+				sizeBytes: bytesRead,
+				modifiedAt: openedMetadata.mtime.toISOString(),
+			};
+		}
+		return readRuntimeBoxProjectRootAgentsOutputSchema.parse({ status: "loaded", body });
+	} catch (error) {
+		signal?.throwIfAborted();
+		return readAgentsFailure(error);
+	} finally {
+		await file?.close().catch(() => undefined);
+	}
+}
+
+function readAgentsFailure(error: unknown): ReadRuntimeBoxProjectRootAgentsOutput {
+	if (isMissingPathError(error)) {
+		return { status: "missing" };
+	}
+	if (error instanceof Error && "code" in error && error.code === "ELOOP") {
+		return { status: "warning", issueCode: "not_regular_file" };
+	}
+	return { status: "warning", issueCode: mapAgentsError(error) };
+}
+
 export async function validateProjectPath(
 	inputValue: ValidateRuntimeBoxProjectPathInput,
 ): Promise<ValidateRuntimeBoxProjectPathOutput> {
 	const input = validateRuntimeBoxProjectPathInputSchema.parse(inputValue);
 	if (!isAbsolute(input.path)) {
-		throw new Error("Project path must be absolute on the Runtime Box.");
+		return { status: "unavailable", issueCode: "not_absolute" };
 	}
-	const normalizedPath = await realpath(resolve(input.path));
-	const metadata = await stat(normalizedPath);
+	let normalizedPath: string;
+	try {
+		normalizedPath = await realpath(resolve(input.path));
+	} catch (error) {
+		return unavailableInspection(mapPathError(error));
+	}
+	let metadata: Stats;
+	try {
+		metadata = await stat(normalizedPath);
+	} catch (error) {
+		return unavailableInspection(mapPathError(error));
+	}
 	if (!metadata.isDirectory()) {
-		throw new Error("Project path must refer to a directory.");
+		return unavailableInspection("not_directory");
 	}
-	await access(normalizedPath, constants.R_OK | constants.X_OK);
+	try {
+		await access(normalizedPath, constants.R_OK | constants.X_OK);
+	} catch (error) {
+		return unavailableInspection(mapPathError(error));
+	}
 	const git = await findGitMetadata(normalizedPath);
-	return validateRuntimeBoxProjectPathOutputSchema.parse({
+	const rootAgents = await inspectRootAgents(normalizedPath);
+	const inspection = {
+		status: "available" as const,
 		normalizedPath,
 		displayName: basename(normalizedPath) || normalizedPath,
 		...(git === undefined ? {} : git),
+		rootAgents,
+	};
+	return validateRuntimeBoxProjectPathOutputSchema.parse({
+		...inspection,
+		confirmationToken: createInspectionFingerprint(inspection),
 	});
+}
+
+async function inspectRootAgents(projectPath: string): Promise<ProjectRootAgentsStatus> {
+	return readBoundedRootAgents(projectPath, "metadata");
+}
+
+function createInspectionFingerprint(input: {
+	normalizedPath: string;
+	displayName: string;
+	gitRootPath?: string;
+	gitBranch?: string;
+	rootAgents: ProjectRootAgentsStatus;
+}): string {
+	return createHash("sha256")
+		.update(
+			JSON.stringify([
+				1,
+				input.normalizedPath,
+				input.displayName,
+				input.gitRootPath ?? null,
+				input.gitBranch ?? null,
+				input.rootAgents,
+			]),
+		)
+		.digest("hex");
 }
 
 async function findGitMetadata(
@@ -102,4 +254,34 @@ function isMissingPathError(error: unknown): boolean {
 		"code" in error &&
 		(error.code === "ENOENT" || error.code === "ENOTDIR")
 	);
+}
+
+function mapPathError(error: unknown): ProjectPathIssueCode {
+	if (!(error instanceof Error) || !("code" in error)) {
+		return "unknown";
+	}
+	if (error.code === "ENOENT") {
+		return "not_found";
+	}
+	if (error.code === "ENOTDIR") {
+		return "not_directory";
+	}
+	if (error.code === "EACCES" || error.code === "EPERM") {
+		return "permission_denied";
+	}
+	return "unknown";
+}
+
+function mapAgentsError(error: unknown): "permission_denied" | "unknown" {
+	return error instanceof Error &&
+		"code" in error &&
+		(error.code === "EACCES" || error.code === "EPERM")
+		? "permission_denied"
+		: "unknown";
+}
+
+function unavailableInspection(
+	issueCode: ProjectPathIssueCode,
+): ValidateRuntimeBoxProjectPathOutput {
+	return validateRuntimeBoxProjectPathOutputSchema.parse({ status: "unavailable", issueCode });
 }

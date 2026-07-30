@@ -86,6 +86,19 @@ describe("ChatSessionInvalidationBridge", () => {
 
 		expect(events).toEqual(["agentsReady", "processed", "ack:true"]);
 	});
+
+	test("acknowledges a retired Session only after authoritative bridge handling", async () => {
+		const bridge = createBridge();
+		const listener = vi.fn();
+		bridge.subscribe(listener, { authoritative: true });
+		const invalidation = {
+			...makeInvalidation("retired"),
+			reason: "session_retired" as const,
+		};
+
+		await expect(bridge.handle(invalidation)).resolves.toBe(true);
+		expect(listener).toHaveBeenCalledWith(invalidation);
+	});
 });
 
 function createBridge(): ChatSessionInvalidationBridge {

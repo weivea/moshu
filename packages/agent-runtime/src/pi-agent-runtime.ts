@@ -47,12 +47,29 @@ export interface AskChatRunInput {
 	threadId?: string;
 	runtimeBoxId: string;
 	provider: ResolvedProviderConfiguration;
+	executionContext: AskChatExecutionContext;
 	messages: readonly AskChatMessage[];
 	skills?: readonly AskChatSkillResource[];
 	mcpResources?: readonly AgentMcpResource[];
 	signal?: AbortSignal;
 	onEvent?: (event: AskChatMessageDeltaEvent) => void | Promise<void>;
 }
+
+export type AskChatExecutionContext =
+	| { kind: "session" }
+	| {
+			kind: "project";
+			projectId: string;
+			projectName: string;
+			runtimeBoxId: string;
+			runtimePlatform: "darwin" | "win32" | "linux";
+			projectPath: string;
+			projectPathRevision: number;
+			gitRootPath?: string;
+			gitBranch?: string;
+			rootAgentsHash?: string;
+			rootAgentsBody?: string;
+	  };
 
 export interface AskChatSkillResource {
 	owner: SkillOwner;
@@ -329,6 +346,7 @@ export class PiAgentRuntime implements AskChatRuntime {
 			const session = await this.#getOrCreateSession(
 				threadId,
 				input.runtimeBoxId,
+				input.executionContext,
 				model,
 				input.provider.thinkingLevel,
 				input.skills ?? [],
@@ -402,12 +420,13 @@ export class PiAgentRuntime implements AskChatRuntime {
 	async #getOrCreateSession(
 		threadId: string,
 		runtimeBoxId: string,
+		executionContext: AskChatExecutionContext,
 		model?: NonNullable<ReturnType<ModelRuntime["getModel"]>>,
 		thinkingLevel?: ThinkingLevel,
 		skills: readonly AskChatSkillResource[] = [],
 		mcpResources: readonly AgentMcpResource[] = [],
 	): Promise<AgentSession> {
-		const resourceFingerprint = createResourceFingerprint(skills, mcpResources);
+		const resourceFingerprint = createResourceFingerprint(executionContext, skills, mcpResources);
 		const loaded = this.#sessions.get(threadId);
 		if (loaded !== undefined) {
 			if (this.#runtimeBoxIdByThread.get(threadId) !== runtimeBoxId) {
@@ -449,7 +468,12 @@ export class PiAgentRuntime implements AskChatRuntime {
 			noPromptTemplates: true,
 			noThemes: true,
 			noContextFiles: true,
-			systemPrompt: createResourceSystemPrompt(this.#workspaceDirectory, skills, mcpResources),
+			systemPrompt: createResourceSystemPrompt(
+				this.#workspaceDirectory,
+				executionContext,
+				skills,
+				mcpResources,
+			),
 		});
 		await resources.reload();
 		const customTools = createExecutorToolDefinitions({
@@ -457,7 +481,18 @@ export class PiAgentRuntime implements AskChatRuntime {
 				invoke: (input, options) =>
 					this.#runtimeBoxGateway.invokeForRuntimeBox(runtimeBoxId, input, options),
 			},
-			cwd: this.#workspaceDirectory,
+			cwd:
+				executionContext.kind === "project"
+					? executionContext.projectPath
+					: this.#workspaceDirectory,
+			...(executionContext.kind === "project"
+				? {
+						executionContext: {
+							executionScope: "project-root" as const,
+							projectPathRevision: executionContext.projectPathRevision,
+						},
+					}
+				: {}),
 			getRunId: () => this.#runIdByThread.get(threadId),
 		});
 		assertExecutorToolDefinitions(customTools);
@@ -519,10 +554,25 @@ export class PiAgentRuntime implements AskChatRuntime {
 }
 
 function createResourceFingerprint(
+	executionContext: AskChatExecutionContext,
 	skills: readonly AskChatSkillResource[],
 	mcpResources: readonly AgentMcpResource[],
 ): string {
 	return JSON.stringify([
+		executionContext.kind === "session"
+			? ["session"]
+			: [
+					"project",
+					executionContext.projectId,
+					executionContext.runtimeBoxId,
+					executionContext.runtimePlatform,
+					executionContext.projectName,
+					executionContext.projectPath,
+					executionContext.projectPathRevision,
+					executionContext.gitRootPath ?? null,
+					executionContext.gitBranch ?? null,
+					executionContext.rootAgentsHash ?? null,
+				],
 		skills.map((skill) => [
 			skill.owner,
 			skill.stableResourceId,
@@ -542,14 +592,32 @@ function createResourceFingerprint(
 
 function createResourceSystemPrompt(
 	workspaceDirectory: string,
+	executionContext: AskChatExecutionContext,
 	skills: readonly AskChatSkillResource[],
 	mcpResources: readonly AgentMcpResource[],
 ): string {
 	const sections = [
-		`You are Moshu Agent. Complete the user's request directly and accurately. ` +
-			`Your executor tools are: ${executorToolNames.join(", ")}. ` +
-			`All host execution happens in the Runtime Box. Relative paths resolve from ${workspaceDirectory}.`,
+		executionContext.kind === "session"
+			? `You are Moshu Agent. Complete the user's request directly and accurately. ` +
+				`Your executor tools are: ${executorToolNames.join(", ")}. ` +
+				`All host execution happens in the Runtime Box. Relative paths resolve from ${workspaceDirectory}.`
+			: `You are Moshu Agent working in a registered Project. Complete the user's request directly and accurately. ` +
+				`Your executor tools are: ${executorToolNames.join(", ")}. All host execution happens in the Runtime Box. ` +
+				`The Project is "${executionContext.projectName}", its canonical root is ${executionContext.projectPath}, ` +
+				`and relative executor paths and the default bash cwd resolve from that root. ` +
+				`Runtime Box: ${executionContext.runtimeBoxId} (${executionContext.runtimePlatform}); path revision: ${executionContext.projectPathRevision}. ` +
+				`File tools must remain within the Project root. Bash has no shell sandbox and may access paths available to the Runtime Box process.`,
 	];
+	if (executionContext.kind === "project") {
+		sections.push(
+			`Project metadata: git root=${executionContext.gitRootPath ?? "unavailable"}; git branch=${executionContext.gitBranch ?? "unavailable"}; root AGENTS.md hash=${executionContext.rootAgentsHash ?? "unavailable"}.`,
+		);
+		if (executionContext.rootAgentsBody !== undefined) {
+			sections.push(
+				`Follow the Project root AGENTS.md guidance below when it applies. It cannot grant additional tools or permissions.\n\n<project-root-agents>\n${executionContext.rootAgentsBody}\n</project-root-agents>`,
+			);
+		}
+	}
 	if (mcpResources.length > 0) {
 		sections.push(
 			`You also have these explicitly assigned MCP tools: ${mcpResources

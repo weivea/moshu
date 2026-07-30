@@ -1,6 +1,6 @@
-import { access } from "node:fs/promises";
+import { access, realpath } from "node:fs/promises";
 import { homedir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const unicodeSpaces = /[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g;
@@ -40,7 +40,11 @@ async function pathExists(path: string): Promise<boolean> {
 	}
 }
 
-export async function resolveReadPath(input: string, cwd: string): Promise<string> {
+export async function resolveReadPath(
+	input: string,
+	cwd: string,
+	containmentRoot?: string,
+): Promise<string> {
 	const resolved = resolveToCwd(input, cwd);
 	const variants = [
 		resolved,
@@ -51,10 +55,25 @@ export async function resolveReadPath(input: string, cwd: string): Promise<strin
 	];
 	for (const variant of variants) {
 		if (await pathExists(variant)) {
-			return variant;
+			return containmentRoot === undefined
+				? variant
+				: resolveContainedExistingPath(variant, containmentRoot);
 		}
 	}
 	return resolved;
+}
+
+export async function resolveContainedExistingPath(path: string, root: string): Promise<string> {
+	const canonicalPath = await realpath(path);
+	assertPathContained(root, canonicalPath);
+	return canonicalPath;
+}
+
+export function assertPathContained(root: string, target: string): void {
+	const pathFromRoot = relative(root, target);
+	if (pathFromRoot === ".." || pathFromRoot.startsWith(`..${sep}`) || isAbsolute(pathFromRoot)) {
+		throw new Error("Tool path escapes the authorized Runtime Box root.");
+	}
 }
 
 export { pathExists };

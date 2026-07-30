@@ -1,11 +1,11 @@
+import { readFile, stat } from "node:fs/promises";
 import {
+	type ExecutorEditToolArguments,
 	executorEditToolDetailsSchema,
 	executorToolTextContentSchema,
 	maxExecutorToolEditDetailBytes,
 	maxExecutorToolTextContentBytes,
-	type ExecutorEditToolArguments,
 } from "@moshu/contracts";
-import { readFile, stat } from "node:fs/promises";
 import { atomicWriteFile } from "./atomic-write.ts";
 import {
 	applyEditOperations,
@@ -15,7 +15,7 @@ import {
 	restoreLineEndings,
 } from "./edit-diff.ts";
 import { withFileMutationQueue } from "./file-mutation-queue.ts";
-import { resolveReadPath } from "./path-utils.ts";
+import { assertPathContained, resolveReadPath } from "./path-utils.ts";
 import type { EditToolResult } from "./tool-result.ts";
 import { textContent, throwIfAborted } from "./tool-result.ts";
 import { truncateUtf8FromStart } from "./truncate.ts";
@@ -25,11 +25,20 @@ export const MAX_EDIT_FILE_BYTES = 16 * 1024 * 1024;
 export async function executeEditTool(
 	params: ExecutorEditToolArguments,
 	cwd: string,
-	signal?: AbortSignal,
+	options: {
+		signal?: AbortSignal;
+		effectiveFilePath?: string;
+		containmentRoot?: string;
+	} = {},
 ): Promise<EditToolResult> {
-	const filePath = await resolveReadPath(params.path, cwd);
+	const { signal } = options;
+	const filePath =
+		options.effectiveFilePath ?? (await resolveReadPath(params.path, cwd, options.containmentRoot));
 	return withFileMutationQueue(filePath, async (canonicalPath) => {
 		throwIfAborted(signal);
+		if (options.containmentRoot !== undefined) {
+			assertPathContained(options.containmentRoot, canonicalPath);
+		}
 		const originalMetadata = await stat(canonicalPath);
 		if (originalMetadata.size > MAX_EDIT_FILE_BYTES) {
 			throw new Error(

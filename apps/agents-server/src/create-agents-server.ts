@@ -1,5 +1,5 @@
-import { chmodSync, mkdirSync } from "node:fs";
-import { dirname, isAbsolute, join } from "node:path";
+import { chmodSync, existsSync, lstatSync, mkdirSync, rmSync } from "node:fs";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import {
 	type AskChatRuntime,
 	AskChatRuntimeError,
@@ -12,50 +12,51 @@ import {
 import type { AgentsServerBootstrapRecord } from "@moshu/contracts";
 import {
 	executorToolRpcTimeoutMs,
+	productRpcEvents,
 	productRpcMaxBufferedOutboundBytes,
 	productRpcMaxFrameBytes,
-	productRpcEvents,
 	productRpcMethods,
 	remoteAccessMutationMethods,
 	remoteAccessMutationRpcTimeoutMs,
-	runtimeBoxProtocolMinVersion,
 	runtimeBoxProtocolMaxVersion,
+	runtimeBoxProtocolMinVersion,
 	runtimeDiagnosticsOutputSchema,
 } from "@moshu/contracts";
 import {
 	currentAppDatabaseVersion,
 	openAppDatabase,
+	PairingSessionNotFoundError,
 	prepareCoordinatedDatabaseReset,
 } from "@moshu/database";
-import { PairingSessionNotFoundError } from "@moshu/database";
 import { FileMcpSecretStore, McpLifecycleManager } from "@moshu/mcp-runtime";
-import { FileSkillContentStore } from "@moshu/skill-runtime";
 import {
+	CURRENT_PROCESS_RPC_PROTOCOL,
 	createRpcBearerAuthenticator,
 	createRpcServer,
 	type RpcServer,
 	rpcJsonValueSchema,
-	CURRENT_PROCESS_RPC_PROTOCOL,
 } from "@moshu/process-rpc";
-
-import { ChatApplicationService } from "./chat-application-service";
+import { FileSkillContentStore } from "@moshu/skill-runtime";
 import { DurableActionAuthorizationService } from "./action-authorization-service";
 import { AgentServerIdentity } from "./agent-server-identity";
+import { ChatApplicationService } from "./chat-application-service";
 import { DevTunnelService } from "./dev-tunnel-service";
 import { resolveEffectiveSkills } from "./effective-skill-resolver";
-import { RuntimeBoxRegistry } from "./runtime-box-registry";
-import { RuntimeBoxGenerationFence } from "./runtime-box-generation-fence";
-import { RuntimeIngressAuth } from "./runtime-ingress-auth";
 import { FileProviderRegistryStore } from "./file-provider-registry-store";
 import { McpActionDispatcher } from "./mcp-action-dispatcher";
-import { createProviderAuthDiagnosticLog } from "./provider-auth-diagnostic-log";
 import {
 	agentsServerClientMethodAllowlist,
 	agentsServerRuntimeMethodAllowlist,
-	createRuntimeBoxesSnapshot,
 	createProductRpcHandlers,
+	createRuntimeBoxesSnapshot,
 	ProductEventRouter,
+	publishRetiredChatSessions,
 } from "./product-rpc";
+import { ProjectApplicationService } from "./project-application-service";
+import { createProviderAuthDiagnosticLog } from "./provider-auth-diagnostic-log";
+import { RuntimeBoxGenerationFence } from "./runtime-box-generation-fence";
+import { RuntimeBoxRegistry } from "./runtime-box-registry";
+import { RuntimeIngressAuth } from "./runtime-ingress-auth";
 
 export interface AgentsServerInstance {
 	readonly productRpcServer: RpcServer;
@@ -95,10 +96,24 @@ export async function createAgentsServer(
 			console.error(message);
 		});
 	assertAbsoluteDataPaths(options.bootstrap);
-	mkdirSync(dirname(options.bootstrap.paths.productDatabase), { recursive: true, mode: 0o700 });
-	mkdirSync(options.bootstrap.paths.agentDataDirectory, { recursive: true, mode: 0o700 });
+	mkdirSync(dirname(options.bootstrap.paths.productDatabase), {
+		recursive: true,
+		mode: 0o700,
+	});
+	mkdirSync(options.bootstrap.paths.agentDataDirectory, {
+		recursive: true,
+		mode: 0o700,
+	});
+	const piSessionsDirectory = findAppOwnedPiSessionsDirectory(
+		options.bootstrap.paths.agentDataDirectory,
+	);
 	const reset = prepareCoordinatedDatabaseReset({
 		productDatabase: options.bootstrap.paths.productDatabase,
+		beforeReset: () => {
+			if (piSessionsDirectory !== undefined) {
+				rmSync(piSessionsDirectory, { recursive: true });
+			}
+		},
 	});
 	if (reset.reset) {
 		const previousSchema =
@@ -143,6 +158,7 @@ export async function createAgentsServer(
 		);
 	}
 	let chatService: ChatApplicationService | undefined;
+	let projectService: ProjectApplicationService | undefined;
 	let productRpcServer: RpcServer | undefined;
 	let runtimeRpcServer: RpcServer | undefined;
 	let devTunnelService: DevTunnelService | undefined;
@@ -174,6 +190,7 @@ export async function createAgentsServer(
 		let publishRuntimeBoxesChanged = () => undefined;
 		const actionAuthorizer = new DurableActionAuthorizationService(
 			database.actions,
+			database.runs,
 			options.bootstrap.serverIdentity,
 		);
 		const runtimeBoxRegistry = new RuntimeBoxRegistry({
@@ -260,6 +277,30 @@ export async function createAgentsServer(
 			),
 			onUpgradeRequired: (runtimeBoxId) => runtimeBoxRegistry.markUpgradeRequired(runtimeBoxId),
 		});
+		const initializedProjectService = new ProjectApplicationService({
+			projects: database.projects,
+			runs: database.runs,
+			actions: database.actions,
+			runtimeBoxes: database.runtimeBoxes,
+			pathInspector: runtimeBoxRegistry,
+			onSessionsRetired: (sessionIds) => {
+				const server = productRpcServer;
+				if (server !== undefined) {
+					try {
+						publishRetiredChatSessions(server.peers, sessionIds, reportDiagnostic);
+					} catch (error) {
+						const message =
+							error instanceof Error ? error.message.slice(0, 256) : "Unknown failure.";
+						reportDiagnostic(
+							`Session retirement publication failed; replay will recover it: ${message}`,
+						);
+					}
+				}
+				void chatService?.drainPendingAgentSessionCleanups({ batchSize: 64 });
+			},
+			reportDiagnostic,
+		});
+		projectService = initializedProjectService;
 		chatService = new ChatApplicationService({
 			sessions: database.sessions,
 			runs: database.runs,
@@ -271,6 +312,10 @@ export async function createAgentsServer(
 				: { fetchProviderModels: options.fetchProviderModels }),
 			isRuntimeReady: (runtimeBoxId) => runtimeBoxRegistry.isReady(runtimeBoxId),
 			getActiveRuntimeBoxId: () => database.runtimeBoxes.getActive().runtimeBoxId,
+			withProjectSessionCreation: (projectId, createSession, signal) =>
+				initializedProjectService.withSessionCreation(projectId, createSession, signal),
+			withProjectRunPreflight: (projectId, createRun, signal) =>
+				initializedProjectService.withRunPreflight(projectId, createRun, signal),
 			resolveRuntimeResources: async (runtimeBoxId, signal) => {
 				const profile = database.runtimeProfiles.getOrCreate("moshu.default", runtimeBoxId);
 				const globalProfile = database.agentGlobalProfiles.getOrCreate("moshu.default");
@@ -312,7 +357,10 @@ export async function createAgentsServer(
 						contentHash: resource.contentHash,
 						tools: resource.mcpTools,
 					}));
-				return { skills, mcpResources: [...serverMcpResources, ...runtimeBoxMcpResources] };
+				return {
+					skills,
+					mcpResources: [...serverMcpResources, ...runtimeBoxMcpResources],
+				};
 			},
 			logger: {
 				error(message, error) {
@@ -346,7 +394,10 @@ export async function createAgentsServer(
 				? {}
 				: { shutdownTimeoutMs: options.shutdownTimeoutMs }),
 		});
-		const ready = chatService.drainPendingAgentSessionCleanups({ batchSize: 64 });
+		const ready = Promise.all([
+			chatService.drainPendingAgentSessionCleanups({ batchSize: 64 }),
+			projectService.drainPendingDeletions(),
+		]).then(() => undefined);
 		const requireDevTunnelService = (): DevTunnelService => {
 			if (devTunnelService === undefined) {
 				throw new Error("Dev Tunnel service is not initialized.");
@@ -359,7 +410,7 @@ export async function createAgentsServer(
 			runtimeBoxRegistry,
 			runtimeBoxes: database.runtimeBoxes,
 			runtimeBoxPairings: database.runtimeBoxPairings,
-			projects: database.projects,
+			projectService,
 			runtimeBoxInventory: database.runtimeBoxInventory,
 			runtimeProfiles: database.runtimeProfiles,
 			agentGlobalProfiles: database.agentGlobalProfiles,
@@ -519,6 +570,7 @@ export async function createAgentsServer(
 					runtimeRpcServer?.stop();
 					await devTunnelService?.shutdown();
 					await authController?.dispose();
+					await projectService?.shutdown();
 					await chatService?.shutdown();
 					await runtimeBoxRegistry.shutdown();
 					await agentServerMcpLifecycle?.shutdown();
@@ -539,11 +591,29 @@ export async function createAgentsServer(
 		productRpcServer?.stop();
 		runtimeRpcServer?.stop();
 		await authController?.dispose();
+		await projectService?.shutdown();
 		await chatService?.shutdown();
 		await agentServerMcpLifecycle?.shutdown();
 		database.close();
 		throw error;
 	}
+}
+
+function findAppOwnedPiSessionsDirectory(agentDataDirectory: string): string | undefined {
+	const root = resolve(agentDataDirectory);
+	const rootMetadata = lstatSync(root);
+	if (!rootMetadata.isDirectory() || rootMetadata.isSymbolicLink()) {
+		throw new Error("Agent data directory must be a regular directory.");
+	}
+	const sessionsDirectory = join(root, "sessions");
+	if (!existsSync(sessionsDirectory)) {
+		return undefined;
+	}
+	const sessionsMetadata = lstatSync(sessionsDirectory);
+	if (!sessionsMetadata.isDirectory() || sessionsMetadata.isSymbolicLink()) {
+		throw new Error("Pi Session storage must be a regular directory.");
+	}
+	return sessionsDirectory;
 }
 
 function assertAbsoluteDataPaths(bootstrap: AgentsServerBootstrapRecord): void {

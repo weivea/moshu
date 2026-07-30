@@ -1,49 +1,81 @@
 import {
+	type ApproveRuntimeBoxPairingInput,
+	type ApproveRuntimeBoxPairingOutput,
 	type CancelChatRunInput,
 	type CancelChatRunOutput,
 	type ChatRunEvent,
 	type ChatSendAcceptedOutput,
+	type CheckProjectPathInput,
+	type CheckProjectPathOutput,
+	type ConfirmCreateProjectInput,
+	type ConfirmCreateProjectOutput,
 	type CreateChatSessionOutput,
 	type CreateProviderInput,
-	type CreateProjectInput,
-	type CreateProjectOutput,
-	type DeleteProjectInput,
-	type DeleteProjectOutput,
+	type CreateRuntimeBoxPairingOutput,
 	type DeleteChatSessionInput,
 	type DeleteChatSessionOutput,
+	type DeleteMcpServerInput,
 	type DeleteProviderInput,
 	type DeleteProviderOutput,
+	type DeleteRuntimeBoxMcpServerInput,
+	type DeleteRuntimeBoxSkillInput,
+	type DeleteSkillInput,
 	type EmptyParams,
 	type FetchProviderModelsInput,
 	type FetchProviderModelsOutput,
+	type GetAgentGlobalProfileInput,
+	type GetAgentGlobalProfileOutput,
 	type GetChatSessionInput,
 	type GetChatSessionSnapshotOutput,
 	type GetDefaultModelOutput,
+	type GetProjectDeleteConfirmationInput,
+	type GetProjectDeleteConfirmationOutput,
 	type GetProjectInput,
 	type GetProjectOutput,
+	type GetProjectSidebarInput,
+	type GetProjectSidebarOutput,
+	type GetRuntimeProfileInput,
+	type GetRuntimeProfileOutput,
+	type InstallRuntimeBoxSkillInput,
 	type ListAvailableModelsOutput,
 	type ListChatSessionsInput,
 	type ListChatSessionsOutput,
-	type ListProvidersOutput,
+	type ListMcpServersInput,
+	type ListMcpServersOutput,
 	type ListProjectsInput,
 	type ListProjectsOutput,
-	type ListRuntimeBoxPairingClaimsOutput,
+	type ListProvidersOutput,
 	type ListRuntimeBoxesOutput,
-	type CreateRuntimeBoxPairingOutput,
-	type ApproveRuntimeBoxPairingInput,
-	type ApproveRuntimeBoxPairingOutput,
+	type ListRuntimeBoxInventoryOutput,
+	type ListRuntimeBoxMcpServerSummariesOutput,
+	type ListRuntimeBoxMcpServersInput,
+	type ListRuntimeBoxPairingClaimsOutput,
+	type ListRuntimeBoxSkillsInput,
+	type ListRuntimeBoxSkillsOutput,
+	type ListSkillsInput,
+	type ListSkillsOutput,
+	type McpServerMutationResult,
+	type PreviewProjectPathInput,
+	type PreviewProjectPathOutput,
+	type PreviewProjectRelinkInput,
+	type PreviewProjectRelinkOutput,
+	type ProviderAuthAttemptOutput,
+	type ProviderMutationOutput,
 	type RejectRuntimeBoxPairingInput,
 	type RejectRuntimeBoxPairingOutput,
-	type RevokeRuntimeBoxDeviceInput,
-	type RevokeRuntimeBoxDeviceOutput,
+	type RelinkProjectInput,
+	type RelinkProjectOutput,
 	type RemoteAccessAuthAttempt,
 	type RemoteAccessMutationOutput,
 	type RemoteAccessStatusOutput,
-	type ProviderMutationOutput,
-	type ProviderAuthAttemptOutput,
+	type RequestProjectDeletionInput,
+	type RequestProjectDeletionOutput,
 	type RespondProviderAuthInput,
+	type RevokeRuntimeBoxDeviceInput,
+	type RevokeRuntimeBoxDeviceOutput,
+	type RuntimeBoxResourceMutationResult,
+	type RuntimeDiagnosticsOutput,
 	type RuntimeInfo,
-	type StartProviderAuthInput,
 	type SessionModelSelection,
 	type SetChatSessionArchivedInput,
 	type SetChatSessionArchivedOutput,
@@ -51,49 +83,29 @@ import {
 	type SetChatSessionModelOutput,
 	type SetDefaultModelInput,
 	type SetDefaultModelOutput,
-	type SetProviderModelsEnabledInput,
-	type SetProviderModelsEnabledOutput,
+	type SetMcpServerEnabledInput,
 	type SetProjectArchivedInput,
 	type SetProjectArchivedOutput,
-	type TestProviderInput,
-	type TestProviderOutput,
+	type SetProviderModelsEnabledInput,
+	type SetProviderModelsEnabledOutput,
+	type SetRuntimeBoxMcpServerEnabledInput,
+	type SetSkillEnabledInput,
+	type SkillMutationResult,
+	type StartProviderAuthInput,
 	type SwitchRuntimeBoxInput,
 	type SwitchRuntimeBoxOutput,
+	type TestProviderInput,
+	type TestProviderOutput,
+	type UpdateAgentGlobalProfileInput,
 	type UpdateChatSessionInput,
 	type UpdateChatSessionOutput,
-	type UpdateProviderInput,
 	type UpdateProjectInput,
 	type UpdateProjectOutput,
-	type ListRuntimeBoxInventoryOutput,
-	type ListRuntimeBoxMcpServersInput,
-	type ListRuntimeBoxMcpServerSummariesOutput,
-	type SetRuntimeBoxMcpServerEnabledInput,
-	type UpsertRuntimeBoxMcpServerInput,
-	type DeleteRuntimeBoxMcpServerInput,
-	type RuntimeBoxResourceMutationResult,
-	type ListMcpServersInput,
-	type ListMcpServersOutput,
-	type UpsertMcpServerInput,
-	type SetMcpServerEnabledInput,
-	type DeleteMcpServerInput,
-	type McpServerMutationResult,
-	type GetAgentGlobalProfileInput,
-	type GetAgentGlobalProfileOutput,
-	type UpdateAgentGlobalProfileInput,
-	type ListRuntimeBoxSkillsInput,
-	type ListRuntimeBoxSkillsOutput,
-	type InstallRuntimeBoxSkillInput,
-	type DeleteRuntimeBoxSkillInput,
-	type ListSkillsInput,
-	type ListSkillsOutput,
-	type UpsertSkillInput,
-	type SetSkillEnabledInput,
-	type DeleteSkillInput,
-	type SkillMutationResult,
-	type GetRuntimeProfileInput,
-	type GetRuntimeProfileOutput,
+	type UpdateProviderInput,
 	type UpdateRuntimeProfileInput,
-	type RuntimeDiagnosticsOutput,
+	type UpsertMcpServerInput,
+	type UpsertRuntimeBoxMcpServerInput,
+	type UpsertSkillInput,
 	uuidV7Schema,
 } from "@moshu/contracts";
 import type { RPCSchema } from "electrobun/bun";
@@ -103,6 +115,7 @@ type EmptyRpcMap = Record<never, never>;
 
 export interface CreateDesktopChatSessionInput {
 	model?: SessionModelSelection;
+	projectId?: string;
 }
 
 export interface SendDesktopChatMessageInput {
@@ -139,6 +152,11 @@ export type AcknowledgeChatSessionInvalidationInput = z.infer<
 >;
 export const openExternalUrlInputSchema = z.object({ url: z.string().url() }).strict();
 export const openExternalUrlOutputSchema = z.object({ opened: z.boolean() }).strict();
+export const pickProjectDirectoryOutputSchema = z.discriminatedUnion("cancelled", [
+	z.object({ cancelled: z.literal(true) }).strict(),
+	z.object({ cancelled: z.literal(false), path: z.string().trim().min(1).max(4_096) }).strict(),
+]);
+export type PickProjectDirectoryOutput = z.infer<typeof pickProjectDirectoryOutputSchema>;
 
 export type DesktopRpc = {
 	bun: RPCSchema<{
@@ -203,9 +221,17 @@ export type DesktopRpc = {
 				params: EmptyParams;
 				response: RuntimeDiagnosticsOutput;
 			};
-			createProject: {
-				params: CreateProjectInput;
-				response: CreateProjectOutput;
+			pickProjectDirectory: {
+				params: EmptyParams;
+				response: PickProjectDirectoryOutput;
+			};
+			previewProjectPath: {
+				params: PreviewProjectPathInput;
+				response: PreviewProjectPathOutput;
+			};
+			confirmCreateProject: {
+				params: ConfirmCreateProjectInput;
+				response: ConfirmCreateProjectOutput;
 			};
 			listProjects: {
 				params: ListProjectsInput;
@@ -215,6 +241,10 @@ export type DesktopRpc = {
 				params: GetProjectInput;
 				response: GetProjectOutput;
 			};
+			checkProjectPath: {
+				params: CheckProjectPathInput;
+				response: CheckProjectPathOutput;
+			};
 			updateProject: {
 				params: UpdateProjectInput;
 				response: UpdateProjectOutput;
@@ -223,9 +253,25 @@ export type DesktopRpc = {
 				params: SetProjectArchivedInput;
 				response: SetProjectArchivedOutput;
 			};
-			deleteProject: {
-				params: DeleteProjectInput;
-				response: DeleteProjectOutput;
+			previewProjectRelink: {
+				params: PreviewProjectRelinkInput;
+				response: PreviewProjectRelinkOutput;
+			};
+			relinkProject: {
+				params: RelinkProjectInput;
+				response: RelinkProjectOutput;
+			};
+			getProjectDeleteConfirmation: {
+				params: GetProjectDeleteConfirmationInput;
+				response: GetProjectDeleteConfirmationOutput;
+			};
+			requestProjectDeletion: {
+				params: RequestProjectDeletionInput;
+				response: RequestProjectDeletionOutput;
+			};
+			getProjectSidebar: {
+				params: GetProjectSidebarInput;
+				response: GetProjectSidebarOutput;
 			};
 			listRuntimeInventory: {
 				params: { runtimeBoxId?: string };

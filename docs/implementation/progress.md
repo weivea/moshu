@@ -126,6 +126,17 @@ Agent Server
   renderer、Electrobun RPC 和 Product RPC。
 - 普通 Chat 支持流式回复、停止、继续已有 Session、失败状态、自动标题、搜索、重命名、归档和永久删除。
 - `/chat/new` 与 `/chat/:sessionId` 是当前 Session 选择事实来源。
+- Projects 支持 Local 系统目录选择、Remote 绝对路径输入、规范化/Git/根 `AGENTS.md` 预览确认、路径健康检查、
+  重命名、重新关联、归档/恢复和 typed-confirmation durable 删除；删除只清理产品记录与 Pi Session，
+  不删除 Runtime Box 上的目录。
+- Project Session 使用不可变 `projectId + runtimeBoxId` 归属；全局 Chats 不返回 Project Session。
+  `/projects/:projectId` 提供完整 Session 搜索与管理，Project Chat 复用现有 Chat controller，
+  archived/offline/path unavailable 状态下历史只读。
+- Project Run 在执行前实时验证 owning Box 与 canonical path，只在内存加载根 `AGENTS.md` 正文，
+  并持久化 path revision/Git/hash 快照。Local/Remote Project 的文件 Tool 使用签名的 `project-root`
+  scope 和 lexical/canonical containment；`bash` 仅以 Project 为默认 cwd，仍不属于 shell sandbox。
+- Project 删除按持久 job 分批 retire Session；tombstone 同时提供 TTL 内的 replay 与 Desktop retirement
+  recovery，Pi JSONL 由 cleanup outbox 最终清理。
 - 事件先持久化再发布；snapshot、cursor、replay、tombstone 和 reconciliation 可处理重连。
 - 非终态 orphan Run 在启动时安全终结；当前不宣称可从进程崩溃点继续执行同一个 Run。
 
@@ -133,7 +144,8 @@ Agent Server
 
 - 当前 POC 的 Policy 默认信任已认证且绑定的 Agent Server，包括 Remote `bash`；用户级命令审批与 shell
   sandbox 明确后置。现有 grant 用于 durable dispatch、单次消费、generation fencing 和恢复，不是交互审批。
-- Remote 直接 path tools 受 Box workspace canonical containment；`bash` 按当前完全信任决策不受该限制。
+- Remote 普通 Chat 的 path tools 受 Box workspace canonical containment；Project Chat 文件 Tool 受
+  Project root containment。`bash` 按当前完全信任决策不受文件 containment 限制。
 - 尚无独立 Git Tool；Agent 可经 `bash` 调用环境中可用的 Git，但没有 Git 专用合同、Diff journal 或 revert。
 - Plan、自定义 Agent、subagent、任务中心、Diff/撤销和桌面通知仍是后续产品范围。
 - MCP OAuth 2.1 浏览器授权/DCR、Git URL Skill 更新和完整目录/压缩包导入 UI 仍是后续产品增强。
@@ -158,7 +170,7 @@ Agent Server
 | RB-03 Ingress/pairing | 已完成 | Runtime-only ingress、Ed25519 配对认证、吊销、防重放、持久 generation 和限流 |
 | RB-04 Remote service | 已完成 | 三平台普通用户服务、pair/run/status/doctor/unpair/uninstall 和单二进制资源 |
 | RB-05 Dev Tunnel | 已完成 | Microsoft device-code、持久 Tunnel、精确端口/ACL、watchdog、修复、取消和重试 |
-| RB-06 Switch/Projects/UI | 已完成 | 设置页、active switch 广播、按 Box 过滤、Projects/path validation 和离线只读 |
+| RB-06 Switch/Projects/UI | 已完成 | active Box 过滤、Project lifecycle、Project Session/Chat、path health/relink、根 `AGENTS.md`、`project-root` Tool 和离线历史只读 |
 | RB-07 Grants/recovery | 已完成 | durable Action/grant、Box journal、deadline lease、三阶段结果确认和 reset epoch |
 | RB-08 MCP/Skills | 已完成 | Box private store、SecretStore、inventory sync、Runtime Profile、live validation 与 MCP grant bridge |
 | RB-09 Hardening/release | 已完成（外部 release gate 待执行） | protocol/quota/diagnostics/fault matrix/signed package gates；真实 Tunnel 与正式平台签名由 release runner 验证 |

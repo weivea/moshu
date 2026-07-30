@@ -11,15 +11,19 @@ import {
 } from "@moshu/agent-runtime";
 import {
 	type ChatRunEvent,
+	type CreateProcessChatSessionInput,
+	chatSessionsRetiredEventSchema,
 	clientProductRequestMethods,
 	createChatSessionOutputSchema,
 	defaultLocalRuntimeBoxId,
 	getAgentGlobalProfileOutputSchema,
+	type ListChatSessionsInput,
 	mcpServerMutationResultSchema,
-	skillMutationResultSchema,
+	type ProcessPeerIdentity,
 	productRpcInternalHandlerErrorCode,
 	productRpcMethods,
 	runtimeBoxProductRequestMethods,
+	skillMutationResultSchema,
 } from "@moshu/contracts";
 import {
 	ChatSessionNotFoundError,
@@ -31,11 +35,17 @@ import { FileSkillContentStore } from "@moshu/skill-runtime";
 import { z } from "zod";
 
 import type { ChatApplicationService } from "./chat-application-service";
-import { createProductRpcHandlers, ProductEventRouter, publishChatEvent } from "./product-rpc";
+import type { DevTunnelService } from "./dev-tunnel-service";
+import {
+	createProductRpcHandlers,
+	ProductEventRouter,
+	publishChatEvent,
+	publishRetiredChatSessions,
+} from "./product-rpc";
+import { ProjectApplicationService } from "./project-application-service";
 import { ProviderCatalogError } from "./provider-catalog";
 import { type RuntimeBoxGatewayPeer, RuntimeBoxRegistry } from "./runtime-box-registry";
 import type { RuntimeIngressAuth } from "./runtime-ingress-auth";
-import type { DevTunnelService } from "./dev-tunnel-service";
 
 const authController = {} as HeadlessAuthController;
 const runtimeBoxes = {} as RuntimeBoxRepository;
@@ -130,8 +140,8 @@ describe("Runtime Box product RPC", () => {
 						generation: 1,
 					},
 					processRpcProtocol: { major: 1, minor: 0 },
-					runtimeProtocolMinVersion: 3,
-					runtimeProtocolMaxVersion: 3,
+					runtimeProtocolMinVersion: 5,
+					runtimeProtocolMaxVersion: 5,
 					transportSecurity: "relay-tls",
 					noiseUpgradeAvailable: false,
 				},
@@ -475,6 +485,7 @@ describe("Runtime Box product RPC", () => {
 	test("creates Projects only after the owning Runtime Box validates their path", async () => {
 		const database = openAppDatabase(":memory:");
 		try {
+			let projectPathAvailable = true;
 			const registry = new RuntimeBoxRegistry({
 				descriptors: database.runtimeBoxes.list(),
 				activeRuntimeBoxId: database.runtimeBoxes.getActive().runtimeBoxId,
@@ -491,24 +502,65 @@ describe("Runtime Box product RPC", () => {
 				request(method, payload) {
 					expect(method).toBe(productRpcMethods.runtimeBoxProjectValidatePath);
 					expect(payload).toEqual({ path: "/workspace/moshu" });
+					if (!projectPathAvailable) {
+						return Promise.resolve(
+							rpcJsonValueSchema.parse({
+								status: "unavailable",
+								issueCode: "not_found",
+							}),
+						);
+					}
 					return Promise.resolve(
 						rpcJsonValueSchema.parse({
+							status: "available",
 							normalizedPath: "/workspace/moshu",
 							displayName: "moshu",
 							gitRootPath: "/workspace/moshu",
 							gitBranch: "main",
+							rootAgents: { status: "missing" },
+							confirmationToken: "a".repeat(64),
 						}),
 					);
 				},
 			};
 			registry.register(runtimePeer, database.runtimeBoxes.get(defaultLocalRuntimeBoxId));
 			registry.markReady(runtimePeer);
+			const projectService = new ProjectApplicationService({
+				projects: database.projects,
+				runs: database.runs,
+				actions: database.actions,
+				runtimeBoxes: database.runtimeBoxes,
+				pathInspector: registry,
+			});
+			const chatService = {
+				async createSessionIdempotently(
+					input: CreateProcessChatSessionInput,
+					origin: ProcessPeerIdentity,
+					signal?: AbortSignal,
+				) {
+					const existing = database.sessions.findIdempotent({ request: input, origin });
+					if (existing !== undefined) {
+						return existing;
+					}
+					if (input.projectId !== undefined) {
+						return projectService.withSessionCreation(
+							input.projectId,
+							() => database.sessions.createIdempotently({ request: input, origin }),
+							signal,
+						);
+					}
+					return database.sessions.createIdempotently({ request: input, origin });
+				},
+				listSessions(input: ListChatSessionsInput) {
+					return database.sessions.list(input);
+				},
+			} as unknown as ChatApplicationService;
 			const handlers = createProductRpcHandlers({
 				authController,
-				chatService: {} as ChatApplicationService,
+				chatService,
 				runtimeBoxRegistry: registry,
 				runtimeBoxes: database.runtimeBoxes,
-				projects: database.projects,
+				projectService,
 				runtimeIngressAuth,
 				getDevTunnelService: () => devTunnelService,
 				eventRouter: new ProductEventRouter(),
@@ -516,13 +568,37 @@ describe("Runtime Box product RPC", () => {
 			}).requests;
 			const peer = createPeer({ emitEvent: () => "event", close() {} });
 			const create = handlers?.[productRpcMethods.projectsCreate];
+			const preview = handlers?.[productRpcMethods.projectsPreviewPath];
 			const list = handlers?.[productRpcMethods.projectsList];
 			const archive = handlers?.[productRpcMethods.projectsArchive];
-			if (create === undefined || list === undefined || archive === undefined) {
+			const createSession = handlers?.[productRpcMethods.sessionCreate];
+			const listSessions = handlers?.[productRpcMethods.sessionList];
+			if (
+				create === undefined ||
+				preview === undefined ||
+				list === undefined ||
+				archive === undefined ||
+				createSession === undefined ||
+				listSessions === undefined
+			) {
 				throw new Error("Project handlers are missing.");
 			}
-			const created = await create(
+			const previewed = await preview(
 				{ path: "/workspace/moshu" },
+				createRequestContext(peer, productRpcMethods.projectsPreviewPath),
+			);
+			const confirmationToken = z
+				.object({ preview: z.object({ confirmationToken: z.string() }) })
+				.parse(previewed).preview.confirmationToken;
+			expect(confirmationToken).not.toBe("a".repeat(64));
+			await expect(
+				create(
+					{ path: "/workspace/moshu", confirmationToken: "b".repeat(64) },
+					createRequestContext(peer, productRpcMethods.projectsCreate),
+				),
+			).rejects.toMatchObject({ code: "PROJECT_PREVIEW_STALE" });
+			const created = await create(
+				{ path: "/workspace/moshu", confirmationToken },
 				createRequestContext(peer, productRpcMethods.projectsCreate),
 			);
 			expect(created).toMatchObject({
@@ -535,22 +611,97 @@ describe("Runtime Box product RPC", () => {
 			});
 			const projectId = z.object({ project: z.object({ id: z.string() }) }).parse(created)
 				.project.id;
+			const sessionRequest = {
+				schemaVersion: 1,
+				createKey: crypto.randomUUID(),
+				title: "Project chat",
+				defaultMode: "agent",
+				projectId,
+				runtimeBoxId: "untrusted-runtime-box",
+			} as const;
+			const projectSession = await createSession(
+				sessionRequest,
+				createRequestContext(peer, productRpcMethods.sessionCreate),
+			);
+			expect(projectSession).toMatchObject({
+				session: { projectId, runtimeBoxId: defaultLocalRuntimeBoxId },
+			});
+			await expect(
+				listSessions({}, createRequestContext(peer, productRpcMethods.sessionList)),
+			).resolves.toEqual({ items: [] });
+			await expect(
+				listSessions(
+					{ scope: { kind: "project", projectId } },
+					createRequestContext(peer, productRpcMethods.sessionList),
+				),
+			).resolves.toMatchObject({ items: [{ projectId }] });
 			await expect(
 				list({}, createRequestContext(peer, productRpcMethods.projectsList)),
 			).resolves.toMatchObject({ items: [{ id: projectId }] });
 			registry.clear(runtimePeer);
 			await expect(
-				archive(
-					{ projectId, archived: true },
-					createRequestContext(peer, productRpcMethods.projectsArchive),
+				preview(
+					{ path: "/workspace/other" },
+					createRequestContext(peer, productRpcMethods.projectsPreviewPath),
 				),
-			).rejects.toMatchObject({ code: "RUNTIME_BOX_NOT_READY" });
-			registry.register(runtimePeer, database.runtimeBoxes.get(defaultLocalRuntimeBoxId));
-			registry.markReady(runtimePeer);
+			).rejects.toMatchObject({ code: "PROJECT_RUNTIME_UNAVAILABLE" });
 			await archive(
 				{ projectId, archived: true },
 				createRequestContext(peer, productRpcMethods.projectsArchive),
 			);
+			await expect(
+				createSession(sessionRequest, createRequestContext(peer, productRpcMethods.sessionCreate)),
+			).resolves.toEqual(projectSession);
+			await expect(
+				createSession(
+					{ ...sessionRequest, createKey: crypto.randomUUID() },
+					createRequestContext(peer, productRpcMethods.sessionCreate),
+				),
+			).rejects.toMatchObject({ code: "PROJECT_ARCHIVED" });
+			await archive(
+				{ projectId, archived: false },
+				createRequestContext(peer, productRpcMethods.projectsArchive),
+			);
+			await expect(
+				createSession(
+					{ ...sessionRequest, createKey: crypto.randomUUID() },
+					createRequestContext(peer, productRpcMethods.sessionCreate),
+				),
+			).rejects.toMatchObject({ code: "PROJECT_RUNTIME_UNAVAILABLE" });
+			await archive(
+				{ projectId, archived: true },
+				createRequestContext(peer, productRpcMethods.projectsArchive),
+			);
+			registry.register(runtimePeer, database.runtimeBoxes.get(defaultLocalRuntimeBoxId));
+			registry.markReady(runtimePeer);
+			await archive(
+				{ projectId, archived: false },
+				createRequestContext(peer, productRpcMethods.projectsArchive),
+			);
+			projectPathAvailable = false;
+			await expect(
+				createSession(
+					{ ...sessionRequest, createKey: crypto.randomUUID() },
+					createRequestContext(peer, productRpcMethods.sessionCreate),
+				),
+			).rejects.toMatchObject({
+				code: "PROJECT_PATH_UNAVAILABLE",
+				data: { issueCode: "not_found" },
+			});
+			projectPathAvailable = true;
+			await archive(
+				{ projectId, archived: true },
+				createRequestContext(peer, productRpcMethods.projectsArchive),
+			);
+			await expect(
+				create(
+					{ path: "/workspace/moshu", confirmationToken },
+					createRequestContext(peer, productRpcMethods.projectsCreate),
+				),
+			).rejects.toMatchObject({
+				code: "PROJECT_PATH_CONFLICT",
+				data: { conflictingProjectId: projectId, conflictingProjectArchived: true },
+			});
 			await expect(
 				list({}, createRequestContext(peer, productRpcMethods.projectsList)),
 			).resolves.toEqual({ items: [] });
@@ -720,6 +871,38 @@ describe("product RPC event broadcast", () => {
 		);
 		expect(failedCloseCalls).toBe(1);
 		expect(healthyDeliveries).toBe(1);
+	});
+
+	test("broadcasts bounded retired Session IDs and diagnoses isolated publication failures", () => {
+		const sessionIds = ["018f0f2c-7b18-7abc-8def-1234567890ab"];
+		const diagnostics: string[] = [];
+		const deliveries: unknown[] = [];
+		let failedCloseCalls = 0;
+		const failedPeer = createPeer({
+			emitEvent() {
+				throw new Error("dropped frame");
+			},
+			close() {
+				failedCloseCalls += 1;
+			},
+		});
+		const healthyPeer = createPeer({
+			emitEvent(method, payload) {
+				expect(method).toBe("moshu.v1.chat.sessions.retired");
+				deliveries.push(chatSessionsRetiredEventSchema.parse(payload));
+				return "retirement-event";
+			},
+			close() {},
+		});
+
+		publishRetiredChatSessions([failedPeer, healthyPeer], sessionIds, (message) =>
+			diagnostics.push(message),
+		);
+
+		expect(failedCloseCalls).toBe(1);
+		expect(deliveries).toEqual([{ schemaVersion: 1, sessionIds }]);
+		expect(diagnostics).toHaveLength(1);
+		expect(diagnostics[0]).toContain("replay will recover");
 	});
 
 	test("routes live events only to the originating client peer", () => {
@@ -1059,7 +1242,7 @@ describe("product RPC event broadcast", () => {
 					completedOperations.push("session-create");
 					return { session: { schemaVersion: 1 } };
 				},
-				sendMessage() {
+				sendMessageWithPreflight() {
 					completedOperations.push("chat-send");
 					return { run: { status: "queued" } };
 				},
@@ -1249,7 +1432,7 @@ describe("product RPC event broadcast", () => {
 		const handler = createProductRpcHandlers({
 			authController,
 			chatService: {
-				createSessionIdempotently(input, peerIdentity) {
+				async createSessionIdempotently(input, peerIdentity) {
 					return database.sessions.createIdempotently({
 						request: input,
 						origin: peerIdentity,
@@ -1696,5 +1879,39 @@ describe("product RPC provider and model handlers", () => {
 		for (const method of runtimeBoxProductRequestMethods) {
 			expect(typeof handlers?.[method]).toBe("function");
 		}
+	});
+
+	test("serves the durable retired Session recovery page without metadata", async () => {
+		const peer = createPeer({ emitEvent: () => "event", close() {} });
+		const retiredSessionId = "01984df0-cf17-7e6e-9a7d-4d98c1f0d5ce";
+		const received: unknown[] = [];
+		const handlers = createProductRpcHandlers({
+			authController,
+			chatService: {
+				listRetiredSessions(input: unknown) {
+					received.push(input);
+					return { schemaVersion: 1, sessionIds: [retiredSessionId] };
+				},
+			} as unknown as ChatApplicationService,
+			runtimeBoxRegistry: {} as RuntimeBoxRegistry,
+			runtimeBoxes,
+			runtimeIngressAuth,
+			getDevTunnelService: () => devTunnelService,
+			eventRouter: new ProductEventRouter(),
+			serverVersion: "test",
+		}).requests;
+		const handler = handlers?.[productRpcMethods.chatRetiredSessionsList];
+		if (handler === undefined) {
+			throw new Error("Retired Session recovery handler is missing.");
+		}
+
+		const output = await handler(
+			{ schemaVersion: 1, limit: 100 },
+			createRequestContext(peer, productRpcMethods.chatRetiredSessionsList),
+		);
+
+		expect(output).toEqual({ schemaVersion: 1, sessionIds: [retiredSessionId] });
+		expect(received).toEqual([{ schemaVersion: 1, limit: 100 }]);
+		expect(JSON.stringify(output)).not.toContain("project");
 	});
 });

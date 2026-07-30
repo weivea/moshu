@@ -7,6 +7,8 @@ import {
 	cancelChatRunInputSchema,
 	cancelChatRunOutputSchema,
 	chatSendAcceptedOutputSchema,
+	confirmCreateProjectInputSchema,
+	confirmCreateProjectOutputSchema,
 	createChatSessionOutputSchema,
 	createProcessChatSessionInputSchema,
 	defaultLocalRuntimeBoxId,
@@ -17,7 +19,9 @@ import {
 	getChatSessionPageOutputSchema,
 	listChatSessionsInputSchema,
 	listChatSessionsOutputSchema,
+	listRetiredChatSessionsInputSchema,
 	maxRetainedSessionRetirements,
+	productRpcEvents,
 	productRpcInternalHandlerErrorCode,
 	productRpcMethods,
 	replayChatEventsInputSchema,
@@ -41,7 +45,13 @@ import {
 	rpcJsonValueSchema,
 } from "@moshu/process-rpc";
 
-import { agentsUnavailableMessagePrefix, ChatSessionNotFoundError } from "../shared/rpc-errors";
+import {
+	agentsUnavailableMessagePrefix,
+	ChatSessionNotFoundError,
+	ProjectPreviewStaleError,
+	projectPreviewStaleCode,
+	projectPreviewStaleMessagePrefix,
+} from "../shared/rpc-errors";
 import type { DesktopAgentsConnectOptions } from "./companion-process-supervisor";
 import {
 	AgentsUnavailableError,
@@ -92,6 +102,175 @@ describe("DesktopAgentsClient", () => {
 		unsubscribe();
 		client.close();
 		expect(readyCount).toBe(2);
+	});
+
+	test("routes live retired Session batches through acknowledged renderer invalidation", async () => {
+		let connectionOptions: ConnectRpcClientOptions | undefined;
+		const peer = new FakePeer(() => ({ events: [] }));
+		const client = new DesktopAgentsClient(async (options) => {
+			connectionOptions = options;
+			return peer;
+		});
+		const invalidations: string[] = [];
+		client.subscribeChatSessionInvalidations((invalidation) => {
+			invalidations.push(`${invalidation.reason}:${invalidation.sessionId}`);
+			client.acknowledgeChatSessionInvalidation({
+				schemaVersion: 1,
+				invalidationId: invalidation.invalidationId,
+				sessionId: invalidation.sessionId,
+				accepted: true,
+			});
+		});
+		await client.connect(createConnectOptions());
+		const handler = connectionOptions?.handlers?.events?.[productRpcEvents.chatSessionsRetired];
+		if (handler === undefined) {
+			throw new Error("Session retirement event handler was not installed.");
+		}
+
+		await handler(
+			{ schemaVersion: 1, sessionIds: [sessionId, otherSessionId] },
+			{} as RpcEventContext,
+		);
+
+		expect(invalidations).toEqual([
+			`session_retired:${sessionId}`,
+			`session_retired:${otherSessionId}`,
+		]);
+		client.close();
+	});
+
+	test("recovers an empty retired Session from durable pages after restart without a live event", async () => {
+		const peers = [new FakePeer(() => ({ events: [] })), new FakePeer(() => ({ events: [] }))];
+		const recoveryInputs: unknown[] = [];
+		for (const peer of peers) {
+			peer.retiredSessionPageHandler = (payload) => {
+				recoveryInputs.push(listRetiredChatSessionsInputSchema.parse(payload));
+				return { schemaVersion: 1, sessionIds: [sessionId] };
+			};
+		}
+		let index = 0;
+		const client = new DesktopAgentsClient(async () => {
+			const peer = peers[index];
+			index += 1;
+			return peer ?? Promise.reject(new Error("No fake peer available."));
+		});
+		const invalidations: string[] = [];
+		client.subscribeChatSessionInvalidations((invalidation) => {
+			invalidations.push(invalidation.sessionId);
+			client.acknowledgeChatSessionInvalidation({
+				schemaVersion: 1,
+				invalidationId: invalidation.invalidationId,
+				sessionId: invalidation.sessionId,
+				accepted: true,
+			});
+		});
+
+		const first = await client.connect(createConnectOptions());
+		first.close();
+		await client.connect(createConnectOptions());
+
+		expect(recoveryInputs).toEqual([
+			{ schemaVersion: 1, limit: 100 },
+			{ schemaVersion: 1, limit: 100 },
+		]);
+		expect(invalidations).toEqual([sessionId]);
+		client.close();
+	});
+
+	test("stages an entire live retirement batch before the first renderer failure", async () => {
+		const peers = [new FakePeer(() => ({ events: [] })), new FakePeer(() => ({ events: [] }))];
+		let index = 0;
+		let activeOptions: ConnectRpcClientOptions | undefined;
+		const client = new DesktopAgentsClient(async (options) => {
+			activeOptions = options;
+			const peer = peers[index];
+			index += 1;
+			return peer ?? Promise.reject(new Error("No fake peer available."));
+		});
+		const invalidations: string[] = [];
+		let rejectFirst = true;
+		client.subscribeChatSessionInvalidations((invalidation) => {
+			invalidations.push(invalidation.sessionId);
+			client.acknowledgeChatSessionInvalidation({
+				schemaVersion: 1,
+				invalidationId: invalidation.invalidationId,
+				sessionId: invalidation.sessionId,
+				accepted: !rejectFirst,
+			});
+			rejectFirst = false;
+		});
+		await client.connect(createConnectOptions());
+		const handler = activeOptions?.handlers?.events?.[productRpcEvents.chatSessionsRetired];
+		if (handler === undefined) {
+			throw new Error("Session retirement event handler was not installed.");
+		}
+
+		await expect(
+			handler({ schemaVersion: 1, sessionIds: [sessionId, otherSessionId] }, {} as RpcEventContext),
+		).rejects.toThrow("Session retirement delivery failed");
+		await client.connect(createConnectOptions());
+
+		expect(invalidations).toEqual([sessionId, sessionId, otherSessionId]);
+		client.close();
+	});
+
+	test("drains a provisional retirement staged while the final retry awaits acknowledgement", async () => {
+		const peers = [new FakePeer(() => ({ events: [] })), new FakePeer(() => ({ events: [] }))];
+		let index = 0;
+		let connectionOptions: ConnectRpcClientOptions | undefined;
+		const client = new DesktopAgentsClient(async (options) => {
+			connectionOptions = options;
+			const peer = peers[index];
+			index += 1;
+			return peer ?? Promise.reject(new Error("No fake peer available."));
+		});
+		let phase: "seed" | "recover" = "seed";
+		const recoveryOrder: string[] = [];
+		client.subscribeChatSessionInvalidations((invalidation) => {
+			if (phase === "seed") {
+				client.acknowledgeChatSessionInvalidation({
+					schemaVersion: 1,
+					invalidationId: invalidation.invalidationId,
+					sessionId: invalidation.sessionId,
+					accepted: false,
+				});
+				return;
+			}
+			recoveryOrder.push(invalidation.sessionId);
+			if (invalidation.sessionId === sessionId) {
+				const provisionalHandler =
+					connectionOptions?.handlers?.events?.[productRpcEvents.chatSessionsRetired];
+				if (provisionalHandler === undefined) {
+					throw new Error("Provisional retirement handler was not installed.");
+				}
+				void provisionalHandler(
+					{ schemaVersion: 1, sessionIds: [otherSessionId] },
+					{} as RpcEventContext,
+				);
+			}
+			client.acknowledgeChatSessionInvalidation({
+				schemaVersion: 1,
+				invalidationId: invalidation.invalidationId,
+				sessionId: invalidation.sessionId,
+				accepted: true,
+			});
+		});
+		await client.connect(createConnectOptions());
+		const activeHandler =
+			connectionOptions?.handlers?.events?.[productRpcEvents.chatSessionsRetired];
+		if (activeHandler === undefined) {
+			throw new Error("Active retirement handler was not installed.");
+		}
+		await expect(
+			activeHandler({ schemaVersion: 1, sessionIds: [sessionId] }, {} as RpcEventContext),
+		).rejects.toThrow();
+		phase = "recover";
+		client.subscribeReady(() => recoveryOrder.push("ready"));
+
+		await client.connect(createConnectOptions());
+
+		expect(recoveryOrder).toEqual([sessionId, otherSessionId, "ready"]);
+		client.close();
 	});
 
 	test.each([
@@ -818,6 +997,35 @@ describe("DesktopAgentsClient", () => {
 				getChatSessionPageOutputSchema,
 			),
 		).rejects.toBeInstanceOf(ChatSessionNotFoundError);
+		client.close();
+	});
+
+	test("wraps a stale Project preview code for Electrobun transport", async () => {
+		const peer = new FakePeer((method) => {
+			if (method === productRpcMethods.projectsCreate) {
+				throw new RpcRemoteError("project-create", {
+					code: projectPreviewStaleCode,
+					message: "The Project path preview is stale.",
+				});
+			}
+			return { events: [] };
+		});
+		const client = new DesktopAgentsClient(async () => peer);
+		await client.connect(createConnectOptions());
+
+		const error = await client
+			.request(
+				productRpcMethods.projectsCreate,
+				{ path: "/workspace/project", confirmationToken: "a".repeat(64) },
+				confirmCreateProjectInputSchema,
+				confirmCreateProjectOutputSchema,
+			)
+			.catch((reason: unknown) => reason);
+		expect(error).toBeInstanceOf(ProjectPreviewStaleError);
+		expect((error as ProjectPreviewStaleError).code).toBe(projectPreviewStaleCode);
+		expect((error as Error).message).toBe(
+			`${projectPreviewStaleMessagePrefix}The Project path preview is stale.`,
+		);
 		client.close();
 	});
 
@@ -3093,6 +3301,9 @@ describe("DesktopAgentsClient", () => {
 
 class FakePeer implements DesktopAgentsRpcPeer {
 	closeCalls = 0;
+	retiredSessionPageHandler:
+		| ((payload: JsonValue, options?: RpcRequestOptions) => JsonValue | Promise<JsonValue>)
+		| undefined;
 
 	constructor(
 		private readonly onRequest: (
@@ -3114,6 +3325,11 @@ class FakePeer implements DesktopAgentsRpcPeer {
 		payload: JsonValue,
 		options?: RpcRequestOptions,
 	): Promise<JsonValue> {
+		if (method === productRpcMethods.chatRetiredSessionsList) {
+			return this.retiredSessionPageHandler === undefined
+				? { schemaVersion: 1, sessionIds: [] }
+				: this.retiredSessionPageHandler(payload, options);
+		}
 		if (
 			method === productRpcMethods.chatReplay &&
 			typeof payload === "object" &&

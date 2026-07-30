@@ -9,6 +9,7 @@
 - **Runtime Box**：在本机或远程设备执行 `read`、`bash`、`edit`、`write`、`grep`、`find`、`ls`，并拥有自己的 MCP、完整 Skill packages、credential、journal 和 workspace。
 - **Remote Runtime Box**：通过 Agent Server 管理的 Anonymous Microsoft Dev Tunnel 主动连接，使用一次性配对码、Ed25519 双向身份、generation fence 和版本协商。
 - **多 Box 路由**：切换 Runtime Box 后，界面切换 Box-owned Session、Project、MCP 和 Skills；Server-owned MCP/Skills 保持不变，既有 Session/Run 永远按持久归属路由。
+- **Projects 与 Project Chat**：支持 Local 目录选择和 Remote 路径、预览确认、路径健康/重新关联、归档/删除、Project Session 管理、根 `AGENTS.md` 上下文和 Project root 文件 Tool 边界。
 - **MCP 与 Skills**：支持 MCP 与 Skills 双归属、MCP stdio/Streamable HTTP/SSE、prompt-only Server Skills、Box immutable Skill packages、global/Runtime Profile 和 inventory reconciliation。
 - **恢复与发布门**：durable Action intent、单次 grant、fsync journal、未知结果对账、进程树清理、协议升级状态、脱敏诊断、流量估算及签名 package/update gate。
 

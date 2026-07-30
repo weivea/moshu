@@ -8,10 +8,10 @@ import { SessionSidebar } from "./chat/session-sidebar";
 import type { ChatSessionSummary } from "./chat/transport";
 import { type MessageKey, useI18n } from "./i18n";
 import { useLocalProfile } from "./local-profile";
+import { ProjectsSidebar } from "./projects-page";
+import { useRuntimeBoxes } from "./runtime-boxes";
 import { AppShellContext, type ShellSessionUpdate } from "./shell-context";
 import { usePersistedPanelResize } from "./use-persisted-panel-resize";
-import { useRuntimeBoxes } from "./runtime-boxes";
-import { ProjectsSidebar } from "./projects-page";
 
 const primaryNavigation = [
 	{ label: "nav.home", icon: "home", active: true },
@@ -43,10 +43,9 @@ export function AppShell() {
 	const runtimeBoxes = useRuntimeBoxes();
 	const { pathname } = location;
 	const activeSessionId = readActiveChatSessionId(pathname);
-	const isChatWorkspace =
+	const isOrdinaryChatWorkspace =
 		pathname === "/" || pathname === "/chats" || pathname.startsWith("/chat/");
-	// Project-scoped Sessions (/projects/:projectId/chat/:sessionId) should also enable
-	// Canvas once their local-project workspace is implemented.
+	const isChatWorkspace = isOrdinaryChatWorkspace || /^\/projects\/[^/]+\/chat\//u.test(pathname);
 	const isCanvasAvailable = activeSessionId !== null;
 	const [isSidebarOpen, setIsSidebarOpen] = useState(() =>
 		readStoredBoolean(sidebarOpenStorageKey, true),
@@ -106,10 +105,10 @@ export function AppShell() {
 		const previousRuntimeBoxId = previousRuntimeBoxIdRef.current;
 		const activeRuntimeBoxId = runtimeBoxes.snapshot.active.runtimeBoxId;
 		previousRuntimeBoxIdRef.current = activeRuntimeBoxId;
-		if (previousRuntimeBoxId !== activeRuntimeBoxId && isChatWorkspace) {
+		if (previousRuntimeBoxId !== activeRuntimeBoxId && isOrdinaryChatWorkspace) {
 			navigate("/chat/new", { replace: true });
 		}
-	}, [isChatWorkspace, navigate, runtimeBoxes.snapshot.active.runtimeBoxId]);
+	}, [isOrdinaryChatWorkspace, navigate, runtimeBoxes.snapshot.active.runtimeBoxId]);
 
 	useEffect(() => {
 		setRouteHistory((current) => {
@@ -156,6 +155,11 @@ export function AppShell() {
 
 	const handleActiveSessionRetired = useCallback(
 		(retiredSessionId: string) => {
+			const projectOverviewPath = readProjectOverviewPath(pathname);
+			if (projectOverviewPath !== null) {
+				navigate(projectOverviewPath, { replace: true });
+				return;
+			}
 			const rememberedSessionId = localStorage.getItem(lastChatSessionStorageKey);
 			navigate("/chat/new", {
 				replace: true,
@@ -165,7 +169,7 @@ export function AppShell() {
 						: null,
 			});
 		},
-		[navigate],
+		[navigate, pathname],
 	);
 
 	const handleSessionUpdated = useCallback((session: ChatSessionSummary) => {
@@ -450,11 +454,16 @@ function TitlebarButton({ label, icon, disabled = false, onClick }: TitlebarButt
 }
 
 function readActiveChatSessionId(pathname: string): string | null {
-	const match = /^\/chat\/([^/]+)$/u.exec(pathname);
+	const match = /^(?:\/chat|\/projects\/[^/]+\/chat)\/([^/]+)$/u.exec(pathname);
 	if (match?.[1] === undefined || match[1] === "new") {
 		return null;
 	}
 	return decodeURIComponent(match[1]);
+}
+
+function readProjectOverviewPath(pathname: string): string | null {
+	const match = /^(\/projects\/[^/]+)\/chat\/[^/]+$/u.exec(pathname);
+	return match?.[1] ?? null;
 }
 
 function readStoredBoolean(key: string, fallback: boolean): boolean {

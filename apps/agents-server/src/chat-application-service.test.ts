@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 
 import {
 	AskChatCancelledError,
@@ -17,6 +18,7 @@ import {
 import {
 	type ChatRunEvent,
 	type DefaultModelSelection,
+	defaultLocalRuntimeBoxId,
 	maxAppErrorSafeMessageCharacters,
 	maxAssistantMessageContentCharacters,
 	maxProviderCount,
@@ -34,7 +36,17 @@ import {
 } from "@moshu/database";
 import { ZodError } from "zod";
 
-import { ChatApplicationService } from "./chat-application-service";
+import {
+	ChatApplicationService,
+	type ChatApplicationServiceOptions,
+} from "./chat-application-service";
+import {
+	ProjectApplicationService,
+	ProjectArchivedError,
+	ProjectPathUnavailableError,
+	ProjectRuntimeUnavailableError,
+} from "./project-application-service";
+import { RuntimeBoxUnavailableError } from "./runtime-box-registry";
 
 describe("ChatApplicationService", () => {
 	test("persists every streamed event before publishing it", async () => {
@@ -885,6 +897,7 @@ describe("ChatApplicationService", () => {
 		const service = createService(database, new FakeAskChatRuntime({}), new ManualScheduler(), {
 			isRuntimeReady: () => ready,
 		});
+
 		const request = {
 			schemaVersion: 1 as const,
 			createKey: crypto.randomUUID(),
@@ -898,14 +911,234 @@ describe("ChatApplicationService", () => {
 			generation: 1,
 		};
 		try {
-			const created = service.createSessionIdempotently(request, origin);
+			const created = await service.createSessionIdempotently(request, origin);
 			ready = false;
-			expect(service.createSessionIdempotently(request, origin)).toEqual(created);
-			expect(() =>
+			await expect(service.createSessionIdempotently(request, origin)).resolves.toEqual(created);
+			await expect(
 				service.createSessionIdempotently({ ...request, createKey: crypto.randomUUID() }, origin),
-			).toThrow("Runtime Box is not authenticated and ready");
+			).rejects.toThrow("Runtime Box is not authenticated and ready");
 		} finally {
 			await service.shutdown();
+			database.close();
+		}
+	});
+
+	test("owns Project Session placement, creation gates, metadata, and history", async () => {
+		const database = openAppDatabase(":memory:");
+		const project = database.projects.create({
+			runtimeBoxId: database.runtimeBoxes.getActive().runtimeBoxId,
+			name: "Project",
+			path: "/workspace/project",
+		}).project;
+		let pathState: "available" | "unavailable" | "offline" = "available";
+		const projectService = new ProjectApplicationService({
+			projects: database.projects,
+			runs: database.runs,
+			actions: database.actions,
+			runtimeBoxes: database.runtimeBoxes,
+			pathInspector: {
+				async validateProjectPath() {
+					if (pathState === "offline") {
+						throw new RuntimeBoxUnavailableError();
+					}
+					if (pathState === "unavailable") {
+						return { status: "unavailable", issueCode: "not_found" };
+					}
+					return {
+						status: "available",
+						normalizedPath: project.path,
+						displayName: project.name,
+						rootAgents: { status: "missing" },
+						confirmationToken: "a".repeat(64),
+					};
+				},
+			},
+		});
+
+		const service = createService(database, new FakeAskChatRuntime({}), new ManualScheduler(), {
+			isRuntimeReady: () => false,
+			withProjectSessionCreation: (projectId, createSession, signal) =>
+				projectService.withSessionCreation(projectId, createSession, signal),
+		});
+		const origin = {
+			role: "client" as const,
+			peerId: "desktop-client",
+			instanceId: crypto.randomUUID(),
+			generation: 1,
+		};
+		const request = {
+			schemaVersion: 1 as const,
+			createKey: crypto.randomUUID(),
+			title: "Project chat",
+			defaultMode: "agent" as const,
+			projectId: project.id,
+			runtimeBoxId: "untrusted-runtime-box",
+		};
+		try {
+			const created = await service.createSessionIdempotently(request, origin);
+			const removable = await service.createSessionIdempotently(
+				{ ...request, createKey: crypto.randomUUID(), title: "Delete me" },
+				origin,
+			);
+			expect(created.session).toMatchObject({
+				projectId: project.id,
+				runtimeBoxId: project.runtimeBoxId,
+			});
+			expect(service.listSessions().items).toEqual([]);
+			expect(
+				service.listSessions({ scope: { kind: "project", projectId: project.id } }).items,
+			).toHaveLength(2);
+
+			await projectService.setArchived({ projectId: project.id, archived: true });
+			pathState = "offline";
+			await expect(service.createSessionIdempotently(request, origin)).resolves.toEqual(created);
+			expect(
+				service.updateSession({ sessionId: created.session.id, title: "Renamed offline" }).session
+					.title,
+			).toBe("Renamed offline");
+			expect(
+				service.setSessionArchived({ sessionId: created.session.id, archived: true }).session
+					.archivedAt,
+			).toBeDefined();
+			expect(
+				service.setSessionModel({ sessionId: created.session.id, model: null }).session.model,
+			).toBe(undefined);
+			await expect(service.getSession({ sessionId: created.session.id })).resolves.toMatchObject({
+				session: { projectId: project.id, title: "Renamed offline" },
+			});
+			await expect(service.deleteSession({ sessionId: removable.session.id })).resolves.toEqual({
+				sessionId: removable.session.id,
+			});
+			await expect(
+				service.createSessionIdempotently({ ...request, createKey: crypto.randomUUID() }, origin),
+			).rejects.toBeInstanceOf(ProjectArchivedError);
+
+			await projectService.setArchived({ projectId: project.id, archived: false });
+			await expect(
+				service.createSessionIdempotently({ ...request, createKey: crypto.randomUUID() }, origin),
+			).rejects.toBeInstanceOf(ProjectRuntimeUnavailableError);
+			pathState = "unavailable";
+			await expect(
+				service.createSessionIdempotently({ ...request, createKey: crypto.randomUUID() }, origin),
+			).rejects.toBeInstanceOf(ProjectPathUnavailableError);
+		} finally {
+			await service.shutdown();
+			await projectService.shutdown();
+			database.close();
+		}
+	});
+
+	test("preflights Project sends, persists snapshots and warnings, and isolates ordinary Runs", async () => {
+		const database = openAppDatabase(":memory:");
+		const scheduler = new ManualScheduler();
+		const runtime = new FakeAskChatRuntime({ deltas: ["done"] });
+		const project = database.projects.create({
+			runtimeBoxId: defaultLocalRuntimeBoxId,
+			name: "Project",
+			path: "/workspace/project",
+		}).project;
+		const secretBody = "EPHEMERAL-ROOT-AGENTS-BODY";
+		let agentsResult:
+			| { status: "loaded"; body: string }
+			| { status: "warning"; issueCode: "invalid_utf8" } = {
+			status: "loaded",
+			body: secretBody,
+		};
+		const projectService = new ProjectApplicationService({
+			projects: database.projects,
+			runs: database.runs,
+			actions: database.actions,
+			runtimeBoxes: database.runtimeBoxes,
+			pathInspector: {
+				async validateProjectPath() {
+					return {
+						status: "available",
+						normalizedPath: project.path,
+						displayName: project.name,
+						gitRootPath: project.path,
+						gitBranch: "main",
+						rootAgents: { status: "missing" },
+						confirmationToken: "a".repeat(64),
+					};
+				},
+				async readProjectRootAgents() {
+					return agentsResult;
+				},
+			},
+		});
+		const service = createService(database, runtime, scheduler, {
+			withProjectRunPreflight: (projectId, createRun, signal) =>
+				projectService.withRunPreflight(projectId, createRun, signal),
+		});
+		const projectSession = database.sessions.create({
+			projectId: project.id,
+			title: "Project chat",
+		}).session;
+		try {
+			const accepted = await service.sendMessageWithPreflight({
+				sessionId: projectSession.id,
+				content: "Use the Project.",
+			});
+			expect(runtime.inputs).toEqual([]);
+			expect(database.runs.get(accepted.run.id).projectContext).toEqual(
+				expect.objectContaining({
+					projectId: project.id,
+					runtimeBoxId: project.runtimeBoxId,
+					projectPath: project.path,
+					projectPathRevision: 1,
+					gitBranch: "main",
+					rootAgentsHash: createHash("sha256").update(secretBody).digest("hex"),
+				}),
+			);
+			expect(JSON.stringify(database.client.query("SELECT * FROM chat_runs").all())).not.toContain(
+				secretBody,
+			);
+			expect(JSON.stringify(database.runs.listEvents({ runId: accepted.run.id }))).not.toContain(
+				secretBody,
+			);
+			scheduler.runAll();
+			await service.waitForIdle();
+			expect(runtime.inputs[0]?.executionContext).toEqual(
+				expect.objectContaining({
+					kind: "project",
+					projectId: project.id,
+					projectPath: project.path,
+					projectPathRevision: 1,
+					rootAgentsBody: secretBody,
+				}),
+			);
+
+			agentsResult = { status: "warning", issueCode: "invalid_utf8" };
+			const warned = await service.sendMessageWithPreflight({
+				sessionId: projectSession.id,
+				content: "Continue.",
+			});
+			expect(database.runs.listEvents({ runId: warned.run.id })).toEqual(
+				expect.arrayContaining([
+					expect.objectContaining({
+						type: "run.warning",
+						payload: {
+							code: "ROOT_AGENTS_SKIPPED",
+							reason: "invalid_utf8",
+						},
+					}),
+				]),
+			);
+			scheduler.runAll();
+			await service.waitForIdle();
+
+			const ordinarySession = database.sessions.create({ title: "Ordinary" }).session;
+			const ordinary = await service.sendMessageWithPreflight({
+				sessionId: ordinarySession.id,
+				content: "Ordinary message.",
+			});
+			expect(ordinary.run.projectContext).toBeUndefined();
+			scheduler.runAll();
+			await service.waitForIdle();
+			expect(runtime.inputs.at(-1)?.executionContext).toEqual({ kind: "session" });
+		} finally {
+			await service.shutdown();
+			await projectService.shutdown();
 			database.close();
 		}
 	});
@@ -1748,6 +1981,78 @@ describe("ChatApplicationService", () => {
 					],
 				}),
 			).toThrow("not found");
+		} finally {
+			await service.shutdown();
+			database.close();
+		}
+	});
+
+	test("retires replay instead of exposing history while its Project is deleting", async () => {
+		const database = openAppDatabase(":memory:");
+		const service = createService(database, new FakeAskChatRuntime({}), new ManualScheduler());
+		try {
+			const project = database.projects.create({
+				runtimeBoxId: database.runtimeBoxes.getActive().runtimeBoxId,
+				name: "Deleting Project",
+				path: "/workspace/deleting-project",
+			}).project;
+			const session = database.sessions.create({
+				projectId: project.id,
+				title: "Private Project history",
+			}).session;
+			const created = database.runs.create({
+				clientRequestId: crypto.randomUUID(),
+				sessionId: session.id,
+				mode: "ask",
+				provider: {
+					schemaVersion: 1,
+					providerId: createUuidV7(),
+					name: "OpenAI",
+					source: "custom",
+					api: "openai-responses",
+					model: "gpt-4.1-mini",
+				},
+				userMessageId: createUuidV7(),
+				userContent: "Do not expose this",
+				assistantMessageId: createUuidV7(),
+				projectContext: {
+					projectId: project.id,
+					runtimeBoxId: project.runtimeBoxId,
+					projectPath: project.path,
+					projectPathRevision: project.pathRevision,
+				},
+			});
+			database.projects.requestDeletion(project.id);
+
+			const replay = service.replayEvents({
+				cursors: [
+					{
+						runId: created.run.id,
+						sessionId: session.id,
+						issuedAtMs: Date.now(),
+						lastSeq: 0,
+					},
+				],
+			});
+
+			expect(replay.events).toEqual([]);
+			expect(replay.retiredSessionIds).toEqual([session.id]);
+			expect(replay.resnapshotSessionIds).toEqual([]);
+			expect(database.runs.get(created.run.id).status).toBe("queued");
+
+			const missingRunReplay = service.replayEvents({
+				cursors: [
+					{
+						runId: createUuidV7(),
+						sessionId: session.id,
+						issuedAtMs: 0,
+						lastSeq: 0,
+					},
+				],
+			});
+			expect(missingRunReplay.events).toEqual([]);
+			expect(missingRunReplay.retiredSessionIds).toEqual([session.id]);
+			expect(missingRunReplay.resnapshotSessionIds).toEqual([]);
 		} finally {
 			await service.shutdown();
 			database.close();
@@ -2866,6 +3171,12 @@ function createService(
 		providers?: ProviderRegistry;
 		fetchProviderModels?: (providerId: string) => Promise<readonly ProviderModel[]>;
 		isRuntimeReady?: () => boolean;
+		withProjectSessionCreation?: <T>(
+			projectId: string,
+			createSession: () => T,
+			signal?: AbortSignal,
+		) => Promise<T>;
+		withProjectRunPreflight?: ChatApplicationServiceOptions["withProjectRunPreflight"];
 		agentSessionCleanupRetryBaseMs?: number;
 		agentSessionCleanupRetryMaxMs?: number;
 		agentSessionCleanupAttemptTimeoutMs?: number;
@@ -2887,6 +3198,12 @@ function createService(
 			: { fetchProviderModels: options.fetchProviderModels }),
 		...(options.logger === undefined ? {} : { logger: options.logger }),
 		...(options.isRuntimeReady === undefined ? {} : { isRuntimeReady: options.isRuntimeReady }),
+		...(options.withProjectSessionCreation === undefined
+			? {}
+			: { withProjectSessionCreation: options.withProjectSessionCreation }),
+		...(options.withProjectRunPreflight === undefined
+			? {}
+			: { withProjectRunPreflight: options.withProjectRunPreflight }),
 		...(options.agentSessionCleanupRetryBaseMs === undefined
 			? {}
 			: { agentSessionCleanupRetryBaseMs: options.agentSessionCleanupRetryBaseMs }),

@@ -1,6 +1,6 @@
 import Database from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 
 import type { AskChatRuntime } from "@moshu/agent-runtime";
@@ -125,7 +125,7 @@ describe("createAgentsServer", () => {
 		});
 	});
 
-	test("resets an old product schema without deleting app-owned Pi data", async () => {
+	test("resets an old product schema and only removes app-owned Pi Sessions", async () => {
 		await withServerDirectory(async (directory) => {
 			const bootstrap = createBootstrap(directory);
 			const legacy = new Database(bootstrap.paths.productDatabase);
@@ -134,6 +134,21 @@ describe("createAgentsServer", () => {
 			mkdirSync(bootstrap.paths.agentDataDirectory, { recursive: true });
 			const marker = join(bootstrap.paths.agentDataDirectory, "pi-data-marker");
 			writeFileSync(marker, "keep");
+			const sessions = join(bootstrap.paths.agentDataDirectory, "sessions");
+			mkdirSync(sessions);
+			writeFileSync(join(sessions, "obsolete.jsonl"), "remove");
+			const credentials = join(bootstrap.paths.agentDataDirectory, "credentials");
+			const diagnosticsDirectory = join(bootstrap.paths.agentDataDirectory, "diagnostics");
+			const mcpDirectory = join(bootstrap.paths.agentDataDirectory, "mcp-secrets");
+			const skillsDirectory = join(bootstrap.paths.agentDataDirectory, "server-skills");
+			mkdirSync(credentials);
+			mkdirSync(diagnosticsDirectory);
+			mkdirSync(mcpDirectory);
+			mkdirSync(skillsDirectory);
+			writeFileSync(join(credentials, "marker"), "credentials");
+			writeFileSync(join(diagnosticsDirectory, "marker"), "diagnostics");
+			writeFileSync(join(mcpDirectory, "marker"), "mcp");
+			writeFileSync(join(bootstrap.paths.agentDataDirectory, "providers.json"), '{"providers":[]}');
 			const diagnostics: string[] = [];
 			const instance = await createAgentsServer({
 				bootstrap,
@@ -153,13 +168,80 @@ describe("createAgentsServer", () => {
 						.get()?.count,
 				).toBe(0);
 				product.close();
+				expect(existsSync(sessions)).toBe(false);
 				expect(readFileSync(marker, "utf8")).toBe("keep");
+				expect(readFileSync(join(credentials, "marker"), "utf8")).toBe("credentials");
+				expect(readFileSync(join(diagnosticsDirectory, "marker"), "utf8")).toBe("diagnostics");
+				expect(readFileSync(join(mcpDirectory, "marker"), "utf8")).toBe("mcp");
+				expect(existsSync(skillsDirectory)).toBe(true);
+				expect(existsSync(join(bootstrap.paths.agentDataDirectory, "providers.json"))).toBe(true);
 				expect(diagnostics).toEqual([
 					"Reset the local product store (product-schema-cutover, previous product schema 6).",
 				]);
 				expect(diagnostics[0]).not.toContain(directory);
 			} finally {
 				await instance.shutdown();
+			}
+		});
+	});
+
+	test("stops a coordinated reset when Pi Session storage is a symlink", async () => {
+		await withServerDirectory(async (directory) => {
+			const bootstrap = createBootstrap(directory);
+			const legacy = new Database(bootstrap.paths.productDatabase);
+			legacy.exec("PRAGMA user_version = 6;");
+			legacy.close();
+			mkdirSync(bootstrap.paths.agentDataDirectory, { recursive: true });
+			const external = join(directory, "external-sessions");
+			mkdirSync(external);
+			const externalMarker = join(external, "keep.jsonl");
+			writeFileSync(externalMarker, "keep");
+			symlinkSync(external, join(bootstrap.paths.agentDataDirectory, "sessions"));
+
+			await expect(
+				createAgentsServer({
+					bootstrap,
+					serverVersion: "test",
+					createRuntime: () => fakeRuntime(),
+				}),
+			).rejects.toThrow("Pi Session storage must be a regular directory.");
+			expect(readFileSync(externalMarker, "utf8")).toBe("keep");
+			const preserved = new Database(bootstrap.paths.productDatabase, { readonly: true });
+			try {
+				expect(
+					preserved.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version,
+				).toBe(6);
+			} finally {
+				preserved.close();
+			}
+		});
+	});
+
+	test("stops a coordinated reset when Pi Session storage is not a directory", async () => {
+		await withServerDirectory(async (directory) => {
+			const bootstrap = createBootstrap(directory);
+			const legacy = new Database(bootstrap.paths.productDatabase);
+			legacy.exec("PRAGMA user_version = 6;");
+			legacy.close();
+			mkdirSync(bootstrap.paths.agentDataDirectory, { recursive: true });
+			const sessions = join(bootstrap.paths.agentDataDirectory, "sessions");
+			writeFileSync(sessions, "unsafe");
+
+			await expect(
+				createAgentsServer({
+					bootstrap,
+					serverVersion: "test",
+					createRuntime: () => fakeRuntime(),
+				}),
+			).rejects.toThrow("Pi Session storage must be a regular directory.");
+			expect(readFileSync(sessions, "utf8")).toBe("unsafe");
+			const preserved = new Database(bootstrap.paths.productDatabase, { readonly: true });
+			try {
+				expect(
+					preserved.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version,
+				).toBe(6);
+			} finally {
+				preserved.close();
 			}
 		});
 	});

@@ -20,11 +20,11 @@ import {
 	type ProcessPeerIdentity,
 	processPeerIdentitySchema,
 	type SessionModelSelection,
-	sessionModelSelectionSchema,
 	type SetChatSessionArchivedInput,
 	type SetChatSessionArchivedOutput,
 	type SetChatSessionModelInput,
 	type SetChatSessionModelOutput,
+	sessionModelSelectionSchema,
 	setChatSessionArchivedInputSchema,
 	setChatSessionArchivedOutputSchema,
 	setChatSessionModelInputSchema,
@@ -38,6 +38,7 @@ import { and, desc, eq, isNotNull, isNull, sql } from "drizzle-orm";
 
 import type { AppDrizzleDatabase } from "./database";
 import { createUuidV7 } from "./ids";
+import type { ProjectRepository } from "./project-repository";
 import type { RuntimeBoxRepository } from "./runtime-box-repository";
 import { chatSessionCreateRequestsTable, chatSessionsTable } from "./schema";
 
@@ -125,6 +126,7 @@ function buildSession(row: SessionRow): ChatSession {
 		id: row.id,
 		agentSessionId: row.piSessionId,
 		runtimeBoxId: row.runtimeBoxId,
+		projectId: row.projectId ?? undefined,
 		title: row.title,
 		defaultMode: row.defaultMode,
 		model: buildSessionModel(row),
@@ -139,19 +141,20 @@ export class SqliteSessionRepository implements SessionRepository {
 	constructor(
 		private readonly orm: AppDrizzleDatabase,
 		private readonly runtimeBoxes: RuntimeBoxRepository,
+		private readonly projects: ProjectRepository,
 		private readonly idGenerator: RepositoryIdGenerator = { create: createUuidV7 },
 		private readonly clock: RepositoryClock = { now: () => Date.now() },
 	) {}
 
 	create(input: CreateChatSessionInput): CreateChatSessionOutput {
 		const parsedInput = createChatSessionInputSchema.parse(input);
-		const runtimeBoxId = parsedInput.runtimeBoxId ?? this.runtimeBoxes.getActive().runtimeBoxId;
-		this.runtimeBoxes.get(runtimeBoxId);
+		const { runtimeBoxId, projectId } = this.#resolvePlacement(parsedInput);
 		const nowMs = this.clock.now();
 		const id = this.idGenerator.create(nowMs);
 		const row: typeof chatSessionsTable.$inferInsert = {
 			id,
 			runtimeBoxId,
+			projectId,
 			piSessionId: id,
 			title: parsedInput.title,
 			defaultMode: parsedInput.defaultMode ?? "agent",
@@ -189,12 +192,12 @@ export class SqliteSessionRepository implements SessionRepository {
 			}
 
 			const nowMs = this.clock.now();
-			const runtimeBoxId = request.runtimeBoxId ?? this.runtimeBoxes.getActive().runtimeBoxId;
-			this.runtimeBoxes.get(runtimeBoxId);
+			const { runtimeBoxId, projectId } = this.#resolvePlacement(request);
 			const id = this.idGenerator.create(nowMs);
 			const row: typeof chatSessionsTable.$inferInsert = {
 				id,
 				runtimeBoxId,
+				projectId,
 				piSessionId: id,
 				title: request.title,
 				defaultMode: request.defaultMode,
@@ -210,6 +213,7 @@ export class SqliteSessionRepository implements SessionRepository {
 				.values({
 					createKey: request.createKey,
 					runtimeBoxId,
+					projectId,
 					originRole: origin.role,
 					originPeerId: origin.peerId,
 					originInstanceId: origin.instanceId,
@@ -235,15 +239,33 @@ export class SqliteSessionRepository implements SessionRepository {
 
 	list(input: ListChatSessionsInput = {}): ListChatSessionsOutput {
 		const parsedInput = listChatSessionsInputSchema.parse(input);
+		const scope =
+			parsedInput.scope ??
+			({
+				kind: "global",
+				...(parsedInput.runtimeBoxId === undefined
+					? {}
+					: { runtimeBoxId: parsedInput.runtimeBoxId }),
+			} as const);
 		const conditions = [
-			eq(
-				chatSessionsTable.runtimeBoxId,
-				parsedInput.runtimeBoxId ?? this.runtimeBoxes.getActive().runtimeBoxId,
-			),
 			parsedInput.archived
 				? isNotNull(chatSessionsTable.archivedAtMs)
 				: isNull(chatSessionsTable.archivedAtMs),
 		];
+		if (scope.kind === "project") {
+			if (this.projects.isDeleting(scope.projectId)) {
+				return listChatSessionsOutputSchema.parse({ items: [] });
+			}
+			this.projects.get({ projectId: scope.projectId });
+			conditions.push(eq(chatSessionsTable.projectId, scope.projectId));
+		} else {
+			const runtimeBoxId = scope.runtimeBoxId ?? this.runtimeBoxes.getActive().runtimeBoxId;
+			this.runtimeBoxes.get(runtimeBoxId);
+			conditions.push(
+				eq(chatSessionsTable.runtimeBoxId, runtimeBoxId),
+				isNull(chatSessionsTable.projectId),
+			);
+		}
 		if (parsedInput.query !== undefined && parsedInput.query.length > 0) {
 			conditions.push(
 				sql`instr(lower(${chatSessionsTable.title}), lower(${parsedInput.query})) > 0`,
@@ -336,7 +358,10 @@ export class SqliteSessionRepository implements SessionRepository {
 			existing.originGeneration !== origin.generation ||
 			existing.title !== request.title ||
 			existing.defaultMode !== request.defaultMode ||
-			(request.runtimeBoxId !== undefined && existing.runtimeBoxId !== request.runtimeBoxId)
+			existing.projectId !== (request.projectId ?? null) ||
+			(request.projectId === undefined &&
+				request.runtimeBoxId !== undefined &&
+				existing.runtimeBoxId !== request.runtimeBoxId)
 		) {
 			throw new SessionCreateKeyConflictError(request.createKey);
 		}
@@ -347,6 +372,9 @@ export class SqliteSessionRepository implements SessionRepository {
 			.get();
 		if (row === undefined) {
 			throw new Error("Session create idempotency record refers to a missing Session.");
+		}
+		if (row.projectId !== null) {
+			this.projects.get({ projectId: row.projectId });
 		}
 		return createChatSessionOutputSchema.parse({ session: buildSession(row) });
 	}
@@ -360,13 +388,33 @@ export class SqliteSessionRepository implements SessionRepository {
 		if (row === undefined) {
 			throw new ChatSessionNotFoundError(sessionId);
 		}
+		if (row.projectId !== null) {
+			this.projects.get({ projectId: row.projectId });
+		}
 		return row;
+	}
+
+	#resolvePlacement(input: { projectId?: string | undefined; runtimeBoxId?: string | undefined }): {
+		runtimeBoxId: string;
+		projectId: string | null;
+	} {
+		if (input.projectId !== undefined) {
+			const project = this.projects.get({ projectId: input.projectId }).project;
+			if (project.deletionRequestedAt !== undefined) {
+				throw new Error("Cannot create a Session for a deleting Project.");
+			}
+			return { runtimeBoxId: project.runtimeBoxId, projectId: project.id };
+		}
+		const runtimeBoxId = input.runtimeBoxId ?? this.runtimeBoxes.getActive().runtimeBoxId;
+		this.runtimeBoxes.get(runtimeBoxId);
+		return { runtimeBoxId, projectId: null };
 	}
 }
 
 export function createSessionRepository(database: {
 	orm: AppDrizzleDatabase;
 	runtimeBoxes: RuntimeBoxRepository;
+	projects: ProjectRepository;
 }): SessionRepository {
-	return new SqliteSessionRepository(database.orm, database.runtimeBoxes);
+	return new SqliteSessionRepository(database.orm, database.runtimeBoxes, database.projects);
 }

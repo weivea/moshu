@@ -1,18 +1,19 @@
-import { createHash } from "node:crypto";
 import { describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
 	createExecutorToolParameterPayload,
+	type ExecutorExecutionContext,
 	type ExecutorToolInvokeInput,
 	reconcileRuntimeBoxInvocationsInputSchema,
 } from "@moshu/contracts";
 import { rpcJsonValueSchema } from "@moshu/process-rpc";
 import {
 	InvocationGrantRejectedError,
-	reconcileInvocationJournal,
 	RuntimeBoxInvocationJournal,
+	reconcileInvocationJournal,
 	watchInvocationReconciliation,
 } from "./invocation-journal";
 
@@ -229,9 +230,98 @@ describe("RuntimeBoxInvocationJournal", () => {
 			rmSync(root, { recursive: true, force: true });
 		}
 	});
+
+	test("validates the complete Project payload before deployment scope compatibility", () => {
+		const root = mkdtempSync(join(tmpdir(), "moshu-project-grants-"));
+		try {
+			const journal = new RuntimeBoxInvocationJournal(root);
+			const project = createAuthorizedInput({
+				executionScope: "project-root",
+				projectPathRevision: 3,
+			});
+			const projectAuthorization = project.authorization;
+			if (projectAuthorization?.executionScope !== "project-root") {
+				throw new Error("Expected project-root authorization.");
+			}
+			expect(() =>
+				journal.begin({ ...project, cwd: "/workspace/tampered" }, authority, target, {
+					kind: "local",
+					trustedRequestCwd: true,
+				}),
+			).toThrow("parameter digest");
+			expect(() =>
+				journal.begin(
+					{
+						...project,
+						call: { tool: "read", arguments: { path: "tampered.txt" } },
+					},
+					authority,
+					target,
+					{ kind: "local", trustedRequestCwd: true },
+				),
+			).toThrow("parameter digest");
+			expect(() =>
+				journal.begin(
+					{
+						...project,
+						authorization: {
+							...projectAuthorization,
+							executionScope: "project-root",
+							projectPathRevision: 4,
+						},
+					},
+					authority,
+					target,
+					{ kind: "local", trustedRequestCwd: true },
+				),
+			).toThrow("parameter digest");
+			const { projectPathRevision: _projectPathRevision, ...authorizationBase } =
+				projectAuthorization;
+			expect(() =>
+				journal.begin(
+					{
+						...project,
+						authorization: {
+							...authorizationBase,
+							executionScope: "request-cwd",
+						},
+					},
+					authority,
+					target,
+					{ kind: "local", trustedRequestCwd: true },
+				),
+			).toThrow("parameter digest");
+
+			const remoteOnly = createAuthorizedInput({ executionScope: "runtime-box-workspace" });
+			expect(() =>
+				journal.begin(remoteOnly, authority, target, {
+					kind: "local",
+					trustedRequestCwd: true,
+				}),
+			).toThrow("incompatible");
+			const localOnly = createAuthorizedInput({ executionScope: "request-cwd" });
+			expect(() =>
+				journal.begin(localOnly, authority, target, {
+					kind: "remote",
+					workspacePath: "/workspace",
+				}),
+			).toThrow("incompatible");
+
+			expect(
+				journal.begin(project, authority, target, {
+					kind: "remote",
+					workspacePath: "/workspace",
+				}),
+			).toEqual({});
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
 });
 
-function createAuthorizedInput(): ExecutorToolInvokeInput {
+function createAuthorizedInput(
+	executionContext: ExecutorExecutionContext = { executionScope: "request-cwd" },
+): ExecutorToolInvokeInput {
 	const parameters = {
 		schemaVersion: 1 as const,
 		invocationId: crypto.randomUUID(),
@@ -247,14 +337,14 @@ function createAuthorizedInput(): ExecutorToolInvokeInput {
 			grantId: crypto.randomUUID(),
 			grantToken: Buffer.alloc(32, 7).toString("base64url"),
 			parameterDigest: createHash("sha256")
-				.update(createExecutorToolParameterPayload(parameters))
+				.update(createExecutorToolParameterPayload(parameters, executionContext))
 				.digest("hex"),
 			originInstanceId: authority.instanceId,
 			originGeneration: authority.generation,
 			targetRuntimeBoxId: target.peerId,
 			targetInstanceId: target.instanceId,
 			targetGeneration: target.generation,
-			executionScope: "request-cwd",
+			...executionContext,
 			expiresAt: new Date(Date.now() + 60_000).toISOString(),
 		},
 	};

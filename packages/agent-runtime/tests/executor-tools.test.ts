@@ -48,6 +48,7 @@ describe("executor tool proxies", () => {
 					sequence: 0,
 					content: [{ type: "text", text: "partial output" }],
 				});
+
 				return {
 					schemaVersion: 1,
 					invocationId: input.invocationId,
@@ -75,6 +76,51 @@ describe("executor tool proxies", () => {
 		expect(result).toEqual({
 			content: [{ type: "text", text: "complete output" }],
 			details: undefined,
+		});
+	});
+
+	test("forwards Project execution scope separately from cwd", async () => {
+		let observed:
+			| {
+					cwd: string;
+					executionContext: unknown;
+			  }
+			| undefined;
+		const read = requireTool(
+			createExecutorToolDefinitions({
+				gateway: {
+					async invoke(input, options) {
+						observed = { cwd: input.cwd, executionContext: options?.executionContext };
+						return {
+							schemaVersion: 1,
+							invocationId: input.invocationId,
+							tool: "read",
+							content: [{ type: "text", text: "ok" }],
+						};
+					},
+				},
+				cwd: "/projects/example",
+				executionContext: {
+					executionScope: "project-root",
+					projectPathRevision: 7,
+				},
+				getRunId: () => runId,
+			}),
+			"read",
+		);
+		await read.execute(
+			"read-project",
+			{ path: "README.md" },
+			undefined,
+			undefined,
+			extensionContext,
+		);
+		expect(observed).toEqual({
+			cwd: "/projects/example",
+			executionContext: {
+				executionScope: "project-root",
+				projectPathRevision: 7,
+			},
 		});
 	});
 

@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { defaultLocalRuntimeBoxId } from "@moshu/contracts";
+import { createHash } from "node:crypto";
+import { createExecutorToolParameterPayload, defaultLocalRuntimeBoxId } from "@moshu/contracts";
 import { createUuidV7, openAppDatabase } from "@moshu/database";
 import {
 	ActionPolicyDeniedError,
@@ -7,6 +8,108 @@ import {
 } from "./action-authorization-service";
 
 describe("DurableActionAuthorizationService", () => {
+	test("binds project-root scope and path revision into the grant digest", async () => {
+		const database = openAppDatabase(":memory:");
+		try {
+			const session = database.sessions.create({
+				title: "Project grant",
+			}).session;
+			const run = database.runs.create({
+				clientRequestId: crypto.randomUUID(),
+				sessionId: session.id,
+				mode: "agent",
+				provider: {
+					schemaVersion: 1,
+					providerId: createUuidV7(),
+					name: "Provider",
+					source: "custom",
+					api: "openai-responses",
+					model: "model",
+				},
+				userMessageId: createUuidV7(),
+				userContent: "run",
+				assistantMessageId: createUuidV7(),
+			}).run;
+			const invocation = {
+				schemaVersion: 1 as const,
+				invocationId: crypto.randomUUID(),
+				runId: run.id,
+				toolCallId: "project-tool-call",
+				cwd: "/workspace/project",
+				call: { tool: "read" as const, arguments: { path: "README.md" } },
+			};
+			const projectContext = {
+				projectId: createUuidV7(),
+				runtimeBoxId: defaultLocalRuntimeBoxId,
+				projectPath: invocation.cwd,
+				projectPathRevision: 7,
+			};
+			const service = new DurableActionAuthorizationService(
+				database.actions,
+				{ get: () => ({ ...run, projectContext }) },
+				{
+					role: "agents",
+					peerId: "agents",
+					instanceId: "agents-instance",
+					generation: 1,
+				},
+			);
+			const executionContext = {
+				executionScope: "project-root" as const,
+				projectPathRevision: 7,
+			};
+			const authorized = await service.authorize(
+				defaultLocalRuntimeBoxId,
+				invocation,
+				{
+					role: "runtime-box",
+					peerId: defaultLocalRuntimeBoxId,
+					instanceId: "runtime-instance",
+					generation: 1,
+				},
+				executionContext,
+			);
+			expect(authorized.authorization).toMatchObject(executionContext);
+			expect(authorized.authorization?.parameterDigest).toBe(
+				createHash("sha256")
+					.update(createExecutorToolParameterPayload(invocation, executionContext))
+					.digest("hex"),
+			);
+			const target = {
+				role: "runtime-box" as const,
+				peerId: defaultLocalRuntimeBoxId,
+				instanceId: "runtime-instance",
+				generation: 1,
+			};
+			await expect(
+				service.authorize(
+					defaultLocalRuntimeBoxId,
+					{ ...invocation, invocationId: crypto.randomUUID(), cwd: "/workspace/other" },
+					target,
+					executionContext,
+				),
+			).rejects.toThrow("persisted Project Run snapshot");
+			await expect(
+				service.authorize(
+					defaultLocalRuntimeBoxId,
+					{ ...invocation, invocationId: crypto.randomUUID() },
+					target,
+					{ executionScope: "project-root", projectPathRevision: 8 },
+				),
+			).rejects.toThrow("persisted Project Run snapshot");
+			await expect(
+				service.authorize(
+					defaultLocalRuntimeBoxId,
+					{ ...invocation, invocationId: crypto.randomUUID() },
+					target,
+					{ executionScope: "request-cwd" },
+				),
+			).rejects.toThrow("persisted Project Run snapshot");
+		} finally {
+			database.close();
+		}
+	});
+
 	test("binds and consumes a grant before dispatch, then reconciles old-generation evidence", async () => {
 		const database = openAppDatabase(":memory:");
 		try {
@@ -28,7 +131,7 @@ describe("DurableActionAuthorizationService", () => {
 				userContent: "run",
 				assistantMessageId: createUuidV7(),
 			}).run;
-			const service = new DurableActionAuthorizationService(database.actions, {
+			const service = new DurableActionAuthorizationService(database.actions, database.runs, {
 				role: "agents",
 				peerId: "agents",
 				instanceId: "agents-generation-five",
@@ -40,7 +143,10 @@ describe("DurableActionAuthorizationService", () => {
 				runId: run.id,
 				toolCallId: "tool-call",
 				cwd: "/workspace",
-				call: { tool: "write" as const, arguments: { path: "file.txt", content: "data" } },
+				call: {
+					tool: "write" as const,
+					arguments: { path: "file.txt", content: "data" },
+				},
 			};
 			const authorized = await service.authorize(
 				defaultLocalRuntimeBoxId,
@@ -51,7 +157,7 @@ describe("DurableActionAuthorizationService", () => {
 					instanceId: "runtime-instance",
 					generation: 3,
 				},
-				"request-cwd",
+				{ executionScope: "request-cwd" },
 			);
 			expect(authorized.authorization).toMatchObject({
 				originInstanceId: "agents-generation-five",
@@ -121,7 +227,7 @@ describe("DurableActionAuthorizationService", () => {
 					instanceId: "runtime-instance",
 					generation: 3,
 				},
-				"request-cwd",
+				{ executionScope: "request-cwd" },
 			);
 			service.cancelUndispatched(undispatchedAuthorized, "readiness changed");
 			expect(database.actions.get(undispatched.invocationId)).toMatchObject({
@@ -144,6 +250,7 @@ describe("DurableActionAuthorizationService", () => {
 		try {
 			const service = new DurableActionAuthorizationService(
 				database.actions,
+				database.runs,
 				{
 					role: "agents",
 					peerId: "agents",
@@ -169,7 +276,7 @@ describe("DurableActionAuthorizationService", () => {
 						instanceId: "runtime-instance",
 						generation: 1,
 					},
-					"request-cwd",
+					{ executionScope: "request-cwd" },
 				),
 			).rejects.toBeInstanceOf(ActionPolicyDeniedError);
 		} finally {
@@ -198,7 +305,7 @@ describe("DurableActionAuthorizationService", () => {
 				userContent: "run",
 				assistantMessageId: createUuidV7(),
 			}).run;
-			const service = new DurableActionAuthorizationService(database.actions, {
+			const service = new DurableActionAuthorizationService(database.actions, database.runs, {
 				role: "agents",
 				peerId: "agents",
 				instanceId: "agents-instance",

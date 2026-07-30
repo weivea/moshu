@@ -5,6 +5,7 @@ import type {
 	ProviderAuthAttempt,
 	ProviderAuthType,
 	ProviderSummary,
+	SessionListScope,
 	SessionModelSelection,
 	TestProviderInput,
 	UpdateProviderInput,
@@ -42,6 +43,7 @@ export interface ChatMessage {
 export interface ChatSession {
 	id: string;
 	runtimeBoxId: string;
+	projectId?: string;
 	title: string;
 	updatedAt: string;
 	archivedAt?: string;
@@ -58,6 +60,7 @@ export interface ChatSession {
 export interface ChatSessionSummary {
 	id: string;
 	runtimeBoxId: string;
+	projectId?: string;
 	title: string;
 	createdAt: string;
 	updatedAt: string;
@@ -69,6 +72,8 @@ export interface ListChatSessionsOptions {
 	query?: string;
 	archived?: boolean;
 	limit?: number;
+	runtimeBoxId?: string;
+	scope?: SessionListScope;
 }
 
 export interface ChatSendResult {
@@ -110,6 +115,14 @@ export type ChatTransportEvent =
 			messageId: string;
 			content: string;
 			message: string;
+			sequence?: number;
+	  }
+	| {
+			type: "run.warning";
+			sessionId: string;
+			requestId: string;
+			code: "ROOT_AGENTS_SKIPPED";
+			reason: "not_regular_file" | "permission_denied" | "too_large" | "invalid_utf8" | "unknown";
 			sequence?: number;
 	  };
 
@@ -155,7 +168,7 @@ export interface ChatTransport {
 		sessionId: string,
 		selection: SessionModelSelection | null,
 	): Promise<SessionModelSelection | undefined>;
-	createSession(model?: SessionModelSelection): Promise<ChatSession>;
+	createSession(model?: SessionModelSelection, projectId?: string): Promise<ChatSession>;
 	getSession(sessionId: string): Promise<ChatSession>;
 	listSessions(input?: ListChatSessionsOptions): Promise<ChatSessionSummary[]>;
 	renameSession(sessionId: string, title: string): Promise<ChatSessionSummary>;

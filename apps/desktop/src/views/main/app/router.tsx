@@ -5,15 +5,18 @@ import {
 	ChatsPage,
 	DefaultModelSettingsRoutePage,
 	GeneralSettingsRoutePage,
+	McpServersSettingsRoutePage,
 	NewChatPage,
 	PlaceholderPage,
+	ProjectChatSessionPage,
+	ProjectDetailRoutePage,
+	ProjectNewChatPage,
+	ProjectSettingsRoutePage,
+	ProjectsRoutePage,
 	ProviderSettingsRoutePage,
 	RuntimeBoxesSettingsRoutePage,
-	McpServersSettingsRoutePage,
-	SkillsSettingsRoutePage,
-	ProjectDetailRoutePage,
-	ProjectsRoutePage,
 	SettingsPlaceholderPage,
+	SkillsSettingsRoutePage,
 } from "./pages";
 import { SettingsLayout } from "./settings/settings-layout";
 import { AppShell } from "./shell";
@@ -42,12 +45,16 @@ export const router = createHashRouter([
 				element: <ProjectDetailRoutePage />,
 			},
 			{
+				path: "projects/:projectId/settings",
+				element: <ProjectSettingsRoutePage />,
+			},
+			{
 				path: "projects/:projectId/chat/new",
-				element: <PlaceholderPage titleKey="page.projectChat.title" icon="chat" />,
+				element: <ProjectNewChatPage />,
 			},
 			{
 				path: "projects/:projectId/chat/:sessionId",
-				element: <PlaceholderPage titleKey="page.projectChat.title" icon="chat" />,
+				element: <ProjectChatSessionPage />,
 			},
 			{
 				path: "tasks",

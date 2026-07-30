@@ -24,6 +24,47 @@ import {
 	uuidV7Schema,
 } from "./chat";
 import {
+	acknowledgeRuntimeBoxInvocationsInputSchema,
+	acknowledgeRuntimeBoxInvocationsOutputSchema,
+	reconcileRuntimeBoxInvocationsInputSchema,
+	reconcileRuntimeBoxInvocationsOutputSchema,
+	runtimeBoxMcpToolInvokeInputSchema,
+	runtimeBoxMcpToolInvokeOutputSchema,
+	runtimeBoxToolInvokeInputSchema,
+	runtimeBoxToolInvokeOutputSchema,
+	runtimeBoxToolProgressEventSchema,
+} from "./executor-tools";
+import {
+	checkProjectPathInputSchema,
+	checkProjectPathOutputSchema,
+	confirmCreateProjectInputSchema,
+	confirmCreateProjectOutputSchema,
+	getProjectDeleteConfirmationInputSchema,
+	getProjectDeleteConfirmationOutputSchema,
+	getProjectInputSchema,
+	getProjectOutputSchema,
+	getProjectSidebarInputSchema,
+	getProjectSidebarOutputSchema,
+	listProjectsInputSchema,
+	listProjectsOutputSchema,
+	previewProjectPathInputSchema,
+	previewProjectPathOutputSchema,
+	previewProjectRelinkInputSchema,
+	previewProjectRelinkOutputSchema,
+	readRuntimeBoxProjectRootAgentsInputSchema,
+	readRuntimeBoxProjectRootAgentsOutputSchema,
+	relinkProjectInputSchema,
+	relinkProjectOutputSchema,
+	requestProjectDeletionInputSchema,
+	requestProjectDeletionOutputSchema,
+	setProjectArchivedInputSchema,
+	setProjectArchivedOutputSchema,
+	updateProjectInputSchema,
+	updateProjectOutputSchema,
+	validateRuntimeBoxProjectPathInputSchema,
+	validateRuntimeBoxProjectPathOutputSchema,
+} from "./project";
+import {
 	createProviderInputSchema,
 	deleteProviderInputSchema,
 	deleteProviderOutputSchema,
@@ -49,70 +90,42 @@ import {
 	respondProviderAuthInputSchema,
 	startProviderAuthInputSchema,
 } from "./provider-auth";
-import {
-	createProjectInputSchema,
-	createProjectOutputSchema,
-	deleteProjectInputSchema,
-	deleteProjectOutputSchema,
-	getProjectInputSchema,
-	getProjectOutputSchema,
-	listProjectsInputSchema,
-	listProjectsOutputSchema,
-	setProjectArchivedInputSchema,
-	setProjectArchivedOutputSchema,
-	updateProjectInputSchema,
-	updateProjectOutputSchema,
-	validateRuntimeBoxProjectPathInputSchema,
-	validateRuntimeBoxProjectPathOutputSchema,
-} from "./project";
 import { agentsRuntimeInfoSchema, emptyParamsSchema } from "./runtime";
-import {
-	runtimeBoxToolInvokeInputSchema,
-	runtimeBoxToolInvokeOutputSchema,
-	runtimeBoxMcpToolInvokeInputSchema,
-	runtimeBoxMcpToolInvokeOutputSchema,
-	runtimeBoxToolProgressEventSchema,
-	acknowledgeRuntimeBoxInvocationsInputSchema,
-	acknowledgeRuntimeBoxInvocationsOutputSchema,
-	reconcileRuntimeBoxInvocationsInputSchema,
-	reconcileRuntimeBoxInvocationsOutputSchema,
-} from "./executor-tools";
 import {
 	approveRuntimeBoxPairingInputSchema,
 	approveRuntimeBoxPairingOutputSchema,
 	createRuntimeBoxPairingOutputSchema,
-	listRuntimeBoxPairingClaimsOutputSchema,
+	currentRuntimeBoxProtocolVersion,
 	listRuntimeBoxesOutputSchema,
+	listRuntimeBoxPairingClaimsOutputSchema,
 	rejectRuntimeBoxPairingInputSchema,
 	rejectRuntimeBoxPairingOutputSchema,
-	revokeRuntimeBoxDeviceInputSchema,
-	revokeRuntimeBoxDeviceOutputSchema,
 	remoteAccessAuthAttemptInputSchema,
 	remoteAccessAuthAttemptSchema,
 	remoteAccessMutationOutputSchema,
 	remoteAccessStatusOutputSchema,
-	runtimeDiagnosticsOutputSchema,
+	revokeRuntimeBoxDeviceInputSchema,
+	revokeRuntimeBoxDeviceOutputSchema,
 	runtimeBoxDescriptorSchema,
 	runtimeBoxIdSchema,
-	currentRuntimeBoxProtocolVersion,
 	runtimeBoxTransportSecuritySchema,
+	runtimeDiagnosticsOutputSchema,
 	switchRuntimeBoxInputSchema,
 	switchRuntimeBoxOutputSchema,
 } from "./runtime-box";
 import {
+	deleteMcpServerInputSchema,
 	deleteRuntimeBoxMcpServerInputSchema,
 	deleteRuntimeBoxSkillInputSchema,
 	deleteSkillInputSchema,
+	getAgentGlobalProfileInputSchema,
+	getAgentGlobalProfileOutputSchema,
 	getRuntimeBoxInventoryChangesInputSchema,
 	getRuntimeBoxSkillContentInputSchema,
 	getRuntimeBoxSkillContentOutputSchema,
 	getRuntimeProfileInputSchema,
 	getRuntimeProfileOutputSchema,
-	getAgentGlobalProfileInputSchema,
-	getAgentGlobalProfileOutputSchema,
 	installRuntimeBoxSkillInputSchema,
-	listSkillsInputSchema,
-	listSkillsOutputSchema,
 	listMcpServersInputSchema,
 	listMcpServersOutputSchema,
 	listRuntimeBoxInventoryInputSchema,
@@ -122,24 +135,25 @@ import {
 	listRuntimeBoxMcpServersOutputSchema,
 	listRuntimeBoxSkillsInputSchema,
 	listRuntimeBoxSkillsOutputSchema,
+	listSkillsInputSchema,
+	listSkillsOutputSchema,
+	mcpServerMutationResultSchema,
 	runtimeBoxInventoryChangedHintSchema,
 	runtimeBoxInventoryChangesPageSchema,
 	runtimeBoxInventorySnapshotSchema,
 	runtimeBoxResourceMutationResultSchema,
-	mcpServerMutationResultSchema,
-	skillMutationResultSchema,
+	setMcpServerEnabledInputSchema,
 	setRuntimeBoxMcpServerEnabledInputSchema,
 	setRuntimeBoxSkillEnabledInputSchema,
-	setMcpServerEnabledInputSchema,
 	setSkillEnabledInputSchema,
-	updateRuntimeProfileInputSchema,
-	updateRuntimeProfileOutputSchema,
+	skillMutationResultSchema,
 	updateAgentGlobalProfileInputSchema,
 	updateAgentGlobalProfileOutputSchema,
-	upsertRuntimeBoxMcpServerInputSchema,
+	updateRuntimeProfileInputSchema,
+	updateRuntimeProfileOutputSchema,
 	upsertMcpServerInputSchema,
+	upsertRuntimeBoxMcpServerInputSchema,
 	upsertSkillInputSchema,
-	deleteMcpServerInputSchema,
 	validateRuntimeBoxResourcesInputSchema,
 	validateRuntimeBoxResourcesOutputSchema,
 } from "./runtime-resources";
@@ -160,12 +174,20 @@ export const productRpcMethods = {
 	remoteAccessDisable: "moshu.v1.remoteAccess.disable",
 	remoteAccessRecreate: "moshu.v1.remoteAccess.recreate",
 	runtimeDiagnosticsGet: "moshu.v1.runtimeDiagnostics.get",
+	projectsPreviewPath: "moshu.v1.projects.previewPath",
 	projectsCreate: "moshu.v1.projects.create",
 	projectsList: "moshu.v1.projects.list",
 	projectsGet: "moshu.v1.projects.get",
+	projectsCheckPath: "moshu.v1.projects.checkPath",
+	projectsUpdateName: "moshu.v1.projects.updateName",
 	projectsUpdate: "moshu.v1.projects.update",
+	projectsPreviewRelink: "moshu.v1.projects.previewRelink",
+	projectsRelink: "moshu.v1.projects.relink",
+	projectsSetArchived: "moshu.v1.projects.setArchived",
 	projectsArchive: "moshu.v1.projects.archive",
+	projectsGetDeleteConfirmation: "moshu.v1.projects.getDeleteConfirmation",
 	projectsDelete: "moshu.v1.projects.delete",
+	projectsGetSidebar: "moshu.v1.projects.getSidebar",
 	runtimeInventoryList: "moshu.v1.runtimeInventory.list",
 	mcpServersList: "moshu.v1.mcpServers.list",
 	mcpServersUpsert: "moshu.v1.mcpServers.upsert",
@@ -211,11 +233,13 @@ export const productRpcMethods = {
 	chatSend: "moshu.v1.chat.send",
 	chatCancel: "moshu.v1.chat.cancel",
 	chatReplay: "moshu.v1.chat.replay",
+	chatRetiredSessionsList: "moshu.v1.chat.retiredSessions.list",
 	runtimeBoxRegister: "moshu.v1.runtimeBox.register",
 	runtimeBoxReady: "moshu.v1.runtimeBox.ready",
 	runtimeBoxToolInvoke: "moshu.v1.runtimeBox.tool.invoke",
 	runtimeBoxMcpToolInvoke: "moshu.v1.runtimeBox.mcpTool.invoke",
 	runtimeBoxProjectValidatePath: "moshu.v1.runtimeBox.projects.validatePath",
+	runtimeBoxProjectReadRootAgents: "moshu.v1.runtimeBox.projects.readRootAgents",
 	runtimeBoxInvocationsReconcile: "moshu.v1.runtimeBox.invocations.reconcile",
 	runtimeBoxInvocationsAck: "moshu.v1.runtimeBox.invocations.ack",
 	runtimeBoxInventoryGetSnapshot: "moshu.v1.runtimeBox.inventory.getSnapshot",
@@ -241,6 +265,7 @@ export const remoteAccessMutationMethods = [
 
 export const productRpcEvents = {
 	chatEvent: "moshu.v1.chat.event",
+	chatSessionsRetired: "moshu.v1.chat.sessions.retired",
 	runtimeBoxesChanged: "moshu.v1.runtimeBoxes.changed",
 	runtimeBoxToolProgress: "moshu.v1.runtimeBox.tool.progress",
 	runtimeBoxInventoryChanged: "moshu.v1.runtimeBox.inventory.changed",
@@ -252,6 +277,8 @@ export const maxReplayRunCursors = 1;
 export const maxReplayEventsPerPage = 256;
 export const maxReplayEventBytesPerPage = 2 * 1024 * 1024;
 export const maxSessionRunsPerPage = 2;
+export const maxRetiredSessionsPerEvent = 100;
+export const maxRetiredSessionsPerRecoveryPage = 100;
 export const retiredSessionTombstoneTtlMs = 30 * 24 * 60 * 60 * 1_000;
 export const maxRetainedSessionRetirements = 256;
 export const productRpcInternalHandlerErrorCode = "INTERNAL_HANDLER_ERROR";
@@ -300,6 +327,54 @@ export const chatEventDeliverySchema = z
 		event: chatRunEventSchema,
 	})
 	.strict();
+
+export const chatSessionsRetiredEventSchema = z
+	.object({
+		schemaVersion: z.literal(1),
+		sessionIds: z
+			.array(uuidV7Schema)
+			.min(1)
+			.max(maxRetiredSessionsPerEvent)
+			.refine((sessionIds) => new Set(sessionIds).size === sessionIds.length, {
+				message: "Retired Session IDs must be unique.",
+			}),
+	})
+	.strict();
+
+export const listRetiredChatSessionsInputSchema = z
+	.object({
+		schemaVersion: z.literal(1),
+		cursor: uuidV7Schema.optional(),
+		limit: z.int().min(1).max(maxRetiredSessionsPerRecoveryPage),
+	})
+	.strict();
+
+export const listRetiredChatSessionsOutputSchema = z
+	.object({
+		schemaVersion: z.literal(1),
+		sessionIds: z.array(uuidV7Schema).max(maxRetiredSessionsPerRecoveryPage),
+		nextCursor: uuidV7Schema.optional(),
+	})
+	.strict()
+	.superRefine((value, context) => {
+		for (let index = 1; index < value.sessionIds.length; index += 1) {
+			if ((value.sessionIds[index - 1] ?? "") >= (value.sessionIds[index] ?? "")) {
+				context.addIssue({
+					code: "custom",
+					path: ["sessionIds", index],
+					message: "Retired Session IDs must be unique and strictly ordered.",
+				});
+				break;
+			}
+		}
+		if (value.nextCursor !== undefined && value.nextCursor !== value.sessionIds.at(-1)) {
+			context.addIssue({
+				code: "custom",
+				path: ["nextCursor"],
+				message: "The retirement cursor must match the final Session ID.",
+			});
+		}
+	});
 
 export const replayRunCursorSchema = chatRunEventCursorSchema.extend({
 	sessionId: uuidV7Schema,
@@ -407,9 +482,13 @@ export const productRpcRequestSchemas = {
 		input: emptyParamsSchema,
 		output: runtimeDiagnosticsOutputSchema,
 	},
+	[productRpcMethods.projectsPreviewPath]: {
+		input: previewProjectPathInputSchema,
+		output: previewProjectPathOutputSchema,
+	},
 	[productRpcMethods.projectsCreate]: {
-		input: createProjectInputSchema,
-		output: createProjectOutputSchema,
+		input: confirmCreateProjectInputSchema,
+		output: confirmCreateProjectOutputSchema,
 	},
 	[productRpcMethods.projectsList]: {
 		input: listProjectsInputSchema,
@@ -419,17 +498,45 @@ export const productRpcRequestSchemas = {
 		input: getProjectInputSchema,
 		output: getProjectOutputSchema,
 	},
+	[productRpcMethods.projectsCheckPath]: {
+		input: checkProjectPathInputSchema,
+		output: checkProjectPathOutputSchema,
+	},
+	[productRpcMethods.projectsUpdateName]: {
+		input: updateProjectInputSchema,
+		output: updateProjectOutputSchema,
+	},
 	[productRpcMethods.projectsUpdate]: {
 		input: updateProjectInputSchema,
 		output: updateProjectOutputSchema,
+	},
+	[productRpcMethods.projectsPreviewRelink]: {
+		input: previewProjectRelinkInputSchema,
+		output: previewProjectRelinkOutputSchema,
+	},
+	[productRpcMethods.projectsRelink]: {
+		input: relinkProjectInputSchema,
+		output: relinkProjectOutputSchema,
+	},
+	[productRpcMethods.projectsSetArchived]: {
+		input: setProjectArchivedInputSchema,
+		output: setProjectArchivedOutputSchema,
 	},
 	[productRpcMethods.projectsArchive]: {
 		input: setProjectArchivedInputSchema,
 		output: setProjectArchivedOutputSchema,
 	},
+	[productRpcMethods.projectsGetDeleteConfirmation]: {
+		input: getProjectDeleteConfirmationInputSchema,
+		output: getProjectDeleteConfirmationOutputSchema,
+	},
 	[productRpcMethods.projectsDelete]: {
-		input: deleteProjectInputSchema,
-		output: deleteProjectOutputSchema,
+		input: requestProjectDeletionInputSchema,
+		output: requestProjectDeletionOutputSchema,
+	},
+	[productRpcMethods.projectsGetSidebar]: {
+		input: getProjectSidebarInputSchema,
+		output: getProjectSidebarOutputSchema,
 	},
 	[productRpcMethods.runtimeInventoryList]: {
 		input: listRuntimeBoxInventoryInputSchema,
@@ -611,6 +718,10 @@ export const productRpcRequestSchemas = {
 		input: replayChatEventsInputSchema,
 		output: replayChatEventsOutputSchema,
 	},
+	[productRpcMethods.chatRetiredSessionsList]: {
+		input: listRetiredChatSessionsInputSchema,
+		output: listRetiredChatSessionsOutputSchema,
+	},
 	[productRpcMethods.runtimeBoxRegister]: {
 		input: runtimeBoxRegisterInputSchema,
 		output: runtimeBoxRegisterOutputSchema,
@@ -630,6 +741,10 @@ export const productRpcRequestSchemas = {
 	[productRpcMethods.runtimeBoxProjectValidatePath]: {
 		input: validateRuntimeBoxProjectPathInputSchema,
 		output: validateRuntimeBoxProjectPathOutputSchema,
+	},
+	[productRpcMethods.runtimeBoxProjectReadRootAgents]: {
+		input: readRuntimeBoxProjectRootAgentsInputSchema,
+		output: readRuntimeBoxProjectRootAgentsOutputSchema,
 	},
 	[productRpcMethods.runtimeBoxInvocationsReconcile]: {
 		input: reconcileRuntimeBoxInvocationsInputSchema,
@@ -712,12 +827,20 @@ export const clientProductRequestMethods = [
 	productRpcMethods.remoteAccessDisable,
 	productRpcMethods.remoteAccessRecreate,
 	productRpcMethods.runtimeDiagnosticsGet,
+	productRpcMethods.projectsPreviewPath,
 	productRpcMethods.projectsCreate,
 	productRpcMethods.projectsList,
 	productRpcMethods.projectsGet,
+	productRpcMethods.projectsCheckPath,
+	productRpcMethods.projectsUpdateName,
 	productRpcMethods.projectsUpdate,
+	productRpcMethods.projectsPreviewRelink,
+	productRpcMethods.projectsRelink,
+	productRpcMethods.projectsSetArchived,
 	productRpcMethods.projectsArchive,
+	productRpcMethods.projectsGetDeleteConfirmation,
 	productRpcMethods.projectsDelete,
+	productRpcMethods.projectsGetSidebar,
 	productRpcMethods.runtimeInventoryList,
 	productRpcMethods.mcpServersList,
 	productRpcMethods.mcpServersUpsert,
@@ -763,6 +886,7 @@ export const clientProductRequestMethods = [
 	productRpcMethods.chatSend,
 	productRpcMethods.chatCancel,
 	productRpcMethods.chatReplay,
+	productRpcMethods.chatRetiredSessionsList,
 ] as const;
 
 export const runtimeBoxProductRequestMethods = [
@@ -772,12 +896,14 @@ export const runtimeBoxProductRequestMethods = [
 ] as const;
 export const agentsProductEventMethods = [
 	productRpcEvents.chatEvent,
+	productRpcEvents.chatSessionsRetired,
 	productRpcEvents.runtimeBoxesChanged,
 ] as const;
 export const agentsRuntimeBoxRequestMethods = [
 	productRpcMethods.runtimeBoxToolInvoke,
 	productRpcMethods.runtimeBoxMcpToolInvoke,
 	productRpcMethods.runtimeBoxProjectValidatePath,
+	productRpcMethods.runtimeBoxProjectReadRootAgents,
 	productRpcMethods.runtimeBoxInvocationsAck,
 	productRpcMethods.runtimeBoxInventoryGetSnapshot,
 	productRpcMethods.runtimeBoxInventoryGetChanges,
@@ -805,5 +931,7 @@ export type ChatEventDelivery = z.infer<typeof chatEventDeliverySchema>;
 export type ReplayChatEventsInput = z.infer<typeof replayChatEventsInputSchema>;
 export type ReplayChatEventsOutput = z.infer<typeof replayChatEventsOutputSchema>;
 export type ReplayCursorSupport = z.infer<typeof replayCursorSupportSchema>;
+export type ListRetiredChatSessionsInput = z.infer<typeof listRetiredChatSessionsInputSchema>;
+export type ListRetiredChatSessionsOutput = z.infer<typeof listRetiredChatSessionsOutputSchema>;
 export type GetChatSessionPageInput = z.infer<typeof getChatSessionPageInputSchema>;
 export type GetChatSessionPageOutput = z.infer<typeof getChatSessionPageOutputSchema>;

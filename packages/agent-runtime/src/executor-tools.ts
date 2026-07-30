@@ -14,6 +14,7 @@ import {
 	type ExecutorToolInvokeInput,
 	type ExecutorToolInvokeOutput,
 	type ExecutorToolProgressEvent,
+	type ExecutorExecutionContext,
 } from "@moshu/contracts";
 
 export interface ExecutorToolGateway {
@@ -22,6 +23,7 @@ export interface ExecutorToolGateway {
 		options?: {
 			signal?: AbortSignal;
 			onProgress?: (event: ExecutorToolProgressEvent) => void;
+			executionContext?: ExecutorExecutionContext;
 		},
 	): Promise<ExecutorToolInvokeOutput>;
 }
@@ -33,6 +35,7 @@ export interface RuntimeBoxToolGateway {
 		options?: {
 			signal?: AbortSignal;
 			onProgress?: (event: ExecutorToolProgressEvent) => void;
+			executionContext?: ExecutorExecutionContext;
 		},
 	): Promise<ExecutorToolInvokeOutput>;
 }
@@ -40,6 +43,7 @@ export interface RuntimeBoxToolGateway {
 export interface ExecutorToolDefinitionOptions {
 	gateway: ExecutorToolGateway;
 	cwd: string;
+	executionContext?: ExecutorExecutionContext;
 	getRunId: () => string | undefined;
 }
 
@@ -150,6 +154,9 @@ export function createExecutorToolDefinitions(
 		});
 		return options.gateway.invoke(input, {
 			...(signal ? { signal } : {}),
+			...(options.executionContext === undefined
+				? {}
+				: { executionContext: options.executionContext }),
 			...(onUpdate
 				? {
 						onProgress: (event: ExecutorToolProgressEvent) => {

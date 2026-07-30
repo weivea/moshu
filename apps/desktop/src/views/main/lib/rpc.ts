@@ -1,126 +1,139 @@
 import {
+	type ApproveRuntimeBoxPairingInput,
+	approveRuntimeBoxPairingInputSchema,
+	approveRuntimeBoxPairingOutputSchema,
 	type ChatRunEvent,
+	type ConfirmCreateProjectInput,
 	type CreateProviderInput,
 	cancelChatRunOutputSchema,
 	chatRunEventSchema,
 	chatSendAcceptedOutputSchema,
+	checkProjectPathInputSchema,
+	checkProjectPathOutputSchema,
+	confirmCreateProjectInputSchema,
+	confirmCreateProjectOutputSchema,
 	createChatSessionOutputSchema,
 	createProviderInputSchema,
+	createRuntimeBoxPairingOutputSchema,
+	type DeleteRuntimeBoxMcpServerInput,
+	type DeleteRuntimeBoxSkillInput,
 	deleteChatSessionInputSchema,
 	deleteChatSessionOutputSchema,
+	deleteMcpServerInputSchema,
 	deleteProviderInputSchema,
 	deleteProviderOutputSchema,
+	deleteRuntimeBoxMcpServerInputSchema,
+	deleteRuntimeBoxSkillInputSchema,
+	deleteSkillInputSchema,
 	emptyParamsSchema,
 	fetchProviderModelsInputSchema,
 	fetchProviderModelsOutputSchema,
+	getAgentGlobalProfileInputSchema,
+	getAgentGlobalProfileOutputSchema,
 	getChatSessionInputSchema,
 	getChatSessionSnapshotOutputSchema,
 	getDefaultModelOutputSchema,
-	type ApproveRuntimeBoxPairingInput,
-	approveRuntimeBoxPairingInputSchema,
-	approveRuntimeBoxPairingOutputSchema,
-	createRuntimeBoxPairingOutputSchema,
-	listRuntimeBoxPairingClaimsOutputSchema,
-	listRuntimeBoxesOutputSchema,
-	type RejectRuntimeBoxPairingInput,
-	rejectRuntimeBoxPairingInputSchema,
-	rejectRuntimeBoxPairingOutputSchema,
-	remoteAccessAuthAttemptInputSchema,
-	remoteAccessAuthAttemptSchema,
-	remoteAccessMutationOutputSchema,
-	runtimeDiagnosticsOutputSchema,
-	remoteAccessStatusOutputSchema,
-	type CreateProjectInput,
-	createProjectInputSchema,
-	createProjectOutputSchema,
-	type ListProjectsInput,
-	listProjectsInputSchema,
-	listProjectsOutputSchema,
+	getProjectDeleteConfirmationInputSchema,
+	getProjectDeleteConfirmationOutputSchema,
 	getProjectInputSchema,
 	getProjectOutputSchema,
-	type UpdateProjectInput,
-	updateProjectInputSchema,
-	updateProjectOutputSchema,
-	type SetProjectArchivedInput,
-	setProjectArchivedInputSchema,
-	setProjectArchivedOutputSchema,
-	deleteProjectInputSchema,
-	deleteProjectOutputSchema,
-	type UpsertRuntimeBoxMcpServerInput,
-	type SetRuntimeBoxMcpServerEnabledInput,
-	type DeleteRuntimeBoxMcpServerInput,
-	type InstallRuntimeBoxSkillInput,
-	type DeleteRuntimeBoxSkillInput,
-	type UpdateRuntimeProfileInput,
-	listRuntimeBoxInventoryInputSchema,
-	listRuntimeBoxInventoryOutputSchema,
-	listRuntimeBoxMcpServersInputSchema,
-	listRuntimeBoxMcpServerSummariesOutputSchema,
-	setRuntimeBoxMcpServerEnabledInputSchema,
-	upsertRuntimeBoxMcpServerInputSchema,
-	deleteRuntimeBoxMcpServerInputSchema,
-	runtimeBoxResourceMutationResultSchema,
-	listMcpServersInputSchema,
-	listMcpServersOutputSchema,
-	upsertMcpServerInputSchema,
-	setMcpServerEnabledInputSchema,
-	deleteMcpServerInputSchema,
-	mcpServerMutationResultSchema,
-	getAgentGlobalProfileInputSchema,
-	getAgentGlobalProfileOutputSchema,
-	updateAgentGlobalProfileInputSchema,
-	listRuntimeBoxSkillsInputSchema,
-	listRuntimeBoxSkillsOutputSchema,
-	installRuntimeBoxSkillInputSchema,
-	deleteRuntimeBoxSkillInputSchema,
-	listSkillsInputSchema,
-	listSkillsOutputSchema,
-	upsertSkillInputSchema,
-	setSkillEnabledInputSchema,
-	deleteSkillInputSchema,
-	skillMutationResultSchema,
+	getProjectSidebarInputSchema,
+	getProjectSidebarOutputSchema,
 	getRuntimeProfileInputSchema,
 	getRuntimeProfileOutputSchema,
-	updateRuntimeProfileInputSchema,
-	type RevokeRuntimeBoxDeviceInput,
-	revokeRuntimeBoxDeviceInputSchema,
-	revokeRuntimeBoxDeviceOutputSchema,
-	type SwitchRuntimeBoxInput,
-	switchRuntimeBoxInputSchema,
-	switchRuntimeBoxOutputSchema,
+	type InstallRuntimeBoxSkillInput,
+	installRuntimeBoxSkillInputSchema,
+	type ListProjectsInput,
 	listAvailableModelsOutputSchema,
 	listChatSessionsInputSchema,
 	listChatSessionsOutputSchema,
+	listMcpServersInputSchema,
+	listMcpServersOutputSchema,
+	listProjectsInputSchema,
+	listProjectsOutputSchema,
 	listProvidersOutputSchema,
+	listRuntimeBoxesOutputSchema,
+	listRuntimeBoxInventoryInputSchema,
+	listRuntimeBoxInventoryOutputSchema,
+	listRuntimeBoxMcpServerSummariesOutputSchema,
+	listRuntimeBoxMcpServersInputSchema,
+	listRuntimeBoxPairingClaimsOutputSchema,
+	listRuntimeBoxSkillsInputSchema,
+	listRuntimeBoxSkillsOutputSchema,
+	listSkillsInputSchema,
+	listSkillsOutputSchema,
 	logoutProviderInputSchema,
 	logoutProviderOutputSchema,
-	providerMutationOutputSchema,
+	mcpServerMutationResultSchema,
+	previewProjectPathInputSchema,
+	previewProjectPathOutputSchema,
+	previewProjectRelinkInputSchema,
+	previewProjectRelinkOutputSchema,
 	providerAuthAttemptInputSchema,
 	providerAuthAttemptOutputSchema,
-	respondProviderAuthInputSchema,
-	runtimeInfoSchema,
-	startProviderAuthInputSchema,
-	type StartProviderAuthInput,
+	providerMutationOutputSchema,
+	type RejectRuntimeBoxPairingInput,
 	type RespondProviderAuthInput,
+	type RevokeRuntimeBoxDeviceInput,
+	rejectRuntimeBoxPairingInputSchema,
+	rejectRuntimeBoxPairingOutputSchema,
+	relinkProjectInputSchema,
+	relinkProjectOutputSchema,
+	remoteAccessAuthAttemptInputSchema,
+	remoteAccessAuthAttemptSchema,
+	remoteAccessMutationOutputSchema,
+	remoteAccessStatusOutputSchema,
+	requestProjectDeletionInputSchema,
+	requestProjectDeletionOutputSchema,
+	respondProviderAuthInputSchema,
+	revokeRuntimeBoxDeviceInputSchema,
+	revokeRuntimeBoxDeviceOutputSchema,
+	runtimeBoxResourceMutationResultSchema,
+	runtimeDiagnosticsOutputSchema,
+	runtimeInfoSchema,
+	type SessionListScope,
 	type SessionModelSelection,
 	type SetChatSessionModelInput,
 	type SetDefaultModelInput,
+	type SetProjectArchivedInput,
 	type SetProviderModelsEnabledInput,
+	type SetRuntimeBoxMcpServerEnabledInput,
+	type StartProviderAuthInput,
+	type SwitchRuntimeBoxInput,
 	setChatSessionArchivedInputSchema,
 	setChatSessionArchivedOutputSchema,
 	setChatSessionModelInputSchema,
 	setChatSessionModelOutputSchema,
 	setDefaultModelInputSchema,
 	setDefaultModelOutputSchema,
+	setMcpServerEnabledInputSchema,
+	setProjectArchivedInputSchema,
+	setProjectArchivedOutputSchema,
 	setProviderModelsEnabledInputSchema,
 	setProviderModelsEnabledOutputSchema,
+	setRuntimeBoxMcpServerEnabledInputSchema,
+	setSkillEnabledInputSchema,
+	skillMutationResultSchema,
+	startProviderAuthInputSchema,
+	switchRuntimeBoxInputSchema,
+	switchRuntimeBoxOutputSchema,
 	type TestProviderInput,
 	testProviderInputSchema,
 	testProviderOutputSchema,
+	type UpdateProjectInput,
 	type UpdateProviderInput,
+	type UpdateRuntimeProfileInput,
+	type UpsertRuntimeBoxMcpServerInput,
+	updateAgentGlobalProfileInputSchema,
 	updateChatSessionInputSchema,
 	updateChatSessionOutputSchema,
+	updateProjectInputSchema,
+	updateProjectOutputSchema,
 	updateProviderInputSchema,
+	updateRuntimeProfileInputSchema,
+	upsertMcpServerInputSchema,
+	upsertRuntimeBoxMcpServerInputSchema,
+	upsertSkillInputSchema,
 	uuidV7Schema,
 } from "@moshu/contracts";
 import Electrobun, { Electroview } from "electrobun/view";
@@ -131,6 +144,7 @@ import {
 	type DesktopRpc,
 	openExternalUrlInputSchema,
 	openExternalUrlOutputSchema,
+	pickProjectDirectoryOutputSchema,
 } from "../../../shared/rpc";
 import { normalizeDesktopRpcError } from "../../../shared/rpc-errors";
 import { ChatSessionInvalidationBridge } from "./session-invalidation-bridge";
@@ -282,10 +296,21 @@ export const desktopClient = {
 			await requestDesktop(() => getRequest().getRuntimeDiagnostics({})),
 		);
 	},
-	async createProject(input: CreateProjectInput) {
-		const parsedInput = createProjectInputSchema.parse(input);
-		return createProjectOutputSchema.parse(
-			await requestDesktop(() => getRequest().createProject(parsedInput)),
+	async pickProjectDirectory() {
+		return pickProjectDirectoryOutputSchema.parse(
+			await requestDesktop(() => getRequest().pickProjectDirectory({})),
+		);
+	},
+	async previewProjectPath(input: Parameters<typeof previewProjectPathInputSchema.parse>[0]) {
+		const parsedInput = previewProjectPathInputSchema.parse(input);
+		return previewProjectPathOutputSchema.parse(
+			await requestDesktop(() => getRequest().previewProjectPath(parsedInput)),
+		);
+	},
+	async confirmCreateProject(input: ConfirmCreateProjectInput) {
+		const parsedInput = confirmCreateProjectInputSchema.parse(input);
+		return confirmCreateProjectOutputSchema.parse(
+			await requestDesktop(() => getRequest().confirmCreateProject(parsedInput)),
 		);
 	},
 	async listProjects(input: ListProjectsInput = {}) {
@@ -297,6 +322,12 @@ export const desktopClient = {
 	async getProject(projectId: string) {
 		const input = getProjectInputSchema.parse({ projectId });
 		return getProjectOutputSchema.parse(await requestDesktop(() => getRequest().getProject(input)));
+	},
+	async checkProjectPath(projectId: string) {
+		const input = checkProjectPathInputSchema.parse({ projectId });
+		return checkProjectPathOutputSchema.parse(
+			await requestDesktop(() => getRequest().checkProjectPath(input)),
+		);
 	},
 	async updateProject(input: UpdateProjectInput) {
 		const parsedInput = updateProjectInputSchema.parse(input);
@@ -310,10 +341,38 @@ export const desktopClient = {
 			await requestDesktop(() => getRequest().setProjectArchived(parsedInput)),
 		);
 	},
-	async deleteProject(projectId: string) {
-		const input = deleteProjectInputSchema.parse({ projectId });
-		return deleteProjectOutputSchema.parse(
-			await requestDesktop(() => getRequest().deleteProject(input)),
+	async previewProjectRelink(input: Parameters<typeof previewProjectRelinkInputSchema.parse>[0]) {
+		const parsedInput = previewProjectRelinkInputSchema.parse(input);
+		return previewProjectRelinkOutputSchema.parse(
+			await requestDesktop(() => getRequest().previewProjectRelink(parsedInput)),
+		);
+	},
+	async relinkProject(input: Parameters<typeof relinkProjectInputSchema.parse>[0]) {
+		const parsedInput = relinkProjectInputSchema.parse(input);
+		return relinkProjectOutputSchema.parse(
+			await requestDesktop(() => getRequest().relinkProject(parsedInput)),
+		);
+	},
+	async getProjectDeleteConfirmation(projectId: string) {
+		const input = getProjectDeleteConfirmationInputSchema.parse({ projectId });
+		return getProjectDeleteConfirmationOutputSchema.parse(
+			await requestDesktop(() => getRequest().getProjectDeleteConfirmation(input)),
+		);
+	},
+	async requestProjectDeletion(
+		input: Parameters<typeof requestProjectDeletionInputSchema.parse>[0],
+	) {
+		const parsedInput = requestProjectDeletionInputSchema.parse(input);
+		return requestProjectDeletionOutputSchema.parse(
+			await requestDesktop(() => getRequest().requestProjectDeletion(parsedInput)),
+		);
+	},
+	async getProjectSidebar(runtimeBoxId?: string) {
+		const input = getProjectSidebarInputSchema.parse({
+			...(runtimeBoxId === undefined ? {} : { runtimeBoxId }),
+		});
+		return getProjectSidebarOutputSchema.parse(
+			await requestDesktop(() => getRequest().getProjectSidebar(input)),
 		);
 	},
 	async listRuntimeInventory(runtimeBoxId?: string) {
@@ -548,8 +607,11 @@ export const desktopClient = {
 			await requestDesktop(() => getRequest().setChatSessionModel(parsedInput)),
 		);
 	},
-	async createChatSession(model?: SessionModelSelection) {
-		const input = model === undefined ? {} : { model };
+	async createChatSession(model?: SessionModelSelection, projectId?: string) {
+		const input = {
+			...(model === undefined ? {} : { model }),
+			...(projectId === undefined ? {} : { projectId }),
+		};
 		return traceChatRpcRequest({
 			side: "web",
 			operation: "createChatSession",
@@ -572,7 +634,15 @@ export const desktopClient = {
 				),
 		});
 	},
-	async listChatSessions(input: { query?: string; archived?: boolean; limit?: number } = {}) {
+	async listChatSessions(
+		input: {
+			query?: string;
+			archived?: boolean;
+			limit?: number;
+			runtimeBoxId?: string;
+			scope?: SessionListScope;
+		} = {},
+	) {
 		const parsedInput = listChatSessionsInputSchema.parse(input);
 		return listChatSessionsOutputSchema.parse(
 			await requestDesktop(() => getRequest().listChatSessions(parsedInput)),

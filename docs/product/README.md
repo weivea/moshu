@@ -38,8 +38,8 @@
 | 数据策略 | Local-first，首版无需账号，数据和配置默认保存在本机 |
 | Project | 一个本地文件夹或 Git 仓库，可用于代码、文档或通用任务 |
 | Chat 类型 | 普通 Chat 不绑定目录；Project Chat 绑定项目并可操作项目环境 |
-| Agent 模式 | 当前已实现 no-tools Ask；Plan、Agent 和 Tool execution 是后续目标 |
-| 本机能力 | 当前 Ask 不执行文件或命令；未来由 Moshu-owned Policy/grant/Runtime Box 边界提供 |
+| Agent 模式 | 当前默认 Agent 模式已接入 Runtime Box Tool；完整 Plan 审批工作流仍是后续目标 |
+| 本机能力 | 文件与命令通过 Moshu-owned Action/grant/Runtime Box 边界执行；用户级审批和 shell sandbox 后置 |
 | Allow all | 输入框可开启，仅当前会话生效；重启后关闭；系统级高风险操作仍需确认 |
 | 并发 | 默认最多 3 个活跃会话，可配置为 1–5 个，超出后排队 |
 | Pi runtime | public Pi `0.82.1` 提供 `ModelRuntime`、headless `AgentSession`、stream/usage、取消和 Session JSONL |
@@ -66,13 +66,14 @@
 用户安装应用后，不登录即可完成以下流程：
 
 1. 配置并测试一个模型 Provider。
-2. 创建普通 Chat 并选择已启用模型和可用 `ThinkingLevel`。
-3. 以 no-tools Ask 提交任务并查看流式文本、状态和错误。
-4. 停止活动回复，或切换到其他 Session。
-5. 重启应用后读取产品 Session、历史 Run/event 和 Pi conversation context。
-6. 搜索、重命名、归档、恢复或永久删除 Session。
+2. 添加 Local/Remote Project，预览并确认 canonical path、Git 和根 `AGENTS.md` 状态。
+3. 创建普通 Chat 或 Project Chat，并选择已启用模型和可用 `ThinkingLevel`。
+4. 在 owning Runtime Box 上使用文件、搜索和命令 Tool，并查看流式文本、状态和错误。
+5. 停止活动回复，或切换到普通/Project Session。
+6. 重启应用后读取产品 Session、历史 Run/event 和 Pi conversation context。
+7. 搜索、重命名、归档、恢复或永久删除 Session；管理、重新关联、归档或删除 Project。
 
-Project Chat、Plan/Agent、Tool、审批、Diff、MCP、Skills 和 subagent 仍是后续阶段目标。
+完整 Plan 审批工作流、用户级 Tool 审批、Diff/撤销、subagent 和 shell sandbox 仍是后续阶段目标。
 
 ### 首版不追求
 

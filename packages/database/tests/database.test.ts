@@ -381,7 +381,7 @@ describe("application database", () => {
 		}
 	});
 
-	test("persists Projects per Runtime Box and enforces normalized path uniqueness", () => {
+	test("persists Projects, scopes Project Sessions, and snapshots Project Runs", () => {
 		const database = openAppDatabase(":memory:");
 		try {
 			const local = database.projects.create({
@@ -401,6 +401,177 @@ describe("application database", () => {
 				arch: "x64",
 				capabilities: ["projects.validate-path"],
 			});
+
+			{
+				const database = openAppDatabase(":memory:");
+				try {
+					const globalSession = database.sessions.create({ title: "Global" }).session;
+					const project = database.projects.create({
+						runtimeBoxId: defaultLocalRuntimeBoxId,
+						name: "Project sessions",
+						path: "/workspace/project-sessions",
+						pathStatus: "available",
+						pathCheckedAt: new Date().toISOString(),
+					}).project;
+					const otherProject = database.projects.create({
+						runtimeBoxId: defaultLocalRuntimeBoxId,
+						name: "Other project",
+						path: "/workspace/other-project",
+					}).project;
+					database.client
+						.query("UPDATE projects SET created_at_ms = ? WHERE id = ?")
+						.run(1, project.id);
+					database.client
+						.query("UPDATE projects SET created_at_ms = ? WHERE id = ?")
+						.run(2, otherProject.id);
+					expect(database.projects.list().items.map((item) => item.id)).toEqual([
+						otherProject.id,
+						project.id,
+					]);
+
+					const projectSession = database.sessions.create({
+						title: "Project chat",
+						projectId: project.id,
+						runtimeBoxId: "untrusted-conflicting-box",
+					}).session;
+					expect(projectSession).toMatchObject({
+						projectId: project.id,
+						runtimeBoxId: defaultLocalRuntimeBoxId,
+					});
+					expect(database.sessions.list().items.map((item) => item.id)).toEqual([globalSession.id]);
+					expect(
+						database.sessions.list({ scope: { kind: "global" } }).items.map((item) => item.id),
+					).toEqual([globalSession.id]);
+					expect(
+						database.sessions
+							.list({ scope: { kind: "project", projectId: project.id } })
+							.items.map((item) => item.id),
+					).toEqual([projectSession.id]);
+					expect(database.sessions.list({ query: "Project chat" }).items).toEqual([]);
+					database.runtimeBoxes.upsertRegistration({
+						schemaVersion: 1,
+						runtimeBoxId: "other-active-box",
+						kind: "remote",
+						displayName: "Other Active Box",
+						runtimeBoxVersion: "0.0.1",
+						platform: "linux",
+						arch: "x64",
+						capabilities: [],
+					});
+					const localActive = database.runtimeBoxes.getActive();
+					const otherActive = database.runtimeBoxes.switchActive({
+						runtimeBoxId: "other-active-box",
+						expectedRevision: localActive.revision,
+					});
+					expect(
+						database.sessions
+							.list({
+								scope: { kind: "project", projectId: project.id },
+								query: "Project chat",
+							})
+							.items.map((item) => item.id),
+					).toEqual([projectSession.id]);
+					database.runtimeBoxes.switchActive({
+						runtimeBoxId: defaultLocalRuntimeBoxId,
+						expectedRevision: otherActive.revision,
+					});
+
+					const request = {
+						...makeSessionCreateRequest(),
+						projectId: project.id,
+						runtimeBoxId: "another-untrusted-box",
+					};
+					const origin = makeClientOrigin();
+					const idempotent = database.sessions.createIdempotently({ request, origin }).session;
+					expect(database.sessions.createIdempotently({ request, origin }).session.id).toBe(
+						idempotent.id,
+					);
+					expect(() =>
+						database.sessions.createIdempotently({
+							request: { ...request, projectId: otherProject.id },
+							origin,
+						}),
+					).toThrow("different origin or parameters");
+
+					const relinked = database.projects.relinkPath({
+						projectId: project.id,
+						path: "/workspace/project-sessions-moved",
+						checkedAt: new Date().toISOString(),
+						gitRootPath: "/workspace/project-sessions-moved",
+						gitBranch: "main",
+					});
+					expect(relinked).toMatchObject({
+						path: "/workspace/project-sessions-moved",
+						pathRevision: 2,
+						pathStatus: "available",
+					});
+					const context = {
+						projectId: project.id,
+						runtimeBoxId: defaultLocalRuntimeBoxId,
+						projectPath: relinked.path,
+						projectPathRevision: relinked.pathRevision,
+						rootAgentsHash: "a".repeat(64),
+					};
+					const run = database.runs.create({
+						clientRequestId: crypto.randomUUID(),
+						sessionId: projectSession.id,
+						mode: "ask",
+						provider: makeProviderInput(),
+						userMessageId: createUuidV7(),
+						userContent: "Project prompt",
+						assistantMessageId: createUuidV7(),
+						projectContext: context,
+					}).run;
+					expect(run.projectContext).toEqual(context);
+					database.projects.relinkPath({
+						projectId: project.id,
+						path: "/workspace/project-sessions-later",
+						checkedAt: new Date().toISOString(),
+					});
+					expect(database.runs.get(run.id).projectContext).toEqual(context);
+					expect(database.runs.hasNonTerminalForProject(project.id)).toBe(true);
+					expect(() =>
+						database.runs.create({
+							clientRequestId: crypto.randomUUID(),
+							sessionId: globalSession.id,
+							mode: "ask",
+							provider: makeProviderInput(),
+							userMessageId: createUuidV7(),
+							userContent: "Wrong context",
+							assistantMessageId: createUuidV7(),
+							projectContext: context,
+						}),
+					).toThrow("Global Sessions");
+
+					expect(database.projects.getSessionCounts(project.id)).toEqual({
+						active: 2,
+						archived: 0,
+						total: 2,
+					});
+					expect(database.projects.getSidebar().items[1]).toMatchObject({
+						project: { id: project.id },
+						activeSessionCount: 2,
+					});
+
+					const deleting = database.projects.requestDeletion(project.id);
+					expect(deleting.deletionRequestedAt).toBeDefined();
+					expect(
+						database.client
+							.query<{ count: number }, []>("SELECT count(*) AS count FROM project_deletion_jobs")
+							.get()?.count,
+					).toBe(1);
+					expect(database.projects.list().items.map((item) => item.id)).toEqual([otherProject.id]);
+					expect(
+						database.sessions.list({ scope: { kind: "project", projectId: project.id } }).items,
+					).toEqual([]);
+					expect(() => database.sessions.get({ sessionId: projectSession.id })).toThrow(
+						"not found",
+					);
+					expect(() => database.sessions.findIdempotent({ request, origin })).toThrow("not found");
+				} finally {
+					database.close();
+				}
+			}
 
 			const active = database.runtimeBoxes.getActive();
 			database.runtimeBoxes.switchActive({
@@ -699,6 +870,57 @@ describe("application database", () => {
 			} finally {
 				reopened.close();
 			}
+		});
+	});
+
+	test("runs pre-reset work after validation and preserves the database when it fails", () => {
+		withTempDatabase((databasePath) => {
+			const legacy = new Database(databasePath);
+			legacy.exec("PRAGMA user_version = 6;");
+			legacy.close();
+			const observations: boolean[] = [];
+
+			expect(() =>
+				prepareCoordinatedDatabaseReset({
+					productDatabase: databasePath,
+					beforeReset: () => {
+						observations.push(existsSync(databasePath));
+						throw new Error("Session cleanup failed");
+					},
+				}),
+			).toThrow("Session cleanup failed");
+			expect(observations).toEqual([true]);
+			const preserved = new Database(databasePath, { readonly: true });
+			try {
+				expect(getDatabaseUserVersion(preserved)).toBe(6);
+			} finally {
+				preserved.close();
+			}
+		});
+	});
+
+	test("does not run pre-reset work for an absent or current database", () => {
+		withTempDatabase((databasePath) => {
+			let calls = 0;
+			expect(
+				prepareCoordinatedDatabaseReset({
+					productDatabase: databasePath,
+					beforeReset: () => {
+						calls += 1;
+					},
+				}),
+			).toEqual({ reset: false });
+			const database = openAppDatabase(databasePath);
+			database.close();
+			expect(
+				prepareCoordinatedDatabaseReset({
+					productDatabase: databasePath,
+					beforeReset: () => {
+						calls += 1;
+					},
+				}),
+			).toEqual({ reset: false });
+			expect(calls).toBe(0);
 		});
 	});
 
@@ -1418,6 +1640,48 @@ describe("application database", () => {
 		}
 	});
 
+	test("pages only unexpired retired Session IDs with a deterministic bounded cursor", () => {
+		const database = openAppDatabase(":memory:");
+		let nowMs = retiredSessionTombstoneTtlMs;
+		const runs = new SqliteRunJournalRepository(
+			database.client,
+			database.orm,
+			{ create: createUuidV7 },
+			{ now: () => nowMs },
+		);
+		try {
+			const sessionIds = Array.from(
+				{ length: 3 },
+				(_, index) => database.sessions.create({ title: `Retired ${index}` }).session.id,
+			);
+			for (const sessionId of sessionIds) {
+				runs.deleteSessionAndRetireRuns(sessionId);
+			}
+			const sorted = sessionIds.toSorted();
+			const firstCursor = sorted[1];
+			if (firstCursor === undefined) {
+				throw new Error("Retired Session fixture is missing its page cursor.");
+			}
+			const first = runs.listRetiredSessionPage({ limit: 2 });
+			expect(first).toEqual({
+				sessionIds: sorted.slice(0, 2),
+				nextCursor: firstCursor,
+			});
+			expect(
+				runs.listRetiredSessionPage({
+					cursor: firstCursor,
+					limit: 2,
+				}),
+			).toEqual({ sessionIds: sorted.slice(2) });
+			expect(() => runs.listRetiredSessionPage({ limit: 101 })).toThrow("between 1 and 100");
+
+			nowMs += retiredSessionTombstoneTtlMs;
+			expect(runs.listRetiredSessionPage({ limit: 100 })).toEqual({ sessionIds: [] });
+		} finally {
+			database.close();
+		}
+	});
+
 	test("backpressures unexpired retired Sessions and prunes only at the TTL boundary", () => {
 		const database = openAppDatabase(":memory:");
 		let nowMs = retiredSessionTombstoneTtlMs;
@@ -1504,6 +1768,9 @@ describe("application database", () => {
 						)
 						.get(session.id)?.count,
 				).toBe(1);
+				expect(reopened.runs.listRetiredSessionPage({ limit: 100 })).toEqual({
+					sessionIds: [session.id],
+				});
 				expect(() => reopened.runs.deleteSessionAndRetireRuns(createUuidV7())).toThrow("not found");
 			} finally {
 				reopened.close();

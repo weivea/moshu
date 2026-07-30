@@ -9,14 +9,21 @@ import {
 	thinkingLevelSchema,
 } from "./provider";
 import { runtimeBoxIdSchema } from "./runtime-box";
+import {
+	projectGitBranchSchema,
+	projectPathRevisionSchema,
+	projectPathSchema,
+	projectRootAgentsIssueCodeSchema,
+} from "./project";
+import { isoDateTimeSchema, uuidV7Schema } from "./contract-primitives";
+
+export {
+	isoDateTimeSchema,
+	uuidV7Pattern,
+	uuidV7Schema,
+} from "./contract-primitives";
 
 export const contractSchemaVersion = 1 as const;
-
-export const uuidV7Pattern =
-	/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
-
-export const uuidV7Schema = z.string().regex(uuidV7Pattern, "Expected UUIDv7.");
-export const isoDateTimeSchema = z.string().datetime({ offset: true });
 
 const providerNameSchema = z.string().trim().min(1).max(120);
 const providerModelSchema = z.string().trim().min(1).max(200);
@@ -150,6 +157,7 @@ export const chatSessionSchema = z
 		id: uuidV7Schema,
 		agentSessionId: uuidV7Schema,
 		runtimeBoxId: runtimeBoxIdSchema,
+		projectId: uuidV7Schema.optional(),
 		title: sessionTitleSchema,
 		defaultMode: agentModeSchema,
 		model: sessionModelSelectionSchema.optional(),
@@ -160,12 +168,28 @@ export const chatSessionSchema = z
 	})
 	.strict();
 
+export const projectRunContextSchema = z
+	.object({
+		projectId: uuidV7Schema,
+		runtimeBoxId: runtimeBoxIdSchema,
+		projectPath: projectPathSchema,
+		projectPathRevision: projectPathRevisionSchema,
+		gitRootPath: projectPathSchema.optional(),
+		gitBranch: projectGitBranchSchema.optional(),
+		rootAgentsHash: z
+			.string()
+			.regex(/^[a-f0-9]{64}$/)
+			.optional(),
+	})
+	.strict();
+
 export const chatRunSchema = z
 	.object({
 		schemaVersion: z.literal(contractSchemaVersion),
 		id: uuidV7Schema,
 		sessionId: uuidV7Schema,
 		runtimeBoxId: runtimeBoxIdSchema,
+		projectContext: projectRunContextSchema.optional(),
 		mode: agentModeSchema,
 		status: chatRunStatusSchema,
 		provider: runProviderStateSchema,
@@ -277,12 +301,23 @@ export const chatRunErrorEventSchema = chatRunEventBaseSchema.extend({
 		.strict(),
 });
 
+export const chatRunWarningEventSchema = chatRunEventBaseSchema.extend({
+	type: z.literal("run.warning"),
+	payload: z
+		.object({
+			code: z.literal("ROOT_AGENTS_SKIPPED"),
+			reason: projectRootAgentsIssueCodeSchema,
+		})
+		.strict(),
+});
+
 export const chatRunEventSchema = z.discriminatedUnion("type", [
 	chatRunStatusEventSchema,
 	chatMessageStartedEventSchema,
 	chatMessageDeltaEventSchema,
 	chatMessageCompletedEventSchema,
 	chatRunErrorEventSchema,
+	chatRunWarningEventSchema,
 ]);
 
 export const createChatSessionInputSchema = z
@@ -291,6 +326,7 @@ export const createChatSessionInputSchema = z
 		defaultMode: agentModeSchema.optional(),
 		model: sessionModelSelectionSchema.optional(),
 		runtimeBoxId: runtimeBoxIdSchema.optional(),
+		projectId: uuidV7Schema.optional(),
 	})
 	.strict();
 
@@ -306,8 +342,27 @@ export const listChatSessionsInputSchema = z
 		query: sessionSearchQuerySchema.optional(),
 		archived: z.boolean().optional(),
 		runtimeBoxId: runtimeBoxIdSchema.optional(),
+		scope: z
+			.discriminatedUnion("kind", [
+				z
+					.object({
+						kind: z.literal("global"),
+						runtimeBoxId: runtimeBoxIdSchema.optional(),
+					})
+					.strict(),
+				z.object({ kind: z.literal("project"), projectId: uuidV7Schema }).strict(),
+			])
+			.optional(),
 	})
-	.strict();
+	.strict()
+	.superRefine((value, context) => {
+		if (value.runtimeBoxId !== undefined && value.scope !== undefined) {
+			context.addIssue({
+				code: "custom",
+				message: "runtimeBoxId cannot be combined with an explicit Session scope.",
+			});
+		}
+	});
 
 export const listChatSessionsOutputSchema = z
 	.object({
@@ -421,12 +476,14 @@ export type ChatMessageStatus = z.infer<typeof chatMessageStatusSchema>;
 export type ChatMessage = z.infer<typeof chatMessageSchema>;
 export type ChatRunStatus = z.infer<typeof chatRunStatusSchema>;
 export type ChatSession = z.infer<typeof chatSessionSchema>;
+export type ProjectRunContext = z.infer<typeof projectRunContextSchema>;
 export type ChatRun = z.infer<typeof chatRunSchema>;
 export type ChatRunEventSource = z.infer<typeof chatRunEventSourceSchema>;
 export type ChatRunEvent = z.infer<typeof chatRunEventSchema>;
 export type CreateChatSessionInput = z.infer<typeof createChatSessionInputSchema>;
 export type CreateChatSessionOutput = z.infer<typeof createChatSessionOutputSchema>;
 export type ListChatSessionsInput = z.infer<typeof listChatSessionsInputSchema>;
+export type SessionListScope = NonNullable<ListChatSessionsInput["scope"]>;
 export type ListChatSessionsOutput = z.infer<typeof listChatSessionsOutputSchema>;
 export type UpdateChatSessionInput = z.infer<typeof updateChatSessionInputSchema>;
 export type UpdateChatSessionOutput = z.infer<typeof updateChatSessionOutputSchema>;

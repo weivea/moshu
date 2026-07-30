@@ -12,102 +12,108 @@ import {
 	type ChatRunEvent,
 	chatEventDeliverySchema,
 	chatRunEventSchema,
+	chatSessionsRetiredEventSchema,
 	clientProductRequestMethods,
+	currentRuntimeBoxProtocolVersion,
+	getAgentGlobalProfileOutputSchema,
+	getRuntimeProfileOutputSchema,
+	type ListRuntimeBoxesOutput,
+	listMcpServersOutputSchema,
+	listRuntimeBoxesOutputSchema,
+	listRuntimeBoxInventoryOutputSchema,
+	listRuntimeBoxMcpServerSummariesOutputSchema,
+	listRuntimeBoxSkillsOutputSchema,
+	listSkillsOutputSchema,
+	mcpServerMutationResultSchema,
+	productRpcEvents,
+	productRpcInternalHandlerErrorCode,
+	productRpcMethods,
+	productRpcRequestSchemas,
+	type RuntimeDiagnosticsOutput,
+	remoteAccessMutationOutputSchema,
+	remoteAccessStatusOutputSchema,
+	runtimeBoxInventoryChangedHintSchema,
 	runtimeBoxProductEventMethods,
 	runtimeBoxProductRequestMethods,
 	runtimeBoxRegisterOutputSchema,
-	listRuntimeBoxesOutputSchema,
-	type ListRuntimeBoxesOutput,
-	remoteAccessMutationOutputSchema,
-	remoteAccessStatusOutputSchema,
-	createProjectOutputSchema,
-	deleteProjectOutputSchema,
-	getProjectOutputSchema,
-	listProjectsOutputSchema,
-	updateProjectOutputSchema,
-	setProjectArchivedOutputSchema,
-	switchRuntimeBoxOutputSchema,
+	runtimeBoxResourceMutationResultSchema,
 	runtimeBoxToolProgressEventSchema,
-	runtimeBoxInventoryChangedHintSchema,
-	listRuntimeBoxInventoryOutputSchema,
-	listRuntimeBoxMcpServerSummariesOutputSchema,
-	listMcpServersOutputSchema,
-	mcpServerMutationResultSchema,
-	listSkillsOutputSchema,
+	runtimeDiagnosticsOutputSchema,
 	skillMutationResultSchema,
 	skillSummarySchema,
-	listRuntimeBoxSkillsOutputSchema,
-	runtimeBoxResourceMutationResultSchema,
-	getRuntimeProfileOutputSchema,
-	getAgentGlobalProfileOutputSchema,
-	updateRuntimeProfileOutputSchema,
+	switchRuntimeBoxOutputSchema,
 	updateAgentGlobalProfileOutputSchema,
-	productRpcInternalHandlerErrorCode,
-	productRpcEvents,
-	productRpcMethods,
-	productRpcRequestSchemas,
-	currentRuntimeBoxProtocolVersion,
-	runtimeDiagnosticsOutputSchema,
-	type RuntimeDiagnosticsOutput,
+	updateRuntimeProfileOutputSchema,
 } from "@moshu/contracts";
 import {
-	ChatSessionNotFoundError,
 	ActiveRuntimeRevisionConflictError,
-	RuntimeBoxArchivedError,
-	RuntimeBoxNotFoundError,
-	PairingFingerprintMismatchError,
-	PairingSessionNotFoundError,
-	PairingSessionStateError,
-	type RuntimeBoxRepository,
-	type RuntimeBoxPairingRepository,
-	type RuntimeBoxInventoryRepository,
-	type RuntimeProfileRepository,
-	RuntimeProfileRevisionConflictError,
 	type AgentGlobalProfileRepository,
 	AgentGlobalProfileRevisionConflictError,
 	type AgentServerMcpRepository,
 	type AgentServerSkillRepository,
+	ChatSessionNotFoundError,
 	McpResourceNotFoundError,
 	McpResourceVersionConflictError,
-	SkillResourceNotFoundError,
-	SkillResourceVersionConflictError,
-	SkillOwnerCapabilityError,
-	SkillPackageValidationError,
-	type ProjectRepository,
+	PairingFingerprintMismatchError,
+	PairingSessionNotFoundError,
+	PairingSessionStateError,
 	ProjectNotFoundError,
 	ProjectPathConflictError,
+	RuntimeBoxArchivedError,
+	type RuntimeBoxInventoryRepository,
+	RuntimeBoxNotFoundError,
+	type RuntimeBoxPairingRepository,
+	type RuntimeBoxRepository,
+	type RuntimeProfileRepository,
+	RuntimeProfileRevisionConflictError,
 	SessionCreateCapacityError,
 	SessionCreateKeyConflictError,
+	SkillOwnerCapabilityError,
+	SkillPackageValidationError,
+	SkillResourceNotFoundError,
+	SkillResourceVersionConflictError,
 } from "@moshu/database";
 import {
 	isSameRpcPeerIdentity,
 	type JsonValue,
 	RpcHandlerError,
-	RpcRemoteError,
 	type RpcHandlers,
 	type RpcMethodAllowlist,
 	type RpcPeer,
+	RpcRemoteError,
 	type RpcRequestContext,
 	rpcJsonValueSchema,
 } from "@moshu/process-rpc";
 import { ZodError, type ZodType, type z } from "zod";
 
 import type { ChatApplicationService } from "./chat-application-service";
+import type { DevTunnelService } from "./dev-tunnel-service";
+import {
+	type ProjectApplicationService,
+	ProjectArchivedError,
+	ProjectDeletingError,
+	ProjectHasActiveRunsError,
+	ProjectHasUnacknowledgedActionsError,
+	ProjectNameConfirmationMismatchError,
+	ProjectPathUnavailableError,
+	ProjectPreviewStaleError,
+	ProjectRelinkRuntimeMismatchError,
+	ProjectRuntimeUnavailableError,
+} from "./project-application-service";
 import { ProviderCatalogError } from "./provider-catalog";
 import {
-	type RuntimeBoxRegistry,
 	RuntimeBoxCapabilityError,
+	type RuntimeBoxRegistry,
 	RuntimeBoxUnavailableError,
 } from "./runtime-box-registry";
 import type { RuntimeIngressAuth } from "./runtime-ingress-auth";
-import type { DevTunnelService } from "./dev-tunnel-service";
 
 export interface ProductRpcDependencies {
 	chatService: ChatApplicationService;
 	runtimeBoxRegistry: RuntimeBoxRegistry;
 	runtimeBoxes: RuntimeBoxRepository;
 	runtimeBoxPairings?: RuntimeBoxPairingRepository;
-	projects?: ProjectRepository;
+	projectService?: ProjectApplicationService;
 	runtimeBoxInventory?: RuntimeBoxInventoryRepository;
 	runtimeProfiles?: RuntimeProfileRepository;
 	agentGlobalProfiles?: AgentGlobalProfileRepository;
@@ -243,7 +249,7 @@ export function createProductRpcHandlers(dependencies: ProductRpcDependencies): 
 		runtimeBoxRegistry,
 		runtimeBoxes,
 		runtimeBoxPairings,
-		projects,
+		projectService,
 		runtimeBoxInventory,
 		runtimeProfiles,
 		agentGlobalProfiles,
@@ -255,11 +261,11 @@ export function createProductRpcHandlers(dependencies: ProductRpcDependencies): 
 		authController,
 		getRuntimeDiagnostics,
 	} = dependencies;
-	const getProjects = (): ProjectRepository => {
-		if (projects === undefined) {
-			throw new Error("Project repository is not initialized.");
+	const getProjectService = (): ProjectApplicationService => {
+		if (projectService === undefined) {
+			throw new Error("Project application service is not initialized.");
 		}
-		return projects;
+		return projectService;
 	};
 	const getRuntimeBoxInventory = (): RuntimeBoxInventoryRepository => {
 		if (runtimeBoxInventory === undefined) {
@@ -323,14 +329,6 @@ export function createProductRpcHandlers(dependencies: ProductRpcDependencies): 
 			if (runtimeResourceMutationTails.get(runtimeBoxId) === tail) {
 				runtimeResourceMutationTails.delete(runtimeBoxId);
 			}
-		}
-	};
-	const requireProjectRuntimeReady = (projectId: string): void => {
-		const project = getProjects().get({ projectId }).project;
-		if (!runtimeBoxRegistry.isReady(project.runtimeBoxId)) {
-			throw new RuntimeBoxUnavailableError(
-				`Runtime Box ${project.runtimeBoxId} is not available for Project mutation.`,
-			);
 		}
 	};
 	return {
@@ -445,57 +443,61 @@ export function createProductRpcHandlers(dependencies: ProductRpcDependencies): 
 					return runtimeDiagnosticsOutputSchema.parse(getRuntimeDiagnostics());
 				},
 			),
+			[productRpcMethods.projectsPreviewPath]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.projectsPreviewPath],
+				(input, _peer, context) => getProjectService().previewPath(input, context.signal),
+			),
 			[productRpcMethods.projectsCreate]: createRequestHandler(
 				productRpcRequestSchemas[productRpcMethods.projectsCreate],
-				async (input, _peer, context) => {
-					const runtimeBoxId = input.runtimeBoxId ?? runtimeBoxes.getActive().runtimeBoxId;
-					runtimeBoxes.get(runtimeBoxId);
-					const validated = await runtimeBoxRegistry.validateProjectPath(
-						runtimeBoxId,
-						{ path: input.path },
-						context.signal,
-					);
-					return createProjectOutputSchema.parse(
-						getProjects().create({
-							runtimeBoxId,
-							name: input.name ?? validated.displayName,
-							path: validated.normalizedPath,
-							...(validated.gitRootPath === undefined
-								? {}
-								: { gitRootPath: validated.gitRootPath }),
-							...(validated.gitBranch === undefined ? {} : { gitBranch: validated.gitBranch }),
-						}),
-					);
-				},
+				(input, _peer, context) => getProjectService().create(input, context.signal),
 			),
 			[productRpcMethods.projectsList]: createRequestHandler(
 				productRpcRequestSchemas[productRpcMethods.projectsList],
-				(input) => listProjectsOutputSchema.parse(getProjects().list(input)),
+				(input) => getProjectService().list(input),
 			),
 			[productRpcMethods.projectsGet]: createRequestHandler(
 				productRpcRequestSchemas[productRpcMethods.projectsGet],
-				(input) => getProjectOutputSchema.parse(getProjects().get(input)),
+				(input) => getProjectService().get(input),
+			),
+			[productRpcMethods.projectsCheckPath]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.projectsCheckPath],
+				(input, _peer, context) => getProjectService().checkPath(input, context.signal),
+			),
+			[productRpcMethods.projectsUpdateName]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.projectsUpdateName],
+				(input) => getProjectService().updateName(input),
 			),
 			[productRpcMethods.projectsUpdate]: createRequestHandler(
 				productRpcRequestSchemas[productRpcMethods.projectsUpdate],
-				(input) => {
-					requireProjectRuntimeReady(input.projectId);
-					return updateProjectOutputSchema.parse(getProjects().update(input));
-				},
+				(input) => getProjectService().updateName(input),
+			),
+			[productRpcMethods.projectsPreviewRelink]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.projectsPreviewRelink],
+				(input, _peer, context) => getProjectService().previewRelink(input, context.signal),
+			),
+			[productRpcMethods.projectsRelink]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.projectsRelink],
+				(input, _peer, context) => getProjectService().relink(input, context.signal),
+			),
+			[productRpcMethods.projectsSetArchived]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.projectsSetArchived],
+				(input) => getProjectService().setArchived(input),
 			),
 			[productRpcMethods.projectsArchive]: createRequestHandler(
 				productRpcRequestSchemas[productRpcMethods.projectsArchive],
-				(input) => {
-					requireProjectRuntimeReady(input.projectId);
-					return setProjectArchivedOutputSchema.parse(getProjects().setArchived(input));
-				},
+				(input) => getProjectService().setArchived(input),
+			),
+			[productRpcMethods.projectsGetDeleteConfirmation]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.projectsGetDeleteConfirmation],
+				(input) => getProjectService().getDeleteConfirmation(input),
 			),
 			[productRpcMethods.projectsDelete]: createRequestHandler(
 				productRpcRequestSchemas[productRpcMethods.projectsDelete],
-				(input) => {
-					requireProjectRuntimeReady(input.projectId);
-					return deleteProjectOutputSchema.parse(getProjects().delete(input));
-				},
+				(input) => getProjectService().requestDeletion(input),
+			),
+			[productRpcMethods.projectsGetSidebar]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.projectsGetSidebar],
+				(input) => getProjectService().getSidebar(input),
 			),
 			[productRpcMethods.runtimeInventoryList]: createRequestHandler(
 				productRpcRequestSchemas[productRpcMethods.runtimeInventoryList],
@@ -968,7 +970,8 @@ export function createProductRpcHandlers(dependencies: ProductRpcDependencies): 
 			),
 			[productRpcMethods.sessionCreate]: createRequestHandler(
 				productRpcRequestSchemas[productRpcMethods.sessionCreate],
-				(input, peer) => chatService.createSessionIdempotently(input, peer.remoteIdentity),
+				(input, peer, context) =>
+					chatService.createSessionIdempotently(input, peer.remoteIdentity, context.signal),
 			),
 			[productRpcMethods.sessionGet]: createRequestHandler(
 				productRpcRequestSchemas[productRpcMethods.sessionGet],
@@ -996,10 +999,10 @@ export function createProductRpcHandlers(dependencies: ProductRpcDependencies): 
 			),
 			[productRpcMethods.chatSend]: createRequestHandler(
 				productRpcRequestSchemas[productRpcMethods.chatSend],
-				(input, peer) => {
+				async (input, peer, context) => {
 					const routeLease = eventRouter.bind(input.requestId, peer);
 					try {
-						const output = chatService.sendMessage(input);
+						const output = await chatService.sendMessageWithPreflight(input, context.signal);
 						eventRouter.commit(routeLease);
 						if (
 							output.run.status === "completed" ||
@@ -1023,6 +1026,10 @@ export function createProductRpcHandlers(dependencies: ProductRpcDependencies): 
 			[productRpcMethods.chatReplay]: createRequestHandler(
 				productRpcRequestSchemas[productRpcMethods.chatReplay],
 				(input) => chatService.replayEvents(input),
+			),
+			[productRpcMethods.chatRetiredSessionsList]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.chatRetiredSessionsList],
+				(input) => chatService.listRetiredSessions(input),
 			),
 			[productRpcMethods.runtimeBoxRegister]: createRequestHandler(
 				productRpcRequestSchemas[productRpcMethods.runtimeBoxRegister],
@@ -1137,6 +1144,32 @@ export function publishChatEvent(
 					error,
 				);
 			}
+		}
+	}
+}
+
+export function publishRetiredChatSessions(
+	peers: readonly RpcPeer[],
+	sessionIds: readonly string[],
+	reportDiagnostic: (message: string) => void = console.error,
+): void {
+	const payload = encodeJsonValue(
+		chatSessionsRetiredEventSchema.parse({
+			schemaVersion: 1,
+			sessionIds,
+		}),
+	);
+	for (const peer of peers) {
+		if (peer.remoteIdentity.role !== "client") {
+			continue;
+		}
+		try {
+			peer.emitEvent(productRpcEvents.chatSessionsRetired, payload);
+		} catch {
+			peer.close(1011, "Session retirement publication failed.");
+			reportDiagnostic(
+				`Failed to publish Session retirement to client ${peer.remoteIdentity.peerId}; replay will recover it.`,
+			);
 		}
 	}
 }
@@ -1285,7 +1318,39 @@ function rethrowProductHandlerError(error: unknown): never {
 		throw new RpcHandlerError("PROJECT_NOT_FOUND", "The Project was not found.");
 	}
 	if (error instanceof ProjectPathConflictError) {
-		throw new RpcHandlerError("PROJECT_PATH_CONFLICT", "The Project path is already registered.");
+		throw new RpcHandlerError("PROJECT_PATH_CONFLICT", "The Project path is already registered.", {
+			conflictingProjectId: error.conflictingProjectId,
+			conflictingProjectArchived: error.conflictingProjectArchived,
+		});
+	}
+	if (error instanceof ProjectPreviewStaleError) {
+		throw new RpcHandlerError("PROJECT_PREVIEW_STALE", error.message);
+	}
+	if (error instanceof ProjectRuntimeUnavailableError) {
+		throw new RpcHandlerError("PROJECT_RUNTIME_UNAVAILABLE", error.message);
+	}
+	if (error instanceof ProjectPathUnavailableError) {
+		throw new RpcHandlerError("PROJECT_PATH_UNAVAILABLE", error.message, {
+			issueCode: error.issueCode,
+		});
+	}
+	if (error instanceof ProjectArchivedError) {
+		throw new RpcHandlerError("PROJECT_ARCHIVED", error.message);
+	}
+	if (error instanceof ProjectDeletingError) {
+		throw new RpcHandlerError("PROJECT_DELETING", error.message);
+	}
+	if (error instanceof ProjectHasActiveRunsError) {
+		throw new RpcHandlerError("PROJECT_HAS_ACTIVE_RUNS", error.message);
+	}
+	if (error instanceof ProjectHasUnacknowledgedActionsError) {
+		throw new RpcHandlerError("PROJECT_HAS_UNACKNOWLEDGED_ACTIONS", error.message);
+	}
+	if (error instanceof ProjectNameConfirmationMismatchError) {
+		throw new RpcHandlerError("PROJECT_NAME_CONFIRMATION_MISMATCH", error.message);
+	}
+	if (error instanceof ProjectRelinkRuntimeMismatchError) {
+		throw new RpcHandlerError("PROJECT_RELINK_RUNTIME_MISMATCH", error.message);
 	}
 	if (
 		error instanceof PairingSessionNotFoundError ||
@@ -1304,6 +1369,12 @@ function rethrowProductHandlerError(error: unknown): never {
 		throw new RpcHandlerError(
 			productRpcInternalHandlerErrorCode,
 			"The Product RPC handler failed internal validation.",
+		);
+	}
+	if (error instanceof Error && error.name === "SQLiteError") {
+		throw new RpcHandlerError(
+			productRpcInternalHandlerErrorCode,
+			"The Product RPC database operation failed.",
 		);
 	}
 	throw error;

@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { beforeEach, describe, expect, test, vi } from "vitest";
 import { I18nProvider } from "./i18n";
@@ -11,8 +11,16 @@ const fakeChatTransport = vi.hoisted(() => ({
 	listSessions: vi.fn(async () => []),
 	retireSession: vi.fn(),
 	subscribeAgentsReady: vi.fn(() => () => undefined),
-	subscribeSessionInvalidations: vi.fn(() => () => undefined),
+	subscribeSessionInvalidations: vi.fn(),
 }));
+let invalidationListener:
+	| ((invalidation: {
+			schemaVersion: 1;
+			invalidationId: string;
+			sessionId: string;
+			reason: "session_retired";
+	  }) => void | Promise<void>)
+	| undefined;
 
 vi.mock("./chat/rpc-chat-transport", () => ({
 	chatTransport: fakeChatTransport,
@@ -29,7 +37,19 @@ class MockPointerEvent extends MouseEvent {
 
 beforeEach(() => {
 	localStorage.clear();
+	sessionStorage.clear();
 	vi.clearAllMocks();
+	invalidationListener = undefined;
+	fakeChatTransport.subscribeSessionInvalidations.mockImplementation((listener, options) => {
+		if (options?.authoritative) {
+			invalidationListener = listener;
+		}
+		return () => {
+			if (invalidationListener === listener) {
+				invalidationListener = undefined;
+			}
+		};
+	});
 	Object.defineProperty(window, "PointerEvent", {
 		configurable: true,
 		value: MockPointerEvent,
@@ -339,5 +359,58 @@ describe("AppShell", () => {
 		});
 		expect(restoredShell.style.getPropertyValue("--canvas-width")).toBe("588px");
 		expect(localStorage.getItem("moshu.shell.canvasWidth")).toBe("588");
+	});
+
+	test.each([
+		{
+			initialPath: "/projects/project-a/chat/project-session",
+			sessionId: "project-session",
+			expected: "Project overview fallback",
+		},
+		{
+			initialPath: "/chat/global-session",
+			sessionId: "global-session",
+			expected: "Global chat fallback",
+		},
+	])("uses the route-aware fallback for early retirement at $initialPath", async (testCase) => {
+		render(
+			<I18nProvider>
+				<AppearanceProvider>
+					<LocalProfileProvider>
+						<MemoryRouter initialEntries={[testCase.initialPath]}>
+							<Routes>
+								<Route element={<AppShell />}>
+									<Route
+										path="/projects/:projectId/chat/:sessionId"
+										element={<div>Project chat without controller</div>}
+									/>
+									<Route
+										path="/projects/:projectId"
+										element={<div>Project overview fallback</div>}
+									/>
+									<Route
+										path="/chat/:sessionId"
+										element={<div>Global chat without controller</div>}
+									/>
+									<Route path="/chat/new" element={<div>Global chat fallback</div>} />
+								</Route>
+							</Routes>
+						</MemoryRouter>
+					</LocalProfileProvider>
+				</AppearanceProvider>
+			</I18nProvider>,
+		);
+		await waitFor(() => expect(invalidationListener).toBeDefined());
+
+		await act(async () => {
+			await invalidationListener?.({
+				schemaVersion: 1,
+				invalidationId: crypto.randomUUID(),
+				sessionId: testCase.sessionId,
+				reason: "session_retired",
+			});
+		});
+
+		expect(await screen.findByText(testCase.expected)).toBeVisible();
 	});
 });

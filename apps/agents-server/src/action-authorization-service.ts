@@ -3,20 +3,21 @@ import { DefaultActionPolicy, getExecutorToolMetadata } from "@moshu/action-brok
 import {
 	createExecutorToolParameterPayload,
 	createMcpToolParameterPayload,
+	type ExecutorExecutionContext,
 	type ExecutorToolInvokeInput,
 	type ExecutorToolInvokeOutput,
 	type ProcessPeerIdentity,
-	reconcileRuntimeBoxInvocationsOutputSchema,
 	type ReconcileRuntimeBoxInvocationsOutput,
+	type RuntimeBoxActionResult,
 	type RuntimeBoxInvocationEvidence,
-	type RuntimeBoxToolAuthorization,
 	type RuntimeBoxMcpToolInvokeInput,
 	type RuntimeBoxMcpToolInvokeOutput,
-	type RuntimeBoxActionResult,
+	type RuntimeBoxToolAuthorization,
+	reconcileRuntimeBoxInvocationsOutputSchema,
 	runtimeBoxMcpToolInvokeInputSchema,
 	runtimeBoxToolInvokeInputSchema,
 } from "@moshu/contracts";
-import type { ActionRepository } from "@moshu/database";
+import type { ActionRepository, RunJournalRepository } from "@moshu/database";
 import type { RpcPeerIdentity } from "@moshu/process-rpc";
 import type { RuntimeBoxActionAuthorizer } from "./runtime-box-registry";
 
@@ -35,6 +36,7 @@ export class DurableActionAuthorizationService implements RuntimeBoxActionAuthor
 
 	constructor(
 		private readonly actions: ActionRepository,
+		private readonly runs: Pick<RunJournalRepository, "get">,
 		private readonly authority: ProcessPeerIdentity,
 		options: { allowSideEffects: boolean } = { allowSideEffects: true },
 	) {
@@ -46,7 +48,7 @@ export class DurableActionAuthorizationService implements RuntimeBoxActionAuthor
 		runtimeBoxId: string,
 		input: ExecutorToolInvokeInput,
 		targetIdentity: RpcPeerIdentity,
-		executionScope: "request-cwd" | "runtime-box-workspace",
+		executionContext: ExecutorExecutionContext,
 	): Promise<ExecutorToolInvokeInput> {
 		if (input.authorization !== undefined) {
 			throw new ActionPolicyDeniedError("Tool invocation authorization is Server-owned.");
@@ -64,7 +66,12 @@ export class DurableActionAuthorizationService implements RuntimeBoxActionAuthor
 		const actionId = randomUUID();
 		const grantId = randomUUID();
 		const grantToken = randomBytes(32).toString("base64url");
-		const parameterDigest = sha256(createExecutorToolParameterPayload(input));
+		const authoritativeContext = this.#resolveExecutionContext(
+			runtimeBoxId,
+			input,
+			executionContext,
+		);
+		const parameterDigest = sha256(createExecutorToolParameterPayload(input, authoritativeContext));
 		const expiresAtMs = Date.now() + executionGrantLifetimeMs;
 		const authorization: RuntimeBoxToolAuthorization = {
 			actionId,
@@ -76,7 +83,7 @@ export class DurableActionAuthorizationService implements RuntimeBoxActionAuthor
 			targetRuntimeBoxId: runtimeBoxId,
 			targetInstanceId: targetIdentity.instanceId,
 			targetGeneration: targetIdentity.generation,
-			executionScope,
+			...authoritativeContext,
 			expiresAt: new Date(expiresAtMs).toISOString(),
 		};
 		const authorizedInput = runtimeBoxToolInvokeInputSchema.parse({
@@ -102,11 +109,47 @@ export class DurableActionAuthorizationService implements RuntimeBoxActionAuthor
 			originGeneration: this.authority.generation,
 			targetInstanceId: targetIdentity.instanceId,
 			targetGeneration: targetIdentity.generation,
-			executionScope,
+			executionScope: authoritativeContext.executionScope,
 			expiresAtMs,
 		});
 		this.actions.consumeGrant(actionId, grantId, sha256(grantToken));
 		return authorizedInput;
+	}
+
+	#resolveExecutionContext(
+		runtimeBoxId: string,
+		input: ExecutorToolInvokeInput,
+		requested: ExecutorExecutionContext,
+	): ExecutorExecutionContext {
+		let run: ReturnType<RunJournalRepository["get"]>;
+		try {
+			run = this.runs.get(input.runId);
+		} catch {
+			throw new ActionPolicyDeniedError("Tool invocation Run snapshot is unavailable.");
+		}
+		const project = run.projectContext;
+		if (project === undefined) {
+			if (requested.executionScope === "project-root") {
+				throw new ActionPolicyDeniedError(
+					"project-root authorization requires a persisted Project Run snapshot.",
+				);
+			}
+			return requested;
+		}
+		if (
+			requested.executionScope !== "project-root" ||
+			requested.projectPathRevision !== project.projectPathRevision ||
+			project.runtimeBoxId !== runtimeBoxId ||
+			input.cwd !== project.projectPath
+		) {
+			throw new ActionPolicyDeniedError(
+				"Tool invocation did not match its persisted Project Run snapshot.",
+			);
+		}
+		return {
+			executionScope: "project-root",
+			projectPathRevision: project.projectPathRevision,
+		};
 	}
 
 	async authorizeMcp(

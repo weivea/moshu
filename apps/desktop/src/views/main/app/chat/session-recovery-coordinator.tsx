@@ -103,8 +103,10 @@ export class ChatSessionRecoveryCoordinator {
 
 	subscribeRetirements(listener: (sessionId: string) => void): () => void {
 		this.#retirementListeners.add(listener);
+		this.#ensureSubscribed();
 		return () => {
 			this.#retirementListeners.delete(listener);
+			this.#stopIfUnused();
 		};
 	}
 
@@ -317,7 +319,11 @@ export class ChatSessionRecoveryCoordinator {
 	}
 
 	#stopIfUnused(): void {
-		if (this.#controllers.size > 0 || this.#rootRetirementHandlers.size > 0) {
+		if (
+			this.#controllers.size > 0 ||
+			this.#rootRetirementHandlers.size > 0 ||
+			this.#retirementListeners.size > 0
+		) {
 			return;
 		}
 		this.#unsubscribeInvalidations?.();

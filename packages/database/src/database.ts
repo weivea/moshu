@@ -1,14 +1,8 @@
 import Database from "bun:sqlite";
 import { chmodSync, existsSync, lstatSync, mkdirSync, rmSync } from "node:fs";
 import { dirname, resolve } from "node:path";
-import { drizzle } from "drizzle-orm/bun-sqlite";
 import { defaultLocalRuntimeBoxId } from "@moshu/contracts";
-
-import {
-	applyAppMigrations,
-	currentAppDatabaseVersion,
-	getDatabaseUserVersion,
-} from "./migrations";
+import { drizzle } from "drizzle-orm/bun-sqlite";
 import { type ActionRepository, SqliteActionRepository } from "./action-repository";
 import {
 	type AgentGlobalProfileRepository,
@@ -24,21 +18,26 @@ import {
 	type AgentServerSkillRepository,
 	SqliteAgentServerSkillRepository,
 } from "./agent-server-skill-repository";
-import { createRunJournalRepository, type RunJournalRepository } from "./run-journal-repository";
+import {
+	applyAppMigrations,
+	currentAppDatabaseVersion,
+	getDatabaseUserVersion,
+} from "./migrations";
 import { type ProjectRepository, SqliteProjectRepository } from "./project-repository";
 import {
 	type RemoteAccessRepository,
 	SqliteRemoteAccessRepository,
 } from "./remote-access-repository";
+import { createRunJournalRepository, type RunJournalRepository } from "./run-journal-repository";
+import {
+	type RuntimeBoxInventoryRepository,
+	SqliteRuntimeBoxInventoryRepository,
+} from "./runtime-box-inventory-repository";
 import {
 	type RuntimeBoxPairingRepository,
 	SqliteRuntimeBoxPairingRepository,
 } from "./runtime-box-pairing-repository";
 import { type RuntimeBoxRepository, SqliteRuntimeBoxRepository } from "./runtime-box-repository";
-import {
-	type RuntimeBoxInventoryRepository,
-	SqliteRuntimeBoxInventoryRepository,
-} from "./runtime-box-inventory-repository";
 import {
 	type RuntimeProfileRepository,
 	SqliteRuntimeProfileRepository,
@@ -76,6 +75,7 @@ export interface CoordinatedDatabaseResetResult {
 
 export function prepareCoordinatedDatabaseReset(input: {
 	productDatabase: string;
+	beforeReset?: () => void;
 }): CoordinatedDatabaseResetResult {
 	const filename = requireDatabaseFilename(input.productDatabase);
 	if (!existsSync(filename)) {
@@ -95,14 +95,19 @@ export function prepareCoordinatedDatabaseReset(input: {
 	if (previousProductVersion === currentAppDatabaseVersion) {
 		return { reset: false };
 	}
+	const artifacts: string[] = [];
 	for (const path of [filename, `${filename}-wal`, `${filename}-shm`]) {
 		if (existsSync(path)) {
 			const pathMetadata = lstatSync(path);
 			if (!pathMetadata.isFile() || pathMetadata.isSymbolicLink()) {
 				throw new Error("Product database artifact must be a regular file.");
 			}
-			rmSync(path);
+			artifacts.push(path);
 		}
+	}
+	input.beforeReset?.();
+	for (const path of artifacts) {
+		rmSync(path);
 	}
 	return {
 		reset: true,
@@ -140,6 +145,7 @@ export function openAppDatabase(
 	}
 	const orm = drizzle(client, { schema: appSchema });
 	const runtimeBoxes = new SqliteRuntimeBoxRepository(orm);
+	const projects = new SqliteProjectRepository(orm, runtimeBoxes);
 	const agentServerMcpSecrets = options.agentServerMcpSecrets ?? createUnavailableMcpSecretStore();
 	const agentServerSkillContent =
 		options.agentServerSkillContent ?? createUnavailableSkillContentStore();
@@ -168,10 +174,10 @@ export function openAppDatabase(
 			options.prepareAgentServerMcpStdioCwd,
 		),
 		agentServerSkills: new SqliteAgentServerSkillRepository(orm, agentServerSkillContent),
-		projects: new SqliteProjectRepository(orm, runtimeBoxes),
+		projects,
 		runtimeBoxPairings: new SqliteRuntimeBoxPairingRepository(orm),
 		remoteAccess: new SqliteRemoteAccessRepository(orm),
-		sessions: createSessionRepository({ orm, runtimeBoxes }),
+		sessions: createSessionRepository({ orm, runtimeBoxes, projects }),
 		runs: createRunJournalRepository({ client, orm }),
 		actions: new SqliteActionRepository(orm),
 		close: () => client.close(),

@@ -32,7 +32,11 @@ describe("McpActionDispatcher", () => {
 				instanceId: "agents-instance",
 				generation: 3,
 			};
-			const authorizer = new DurableActionAuthorizationService(database.actions, serverIdentity);
+			const authorizer = new DurableActionAuthorizationService(
+				database.actions,
+				database.runs,
+				serverIdentity,
+			);
 			const calls: unknown[] = [];
 			const dispatcher = new McpActionDispatcher(
 				"agent-server-id",
@@ -89,7 +93,9 @@ describe("McpActionDispatcher", () => {
 	test("records definitive Agent Server MCP protocol failures as failed", async () => {
 		const database = openAppDatabase(":memory:");
 		try {
-			const session = database.sessions.create({ title: "Definitive MCP failure" }).session;
+			const session = database.sessions.create({
+				title: "Definitive MCP failure",
+			}).session;
 			const run = database.runs.create({
 				clientRequestId: crypto.randomUUID(),
 				sessionId: session.id,
@@ -106,7 +112,7 @@ describe("McpActionDispatcher", () => {
 				userContent: "Call the MCP.",
 				assistantMessageId: createUuidV7(),
 			}).run;
-			const authorizer = new DurableActionAuthorizationService(database.actions, {
+			const authorizer = new DurableActionAuthorizationService(database.actions, database.runs, {
 				role: "agents",
 				peerId: "moshu-agents-server",
 				instanceId: "agents-instance",
@@ -159,7 +165,9 @@ describe("McpActionDispatcher", () => {
 	test("records a readiness race as cancelled before MCP dispatch", async () => {
 		const database = openAppDatabase(":memory:");
 		try {
-			const session = database.sessions.create({ title: "MCP readiness race" }).session;
+			const session = database.sessions.create({
+				title: "MCP readiness race",
+			}).session;
 			const run = database.runs.create({
 				clientRequestId: crypto.randomUUID(),
 				sessionId: session.id,
@@ -176,7 +184,7 @@ describe("McpActionDispatcher", () => {
 				userContent: "Call the MCP.",
 				assistantMessageId: createUuidV7(),
 			}).run;
-			const authorizer = new DurableActionAuthorizationService(database.actions, {
+			const authorizer = new DurableActionAuthorizationService(database.actions, database.runs, {
 				role: "agents",
 				peerId: "moshu-agents-server",
 				instanceId: "agents-instance",

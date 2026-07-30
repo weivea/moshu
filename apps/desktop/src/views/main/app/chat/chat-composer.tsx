@@ -14,6 +14,8 @@ export interface ChatComposerProps {
 	availableModels: readonly AvailableModel[];
 	selectedModel?: AvailableModel;
 	thinkingLevel?: ThinkingLevel;
+	disabledReason?: string;
+	showDisabledReason?: boolean;
 	onDraftChange(value: string): void;
 	onModelChange(selection: SessionModelSelection | null): void;
 	onSend(): void;
@@ -28,6 +30,8 @@ export function ChatComposer({
 	availableModels,
 	selectedModel,
 	thinkingLevel,
+	disabledReason,
+	showDisabledReason = true,
 	onDraftChange,
 	onModelChange,
 	onSend,
@@ -49,6 +53,11 @@ export function ChatComposer({
 
 	return (
 		<section className="chat-card chat-card--composer">
+			{disabledReason && showDisabledReason ? (
+				<p className="chat-composer__disabled-reason" role="status">
+					{disabledReason}
+				</p>
+			) : null}
 			<label className="chat-field chat-field--composer" htmlFor={textareaId}>
 				<span className="chat-live-region">{t("chat.composer.label")}</span>
 				<textarea
@@ -59,13 +68,14 @@ export function ChatComposer({
 					onChange={(event) => onDraftChange(event.target.value)}
 					onKeyDown={handleKeyDown}
 					placeholder={t("chat.composer.placeholder")}
+					disabled={disabledReason !== undefined}
 				/>
 			</label>
 
 			<div className="chat-composer__footer">
 				<ModelSelector
 					models={availableModels}
-					isDisabled={isResponding}
+					isDisabled={isResponding || disabledReason !== undefined}
 					{...(selectedModel === undefined
 						? {}
 						: { providerId: selectedModel.providerId, modelId: selectedModel.model.id })}
@@ -93,7 +103,7 @@ export function ChatComposer({
 						<Button
 							className="chat-button chat-button--danger"
 							onPress={onStop}
-							isDisabled={isStopping}
+							isDisabled={isStopping || disabledReason !== undefined}
 						>
 							{isStopping ? t("chat.composer.stopping") : t("chat.composer.stop")}
 						</Button>

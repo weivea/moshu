@@ -14,6 +14,10 @@ import {
 	chatRunSchema,
 	chatRunStatusSchema,
 	deleteChatSessionOutputSchema,
+	maxRetiredSessionsPerRecoveryPage,
+	type ProjectRootAgentsIssueCode,
+	type ProjectRunContext,
+	projectRunContextSchema,
 	type RunProviderConfigInput,
 	type RunProviderState,
 	retiredSessionTombstoneTtlMs,
@@ -26,10 +30,10 @@ import { and, asc, desc, eq, gt, inArray, sql } from "drizzle-orm";
 import type { AppDrizzleDatabase } from "./database";
 import { createUuidV7 } from "./ids";
 import {
+	agentSessionCleanupOutboxTable,
 	chatRunEventsTable,
 	chatRunsTable,
 	chatSessionsTable,
-	agentSessionCleanupOutboxTable,
 	retiredChatSessionsTable,
 } from "./schema";
 import { ChatSessionNotFoundError } from "./session-repository";
@@ -55,6 +59,8 @@ export interface CreateRunInput {
 	userMessageId: string;
 	userContent: string;
 	assistantMessageId: string;
+	projectContext?: ProjectRunContext;
+	rootAgentsWarning?: ProjectRootAgentsIssueCode;
 }
 
 export interface CreateRunResult {
@@ -107,6 +113,17 @@ export const maxRetiredSessionTombstones = 10_000;
 export const maxAgentSessionCleanupBatchSize = 100;
 export const maxAgentSessionCleanupJobs = 10_000;
 
+export class SessionRetirementCapacityError extends Error {
+	constructor(readonly capacity: "tombstones" | "cleanup_outbox") {
+		super(
+			capacity === "tombstones"
+				? `Retired Session recovery capacity is full (${maxRetiredSessionTombstones}); Session deletion is temporarily unavailable.`
+				: `Agent session cleanup recovery capacity is full (${maxAgentSessionCleanupJobs}); Session deletion is temporarily unavailable.`,
+		);
+		this.name = "SessionRetirementCapacityError";
+	}
+}
+
 export interface ReplayCursorSupport {
 	serverTimeMs: number;
 	oldestSupportedCursorIssuedAtMs: number;
@@ -120,6 +137,16 @@ export interface AgentSessionCleanupJob {
 	nextAttemptAtMs: number;
 	lastAttemptAtMs?: number;
 	lastError?: string;
+}
+
+export interface ListRetiredSessionPageInput {
+	cursor?: string | undefined;
+	limit: number;
+}
+
+export interface ListRetiredSessionPageOutput {
+	sessionIds: string[];
+	nextCursor?: string;
 }
 
 export interface ListRunEventPageInput extends ListRunEventsInput {
@@ -187,6 +214,7 @@ export interface RunJournalRepository {
 		sessionId: string;
 	};
 	isSessionRetired(sessionId: string): boolean;
+	listRetiredSessionPage(input: ListRetiredSessionPageInput): ListRetiredSessionPageOutput;
 	getReplayCursorSupport(): ReplayCursorSupport;
 	listPendingAgentSessionCleanups(
 		limit: number,
@@ -194,6 +222,7 @@ export interface RunJournalRepository {
 	): AgentSessionCleanupJob[];
 	recordAgentSessionCleanupFailure(sessionId: string, error: string, nextAttemptAtMs: number): void;
 	ackAgentSessionCleanup(sessionId: string): void;
+	hasNonTerminalForProject(projectId: string): boolean;
 }
 
 export class ChatRunNotFoundError extends Error {
@@ -271,6 +300,21 @@ function buildRun(row: RunRow): ChatRun {
 		id: row.id,
 		sessionId: row.sessionId,
 		runtimeBoxId: row.runtimeBoxId,
+		...(row.projectId === null
+			? {}
+			: {
+					projectContext: {
+						projectId: row.projectId,
+						runtimeBoxId: row.runtimeBoxId,
+						projectPath: row.projectPath,
+						projectPathRevision: row.projectPathRevision,
+						...(row.projectGitRootPath === null ? {} : { gitRootPath: row.projectGitRootPath }),
+						...(row.projectGitBranch === null ? {} : { gitBranch: row.projectGitBranch }),
+						...(row.projectRootAgentsHash === null
+							? {}
+							: { rootAgentsHash: row.projectRootAgentsHash }),
+					},
+				}),
 		mode: row.mode,
 		status: row.status,
 		provider: parseRunProviderState(row.providerJson),
@@ -296,6 +340,24 @@ function buildEvent(row: EventRow): ChatRunEvent {
 		createdAt: toIsoDateTime(row.createdAtMs),
 		payload: parseJsonValue(row.payloadJson, "event payload"),
 	});
+}
+
+function assertRunProjectContext(
+	session: { runtimeBoxId: string; projectId: string | null },
+	context: ProjectRunContext | undefined,
+): void {
+	if (session.projectId === null) {
+		if (context !== undefined) {
+			throw new Error("Global Sessions cannot create Runs with Project context.");
+		}
+		return;
+	}
+	if (context === undefined) {
+		throw new Error("Project Sessions require an immutable Project Run context.");
+	}
+	if (context.projectId !== session.projectId || context.runtimeBoxId !== session.runtimeBoxId) {
+		throw new Error("Project Run context did not match the Session ownership.");
+	}
 }
 
 function assertTransitionAllowed(currentStatus: ChatRunStatus, nextStatus: ChatRunStatus): void {
@@ -356,9 +418,18 @@ export class SqliteRunJournalRepository implements RunJournalRepository {
 			content: input.userContent,
 		}).content;
 		const provider = toSafeProviderState(input.provider);
+		const projectContext =
+			input.projectContext === undefined
+				? undefined
+				: projectRunContextSchema.parse(input.projectContext);
 
 		return this.inTransaction(() => {
-			const runtimeBoxId = this.getSessionRuntimeBoxId(sessionId);
+			const placement = this.getSessionPlacement(sessionId);
+			assertRunProjectContext(placement, projectContext);
+			if (input.rootAgentsWarning !== undefined && projectContext === undefined) {
+				throw new Error("Global Sessions cannot create Project root AGENTS.md warnings.");
+			}
+			const runtimeBoxId = placement.runtimeBoxId;
 			const nowMs = this.clock.now();
 			const row: RunRow = {
 				id: this.idGenerator.create(nowMs),
@@ -373,6 +444,12 @@ export class SqliteRunJournalRepository implements RunJournalRepository {
 				assistantMessageId,
 				assistantContent: null,
 				lastErrorJson: null,
+				projectId: projectContext?.projectId ?? null,
+				projectPath: projectContext?.projectPath ?? null,
+				projectPathRevision: projectContext?.projectPathRevision ?? null,
+				projectGitRootPath: projectContext?.gitRootPath ?? null,
+				projectGitBranch: projectContext?.gitBranch ?? null,
+				projectRootAgentsHash: projectContext?.rootAgentsHash ?? null,
 				createdAtMs: nowMs,
 				updatedAtMs: nowMs,
 				completedAtMs: null,
@@ -400,12 +477,31 @@ export class SqliteRunJournalRepository implements RunJournalRepository {
 				},
 				createdAtMs: nowMs,
 			});
+			const warningEvent =
+				input.rootAgentsWarning === undefined
+					? undefined
+					: this.insertEvent({
+							runId: row.id,
+							sessionId,
+							type: "run.warning",
+							source: { kind: "system" },
+							visibility: "user",
+							payload: {
+								code: "ROOT_AGENTS_SKIPPED",
+								reason: input.rootAgentsWarning,
+							},
+							createdAtMs: nowMs,
+						});
 			this.touchSession(sessionId, nowMs, true);
 			const event = buildEvent(queuedEvent);
 			return {
 				run: buildRun(row),
 				event,
-				events: [event, buildEvent(startedEvent)],
+				events: [
+					event,
+					buildEvent(startedEvent),
+					...(warningEvent === undefined ? [] : [buildEvent(warningEvent)]),
+				],
 			};
 		});
 	}
@@ -445,6 +541,22 @@ export class SqliteRunJournalRepository implements RunJournalRepository {
 			.orderBy(desc(chatRunsTable.createdAtMs), desc(chatRunsTable.id))
 			.all()
 			.map(buildRun);
+	}
+
+	hasNonTerminalForProject(projectId: string): boolean {
+		const parsedProjectId = uuidV7Schema.parse(projectId);
+		return (
+			this.orm
+				.select({ id: chatRunsTable.id })
+				.from(chatRunsTable)
+				.where(
+					and(
+						eq(chatRunsTable.projectId, parsedProjectId),
+						inArray(chatRunsTable.status, ["queued", "running", "cancelling"]),
+					),
+				)
+				.get() !== undefined
+		);
 	}
 
 	listPageBySession(input: ListRunPageInput): ListRunPageOutput {
@@ -892,9 +1004,7 @@ export class SqliteRunJournalRepository implements RunJournalRepository {
 				this.orm.select({ count: sql<number>`count(*)` }).from(retiredChatSessionsTable).get()
 					?.count ?? 0;
 			if (retainedCount >= maxRetiredSessionTombstones) {
-				throw new Error(
-					`Retired Session recovery capacity is full (${maxRetiredSessionTombstones}); Session deletion is temporarily unavailable.`,
-				);
+				throw new SessionRetirementCapacityError("tombstones");
 			}
 			this.orm
 				.insert(retiredChatSessionsTable)
@@ -904,9 +1014,7 @@ export class SqliteRunJournalRepository implements RunJournalRepository {
 				this.orm.select({ count: sql<number>`count(*)` }).from(agentSessionCleanupOutboxTable).get()
 					?.count ?? 0;
 			if (agentSessionCleanupCount >= maxAgentSessionCleanupJobs) {
-				throw new Error(
-					`Agent session cleanup recovery capacity is full (${maxAgentSessionCleanupJobs}); Session deletion is temporarily unavailable.`,
-				);
+				throw new SessionRetirementCapacityError("cleanup_outbox");
 			}
 			this.orm
 				.insert(agentSessionCleanupOutboxTable)
@@ -938,6 +1046,41 @@ export class SqliteRunJournalRepository implements RunJournalRepository {
 				)
 				.get() !== undefined
 		);
+	}
+
+	listRetiredSessionPage(input: ListRetiredSessionPageInput): ListRetiredSessionPageOutput {
+		if (
+			!Number.isSafeInteger(input.limit) ||
+			input.limit < 1 ||
+			input.limit > maxRetiredSessionsPerRecoveryPage
+		) {
+			throw new Error(
+				`Retired Session page limit must be between 1 and ${maxRetiredSessionsPerRecoveryPage}.`,
+			);
+		}
+		const cursor = input.cursor === undefined ? undefined : uuidV7Schema.parse(input.cursor);
+		const cutoffMs = this.clock.now() - retiredSessionTombstoneTtlMs;
+		const rows = this.orm
+			.select({ sessionId: retiredChatSessionsTable.sessionId })
+			.from(retiredChatSessionsTable)
+			.where(
+				and(
+					gt(retiredChatSessionsTable.retiredAtMs, cutoffMs),
+					cursor === undefined ? undefined : gt(retiredChatSessionsTable.sessionId, cursor),
+				),
+			)
+			.orderBy(asc(retiredChatSessionsTable.sessionId))
+			.limit(input.limit + 1)
+			.all();
+		const sessionIds = rows.slice(0, input.limit).map((row) => row.sessionId);
+		const nextCursor = rows.length > input.limit ? sessionIds.at(-1) : undefined;
+		if (rows.length > input.limit && nextCursor === undefined) {
+			throw new Error("Retired Session page was unexpectedly empty.");
+		}
+		return {
+			sessionIds,
+			...(nextCursor === undefined ? {} : { nextCursor }),
+		};
 	}
 
 	getReplayCursorSupport(): ReplayCursorSupport {
@@ -1034,16 +1177,22 @@ export class SqliteRunJournalRepository implements RunJournalRepository {
 		}
 	}
 
-	private getSessionRuntimeBoxId(sessionId: string): string {
+	private getSessionPlacement(sessionId: string): {
+		runtimeBoxId: string;
+		projectId: string | null;
+	} {
 		const row = this.orm
-			.select({ runtimeBoxId: chatSessionsTable.runtimeBoxId })
+			.select({
+				runtimeBoxId: chatSessionsTable.runtimeBoxId,
+				projectId: chatSessionsTable.projectId,
+			})
 			.from(chatSessionsTable)
 			.where(eq(chatSessionsTable.id, sessionId))
 			.get();
 		if (row === undefined) {
 			throw new ChatSessionNotFoundError(sessionId);
 		}
-		return row.runtimeBoxId;
+		return row;
 	}
 
 	private hasEventType(runId: string, type: ChatRunEvent["type"]): boolean {

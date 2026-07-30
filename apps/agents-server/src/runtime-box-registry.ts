@@ -1,77 +1,87 @@
 import {
-	runtimeBoxToolInvokeInputSchema,
-	runtimeBoxToolInvokeOutputSchema,
-	executorToolRpcTimeoutMs,
-	productRpcMethods,
+	acknowledgeRuntimeBoxInvocationsOutputSchema,
+	currentRuntimeBoxProtocolVersion,
+	type DeleteRuntimeBoxMcpServerInput,
+	type DeleteRuntimeBoxSkillInput,
+	deleteRuntimeBoxMcpServerInputSchema,
+	deleteRuntimeBoxSkillInputSchema,
+	type ExecutorExecutionContext,
 	type ExecutorToolInvokeInput,
 	type ExecutorToolInvokeOutput,
 	type ExecutorToolName,
 	type ExecutorToolProgressEvent,
-	type RuntimeBoxConnectionInfo,
-	type RuntimeBoxDescriptor,
-	type RuntimeBoxInvocationEvidence,
-	type ReconcileRuntimeBoxInvocationsOutput,
-	acknowledgeRuntimeBoxInvocationsOutputSchema,
-	runtimeBoxDescriptorSchema,
-	type ValidateRuntimeBoxProjectPathInput,
-	type ValidateRuntimeBoxProjectPathOutput,
-	validateRuntimeBoxProjectPathInputSchema,
-	validateRuntimeBoxProjectPathOutputSchema,
-	deleteRuntimeBoxMcpServerInputSchema,
-	deleteRuntimeBoxSkillInputSchema,
+	executorToolRpcTimeoutMs,
+	type GetRuntimeBoxSkillContentInput,
+	type GetRuntimeBoxSkillContentOutput,
 	getRuntimeBoxSkillContentInputSchema,
 	getRuntimeBoxSkillContentOutputSchema,
+	type InstallRuntimeBoxSkillInput,
 	installRuntimeBoxSkillInputSchema,
 	listRuntimeBoxMcpServersInputSchema,
 	listRuntimeBoxMcpServersOutputSchema,
 	listRuntimeBoxSkillsInputSchema,
 	listRuntimeBoxSkillsOutputSchema,
+	maxRuntimeBoxInventoryPayloadBytes,
+	maxRuntimeBoxInventoryResources,
+	productRpcMethods,
+	type ReadRuntimeBoxProjectRootAgentsInput,
+	type ReadRuntimeBoxProjectRootAgentsOutput,
+	type ReconcileRuntimeBoxInvocationsOutput,
+	type RuntimeBoxConnectionInfo,
+	type RuntimeBoxDescriptor,
+	type RuntimeBoxInventoryChange,
+	type RuntimeBoxInventoryChangedHint,
+	type RuntimeBoxInvocationEvidence,
+	type RuntimeBoxMcpServer,
+	type RuntimeBoxMcpToolInvokeInput,
+	type RuntimeBoxMcpToolInvokeOutput,
+	type RuntimeBoxResourceMutationResult,
+	type RuntimeBoxSkill,
+	type RuntimeBoxTransportSecurity,
+	readRuntimeBoxProjectRootAgentsInputSchema,
+	readRuntimeBoxProjectRootAgentsOutputSchema,
+	runtimeBoxDescriptorSchema,
 	runtimeBoxInventoryChangedHintSchema,
 	runtimeBoxInventoryChangesPageSchema,
 	runtimeBoxInventorySnapshotSchema,
-	runtimeBoxResourceMutationResultSchema,
-	setRuntimeBoxMcpServerEnabledInputSchema,
-	setRuntimeBoxSkillEnabledInputSchema,
-	upsertRuntimeBoxMcpServerInputSchema,
-	validateRuntimeBoxResourcesInputSchema,
-	validateRuntimeBoxResourcesOutputSchema,
-	type DeleteRuntimeBoxMcpServerInput,
-	type DeleteRuntimeBoxSkillInput,
-	type GetRuntimeBoxSkillContentInput,
-	type GetRuntimeBoxSkillContentOutput,
-	type InstallRuntimeBoxSkillInput,
-	type RuntimeBoxInventoryChangedHint,
-	type RuntimeBoxInventoryChange,
-	type RuntimeBoxMcpServer,
-	type RuntimeBoxResourceMutationResult,
-	type RuntimeBoxSkill,
-	type SetRuntimeBoxMcpServerEnabledInput,
-	type SetRuntimeBoxSkillEnabledInput,
-	type UpsertRuntimeBoxMcpServerInput,
-	type ValidateRuntimeBoxResourcesInput,
-	type ValidateRuntimeBoxResourcesOutput,
-	type RuntimeBoxMcpToolInvokeInput,
-	type RuntimeBoxMcpToolInvokeOutput,
 	runtimeBoxMcpToolInvokeInputSchema,
 	runtimeBoxMcpToolInvokeOutputSchema,
-	maxRuntimeBoxInventoryPayloadBytes,
-	maxRuntimeBoxInventoryResources,
-	currentRuntimeBoxProtocolVersion,
 	runtimeBoxProtocolVersionSchema,
-	type RuntimeBoxTransportSecurity,
+	runtimeBoxResourceMutationResultSchema,
+	runtimeBoxToolInvokeInputSchema,
+	runtimeBoxToolInvokeOutputSchema,
+	type SetRuntimeBoxMcpServerEnabledInput,
+	type SetRuntimeBoxSkillEnabledInput,
+	setRuntimeBoxMcpServerEnabledInputSchema,
+	setRuntimeBoxSkillEnabledInputSchema,
+	type UpsertRuntimeBoxMcpServerInput,
+	upsertRuntimeBoxMcpServerInputSchema,
+	type ValidateRuntimeBoxProjectPathInput,
+	type ValidateRuntimeBoxProjectPathOutput,
+	type ValidateRuntimeBoxResourcesInput,
+	type ValidateRuntimeBoxResourcesOutput,
+	validateRuntimeBoxProjectPathInputSchema,
+	validateRuntimeBoxProjectPathOutputSchema,
+	validateRuntimeBoxResourcesInputSchema,
+	validateRuntimeBoxResourcesOutputSchema,
 } from "@moshu/contracts";
 import type { RuntimeBoxInventoryRepository } from "@moshu/database";
 import {
+	type JsonValue,
+	RpcCancelledError,
+	RpcConnectionClosedError,
 	type RpcPeer,
 	type RpcPeerIdentity,
 	RpcRemoteError,
 	RpcRequestLimitError,
+	RpcTimeoutError,
 	rpcJsonValueSchema,
 } from "@moshu/process-rpc";
 
 export interface RuntimeBoxInvocationOptions {
 	signal?: AbortSignal;
 	onProgress?: (event: ExecutorToolProgressEvent) => void;
+	executionContext?: ExecutorExecutionContext;
 }
 
 export type RuntimeBoxGatewayPeer = Pick<
@@ -103,7 +113,7 @@ export interface RuntimeBoxActionAuthorizer {
 		runtimeBoxId: string,
 		input: ExecutorToolInvokeInput,
 		targetIdentity: RpcPeerIdentity,
-		executionScope: "request-cwd" | "runtime-box-workspace",
+		executionContext: ExecutorExecutionContext,
 	): ExecutorToolInvokeInput | Promise<ExecutorToolInvokeInput>;
 	authorizeMcp?(
 		runtimeBoxId: string,
@@ -158,6 +168,12 @@ interface ActiveInvocation {
 	failure: Error | undefined;
 }
 
+interface ActiveProjectRequest {
+	readonly peer: RuntimeBoxGatewayPeer;
+	readonly controller: AbortController;
+	failure: RuntimeBoxUnavailableError | undefined;
+}
+
 class InventoryResyncRequested extends Error {
 	constructor() {
 		super("Runtime Box inventory requires a full snapshot.");
@@ -193,6 +209,7 @@ export class RuntimeBoxRegistry {
 	readonly #entries = new Map<string, RuntimeBoxEntry>();
 	readonly #runtimeBoxIdByPeer = new Map<RuntimeBoxGatewayPeer, string>();
 	readonly #activeInvocations = new Map<string, ActiveInvocation>();
+	readonly #activeProjectRequests = new Set<ActiveProjectRequest>();
 	readonly #onRegister: ((descriptor: RuntimeBoxDescriptor) => void) | undefined;
 	readonly #isDeviceKeyActive: ((runtimeBoxId: string, deviceKeyId: string) => boolean) | undefined;
 	readonly #onChange: (() => void) | undefined;
@@ -327,6 +344,10 @@ export class RuntimeBoxRegistry {
 				existing.peer,
 				new RuntimeBoxUnavailableError("The registered Runtime Box connection was replaced."),
 			);
+			this.#failProjectRequestsForPeer(
+				existing.peer,
+				new RuntimeBoxUnavailableError("The registered Runtime Box connection was replaced."),
+			);
 		}
 		this.#entries.set(descriptor.runtimeBoxId, {
 			descriptor,
@@ -370,6 +391,10 @@ export class RuntimeBoxRegistry {
 			peer,
 			new RuntimeBoxUnavailableError("The Runtime Box disconnected during tool execution."),
 		);
+		this.#failProjectRequestsForPeer(
+			peer,
+			new RuntimeBoxUnavailableError("The Runtime Box disconnected during Project inspection."),
+		);
 		this.#onChange?.();
 	}
 
@@ -401,6 +426,10 @@ export class RuntimeBoxRegistry {
 	disconnectRuntimeBox(runtimeBoxId: string, reason: string): void {
 		const peer = this.#entries.get(runtimeBoxId)?.peer;
 		if (peer !== null && peer !== undefined && !peer.isClosed) {
+			this.#failProjectRequestsForPeer(
+				peer,
+				new RuntimeBoxUnavailableError("The Runtime Box was disconnected."),
+			);
 			peer.close(1008, reason);
 		}
 		this.#onChange?.();
@@ -414,6 +443,10 @@ export class RuntimeBoxRegistry {
 		if (entry.peer !== null && !entry.peer.isClosed) {
 			entry.peer.close(1008, "A newer Runtime Box generation requires a protocol upgrade.");
 			this.#failInvocationsForPeer(
+				entry.peer,
+				new RuntimeBoxUnavailableError("Runtime Box protocol upgrade is required."),
+			);
+			this.#failProjectRequestsForPeer(
 				entry.peer,
 				new RuntimeBoxUnavailableError("Runtime Box protocol upgrade is required."),
 			);
@@ -805,9 +838,10 @@ export class RuntimeBoxRegistry {
 						runtimeBoxId,
 						input,
 						peer.remoteIdentity,
-						this.#entries.get(runtimeBoxId)?.descriptor.kind === "remote"
-							? "runtime-box-workspace"
-							: "request-cwd",
+						options.executionContext ??
+							(this.#entries.get(runtimeBoxId)?.descriptor.kind === "remote"
+								? { executionScope: "runtime-box-workspace" }
+								: { executionScope: "request-cwd" }),
 					);
 		if (options.signal?.aborted) {
 			this.#actionAuthorizer?.cancelUndispatched(
@@ -1106,21 +1140,42 @@ export class RuntimeBoxRegistry {
 		signal?: AbortSignal,
 	): Promise<ValidateRuntimeBoxProjectPathOutput> {
 		const input = validateRuntimeBoxProjectPathInputSchema.parse(inputValue);
-		const peer = this.#entries.get(runtimeBoxId)?.peer;
-		if (peer === null || peer === undefined || peer.isClosed) {
+		const entry = this.#entries.get(runtimeBoxId);
+		const peer = entry?.peer;
+		if (peer === null || peer === undefined || peer.isClosed || entry?.ready !== true) {
 			throw new RuntimeBoxUnavailableError(`Runtime Box ${runtimeBoxId} is not available.`);
 		}
-		const rawOutput = await peer.request(
+		const rawOutput = await this.#requestProjectData(
+			runtimeBoxId,
+			peer,
 			productRpcMethods.runtimeBoxProjectValidatePath,
 			rpcJsonValueSchema.parse(input),
-			{ timeoutMs: 30_000, ...(signal === undefined ? {} : { signal }) },
+			"Project path validation",
+			signal,
 		);
-		if (this.#entries.get(runtimeBoxId)?.peer !== peer || peer.isClosed) {
-			throw new RuntimeBoxUnavailableError(
-				`Runtime Box ${runtimeBoxId} disconnected during Project path validation.`,
-			);
-		}
 		return validateRuntimeBoxProjectPathOutputSchema.parse(rawOutput);
+	}
+
+	async readProjectRootAgents(
+		runtimeBoxId: string,
+		inputValue: ReadRuntimeBoxProjectRootAgentsInput,
+		signal?: AbortSignal,
+	): Promise<ReadRuntimeBoxProjectRootAgentsOutput> {
+		const input = readRuntimeBoxProjectRootAgentsInputSchema.parse(inputValue);
+		const entry = this.#entries.get(runtimeBoxId);
+		const peer = entry?.peer;
+		if (peer === null || peer === undefined || peer.isClosed || entry?.ready !== true) {
+			throw new RuntimeBoxUnavailableError(`Runtime Box ${runtimeBoxId} is not available.`);
+		}
+		const rawOutput = await this.#requestProjectData(
+			runtimeBoxId,
+			peer,
+			productRpcMethods.runtimeBoxProjectReadRootAgents,
+			rpcJsonValueSchema.parse(input),
+			"root AGENTS.md loading",
+			signal,
+		);
+		return readRuntimeBoxProjectRootAgentsOutputSchema.parse(rawOutput);
 	}
 
 	handleProgress(peer: RuntimeBoxGatewayPeer, event: ExecutorToolProgressEvent): boolean {
@@ -1180,6 +1235,61 @@ export class RuntimeBoxRegistry {
 			throw new RuntimeBoxUnavailableError(`Runtime Box ${runtimeBoxId} is not ready.`);
 		}
 		return peer;
+	}
+
+	async #requestProjectData(
+		runtimeBoxId: string,
+		peer: RuntimeBoxGatewayPeer,
+		method: string,
+		payload: JsonValue,
+		operation: string,
+		signal?: AbortSignal,
+	): Promise<JsonValue> {
+		const active: ActiveProjectRequest = {
+			peer,
+			controller: new AbortController(),
+			failure: undefined,
+		};
+		this.#activeProjectRequests.add(active);
+		const combinedSignal = combineAbortSignals(signal, active.controller.signal);
+		try {
+			const output = await peer.request(method, payload, {
+				timeoutMs: 30_000,
+				signal: combinedSignal.signal,
+			});
+			if (active.failure !== undefined) {
+				throw active.failure;
+			}
+			if (this.#entries.get(runtimeBoxId)?.peer !== peer || peer.isClosed) {
+				throw new RuntimeBoxUnavailableError(
+					`Runtime Box ${runtimeBoxId} disconnected during ${operation}.`,
+				);
+			}
+			return output;
+		} catch (error) {
+			if (signal?.aborted === true || error instanceof RpcTimeoutError) {
+				throw error;
+			}
+			if (active.failure !== undefined) {
+				throw active.failure;
+			}
+			if (error instanceof RpcCancelledError) {
+				throw error;
+			}
+			if (
+				error instanceof RpcConnectionClosedError ||
+				peer.isClosed ||
+				this.#entries.get(runtimeBoxId)?.peer !== peer
+			) {
+				throw new RuntimeBoxUnavailableError(
+					`Runtime Box ${runtimeBoxId} disconnected during ${operation}.`,
+				);
+			}
+			throw error;
+		} finally {
+			combinedSignal.dispose();
+			this.#activeProjectRequests.delete(active);
+		}
 	}
 
 	async #mutateResource(
@@ -1435,6 +1545,18 @@ export class RuntimeBoxRegistry {
 		for (const active of this.#activeInvocations.values()) {
 			if (active.peer === peer) {
 				this.#failInvocation(active, error);
+			}
+		}
+	}
+
+	#failProjectRequestsForPeer(
+		peer: RuntimeBoxGatewayPeer,
+		error: RuntimeBoxUnavailableError,
+	): void {
+		for (const active of this.#activeProjectRequests) {
+			if (active.peer === peer && active.failure === undefined) {
+				active.failure = error;
+				active.controller.abort(error);
 			}
 		}
 	}

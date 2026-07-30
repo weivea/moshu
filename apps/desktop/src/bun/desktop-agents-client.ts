@@ -7,22 +7,27 @@ import {
 	cancelChatRunOutputSchema,
 	chatEventDeliverySchema,
 	chatSendAcceptedOutputSchema,
+	chatSessionsRetiredEventSchema,
 	createChatSessionOutputSchema,
 	createProcessChatSessionInputSchema,
 	deleteChatSessionInputSchema,
 	getChatSessionPageInputSchema,
 	getChatSessionPageOutputSchema,
 	type ListRuntimeBoxesOutput,
+	listRetiredChatSessionsInputSchema,
+	listRetiredChatSessionsOutputSchema,
 	listRuntimeBoxesOutputSchema,
 	maxReplayRunCursors,
+	maxRetainedSessionRetirements,
+	maxRetiredSessionsPerRecoveryPage,
+	productRpcEvents,
 	productRpcMaxBufferedOutboundBytes,
 	productRpcMaxFrameBytes,
 	productRpcMethods,
-	productRpcEvents,
 	type productRpcRequestSchemas,
+	type ReplayCursorSupport,
 	remoteAccessMutationMethods,
 	remoteAccessMutationRpcTimeoutMs,
-	type ReplayCursorSupport,
 	replayChatEventsInputSchema,
 	replayChatEventsOutputSchema,
 	type SessionModelSelection,
@@ -57,6 +62,8 @@ import {
 	AgentsUnavailableError,
 	ChatSessionNotFoundError,
 	chatSessionNotFoundCode,
+	ProjectPreviewStaleError,
+	projectPreviewStaleCode,
 } from "../shared/rpc-errors";
 import {
 	SessionRetirementCache,
@@ -169,6 +176,10 @@ const remoteOperationErrorDispositions: Record<
 	[productRpcMethods.sessionCreate]: {
 		INVALID_ARGUMENT: "definitive-rejection",
 		RUNTIME_BOX_NOT_READY: "definitive-rejection",
+		PROJECT_NOT_FOUND: "definitive-rejection",
+		PROJECT_ARCHIVED: "definitive-rejection",
+		PROJECT_RUNTIME_UNAVAILABLE: "definitive-rejection",
+		PROJECT_PATH_UNAVAILABLE: "definitive-rejection",
 		SESSION_CREATE_KEY_CONFLICT: "definitive-rejection",
 		SESSION_CREATE_CAPACITY: "definitive-rejection",
 	},
@@ -237,6 +248,7 @@ export class DesktopAgentsClient {
 		let provisionalFailure: Error | null = null;
 		let peer: DesktopAgentsRpcPeer | undefined;
 		let deliveryTail = Promise.resolve();
+		let retirementDeliveryTail = Promise.resolve();
 		const closed = new Promise<void>((resolve) => {
 			resolveClosed = resolve;
 		});
@@ -273,6 +285,24 @@ export class DesktopAgentsClient {
 			deliveryTail = operation.catch(() => undefined);
 			return operation;
 		};
+		const deliverRetirements = (sessionIds: readonly string[]): Promise<void> => {
+			const operation = retirementDeliveryTail.then(async () => {
+				if (connectionClosed) {
+					throw new AgentsUnavailableError("The local agents connection closed.");
+				}
+				const deadline = this.now() + this.#recoveryLimits.recoveryTimeoutMs;
+				const retirements = this.#stagePendingSessionRetirementBatch(sessionIds);
+				for (const retirement of retirements) {
+					await this.#invalidatePendingSessionRetirement(
+						retirement,
+						deadline,
+						connectionGeneration,
+					);
+				}
+			});
+			retirementDeliveryTail = operation.catch(() => undefined);
+			return operation;
+		};
 
 		try {
 			peer = await this.connectPeer({
@@ -298,6 +328,20 @@ export class DesktopAgentsClient {
 								provisionalFailure = toRecoveryError(error);
 								closeExactPeer("Chat event delivery failed.");
 								throw new Error("Chat event delivery failed.");
+							}
+						},
+						[productRpcEvents.chatSessionsRetired]: async (payload) => {
+							try {
+								const event = chatSessionsRetiredEventSchema.parse(payload);
+								if (!connectionActive) {
+									this.#stagePendingSessionRetirementBatch(event.sessionIds);
+									return;
+								}
+								await deliverRetirements(event.sessionIds);
+							} catch (error) {
+								provisionalFailure = toRecoveryError(error);
+								closeExactPeer("Session retirement delivery failed.");
+								throw new Error("Session retirement delivery failed.");
 							}
 						},
 						[productRpcEvents.runtimeBoxesChanged]: (payload) => {
@@ -333,6 +377,7 @@ export class DesktopAgentsClient {
 				throw provisionalFailure;
 			}
 			await this.#readCursorSupport(peer, recoveryDeadline);
+			await this.#recoverRetiredSessions(peer, recoveryDeadline, connectionGeneration);
 			await this.#retryPendingSessionRetirements(recoveryDeadline, connectionGeneration);
 			await this.#replayProgressively(peer, recoveryDeadline, connectionGeneration, deliver);
 			await this.#flushProvisionalEvents(provisionalQueue, recoveryDeadline, deliver);
@@ -340,6 +385,7 @@ export class DesktopAgentsClient {
 			await this.#reconcileUnboundReservations(peer, recoveryDeadline, connectionGeneration);
 			await this.#reconcilePendingSessionCreates(peer, recoveryDeadline);
 			await this.#flushProvisionalEvents(provisionalQueue, recoveryDeadline, deliver);
+			await this.#retryPendingSessionRetirements(recoveryDeadline, connectionGeneration);
 			this.#deleteCommittedTerminalCursors();
 			if (this.#shutdown || connectionClosed) {
 				throw new AgentsUnavailableError("The local agents service disconnected during recovery.");
@@ -376,8 +422,9 @@ export class DesktopAgentsClient {
 	async createSession(
 		createKey?: string,
 		model?: SessionModelSelection,
+		projectId?: string,
 	): Promise<CreateChatSessionOutput> {
-		const reservation = this.#getOrCreateSessionCreateReservation(createKey, model);
+		const reservation = this.#getOrCreateSessionCreateReservation(createKey, model, projectId);
 		const recovered = this.#recoveredSessionCreates.get(reservation.createKey);
 		if (recovered !== undefined) {
 			this.#recoveredSessionCreates.delete(reservation.createKey);
@@ -521,6 +568,9 @@ export class DesktopAgentsClient {
 					}
 					throw new ChatSessionNotFoundError(error.message, { cause: error });
 				}
+				if (error.code === projectPreviewStaleCode) {
+					throw new ProjectPreviewStaleError(error.message, { cause: error });
+				}
 				throw error;
 			}
 			if (
@@ -637,6 +687,7 @@ export class DesktopAgentsClient {
 	#getOrCreateSessionCreateReservation(
 		createKey?: string,
 		model?: SessionModelSelection,
+		projectId?: string,
 	): SessionCreateReservation {
 		const selectedKey = createKey ?? this.#implicitSessionCreateKey ?? crypto.randomUUID();
 		const parsedInput = createProcessChatSessionInputSchema.parse({
@@ -645,9 +696,13 @@ export class DesktopAgentsClient {
 			title: "New chat",
 			defaultMode: "agent",
 			...(model === undefined ? {} : { model }),
+			...(projectId === undefined ? {} : { projectId }),
 		});
 		const existing = this.#pendingSessionCreates.get(parsedInput.createKey);
 		if (existing !== undefined) {
+			if (existing.input.projectId !== parsedInput.projectId) {
+				throw new Error("A Session create key cannot be reused for a different Project.");
+			}
 			return existing;
 		}
 		if (this.#recoveredSessionCreates.has(parsedInput.createKey)) {
@@ -1356,6 +1411,18 @@ export class DesktopAgentsClient {
 		}
 	}
 
+	#stagePendingSessionRetirementBatch(
+		sessionIds: readonly string[],
+	): SessionRetirementCacheEntry<SessionRetirementState>[] {
+		const missingSessionIds = new Set(
+			sessionIds.filter((sessionId) => !this.#sessionRetirements.has(sessionId)),
+		);
+		if (this.#sessionRetirements.size + missingSessionIds.size > maxRetainedSessionRetirements) {
+			throw new AgentsUnavailableError("The Session retirement recovery limit was exceeded.");
+		}
+		return sessionIds.map((sessionId) => this.#stagePendingSessionRetirement(sessionId));
+	}
+
 	#finalizePendingSessionRetirement(
 		retirement: SessionRetirementCacheEntry<SessionRetirementState>,
 		expectedGeneration: number | undefined,
@@ -1419,11 +1486,60 @@ export class DesktopAgentsClient {
 		deadline: number,
 		connectionGeneration: number,
 	): Promise<void> {
-		for (const retirement of this.#sessionRetirements.entries()) {
-			if (retirement.value.status !== "pending") {
-				continue;
+		let processed = 0;
+		while (true) {
+			this.#assertRecoveryDeadline(deadline);
+			const retirement = this.#sessionRetirements
+				.entries()
+				.find((entry) => entry.value.status === "pending");
+			if (retirement === undefined) {
+				return;
+			}
+			if (processed >= maxRetainedSessionRetirements) {
+				throw new AgentsUnavailableError(
+					"The pending Session retirement drain exceeded its bounded capacity.",
+				);
 			}
 			await this.#invalidatePendingSessionRetirement(retirement, deadline, connectionGeneration);
+			processed += 1;
+		}
+	}
+
+	async #recoverRetiredSessions(
+		peer: DesktopAgentsRpcPeer,
+		deadline: number,
+		connectionGeneration: number,
+	): Promise<void> {
+		let cursor: string | undefined;
+		while (true) {
+			this.#assertRecoveryDeadline(deadline);
+			const input = listRetiredChatSessionsInputSchema.parse({
+				schemaVersion: 1,
+				...(cursor === undefined ? {} : { cursor }),
+				limit: maxRetiredSessionsPerRecoveryPage,
+			});
+			const output = listRetiredChatSessionsOutputSchema.parse(
+				await peer.request(productRpcMethods.chatRetiredSessionsList, input, {
+					timeoutMs: Math.max(1, deadline - this.now()),
+				}),
+			);
+			const retirements = this.#stagePendingSessionRetirementBatch(output.sessionIds);
+			for (const retirement of retirements) {
+				await this.#invalidatePendingSessionRetirement(retirement, deadline, connectionGeneration);
+			}
+			if (output.nextCursor === undefined) {
+				return;
+			}
+			if (
+				output.sessionIds.length === 0 ||
+				output.nextCursor !== output.sessionIds.at(-1) ||
+				(cursor !== undefined && output.nextCursor <= cursor)
+			) {
+				throw new AgentsUnavailableError(
+					"Agents returned an invalid retired Session recovery cursor.",
+				);
+			}
+			cursor = output.nextCursor;
 		}
 	}
 

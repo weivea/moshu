@@ -1,8 +1,8 @@
-import type { ExecutorReadToolArguments, ExecutorToolTruncation } from "@moshu/contracts";
 import { createReadStream } from "node:fs";
 import { open, readFile, stat } from "node:fs/promises";
+import type { ExecutorReadToolArguments, ExecutorToolTruncation } from "@moshu/contracts";
 import { detectImageMime, MAX_IMAGE_INPUT_BYTES, processImage } from "./image.ts";
-import { resolveReadPath } from "./path-utils.ts";
+import { resolveContainedExistingPath, resolveReadPath } from "./path-utils.ts";
 import type { ReadToolResult } from "./tool-result.ts";
 import { textContent, throwIfAborted } from "./tool-result.ts";
 import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize } from "./truncate.ts";
@@ -128,10 +128,20 @@ async function readTextRange(
 export async function executeReadTool(
 	params: ExecutorReadToolArguments,
 	cwd: string,
-	signal?: AbortSignal,
+	options: {
+		signal?: AbortSignal;
+		effectiveFilePath?: string;
+		containmentRoot?: string;
+	} = {},
 ): Promise<ReadToolResult> {
+	const { signal } = options;
 	throwIfAborted(signal);
-	const filePath = await resolveReadPath(params.path, cwd);
+	const resolvedPath =
+		options.effectiveFilePath ?? (await resolveReadPath(params.path, cwd, options.containmentRoot));
+	const filePath =
+		options.containmentRoot === undefined
+			? resolvedPath
+			: await resolveContainedExistingPath(resolvedPath, options.containmentRoot);
 	const fileStat = await stat(filePath);
 	if (!fileStat.isFile()) {
 		throw new Error(`Path is not a file: ${params.path}`);

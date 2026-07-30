@@ -3,8 +3,12 @@ import {
 	chatRunEventSourceKindValues,
 	chatRunEventVisibilityValues,
 	chatRunStatusValues,
+	projectPathIssueCodeValues,
+	projectPathStatusValues,
 } from "@moshu/contracts";
+import { sql } from "drizzle-orm";
 import {
+	check,
 	index,
 	integer,
 	primaryKey,
@@ -266,20 +270,48 @@ export const projectsTable = sqliteTable(
 			.references(() => runtimeBoxesTable.id),
 		name: text("name").notNull(),
 		path: text("path").notNull(),
+		pathRevision: integer("path_revision").notNull(),
+		pathStatus: text("path_status", { enum: projectPathStatusValues }).notNull(),
+		pathCheckedAtMs: integer("path_checked_at_ms"),
+		pathIssueCode: text("path_issue_code", { enum: projectPathIssueCodeValues }),
 		gitRootPath: text("git_root_path"),
 		gitBranch: text("git_branch"),
 		createdAtMs: integer("created_at_ms").notNull(),
 		updatedAtMs: integer("updated_at_ms").notNull(),
 		archivedAtMs: integer("archived_at_ms"),
+		deletionRequestedAtMs: integer("deletion_requested_at_ms"),
 	},
 	(table) => [
 		uniqueIndex("projects_runtime_path_unique").on(table.runtimeBoxId, table.path),
-		index("projects_runtime_archived_updated_idx").on(
+		index("projects_runtime_archived_created_idx").on(
 			table.runtimeBoxId,
 			table.archivedAtMs,
-			table.updatedAtMs,
+			table.createdAtMs,
 		),
+		check(
+			"projects_path_health_check",
+			sql`(${table.pathStatus} = 'unavailable' AND ${table.pathIssueCode} IS NOT NULL)
+				OR (${table.pathStatus} <> 'unavailable' AND ${table.pathIssueCode} IS NULL)`,
+		),
+		check("projects_path_revision_positive_check", sql`${table.pathRevision} > 0`),
 	],
+);
+
+export const projectDeletionJobsTable = sqliteTable(
+	"project_deletion_jobs",
+	{
+		projectId: text("project_id")
+			.primaryKey()
+			.references(() => projectsTable.id, { onDelete: "cascade" }),
+		state: text("state", { enum: ["pending", "processing", "blocked"] }).notNull(),
+		attemptCount: integer("attempt_count").notNull().default(0),
+		nextAttemptAtMs: integer("next_attempt_at_ms").notNull(),
+		lastAttemptAtMs: integer("last_attempt_at_ms"),
+		lastErrorCode: text("last_error_code"),
+		createdAtMs: integer("created_at_ms").notNull(),
+		updatedAtMs: integer("updated_at_ms").notNull(),
+	},
+	(table) => [index("project_deletion_jobs_next_attempt_idx").on(table.nextAttemptAtMs)],
 );
 
 export const chatSessionsTable = sqliteTable(
@@ -289,6 +321,7 @@ export const chatSessionsTable = sqliteTable(
 		runtimeBoxId: text("runtime_box_id")
 			.notNull()
 			.references(() => runtimeBoxesTable.id),
+		projectId: text("project_id").references(() => projectsTable.id),
 		title: text("title").notNull(),
 		defaultMode: text("default_mode", { enum: agentModeValues }).notNull(),
 		providerId: text("provider_id"),
@@ -304,6 +337,12 @@ export const chatSessionsTable = sqliteTable(
 		index("chat_sessions_updated_at_idx").on(table.updatedAtMs),
 		index("chat_sessions_last_message_at_idx").on(table.lastMessageAtMs),
 		index("chat_sessions_archived_updated_at_idx").on(table.archivedAtMs, table.updatedAtMs),
+		index("chat_sessions_project_archived_activity_idx").on(
+			table.projectId,
+			table.archivedAtMs,
+			table.lastMessageAtMs,
+			table.updatedAtMs,
+		),
 	],
 );
 
@@ -314,6 +353,7 @@ export const chatSessionCreateRequestsTable = sqliteTable(
 		runtimeBoxId: text("runtime_box_id")
 			.notNull()
 			.references(() => runtimeBoxesTable.id),
+		projectId: text("project_id").references(() => projectsTable.id),
 		originRole: text("origin_role").notNull(),
 		originPeerId: text("origin_peer_id").notNull(),
 		originInstanceId: text("origin_instance_id").notNull(),
@@ -350,6 +390,12 @@ export const chatRunsTable = sqliteTable(
 		assistantMessageId: text("assistant_message_id").notNull(),
 		assistantContent: text("assistant_content"),
 		lastErrorJson: text("last_error_json"),
+		projectId: text("project_id").references(() => projectsTable.id),
+		projectPath: text("project_path"),
+		projectPathRevision: integer("project_path_revision"),
+		projectGitRootPath: text("project_git_root_path"),
+		projectGitBranch: text("project_git_branch"),
+		projectRootAgentsHash: text("project_root_agents_hash"),
 		createdAtMs: integer("created_at_ms").notNull(),
 		updatedAtMs: integer("updated_at_ms").notNull(),
 		completedAtMs: integer("completed_at_ms"),
@@ -360,6 +406,15 @@ export const chatRunsTable = sqliteTable(
 		uniqueIndex("chat_runs_user_message_unique").on(table.userMessageId),
 		uniqueIndex("chat_runs_assistant_message_unique").on(table.assistantMessageId),
 		uniqueIndex("chat_runs_client_request_unique").on(table.clientRequestId),
+		index("chat_runs_project_status_idx").on(table.projectId, table.status),
+		check(
+			"chat_runs_project_context_check",
+			sql`(${table.projectId} IS NULL AND ${table.projectPath} IS NULL AND ${table.projectPathRevision} IS NULL
+					AND ${table.projectGitRootPath} IS NULL AND ${table.projectGitBranch} IS NULL
+					AND ${table.projectRootAgentsHash} IS NULL)
+				OR (${table.projectId} IS NOT NULL AND ${table.projectPath} IS NOT NULL
+					AND ${table.projectPathRevision} > 0)`,
+		),
 	],
 );
 
@@ -488,6 +543,7 @@ export const appSchema = {
 	appSettingsTable,
 	remoteAccessSettingsTable,
 	projectsTable,
+	projectDeletionJobsTable,
 	agentSessionCleanupOutboxTable,
 	chatRunEventsTable,
 	chatRunsTable,

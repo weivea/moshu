@@ -19,16 +19,16 @@ import {
 	createMcpToolParameterPayload,
 	type ExecutorToolInvokeInput,
 	type ExecutorToolInvokeOutput,
-	type RuntimeBoxMcpToolInvokeInput,
-	type RuntimeBoxMcpToolInvokeOutput,
-	type RuntimeBoxActionResult,
-	runtimeBoxActionResultSchema,
-	runtimeBoxInvocationEvidenceSchema,
-	type RuntimeBoxInvocationEvidence,
 	productRpcMaxFrameBytes,
 	productRpcMethods,
+	type RuntimeBoxActionResult,
+	type RuntimeBoxInvocationEvidence,
+	type RuntimeBoxMcpToolInvokeInput,
+	type RuntimeBoxMcpToolInvokeOutput,
 	reconcileRuntimeBoxInvocationsInputSchema,
 	reconcileRuntimeBoxInvocationsOutputSchema,
+	runtimeBoxActionResultSchema,
+	runtimeBoxInvocationEvidenceSchema,
 } from "@moshu/contracts";
 import {
 	type JsonValue,
@@ -68,7 +68,7 @@ const journalRecordSchema = z
 		targetRuntimeBoxId: z.string().min(1).max(128),
 		targetInstanceId: z.string().min(1).max(256),
 		targetGeneration: z.int().nonnegative().safe(),
-		executionScope: z.enum(["request-cwd", "runtime-box-workspace"]),
+		executionScope: z.enum(["request-cwd", "runtime-box-workspace", "project-root"]),
 		grantExpiresAt: z.string().datetime({ offset: true }),
 		state: z.enum(["prepared", "running", "succeeded", "failed", "cancelled", "outcome_unknown"]),
 		result: runtimeBoxActionResultSchema.optional(),
@@ -88,6 +88,9 @@ const journalFileSchema = z
 
 type JournalRecord = z.infer<typeof journalRecordSchema>;
 type ConsumedGrant = z.infer<typeof consumedGrantSchema>;
+export type RuntimeBoxToolDeployment =
+	| { kind: "local"; trustedRequestCwd: true }
+	| { kind: "remote"; workspacePath: string };
 
 export class InvocationGrantRejectedError extends Error {
 	constructor(message: string) {
@@ -137,7 +140,7 @@ export class RuntimeBoxInvocationJournal {
 		input: ExecutorToolInvokeInput,
 		authority: RpcPeerIdentity,
 		target: RpcPeerIdentity,
-		executionScope?: "request-cwd" | "runtime-box-workspace",
+		deployment?: RuntimeBoxToolDeployment,
 	): { replayResult?: ExecutorToolInvokeOutput };
 	begin(
 		input: RuntimeBoxMcpToolInvokeInput,
@@ -149,7 +152,10 @@ export class RuntimeBoxInvocationJournal {
 		input: ExecutorToolInvokeInput | RuntimeBoxMcpToolInvokeInput,
 		authority: RpcPeerIdentity,
 		target: RpcPeerIdentity,
-		executionScope: "request-cwd" | "runtime-box-workspace" = "request-cwd",
+		deployment: RuntimeBoxToolDeployment | "runtime-box-workspace" = {
+			kind: "local",
+			trustedRequestCwd: true,
+		},
 	): { replayResult?: RuntimeBoxActionResult } {
 		const authorization = input.authorization;
 		if (authorization === undefined) {
@@ -162,11 +168,6 @@ export class RuntimeBoxInvocationJournal {
 		) {
 			throw new InvocationGrantRejectedError(
 				"Execution grant origin did not match the authenticated Agent Server.",
-			);
-		}
-		if (authorization.executionScope !== executionScope) {
-			throw new InvocationGrantRejectedError(
-				"Execution grant scope did not match Runtime Box workspace policy.",
 			);
 		}
 		if (
@@ -185,12 +186,21 @@ export class RuntimeBoxInvocationJournal {
 		const { authorization: _authorization, ...parameters } = input;
 		const parameterDigest = sha256(
 			"call" in parameters
-				? createExecutorToolParameterPayload(parameters)
+				? createExecutorToolParameterPayload(
+						parameters,
+						authorization.executionScope === "project-root"
+							? {
+									executionScope: "project-root",
+									projectPathRevision: authorization.projectPathRevision,
+								}
+							: { executionScope: authorization.executionScope },
+					)
 				: createMcpToolParameterPayload(parameters),
 		);
 		if (parameterDigest !== authorization.parameterDigest) {
 			throw new InvocationGrantRejectedError("Execution grant parameter digest did not match.");
 		}
+		assertScopeCompatible(authorization.executionScope, deployment);
 		this.#pruneExpiredGrantTombstones();
 		if (this.#consumedGrants.has(authorization.grantId)) {
 			throw new InvocationGrantRejectedError(
@@ -662,6 +672,33 @@ export async function watchInvocationReconciliation(
 
 function sha256(value: string): string {
 	return createHash("sha256").update(value).digest("hex");
+}
+
+function assertScopeCompatible(
+	scope: "request-cwd" | "runtime-box-workspace" | "project-root",
+	deployment: RuntimeBoxToolDeployment | "runtime-box-workspace",
+): void {
+	if (deployment === "runtime-box-workspace") {
+		if (scope !== deployment) {
+			throw new InvocationGrantRejectedError(
+				"Execution grant scope is incompatible with this Runtime Box deployment.",
+			);
+		}
+		return;
+	}
+	const compatible =
+		scope === "project-root" ||
+		(scope === "request-cwd" &&
+			deployment.kind === "local" &&
+			deployment.trustedRequestCwd === true) ||
+		(scope === "runtime-box-workspace" &&
+			deployment.kind === "remote" &&
+			deployment.workspacePath.length > 0);
+	if (!compatible) {
+		throw new InvocationGrantRejectedError(
+			"Execution grant scope is incompatible with this Runtime Box deployment.",
+		);
+	}
 }
 
 function boundSafeError(value: string): string {

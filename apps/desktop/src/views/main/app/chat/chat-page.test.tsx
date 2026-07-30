@@ -1,5 +1,6 @@
-import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { defaultLocalRuntimeBoxId } from "@moshu/contracts";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import { beforeEach, describe, expect, test, vi } from "vitest";
 import { AgentsUnavailableError, ChatSessionNotFoundError } from "../../../../shared/rpc-errors";
 import { I18nProvider } from "../i18n";
@@ -396,9 +397,9 @@ describe("ChatPage", () => {
 		expect(screen.getByText("Earlier answer")).toBeVisible();
 		expect(screen.getByText("Session: existing-session")).toBeVisible();
 
-		const sessionItem = screen
-			.getByText("Existing session", { selector: ".session-item__main strong" })
-			.closest("li");
+		const sessionItem = (
+			await screen.findByText("Existing session", { selector: ".session-item__main strong" })
+		).closest("li");
 		if (sessionItem === null) {
 			throw new Error("Selected Session item was not rendered.");
 		}
@@ -505,6 +506,42 @@ describe("ChatPage", () => {
 		expect(screen.getByRole("button", { name: "Send" })).toBeDisabled();
 		expect(transport.sendCalls).toEqual([]);
 		expect(transport.sessions.size).toBe(0);
+	});
+
+	test("rejects a Project Session opened through a global Chat deep link", async () => {
+		const transport = new FakeChatTransport({ configured: true, model: "gpt-4.1-mini" });
+		transport.sessions.set("globally-routed-project-session", {
+			id: "globally-routed-project-session",
+			runtimeBoxId: defaultLocalRuntimeBoxId,
+			projectId: "project-a",
+			title: "Project Session",
+			updatedAt: "2026-01-01T00:00:00.000Z",
+			askMode: "Ask",
+			messages: [createMessage("project-history", "user", "Project-only history")],
+		});
+
+		renderChatPage({ transport, sessionId: "globally-routed-project-session" });
+
+		expect(await screen.findByRole("alert")).toHaveTextContent("belongs to a different Project");
+		expect(screen.queryByText("Project Session")).not.toBeInTheDocument();
+		expect(screen.queryByText("Project-only history")).not.toBeInTheDocument();
+		expect(transport.listeners.size).toBe(0);
+		expect(screen.getByLabelText("Prompt")).toBeDisabled();
+	});
+
+	test("rejects Project ownership returned when creating a global Session", async () => {
+		const transport = new FakeChatTransport({ configured: true, model: "gpt-4.1-mini" });
+		transport.createdSessionProjectIdOverride = "project-a";
+		renderChatPage({ transport });
+
+		const prompt = await screen.findByLabelText("Prompt");
+		fireEvent.change(prompt, { target: { value: "Global prompt" } });
+		fireEvent.keyDown(prompt, { key: "Enter" });
+
+		expect(await screen.findByRole("alert")).toHaveTextContent(
+			"Created Session ownership is invalid",
+		);
+		expect(transport.sendCalls).toEqual([]);
 	});
 
 	test("restores the selected archived Session without navigating away", async () => {
@@ -1215,10 +1252,297 @@ describe("ChatPage", () => {
 	});
 });
 
+describe("Project Chat", () => {
+	const projectContext = {
+		projectId: "project-a",
+		name: "Project A",
+		path: "/workspace/a",
+		overviewHref: "/projects/project-a",
+		settingsHref: "/projects/project-a/settings",
+		runtimeReady: true,
+		status: "ready" as const,
+	};
+
+	test("passes the persisted route Project ID when creating a Session", async () => {
+		const transport = new FakeChatTransport({ configured: true, model: "gpt-4.1-mini" });
+		renderChatPage({
+			transport,
+			routeProjectId: "project-a",
+			projectContext: {
+				...projectContext,
+				runtimeBoxName: "Build host",
+				pathStatus: "available",
+			},
+		});
+		expect(screen.getByRole("link", { name: "Project A" })).toHaveAttribute(
+			"href",
+			"/projects/project-a",
+		);
+		expect(screen.getByText(/Build host · Runtime ready · Available/)).toBeVisible();
+		expect(screen.getByText(/bash is not sandboxed/i)).toBeVisible();
+		const prompt = await screen.findByLabelText("Prompt");
+		fireEvent.change(prompt, { target: { value: "Project prompt" } });
+		fireEvent.keyDown(prompt, { key: "Enter" });
+		await waitFor(() => expect(transport.createSessionProjectIds).toEqual(["project-a"]));
+	});
+
+	test("rejects route ownership mismatch before subscribing or sending", async () => {
+		const transport = new FakeChatTransport({ configured: true, model: "gpt-4.1-mini" });
+		const mismatchedSession: ChatSession = {
+			id: "project-session",
+			runtimeBoxId: defaultLocalRuntimeBoxId,
+			projectId: "project-b",
+			title: "Sensitive Project title",
+			updatedAt: "2026-01-01T00:00:00.000Z",
+			askMode: "Ask",
+			messages: [createMessage("existing", "user", "Sensitive Project history")],
+			activeResponse: {
+				requestId: "sensitive-request",
+				messageId: "existing",
+			},
+		};
+		transport.sessions.set("project-session", mismatchedSession);
+		renderChatPage({
+			transport,
+			sessionId: "project-session",
+			initialSession: mismatchedSession,
+			routeProjectId: "project-a",
+			projectContext,
+		});
+		expect(await screen.findByRole("alert")).toHaveTextContent("belongs to a different Project");
+		expect(screen.queryByText("Sensitive Project history")).not.toBeInTheDocument();
+		expect(screen.queryByText("Sensitive Project title")).not.toBeInTheDocument();
+		expect(transport.listeners.size).toBe(0);
+		expect(screen.getByLabelText("Prompt")).toBeDisabled();
+	});
+
+	test("masks the previous Project route while replacement ownership hydration is deferred", async () => {
+		const transport = new FakeChatTransport({ configured: true, model: "gpt-4.1-mini" });
+		const sessionId = "reused-project-session";
+		transport.sessions.set(sessionId, {
+			id: sessionId,
+			projectId: "project-a",
+			title: "Previous Project title",
+			updatedAt: "2026-01-01T00:00:00.000Z",
+			askMode: "Ask",
+			messages: [
+				createMessage("previous-history", "user", "Previous Project history"),
+				createMessage("replacement-answer", "assistant", "", "streaming"),
+			],
+			activeResponse: {
+				requestId: "replacement-request",
+				messageId: "replacement-answer",
+			},
+		});
+		const rendered = renderChatPage({
+			transport,
+			sessionId,
+			routeProjectId: "project-a",
+			projectContext,
+		});
+		expect(await screen.findByText("Previous Project history")).toBeVisible();
+		fireEvent.change(screen.getByLabelText("Prompt"), {
+			target: { value: "Previous Project draft" },
+		});
+
+		transport.sessions.set(sessionId, {
+			id: sessionId,
+			projectId: "project-b",
+			title: "Replacement Project title",
+			updatedAt: "2026-01-02T00:00:00.000Z",
+			askMode: "Ask",
+			messages: [createMessage("replacement-answer", "assistant", "", "streaming")],
+			activeResponse: {
+				requestId: "replacement-request",
+				messageId: "replacement-answer",
+			},
+		});
+		const gate = createDeferred();
+		transport.sessionLoadGates.set(sessionId, gate.promise);
+		transport.captureSessionBeforeGate = true;
+		rendered.rerender(
+			<I18nProvider>
+				<MemoryRouter>
+					<ChatPage
+						transport={transport}
+						sessionId={sessionId}
+						routeProjectId="project-b"
+						projectContext={{
+							...projectContext,
+							projectId: "project-b",
+							name: "Project B",
+							overviewHref: "/projects/project-b",
+							settingsHref: "/projects/project-b/settings",
+						}}
+					/>
+				</MemoryRouter>
+			</I18nProvider>,
+		);
+		await waitFor(() => expect(transport.getSessionCalls).toEqual([sessionId, sessionId]));
+		expect(screen.queryByText("Previous Project title")).not.toBeInTheDocument();
+		expect(screen.queryByText("Previous Project history")).not.toBeInTheDocument();
+		expect(screen.queryByDisplayValue("Previous Project draft")).not.toBeInTheDocument();
+		expect(screen.queryByRole("button", { name: "Stop" })).not.toBeInTheDocument();
+
+		transport.emitEvent({
+			type: "response.completed",
+			sessionId,
+			requestId: "replacement-request",
+			messageId: "replacement-answer",
+			content: "Buffered replacement answer",
+			sequence: 1,
+		});
+		gate.resolve();
+
+		expect(await screen.findByText("Replacement Project title")).toBeVisible();
+		expect(await screen.findByText("Buffered replacement answer")).toBeVisible();
+		expect(screen.queryByText("Previous Project history")).not.toBeInTheDocument();
+	});
+
+	test("buffers Project events during ownership hydration and applies them after a match", async () => {
+		const transport = new FakeChatTransport({ configured: true, model: "gpt-4.1-mini" });
+		const gate = createDeferred();
+		transport.sessionLoadGate = gate.promise;
+		transport.captureSessionBeforeGate = true;
+		transport.sessions.set("hydrating-project-session", {
+			id: "hydrating-project-session",
+			runtimeBoxId: defaultLocalRuntimeBoxId,
+			projectId: "project-a",
+			title: "Hydrating Project",
+			updatedAt: "2026-01-01T00:00:00.000Z",
+			askMode: "Ask",
+			messages: [createMessage("project-assistant", "assistant", "", "streaming")],
+			activeResponse: {
+				requestId: "project-request",
+				messageId: "project-assistant",
+			},
+			eventCursors: { "project-request": 0 },
+		});
+
+		renderChatPage({
+			transport,
+			sessionId: "hydrating-project-session",
+			routeProjectId: "project-a",
+			projectContext,
+		});
+		await waitFor(() => expect(transport.getSessionCalls).toEqual(["hydrating-project-session"]));
+		expect(transport.listenerCountsAtSessionLoad).toEqual([1]);
+		transport.emitEvent({
+			type: "response.completed",
+			sessionId: "hydrating-project-session",
+			requestId: "project-request",
+			messageId: "project-assistant",
+			content: "Buffered Project answer",
+			sequence: 1,
+		});
+		gate.resolve();
+
+		expect(await screen.findByText("Buffered Project answer")).toBeVisible();
+		expect(await screen.findByText("Complete")).toBeVisible();
+	});
+
+	test("discards buffered events when hydrated Project ownership mismatches", async () => {
+		const transport = new FakeChatTransport({ configured: true, model: "gpt-4.1-mini" });
+		const gate = createDeferred();
+		transport.sessionLoadGate = gate.promise;
+		transport.sessions.set("mismatched-hydrating-session", {
+			id: "mismatched-hydrating-session",
+			runtimeBoxId: defaultLocalRuntimeBoxId,
+			projectId: "project-b",
+			title: "Wrong Project",
+			updatedAt: "2026-01-01T00:00:00.000Z",
+			askMode: "Ask",
+			messages: [],
+		});
+
+		renderChatPage({
+			transport,
+			sessionId: "mismatched-hydrating-session",
+			routeProjectId: "project-a",
+			projectContext,
+		});
+		await waitFor(() =>
+			expect(transport.getSessionCalls).toEqual(["mismatched-hydrating-session"]),
+		);
+		transport.emitEvent({
+			type: "response.completed",
+			sessionId: "mismatched-hydrating-session",
+			requestId: "wrong-project-request",
+			messageId: "wrong-project-message",
+			content: "Must not render",
+			sequence: 1,
+		});
+		gate.resolve();
+
+		expect(await screen.findByRole("alert")).toHaveTextContent("belongs to a different Project");
+		expect(screen.queryByText("Must not render")).not.toBeInTheDocument();
+		expect(transport.listeners.size).toBe(0);
+	});
+
+	test("keeps history readable while the Project disables the composer", async () => {
+		const transport = new FakeChatTransport({ configured: true, model: "gpt-4.1-mini" });
+		transport.sessions.set("offline-project-session", {
+			id: "offline-project-session",
+			runtimeBoxId: defaultLocalRuntimeBoxId,
+			projectId: "project-a",
+			title: "Offline Project",
+			updatedAt: "2026-01-01T00:00:00.000Z",
+			askMode: "Ask",
+			messages: [createMessage("offline-history", "user", "Offline readable history")],
+		});
+		renderChatPage({
+			transport,
+			sessionId: "offline-project-session",
+			routeProjectId: "project-a",
+			projectContext: {
+				...projectContext,
+				runtimeReady: false,
+				disabledReason: "Runtime offline for this Project.",
+			},
+		});
+		expect(await screen.findByText("Offline readable history")).toBeVisible();
+		expect(screen.getByText("Runtime offline for this Project.")).toBeVisible();
+		expect(screen.getByLabelText("Prompt")).toBeDisabled();
+	});
+
+	test("shows a bounded root AGENTS warning without stopping the run", async () => {
+		const transport = new FakeChatTransport({ configured: true, model: "gpt-4.1-mini" });
+		transport.sessions.set("warning-project-session", {
+			id: "warning-project-session",
+			runtimeBoxId: defaultLocalRuntimeBoxId,
+			projectId: "project-a",
+			title: "Warning Project",
+			updatedAt: "2026-01-01T00:00:00.000Z",
+			askMode: "Ask",
+			messages: [createMessage("warning-history", "user", "Readable history")],
+		});
+		transport.eventOnSubscribe = {
+			type: "run.warning",
+			sessionId: "warning-project-session",
+			requestId: "warning-run",
+			code: "ROOT_AGENTS_SKIPPED",
+			reason: "too_large",
+			sequence: 1,
+		};
+		renderChatPage({
+			transport,
+			sessionId: "warning-project-session",
+			routeProjectId: "project-a",
+			projectContext,
+		});
+		await screen.findByText("Readable history");
+		const warnings = await screen.findAllByText(/Root AGENTS\.md was skipped/i);
+		expect(warnings.some((warning) => warning.textContent?.includes("64 KiB"))).toBe(true);
+		expect(screen.getByLabelText("Prompt")).toBeEnabled();
+	});
+});
+
 function renderChatPage(props: ChatPageProps) {
 	return render(
 		<I18nProvider>
-			<ChatPage {...props} />
+			<MemoryRouter>
+				<ChatPage {...props} />
+			</MemoryRouter>
 		</I18nProvider>,
 	);
 }
@@ -1247,6 +1571,7 @@ class FakeChatTransport extends ProviderModelTransportDefaults implements ChatTr
 	cancelCalls: Array<{ sessionId: string; requestId: string }> = [];
 	getSessionCalls: string[] = [];
 	createSessionModels: Array<SessionModelSelection | undefined> = [];
+	createSessionProjectIds: Array<string | undefined> = [];
 	listenerCountsAtSessionLoad: number[] = [];
 	listSessionCalls = 0;
 	listeners = new Set<ChatTransportListener>();
@@ -1265,6 +1590,7 @@ class FakeChatTransport extends ProviderModelTransportDefaults implements ChatTr
 	sendReturnGate: Promise<void> | null = null;
 	cancelReturnGate: Promise<void> | null = null;
 	eventOnSubscribe: ChatTransportEvent | null = null;
+	createdSessionProjectIdOverride: string | undefined;
 	private readonly configuredModel: string;
 	private eventSequences = new Map<string, number>();
 	private nextSessionNumber = 1;
@@ -1286,15 +1612,18 @@ class FakeChatTransport extends ProviderModelTransportDefaults implements ChatTr
 		this.configuredModel = model;
 	}
 
-	async createSession(model?: SessionModelSelection) {
+	async createSession(model?: SessionModelSelection, projectId?: string) {
 		this.createSessionModels.push(model);
+		this.createSessionProjectIds.push(projectId);
 		const resolvedModel =
 			model ?? (this.configuredModel === "" ? undefined : modelSelectionFor(this.configuredModel));
+		const resolvedProjectId = this.createdSessionProjectIdOverride ?? projectId;
 		const session: ChatSession = {
 			id: `session-${this.nextSessionNumber}`,
 			runtimeBoxId: defaultLocalRuntimeBoxId,
 			title: "New chat",
 			updatedAt: "2026-01-01T00:00:00.000Z",
+			...(resolvedProjectId === undefined ? {} : { projectId: resolvedProjectId }),
 			...(resolvedModel === undefined ? {} : { model: resolvedModel }),
 			askMode: "Ask",
 			messages: [],

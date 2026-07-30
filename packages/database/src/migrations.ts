@@ -1,6 +1,6 @@
 import type Database from "bun:sqlite";
 
-export const currentAppDatabaseVersion = 20;
+export const currentAppDatabaseVersion = 21;
 
 export class AppDatabaseResetRequiredError extends Error {
 	readonly currentVersion: number;
@@ -73,6 +73,7 @@ export function applyAppMigrations(client: Database): void {
 			DROP TABLE IF EXISTS chat_runs;
 			DROP TABLE IF EXISTS chat_session_create_requests;
 			DROP TABLE IF EXISTS chat_sessions;
+			DROP TABLE IF EXISTS project_deletion_jobs;
 			DROP TABLE IF EXISTS retired_chat_runs;
 			DROP TABLE IF EXISTS retired_chat_sessions;
 			DROP TABLE IF EXISTS runtime_box_generation_fences;
@@ -288,19 +289,43 @@ export function applyAppMigrations(client: Database): void {
 				runtime_box_id TEXT NOT NULL REFERENCES runtime_boxes(id),
 				name TEXT NOT NULL,
 				path TEXT NOT NULL,
+				path_revision INTEGER NOT NULL,
+				path_status TEXT NOT NULL,
+				path_checked_at_ms INTEGER,
+				path_issue_code TEXT,
 				git_root_path TEXT,
 				git_branch TEXT,
 				created_at_ms INTEGER NOT NULL,
 				updated_at_ms INTEGER NOT NULL,
 				archived_at_ms INTEGER,
-				UNIQUE (runtime_box_id, path)
+				deletion_requested_at_ms INTEGER,
+				UNIQUE (runtime_box_id, path),
+				CHECK (
+					(path_status = 'unavailable' AND path_issue_code IS NOT NULL)
+					OR (path_status <> 'unavailable' AND path_issue_code IS NULL)
+				),
+				CHECK (path_revision > 0)
 			);
-			CREATE INDEX projects_runtime_archived_updated_idx
-				ON projects(runtime_box_id, archived_at_ms, updated_at_ms);
+			CREATE INDEX projects_runtime_archived_created_idx
+				ON projects(runtime_box_id, archived_at_ms, created_at_ms);
+
+			CREATE TABLE project_deletion_jobs (
+				project_id TEXT PRIMARY KEY NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+				state TEXT NOT NULL,
+				attempt_count INTEGER NOT NULL DEFAULT 0,
+				next_attempt_at_ms INTEGER NOT NULL,
+				last_attempt_at_ms INTEGER,
+				last_error_code TEXT,
+				created_at_ms INTEGER NOT NULL,
+				updated_at_ms INTEGER NOT NULL
+			);
+			CREATE INDEX project_deletion_jobs_next_attempt_idx
+				ON project_deletion_jobs(next_attempt_at_ms);
 
 			CREATE TABLE chat_sessions (
 				id TEXT PRIMARY KEY NOT NULL,
 				runtime_box_id TEXT NOT NULL REFERENCES runtime_boxes(id),
+				project_id TEXT REFERENCES projects(id),
 				title TEXT NOT NULL,
 				default_mode TEXT NOT NULL,
 				provider_id TEXT,
@@ -319,10 +344,13 @@ export function applyAppMigrations(client: Database): void {
 				ON chat_sessions(last_message_at_ms);
 			CREATE INDEX IF NOT EXISTS chat_sessions_archived_updated_at_idx
 				ON chat_sessions(archived_at_ms, updated_at_ms);
+			CREATE INDEX chat_sessions_project_archived_activity_idx
+				ON chat_sessions(project_id, archived_at_ms, last_message_at_ms, updated_at_ms);
 
 			CREATE TABLE chat_session_create_requests (
 				create_key TEXT PRIMARY KEY NOT NULL,
 				runtime_box_id TEXT NOT NULL REFERENCES runtime_boxes(id),
+				project_id TEXT REFERENCES projects(id),
 				origin_role TEXT NOT NULL,
 				origin_peer_id TEXT NOT NULL,
 				origin_instance_id TEXT NOT NULL,
@@ -348,15 +376,38 @@ export function applyAppMigrations(client: Database): void {
 				assistant_message_id TEXT NOT NULL UNIQUE,
 				assistant_content TEXT,
 				last_error_json TEXT,
+				project_id TEXT REFERENCES projects(id),
+				project_path TEXT,
+				project_path_revision INTEGER,
+				project_git_root_path TEXT,
+				project_git_branch TEXT,
+				project_root_agents_hash TEXT,
 				created_at_ms INTEGER NOT NULL,
 				updated_at_ms INTEGER NOT NULL,
-				completed_at_ms INTEGER
+				completed_at_ms INTEGER,
+				CHECK (
+					(
+						project_id IS NULL
+						AND project_path IS NULL
+						AND project_path_revision IS NULL
+						AND project_git_root_path IS NULL
+						AND project_git_branch IS NULL
+						AND project_root_agents_hash IS NULL
+					)
+					OR (
+						project_id IS NOT NULL
+						AND project_path IS NOT NULL
+						AND project_path_revision > 0
+					)
+				)
 			);
 
 			CREATE INDEX IF NOT EXISTS chat_runs_session_created_at_idx
 				ON chat_runs(session_id, created_at_ms);
 			CREATE INDEX IF NOT EXISTS chat_runs_session_cursor_idx
 				ON chat_runs(session_id, created_at_ms, id);
+			CREATE INDEX chat_runs_project_status_idx
+				ON chat_runs(project_id, status);
 
 			CREATE TABLE action_intents (
 				id TEXT PRIMARY KEY NOT NULL,

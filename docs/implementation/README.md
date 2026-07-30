@@ -13,6 +13,7 @@
 | [技术架构](./architecture.md) | 三应用角色、RPC 拓扑、生命周期、职责和安全边界 |
 | [数据与接口契约](./data-contracts.md) | 身份、注册、RPC、Run、Action grant、Agent Session 和数据所有权 |
 | [Runtime Box 技术与实施方案](./runtime-box.md) | Local/Remote Runtime Box、Agent Server Tunnel、配对、安全、数据模型和实施任务 |
+| [Projects 管理与 Project Chat 技术设计](./project-management.md) | Project 生命周期、Session 归属、Path inspection、Run context、Tool cwd 边界和 Desktop 交互 |
 | [MCP 双归属接入技术设计](./mcp-integration.md) | Agent Server-owned 与 Runtime Box-owned MCP 的所有权、生命周期、Agent 绑定和调用链路 |
 | [Skill 双归属管理技术设计](./skill-integration.md) | Agent Server-owned prompt-only Skill 与 Runtime Box-owned 完整 Skill package 的所有权、绑定和 Run 装配 |
 | [Remote Runtime Box 使用文档](../guides/remote-runtime-box.md) | Remote Access、设备配对、远端安装、验证、排障和解除绑定 |

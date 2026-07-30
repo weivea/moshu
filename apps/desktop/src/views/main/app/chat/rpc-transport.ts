@@ -13,11 +13,11 @@ import type {
 	ListAvailableModelsOutput,
 	ListChatSessionsOutput,
 	ListProvidersOutput,
-	ProviderMutationOutput,
 	ProviderAuthAttemptOutput,
 	ProviderAuthType,
+	ProviderMutationOutput,
 	RespondProviderAuthInput,
-	StartProviderAuthInput,
+	SessionListScope,
 	SetChatSessionArchivedOutput,
 	SetChatSessionModelInput,
 	SetChatSessionModelOutput,
@@ -25,6 +25,7 @@ import type {
 	SetDefaultModelOutput,
 	SetProviderModelsEnabledInput,
 	SetProviderModelsEnabledOutput,
+	StartProviderAuthInput,
 	TestProviderInput,
 	TestProviderOutput,
 	UpdateChatSessionOutput,
@@ -72,12 +73,17 @@ export interface RpcChatClient {
 	getDefaultModel(): Promise<GetDefaultModelOutput>;
 	setDefaultModel(input: SetDefaultModelInput): Promise<SetDefaultModelOutput>;
 	setChatSessionModel(input: SetChatSessionModelInput): Promise<SetChatSessionModelOutput>;
-	createChatSession(model?: SessionModelSelection): Promise<CreateChatSessionOutput>;
+	createChatSession(
+		model?: SessionModelSelection,
+		projectId?: string,
+	): Promise<CreateChatSessionOutput>;
 	getChatSession(sessionId: string): Promise<GetChatSessionSnapshotOutput>;
 	listChatSessions(input?: {
 		query?: string;
 		archived?: boolean;
 		limit?: number;
+		runtimeBoxId?: string;
+		scope?: SessionListScope;
 	}): Promise<ListChatSessionsOutput>;
 	updateChatSession(sessionId: string, title: string): Promise<UpdateChatSessionOutput>;
 	setChatSessionArchived(
@@ -233,11 +239,12 @@ export function createRpcChatTransport(
 			const output = await client.setChatSessionModel({ sessionId, model: selection });
 			return output.session.model;
 		},
-		async createSession(model?: SessionModelSelection) {
-			const { session } = await client.createChatSession(model);
+		async createSession(model?: SessionModelSelection, projectId?: string) {
+			const { session } = await client.createChatSession(model, projectId);
 			return {
 				id: session.id,
 				runtimeBoxId: session.runtimeBoxId,
+				...(session.projectId === undefined ? {} : { projectId: session.projectId }),
 				title: session.title,
 				updatedAt: session.updatedAt,
 				...(session.model === undefined ? {} : { model: session.model }),
@@ -255,6 +262,9 @@ export function createRpcChatTransport(
 			const session: ChatSession = {
 				id: snapshot.session.id,
 				runtimeBoxId: snapshot.session.runtimeBoxId,
+				...(snapshot.session.projectId === undefined
+					? {}
+					: { projectId: snapshot.session.projectId }),
 				title: snapshot.session.title,
 				updatedAt: snapshot.session.updatedAt,
 				...(snapshot.session.archivedAt === undefined
@@ -359,6 +369,7 @@ function mapSessionSummary(session: ListChatSessionsOutput["items"][number]): Ch
 	return {
 		id: session.id,
 		runtimeBoxId: session.runtimeBoxId,
+		...(session.projectId === undefined ? {} : { projectId: session.projectId }),
 		title: session.title,
 		createdAt: session.createdAt,
 		updatedAt: session.updatedAt,
@@ -414,6 +425,7 @@ function mapRunEvent(
 				sequence: event.seq,
 			};
 		}
+
 		if (event.payload.status === "cancelled") {
 			return {
 				type: "response.cancelled",
@@ -431,6 +443,17 @@ function mapRunEvent(
 			messageId: event.payload.messageId,
 			content: event.payload.content,
 			message: event.payload.error.safeMessage,
+			sequence: event.seq,
+		};
+	}
+
+	if (event.type === "run.warning") {
+		return {
+			type: "run.warning",
+			sessionId: event.sessionId,
+			requestId: event.runId,
+			code: event.payload.code,
+			reason: event.payload.reason,
 			sequence: event.seq,
 		};
 	}

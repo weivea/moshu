@@ -1,5 +1,5 @@
-import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { defaultLocalRuntimeBoxId } from "@moshu/contracts";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { beforeEach, describe, expect, test, vi } from "vitest";
 
 import { ChatSessionNotFoundError } from "../../../../shared/rpc-errors";
@@ -122,6 +122,36 @@ describe("SessionSidebar", () => {
 		expect(window.history.state).toEqual({ usr: {} });
 	});
 
+	test("always exposes Archived Sessions and restore on the Project page variant", async () => {
+		const transport = new FakeSessionTransport();
+		renderSidebar(transport, { variant: "page" });
+
+		expect(await screen.findByText("Architecture notes")).toBeVisible();
+		expect(screen.getByRole("button", { name: "Active" })).toBeVisible();
+		expect(screen.getByRole("button", { name: "Archived" })).toBeVisible();
+		expect(screen.queryByPlaceholderText("Search chats")).not.toBeInTheDocument();
+
+		const activeItem = screen.getByText("Architecture notes").closest("li");
+		if (activeItem === null) {
+			throw new Error("Active Session item was not rendered.");
+		}
+		fireEvent.click(within(activeItem).getByLabelText("Chat actions"));
+		fireEvent.click(within(activeItem).getByRole("button", { name: "Archive" }));
+		await waitFor(() => expect(screen.queryByText("Architecture notes")).not.toBeInTheDocument());
+
+		fireEvent.click(screen.getByRole("button", { name: "Archived" }));
+		const archivedItem = (await screen.findByText("Architecture notes")).closest("li");
+		if (archivedItem === null) {
+			throw new Error("Archived Session item was not rendered.");
+		}
+		fireEvent.click(within(archivedItem).getByLabelText("Chat actions"));
+		fireEvent.click(within(archivedItem).getByRole("button", { name: "Restore" }));
+		await waitFor(() => expect(screen.queryByText("Architecture notes")).not.toBeInTheDocument());
+
+		fireEvent.click(screen.getByRole("button", { name: "Active" }));
+		expect(await screen.findByText("Architecture notes")).toBeVisible();
+	});
+
 	test("keeps the current selection when a delayed delete completes", async () => {
 		const transport = new FakeSessionTransport();
 		const onNewSession = vi.fn();
@@ -235,6 +265,7 @@ function renderSidebar(
 		selectedSessionId?: string;
 		onNewSession?: () => void;
 		onSelectSession?: (sessionId: string) => void;
+		variant?: "sidebar" | "page";
 	} = {},
 ) {
 	return render(
@@ -243,6 +274,7 @@ function renderSidebar(
 				transport={transport}
 				selectedSessionId={options.selectedSessionId}
 				refreshKey="test"
+				variant={options.variant}
 				onNewSession={options.onNewSession ?? (() => {})}
 				onSelectSession={options.onSelectSession ?? (() => {})}
 			/>

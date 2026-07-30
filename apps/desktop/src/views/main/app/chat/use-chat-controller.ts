@@ -15,6 +15,9 @@ interface UseChatControllerOptions {
 	transport: ChatTransport;
 	sessionId?: string;
 	initialSession?: ChatSession;
+	projectId?: string;
+	expectedProjectId: string | undefined;
+	interactionDisabledReason?: string;
 	onSessionChange?(sessionId: string): void;
 	onSessionHydrated?(sessionId: string): void;
 	onSessionRetired?(sessionId: string): void;
@@ -41,12 +44,23 @@ export function useChatController({
 	transport,
 	sessionId,
 	initialSession,
+	projectId,
+	expectedProjectId,
+	interactionDisabledReason,
 	onSessionChange,
 	onSessionHydrated,
 	onSessionRetired,
 }: UseChatControllerOptions) {
 	const providedSession =
-		initialSession !== undefined && initialSession.id === sessionId ? initialSession : undefined;
+		initialSession !== undefined &&
+		initialSession.id === sessionId &&
+		initialSession.projectId === expectedProjectId
+			? initialSession
+			: undefined;
+	const initialOwnershipMismatch =
+		initialSession !== undefined &&
+		initialSession.id === sessionId &&
+		initialSession.projectId !== expectedProjectId;
 	const { coordinator: sessionRecoveryCoordinator, route: recoveryRoute } = useChatSessionRecovery(
 		transport,
 		sessionId,
@@ -58,6 +72,7 @@ export function useChatController({
 	const [isProviderLoading, setIsProviderLoading] = useState(true);
 	const [providerError, setProviderError] = useState<string | null>(null);
 	const [session, setSession] = useState<ChatSession | null>(providedSession ?? null);
+	const [ownershipMismatch, setOwnershipMismatch] = useState(initialOwnershipMismatch);
 	const [isSessionLoading, setIsSessionLoading] = useState(false);
 	const [draft, setDraft] = useState("");
 	const [notice, setNotice] = useState<ChatNotice | null>(null);
@@ -67,9 +82,13 @@ export function useChatController({
 	);
 	const [isSending, setIsSending] = useState(false);
 	const [isStopping, setIsStopping] = useState(false);
+	const routeIdentity = `${sessionId ?? "new"}\u0000${expectedProjectId ?? "global"}`;
+	const sessionStateRouteRef = useRef(routeIdentity);
+	const preparedRouteRef = useRef(routeIdentity);
 	const providerLoadToken = useRef(0);
 	const sessionLoadToken = useRef(0);
 	const sendGenerationRef = useRef(0);
+	const sendRouteRef = useRef(routeIdentity);
 	const sendInFlightRef = useRef(false);
 	const activeSessionIdRef = useRef<string | null>(null);
 	const lastSubmittedTextRef = useRef<string | null>(null);
@@ -87,17 +106,49 @@ export function useChatController({
 		),
 	);
 	const terminalEventsBeforeAcceptanceRef = useRef(new Set<string>());
+	if (preparedRouteRef.current !== routeIdentity) {
+		preparedRouteRef.current = routeIdentity;
+		sessionLoadToken.current += 1;
+		sessionHydrationRef.current = null;
+		sendGenerationRef.current += 1;
+		sendRouteRef.current = routeIdentity;
+		sendInFlightRef.current = false;
+		lastSubmittedTextRef.current = null;
+		lastSubmittedRequestIdRef.current = null;
+		unroutedSessionIdRef.current = null;
+		hydratedSessionIdRef.current = null;
+		bufferedEventsRef.current =
+			sessionId === undefined
+				? []
+				: bufferedEventsRef.current.filter((event) => event.sessionId === sessionId);
+		eventCursorsRef.current = {};
+		acceptedRequestIdsRef.current.clear();
+		terminalEventsBeforeAcceptanceRef.current.clear();
+	}
+	const routeStateMatches = sessionStateRouteRef.current === routeIdentity;
+	const stateSessionMatches =
+		routeStateMatches &&
+		session !== null &&
+		(sessionId === undefined || session.id === sessionId) &&
+		session.projectId === expectedProjectId;
+	const routedSession = stateSessionMatches ? session : (providedSession ?? null);
+	const routedActiveResponse = stateSessionMatches
+		? activeResponse
+		: (providedSession?.activeResponse ?? null);
+	const routedOwnershipMismatch = routeStateMatches ? ownershipMismatch : initialOwnershipMismatch;
+	const routedDraft = routeStateMatches ? draft : "";
 
-	activeSessionIdRef.current = sessionId ?? session?.id ?? null;
+	activeSessionIdRef.current = sessionId ?? routedSession?.id ?? null;
 
-	// biome-ignore lint/correctness/useExhaustiveDependencies: sessionId invalidates pending sends.
 	useEffect(() => {
+		sendRouteRef.current = routeIdentity;
 		sendGenerationRef.current += 1;
 		sendInFlightRef.current = false;
 		lastSubmittedTextRef.current = null;
 		lastSubmittedRequestIdRef.current = null;
 		setIsSending(false);
 		setDraft("");
+		setPendingModel(null);
 
 		return () => {
 			sendGenerationRef.current += 1;
@@ -105,7 +156,7 @@ export function useChatController({
 			lastSubmittedTextRef.current = null;
 			lastSubmittedRequestIdRef.current = null;
 		};
-	}, [sessionId]);
+	}, [routeIdentity]);
 
 	const applyMessageUpdate = useCallback(
 		(messageId: string, updater: (message: ChatMessage) => ChatMessage) => {
@@ -202,7 +253,9 @@ export function useChatController({
 			lastSubmittedTextRef.current = null;
 			lastSubmittedRequestIdRef.current = null;
 			setSession(null);
+			setOwnershipMismatch(false);
 			setActiveResponse(null);
+			setPendingModel(null);
 			setIsSessionLoading(false);
 			setIsSending(false);
 			setIsStopping(false);
@@ -224,6 +277,7 @@ export function useChatController({
 		) => {
 			const loadToken = sessionLoadToken.current + 1;
 			sessionLoadToken.current = loadToken;
+			sessionStateRouteRef.current = routeIdentity;
 			hydratedSessionIdRef.current = null;
 			bufferedEventsRef.current = bufferedEventsRef.current.filter(
 				(event) => event.sessionId === requestedSessionId,
@@ -232,6 +286,7 @@ export function useChatController({
 			acceptedRequestIdsRef.current.clear();
 			terminalEventsBeforeAcceptanceRef.current.clear();
 			setIsSessionLoading(true);
+			setOwnershipMismatch(false);
 			setSession(optimisticSession ?? null);
 			setActiveResponse(optimisticSession?.activeResponse ?? null);
 			if (optimisticSession?.activeResponse !== undefined) {
@@ -250,24 +305,33 @@ export function useChatController({
 					return false;
 				}
 
-				setSession(nextSession);
-				setActiveResponse(nextSession.activeResponse ?? null);
 				acceptedRequestIdsRef.current.clear();
 				terminalEventsBeforeAcceptanceRef.current.clear();
-				if (nextSession.activeResponse !== undefined) {
-					acceptedRequestIdsRef.current.add(nextSession.activeResponse.requestId);
-				}
-				eventCursorsRef.current = { ...(nextSession.eventCursors ?? {}) };
-				hydratedSessionIdRef.current = requestedSessionId;
 				unroutedSessionIdRef.current = null;
 				const bufferedEvents = orderBufferedTransportEvents(bufferedEventsRef.current);
 				bufferedEventsRef.current = [];
-				for (const event of bufferedEvents) {
-					if (event.sessionId === requestedSessionId) {
-						applyTransportEventIfNew(event);
+				if (nextSession.projectId !== expectedProjectId) {
+					setSession(null);
+					setActiveResponse(null);
+					eventCursorsRef.current = {};
+					hydratedSessionIdRef.current = null;
+					setOwnershipMismatch(true);
+				} else {
+					setSession(nextSession);
+					setActiveResponse(nextSession.activeResponse ?? null);
+					if (nextSession.activeResponse !== undefined) {
+						acceptedRequestIdsRef.current.add(nextSession.activeResponse.requestId);
 					}
+					eventCursorsRef.current = { ...(nextSession.eventCursors ?? {}) };
+					hydratedSessionIdRef.current = requestedSessionId;
+					for (const event of bufferedEvents) {
+						if (event.sessionId === requestedSessionId) {
+							applyTransportEventIfNew(event);
+						}
+					}
+					onSessionHydrated?.(requestedSessionId);
+					setOwnershipMismatch(false);
 				}
-				onSessionHydrated?.(requestedSessionId);
 				setAnnouncement(t("chat.status.historyReady"));
 				return true;
 			} catch (error) {
@@ -286,6 +350,7 @@ export function useChatController({
 					return false;
 				}
 				setSession(null);
+				setOwnershipMismatch(false);
 				hydratedSessionIdRef.current = null;
 				bufferedEventsRef.current = [];
 				eventCursorsRef.current = {};
@@ -312,7 +377,15 @@ export function useChatController({
 				}
 			}
 		},
-		[applyTransportEventIfNew, onSessionHydrated, sessionRecoveryCoordinator, t, transport],
+		[
+			applyTransportEventIfNew,
+			expectedProjectId,
+			onSessionHydrated,
+			routeIdentity,
+			sessionRecoveryCoordinator,
+			t,
+			transport,
+		],
 	);
 
 	const loadSession = useCallback(
@@ -396,6 +469,9 @@ export function useChatController({
 	}, [loadProviderStatus]);
 
 	useEffect(() => {
+		if (routedOwnershipMismatch) {
+			return;
+		}
 		return transport.subscribe((event) => {
 			if (activeSessionIdRef.current !== event.sessionId) {
 				return;
@@ -408,7 +484,28 @@ export function useChatController({
 
 			applyTransportEventIfNew(event);
 		});
-	}, [applyTransportEventIfNew, transport]);
+	}, [applyTransportEventIfNew, routedOwnershipMismatch, transport]);
+
+	useEffect(() => {
+		if (sessionId !== undefined) {
+			return;
+		}
+		sessionLoadToken.current += 1;
+		sessionStateRouteRef.current = routeIdentity;
+		hydratedSessionIdRef.current = null;
+		sessionHydrationRef.current = null;
+		bufferedEventsRef.current = [];
+		eventCursorsRef.current = {};
+		acceptedRequestIdsRef.current.clear();
+		terminalEventsBeforeAcceptanceRef.current.clear();
+		setSession(null);
+		setOwnershipMismatch(false);
+		setActiveResponse(null);
+		setIsSessionLoading(false);
+		setIsStopping(false);
+		setNotice(null);
+		setAnnouncement("");
+	}, [routeIdentity, sessionId]);
 
 	useEffect(() => {
 		if (!sessionId) {
@@ -416,11 +513,7 @@ export function useChatController({
 		}
 
 		activeSessionIdRef.current = sessionId;
-		void loadSession(
-			sessionId,
-			false,
-			initialSession?.id === sessionId ? initialSession : undefined,
-		);
+		void loadSession(sessionId, false, providedSession);
 		return () => {
 			if (activeSessionIdRef.current === sessionId) {
 				activeSessionIdRef.current = null;
@@ -433,7 +526,7 @@ export function useChatController({
 				}
 			}
 		};
-	}, [initialSession, loadSession, sessionId]);
+	}, [loadSession, providedSession, sessionId]);
 
 	useEffect(() => {
 		if (sessionId === undefined || recoveryRoute.sessionId !== sessionId) {
@@ -460,8 +553,12 @@ export function useChatController({
 	 * Session exists the picker edits a pending selection that is handed to `createSession`.
 	 */
 	const modelSelection = useMemo(
-		() => session?.model ?? pendingModel ?? defaultModel ?? undefined,
-		[defaultModel, pendingModel, session?.model],
+		() =>
+			routedSession?.model ??
+			(routeStateMatches ? pendingModel : null) ??
+			defaultModel ??
+			undefined,
+		[defaultModel, pendingModel, routeStateMatches, routedSession?.model],
 	);
 	const selectedModel = useMemo(
 		() => resolveSelectedModel(availableModels, modelSelection),
@@ -470,17 +567,20 @@ export function useChatController({
 	const meta = useMemo(
 		() => ({
 			model: selectedModel?.model.displayName ?? selectedModel?.model.id ?? t("chat.meta.pending"),
-			askMode: session?.askMode ?? "Ask",
+			askMode: routedSession?.askMode ?? "Ask",
 			endpoint: selectedModel?.providerDisplayName ?? t("chat.meta.pending"),
 		}),
-		[selectedModel, session?.askMode, t],
+		[routedSession?.askMode, selectedModel, t],
 	);
 
 	const changeSessionModel = useCallback(
 		async (selection: SessionModelSelection | null) => {
-			const targetSessionId = session?.id ?? sessionId;
+			const targetSessionId = routedSession?.id ?? sessionId;
 			if (targetSessionId === undefined) {
 				setPendingModel(selection);
+				return;
+			}
+			if (routedSession?.projectId !== expectedProjectId) {
 				return;
 			}
 			try {
@@ -496,31 +596,36 @@ export function useChatController({
 				setNotice({ tone: "danger", message: getErrorMessage(error, t("model.error.save")) });
 			}
 		},
-		[session?.id, sessionId, t, transport],
+		[expectedProjectId, routedSession?.id, routedSession?.projectId, sessionId, t, transport],
 	);
 
 	const canSend =
 		hasConfiguredProvider &&
+		interactionDisabledReason === undefined &&
+		(sessionId === undefined || routedSession?.projectId === expectedProjectId) &&
+		routeStateMatches &&
 		!isSessionLoading &&
 		!isSending &&
-		(sessionId === undefined || session?.id === sessionId) &&
-		draft.trim().length > 0 &&
-		!activeResponse;
-	const isResponding = activeResponse !== null;
+		(sessionId === undefined || routedSession?.id === sessionId) &&
+		routedDraft.trim().length > 0 &&
+		!routedActiveResponse;
+	const isResponding = routedActiveResponse !== null;
 
 	const sendMessage = useCallback(
 		async (overrideText?: string) => {
 			if (
 				!hasConfiguredProvider ||
-				activeResponse ||
+				interactionDisabledReason !== undefined ||
+				(sessionId !== undefined && routedSession?.projectId !== expectedProjectId) ||
+				routedActiveResponse ||
 				isSessionLoading ||
-				(sessionId !== undefined && session?.id !== sessionId) ||
+				(sessionId !== undefined && routedSession?.id !== sessionId) ||
 				sendInFlightRef.current
 			) {
 				return;
 			}
 
-			const content = (overrideText ?? draft).trim();
+			const content = (overrideText ?? routedDraft).trim();
 			if (!content) {
 				return;
 			}
@@ -540,10 +645,13 @@ export function useChatController({
 			setAnnouncement(t("chat.status.sending"));
 
 			try {
-				let activeSession = session;
+				let activeSession = routedSession;
 				let createdSession = false;
 				if (!activeSession) {
-					activeSession = await transport.createSession(modelSelection);
+					activeSession = await transport.createSession(modelSelection, projectId);
+					if (activeSession.projectId !== expectedProjectId) {
+						throw new Error("PROJECT_SESSION_MISMATCH: Created Session ownership is invalid.");
+					}
 					if (
 						sendGenerationRef.current !== sendGeneration ||
 						activeSessionIdRef.current !== startingSessionId
@@ -654,14 +762,17 @@ export function useChatController({
 			}
 		},
 		[
-			activeResponse,
 			clearInvalidatedSession,
-			draft,
+			expectedProjectId,
 			hasConfiguredProvider,
+			interactionDisabledReason,
 			isSessionLoading,
 			modelSelection,
 			onSessionChange,
-			session,
+			projectId,
+			routedActiveResponse,
+			routedDraft,
+			routedSession,
 			sessionId,
 			sessionRecoveryCoordinator,
 			t,
@@ -670,20 +781,25 @@ export function useChatController({
 	);
 
 	const stopMessage = useCallback(async () => {
-		if (!session || !activeResponse || isStopping) {
+		if (
+			!routedSession ||
+			routedSession.projectId !== expectedProjectId ||
+			!routedActiveResponse ||
+			isStopping
+		) {
 			return;
 		}
 
 		const stopGeneration = sendGenerationRef.current;
-		const stopSessionId = session.id;
+		const stopSessionId = routedSession.id;
 		setIsStopping(true);
 		setNotice(null);
 		setAnnouncement(t("chat.status.stopping"));
 
 		try {
 			await transport.cancel({
-				sessionId: session.id,
-				requestId: activeResponse.requestId,
+				sessionId: routedSession.id,
+				requestId: routedActiveResponse.requestId,
 			});
 		} catch (error) {
 			const sessionMiss = sessionRecoveryCoordinator.handleSessionMiss(stopSessionId, error);
@@ -704,7 +820,15 @@ export function useChatController({
 			});
 			setAnnouncement(t("chat.status.stopFailed"));
 		}
-	}, [activeResponse, isStopping, session, sessionRecoveryCoordinator, t, transport]);
+	}, [
+		expectedProjectId,
+		isStopping,
+		routedActiveResponse,
+		routedSession,
+		sessionRecoveryCoordinator,
+		t,
+		transport,
+	]);
 
 	const retryNoticeAction = useCallback(() => {
 		switch (notice?.action) {
@@ -727,30 +851,33 @@ export function useChatController({
 	}, [loadSession, notice?.action, sendMessage, sessionId, stopMessage]);
 
 	return {
-		announcement,
+		announcement: routeStateMatches ? announcement : "",
 		availableModels,
 		canSend,
 		changeSessionModel,
 		modelSelection,
-		draft,
+		draft: routedDraft,
 		hasConfiguredProvider,
 		isProviderLoading,
 		isResponding,
-		isSending,
-		isSessionLoading,
-		isStopping,
+		isSending: routeStateMatches ? isSending : false,
+		isSessionLoading: routeStateMatches ? isSessionLoading : sessionId !== undefined,
+		isStopping: routeStateMatches ? isStopping : false,
 		meta,
-		notice,
+		notice: routeStateMatches ? notice : null,
+		ownershipMismatch: routedOwnershipMismatch,
 		providerError,
 		reloadProviderStatus: loadProviderStatus,
 		selectedModel,
 		retryNoticeAction,
 		sendMessage,
-		session,
+		session: routedSession,
 		setDraft,
 		stopMessage,
 		updateSessionSummary: (updatedSession: ChatSessionSummary) => {
-			setSession((currentSession) => mergeSessionSummary(currentSession, updatedSession));
+			if (sessionStateRouteRef.current === routeIdentity) {
+				setSession((currentSession) => mergeSessionSummary(currentSession, updatedSession));
+			}
 		},
 	};
 }
@@ -871,6 +998,13 @@ function handleTransportEvent({
 				action: lastSubmittedText ? "retry-send" : undefined,
 			});
 			setAnnouncement(t("chat.status.failed"));
+			break;
+		case "run.warning":
+			setNotice({
+				tone: "info",
+				message: t("projects.chat.rootAgentsWarning", event.reason),
+			});
+			setAnnouncement(t("projects.chat.rootAgentsWarning", event.reason));
 			break;
 	}
 }

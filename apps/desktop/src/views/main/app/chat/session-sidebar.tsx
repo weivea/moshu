@@ -1,3 +1,4 @@
+import type { SessionListScope } from "@moshu/contracts";
 import { AppIcon } from "@moshu/ui";
 import { type FormEvent, useCallback, useEffect, useRef, useState } from "react";
 import { ConfirmationDialog } from "../confirmation-dialog";
@@ -11,7 +12,11 @@ export interface SessionSidebarProps {
 	refreshKey: string;
 	isNewSessionDisabled?: boolean;
 	isReadOnly?: boolean;
+	scope?: SessionListScope;
+	variant?: "sidebar" | "page";
+	initialShowAllSessions?: boolean;
 	onNewSession(): void;
+	onSessionRetired?(sessionId: string): void;
 	onSessionUpdated?(session: ChatSessionSummary): void;
 	onSelectSession(sessionId: string): void;
 }
@@ -22,7 +27,11 @@ export function SessionSidebar({
 	refreshKey,
 	isNewSessionDisabled = false,
 	isReadOnly = false,
+	scope,
+	variant = "sidebar",
+	initialShowAllSessions = false,
 	onNewSession,
+	onSessionRetired,
 	onSessionUpdated,
 	onSelectSession,
 }: SessionSidebarProps) {
@@ -34,7 +43,7 @@ export function SessionSidebar({
 	const [query, setQuery] = useState("");
 	const [showArchived, setShowArchived] = useState(false);
 	const [isFilterOpen, setIsFilterOpen] = useState(false);
-	const [showAllSessions, setShowAllSessions] = useState(false);
+	const [showAllSessions, setShowAllSessions] = useState(initialShowAllSessions);
 	const [sessions, setSessions] = useState<ChatSessionSummary[]>([]);
 	const [isLoading, setIsLoading] = useState(true);
 	const [errorMessage, setErrorMessage] = useState<string>();
@@ -65,6 +74,7 @@ export function SessionSidebar({
 			const items = await transport.listSessions({
 				...(query.trim().length === 0 ? {} : { query: query.trim() }),
 				archived: showArchived,
+				...(scope === undefined ? {} : { scope }),
 			});
 			if (requestNumberRef.current === requestNumber) {
 				setSessions(items.filter((session) => !isRendererSessionRetired(session.id)));
@@ -78,7 +88,7 @@ export function SessionSidebar({
 				setIsLoading(false);
 			}
 		}
-	}, [query, showArchived, t, transport]);
+	}, [query, scope, showArchived, t, transport]);
 
 	// biome-ignore lint/correctness/useExhaustiveDependencies: refreshKey invalidates this query.
 	useEffect(() => {
@@ -102,8 +112,9 @@ export function SessionSidebar({
 				setPendingSessionId((current) => (current === sessionId ? undefined : current));
 				setSessionToDelete((current) => (current?.id === sessionId ? undefined : current));
 				setOpenMenuSessionId((current) => (current === sessionId ? undefined : current));
+				onSessionRetired?.(sessionId);
 			}),
-		[sessionRecoveryCoordinator],
+		[onSessionRetired, sessionRecoveryCoordinator],
 	);
 
 	const startRename = (session: ChatSessionSummary) => {
@@ -204,7 +215,10 @@ export function SessionSidebar({
 	};
 
 	return (
-		<aside className="session-sidebar" aria-label={t("sessions.title")}>
+		<aside
+			className={variant === "page" ? "session-sidebar session-sidebar--page" : "session-sidebar"}
+			aria-label={t("sessions.title")}
+		>
 			<header className="session-sidebar__header">
 				<h2>{t("sessions.title")}</h2>
 				<div className="session-sidebar__header-actions">
@@ -213,7 +227,11 @@ export function SessionSidebar({
 						aria-label={t("sessions.filter.toggle")}
 						aria-expanded={isFilterOpen}
 						title={t("sessions.filter.toggle")}
-						className={isFilterOpen || showArchived || query.trim().length > 0 ? "is-active" : ""}
+						className={
+							isFilterOpen || query.trim().length > 0 || (variant === "sidebar" && showArchived)
+								? "is-active"
+								: ""
+						}
 						onClick={() => setIsFilterOpen((current) => !current)}
 					>
 						<AppIcon name="filter" size={17} />
@@ -230,6 +248,16 @@ export function SessionSidebar({
 				</div>
 			</header>
 
+			{variant === "page" ? (
+				<SessionStatusTabs
+					showArchived={showArchived}
+					onChange={(archived) => {
+						setShowArchived(archived);
+						setShowAllSessions(false);
+					}}
+				/>
+			) : null}
+
 			{isFilterOpen ? (
 				<div className="session-filter-panel">
 					<label className="session-search">
@@ -245,29 +273,15 @@ export function SessionSidebar({
 						/>
 					</label>
 
-					<fieldset className="session-tabs">
-						<legend className="chat-live-region">{t("sessions.filter.label")}</legend>
-						<button
-							type="button"
-							className={showArchived ? "" : "is-active"}
-							onClick={() => {
-								setShowArchived(false);
+					{variant === "sidebar" ? (
+						<SessionStatusTabs
+							showArchived={showArchived}
+							onChange={(archived) => {
+								setShowArchived(archived);
 								setShowAllSessions(false);
 							}}
-						>
-							{t("sessions.filter.active")}
-						</button>
-						<button
-							type="button"
-							className={showArchived ? "is-active" : ""}
-							onClick={() => {
-								setShowArchived(true);
-								setShowAllSessions(false);
-							}}
-						>
-							{t("sessions.filter.archived")}
-						</button>
-					</fieldset>
+						/>
+					) : null}
 				</div>
 			) : null}
 
@@ -422,5 +436,36 @@ export function SessionSidebar({
 				)}
 			</div>
 		</aside>
+	);
+}
+
+function SessionStatusTabs({
+	showArchived,
+	onChange,
+}: {
+	showArchived: boolean;
+	onChange(archived: boolean): void;
+}) {
+	const { t } = useI18n();
+	return (
+		<fieldset className="session-tabs">
+			<legend className="chat-live-region">{t("sessions.filter.label")}</legend>
+			<button
+				type="button"
+				className={showArchived ? "" : "is-active"}
+				aria-pressed={!showArchived}
+				onClick={() => onChange(false)}
+			>
+				{t("sessions.filter.active")}
+			</button>
+			<button
+				type="button"
+				className={showArchived ? "is-active" : ""}
+				aria-pressed={showArchived}
+				onClick={() => onChange(true)}
+			>
+				{t("sessions.filter.archived")}
+			</button>
+		</fieldset>
 	);
 }

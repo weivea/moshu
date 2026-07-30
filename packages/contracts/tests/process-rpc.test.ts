@@ -3,21 +3,26 @@ import { describe, expect, test } from "bun:test";
 import {
 	agentsRuntimeBoxRequestMethods,
 	agentsServerBootstrapRecordSchema,
+	chatSessionsRetiredEventSchema,
 	clientProductRequestMethods,
 	createProcessChatSessionInputSchema,
-	runtimeBoxProductEventMethods,
-	runtimeBoxToolInvokeInputSchema,
-	runtimeBoxToolInvokeOutputSchema,
-	runtimeBoxToolProgressEventSchema,
+	listRetiredChatSessionsInputSchema,
+	listRetiredChatSessionsOutputSchema,
 	maxRetainedSessionRetirements,
+	maxRetiredSessionsPerEvent,
+	maxRetiredSessionsPerRecoveryPage,
 	productRpcInternalHandlerErrorCode,
 	productRpcMethods,
 	redactCompanionControlRecord,
 	replayChatEventsInputSchema,
 	replayChatEventsOutputSchema,
 	retiredSessionTombstoneTtlMs,
+	runtimeBoxProductEventMethods,
 	runtimeBoxProductRequestMethods,
 	runtimeBoxRegisterInputSchema,
+	runtimeBoxToolInvokeInputSchema,
+	runtimeBoxToolInvokeOutputSchema,
+	runtimeBoxToolProgressEventSchema,
 	sendAskChatMessageInputSchema,
 } from "../src";
 
@@ -26,6 +31,7 @@ describe("product process RPC contracts", () => {
 		expect(clientProductRequestMethods).toContain(productRpcMethods.chatSend);
 		expect(clientProductRequestMethods).toContain(productRpcMethods.providerAuthStart);
 		expect(clientProductRequestMethods).toContain(productRpcMethods.providerAuthRespond);
+		expect(clientProductRequestMethods).toContain(productRpcMethods.chatRetiredSessionsList);
 		expect(clientProductRequestMethods).not.toContain(productRpcMethods.runtimeBoxRegister);
 		expect(runtimeBoxProductRequestMethods).toEqual([
 			productRpcMethods.runtimeBoxRegister,
@@ -36,6 +42,7 @@ describe("product process RPC contracts", () => {
 			productRpcMethods.runtimeBoxToolInvoke,
 			productRpcMethods.runtimeBoxMcpToolInvoke,
 			productRpcMethods.runtimeBoxProjectValidatePath,
+			productRpcMethods.runtimeBoxProjectReadRootAgents,
 			productRpcMethods.runtimeBoxInvocationsAck,
 			productRpcMethods.runtimeBoxInventoryGetSnapshot,
 			productRpcMethods.runtimeBoxInventoryGetChanges,
@@ -53,13 +60,96 @@ describe("product process RPC contracts", () => {
 		expect(runtimeBoxProductEventMethods).toHaveLength(2);
 		expect(productRpcInternalHandlerErrorCode).toBe("INTERNAL_HANDLER_ERROR");
 		expect(maxRetainedSessionRetirements).toBe(256);
+		expect(maxRetiredSessionsPerEvent).toBe(100);
+		expect(maxRetiredSessionsPerRecoveryPage).toBe(100);
+	});
+
+	test("bounds retired Session event payloads without Project data", () => {
+		const sessionId = "018f0f2c-7b18-7abc-8def-1234567890ab";
+		expect(
+			chatSessionsRetiredEventSchema.parse({
+				schemaVersion: 1,
+				sessionIds: [sessionId],
+			}),
+		).toEqual({ schemaVersion: 1, sessionIds: [sessionId] });
+		expect(() =>
+			chatSessionsRetiredEventSchema.parse({
+				schemaVersion: 1,
+				sessionIds: Array.from(
+					{ length: maxRetiredSessionsPerEvent + 1 },
+					(_, index) => `018f0f2c-7b18-7abc-8def-${index.toString().padStart(12, "0")}`,
+				),
+			}),
+		).toThrow();
+		expect(() =>
+			chatSessionsRetiredEventSchema.parse({
+				schemaVersion: 1,
+				sessionIds: [sessionId],
+				projectId: sessionId,
+			}),
+		).toThrow();
+	});
+
+	test("strictly bounds retired Session recovery pages without Project metadata", () => {
+		const first = "018f0f2c-7b18-7abc-8def-1234567890ab";
+		const second = "018f0f2c-7b18-7abc-8def-1234567890ac";
+		expect(
+			listRetiredChatSessionsInputSchema.parse({
+				schemaVersion: 1,
+				cursor: first,
+				limit: maxRetiredSessionsPerRecoveryPage,
+			}),
+		).toEqual({ schemaVersion: 1, cursor: first, limit: 100 });
+		expect(() =>
+			listRetiredChatSessionsInputSchema.parse({
+				schemaVersion: 1,
+				limit: maxRetiredSessionsPerRecoveryPage + 1,
+			}),
+		).toThrow();
+		expect(() =>
+			listRetiredChatSessionsInputSchema.parse({
+				schemaVersion: 1,
+				limit: 1,
+				projectId: first,
+			}),
+		).toThrow();
+		expect(
+			listRetiredChatSessionsOutputSchema.parse({
+				schemaVersion: 1,
+				sessionIds: [first],
+				nextCursor: first,
+			}),
+		).toEqual({ schemaVersion: 1, sessionIds: [first], nextCursor: first });
+		expect(() =>
+			listRetiredChatSessionsOutputSchema.parse({
+				schemaVersion: 1,
+				sessionIds: [first, second],
+				projectId: first,
+			}),
+		).toThrow();
+		expect(() =>
+			listRetiredChatSessionsOutputSchema.parse({
+				schemaVersion: 1,
+				sessionIds: [second, first],
+				nextCursor: second,
+			}),
+		).toThrow();
+		expect(() =>
+			listRetiredChatSessionsOutputSchema.parse({
+				schemaVersion: 1,
+				sessionIds: Array.from(
+					{ length: maxRetiredSessionsPerRecoveryPage + 1 },
+					(_, index) => `018f0f2c-7b18-7abc-8def-${index.toString().padStart(12, "0")}`,
+				),
+			}),
+		).toThrow();
 	});
 
 	test("requires a bounded Runtime Box descriptor during registration", () => {
 		const registration = {
 			schemaVersion: 1 as const,
 			status: "ready" as const,
-			protocolVersion: 3 as const,
+			protocolVersion: 5 as const,
 			transportSecurity: "relay-tls" as const,
 			runtimeBox: {
 				schemaVersion: 1 as const,

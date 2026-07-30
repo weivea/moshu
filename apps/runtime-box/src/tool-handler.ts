@@ -1,26 +1,29 @@
+import { constants } from "node:fs";
+import { access, lstat, readlink, realpath, stat } from "node:fs/promises";
+import { dirname, isAbsolute, resolve } from "node:path";
 import {
-	runtimeBoxToolInvokeInputSchema,
-	productRpcEvents,
-	type ExecutorToolInvokeInput,
-	type ExecutorToolInvokeOutput,
 	acknowledgeRuntimeBoxInvocationsInputSchema,
 	acknowledgeRuntimeBoxInvocationsOutputSchema,
+	type ExecutorToolInvokeInput,
+	type ExecutorToolInvokeOutput,
+	productRpcEvents,
+	runtimeBoxToolInvokeInputSchema,
 } from "@moshu/contracts";
 import {
-	RpcHandlerError,
 	RpcConnectionClosedError,
-	rpcJsonValueSchema,
+	RpcHandlerError,
 	type RpcPeer,
 	type RpcRequestHandler,
+	rpcJsonValueSchema,
 } from "@moshu/process-rpc";
-import { realpath } from "node:fs/promises";
-import { dirname, isAbsolute, relative, resolve } from "node:path";
-import type { ExecutorToolRuntime } from "./tools/index.ts";
 import {
 	InvocationGrantRejectedError,
 	InvocationJournalPrepareFailedError,
 	type RuntimeBoxInvocationJournal,
+	type RuntimeBoxToolDeployment,
 } from "./invocation-journal";
+import type { ExecutorToolRuntime } from "./tools/index.ts";
+import { assertPathContained, resolveReadPath, resolveToCwd } from "./tools/path-utils.ts";
 import { truncateUtf8FromEnd } from "./tools/truncate.ts";
 
 const maxRpcErrorMessageBytes = 1024;
@@ -34,9 +37,8 @@ function executionErrorMessage(error: unknown): string {
 }
 
 export interface ExecutorToolRequestHandlerOptions {
-	readonly cwd?: string;
 	readonly journal: Pick<RuntimeBoxInvocationJournal, "begin" | "succeed" | "fail" | "cancel">;
-	readonly enforceCwdContainment?: boolean;
+	readonly deployment: RuntimeBoxToolDeployment;
 	readonly activeExecutions?: Set<Promise<unknown>>;
 	readonly lifecycleSignal?: AbortSignal;
 	readonly onProgressError?: (error: unknown) => void;
@@ -46,6 +48,10 @@ export function createExecutorToolRequestHandler(
 	runtime: ExecutorToolRuntime,
 	options: ExecutorToolRequestHandlerOptions,
 ): RpcRequestHandler {
+	const deployment = options.deployment;
+	if (deployment.kind === "remote" && !isAbsolute(deployment.workspacePath)) {
+		throw new TypeError("Remote Runtime Box workspace must be an absolute path.");
+	}
 	const activeInvocations = new WeakMap<RpcPeer, Set<string>>();
 	const handle = async (
 		payload: Parameters<RpcRequestHandler>[0],
@@ -53,18 +59,12 @@ export function createExecutorToolRequestHandler(
 	) => {
 		const parsed = runtimeBoxToolInvokeInputSchema.safeParse(payload);
 		if (!parsed.success) {
-			throw new RpcHandlerError("INVALID_RUNTIME_BOX_TOOL_REQUEST", parsed.error.message);
+			throw new RpcHandlerError(
+				"INVALID_RUNTIME_BOX_TOOL_REQUEST",
+				executionErrorMessage(parsed.error),
+			);
 		}
 		const input: ExecutorToolInvokeInput = parsed.data;
-		const executionInput: ExecutorToolInvokeInput =
-			options.cwd === undefined ? input : { ...input, cwd: options.cwd };
-		if (options.enforceCwdContainment) {
-			try {
-				await assertCallContained(executionInput);
-			} catch (error) {
-				throw new RpcHandlerError("RUNTIME_BOX_WORKSPACE_VIOLATION", executionErrorMessage(error));
-			}
-		}
 		let peerInvocations = activeInvocations.get(context.peer);
 		if (!peerInvocations) {
 			peerInvocations = new Set();
@@ -83,7 +83,7 @@ export function createExecutorToolRequestHandler(
 				input,
 				context.peer.remoteIdentity,
 				context.peer.localIdentity,
-				options.cwd === undefined ? "request-cwd" : "runtime-box-workspace",
+				deployment,
 			);
 		} catch (error) {
 			peerInvocations.delete(input.invocationId);
@@ -97,68 +97,6 @@ export function createExecutorToolRequestHandler(
 			);
 		}
 
-		async function assertCallContained(input: ExecutorToolInvokeInput): Promise<void> {
-			if (input.call.tool === "bash") {
-				return;
-			}
-			const path =
-				input.call.tool === "read" ||
-				input.call.tool === "edit" ||
-				input.call.tool === "write" ||
-				input.call.tool === "grep" ||
-				input.call.tool === "find" ||
-				input.call.tool === "ls"
-					? input.call.arguments.path
-					: undefined;
-			if (path === undefined) {
-				return;
-			}
-			const root = await realpath(input.cwd);
-			const lexicalTarget = isAbsolute(path) ? resolve(path) : resolve(root, path);
-			assertContained(root, lexicalTarget);
-			const canonicalTarget = await resolveExistingPath(lexicalTarget);
-			assertContained(root, canonicalTarget);
-		}
-
-		async function resolveExistingPath(path: string): Promise<string> {
-			let current = path;
-			const suffix: string[] = [];
-			while (true) {
-				try {
-					const resolved = await realpath(current);
-					return resolve(resolved, ...suffix.reverse());
-				} catch (error) {
-					if (!isMissingPathError(error)) {
-						throw error;
-					}
-					const parent = dirname(current);
-					if (parent === current) {
-						throw error;
-					}
-					suffix.push(current.slice(parent.length + 1));
-					current = parent;
-				}
-			}
-		}
-
-		function assertContained(root: string, target: string): void {
-			const pathFromRoot = relative(root, target);
-			if (
-				pathFromRoot === ".." ||
-				pathFromRoot.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`) ||
-				isAbsolute(pathFromRoot)
-			) {
-				throw new Error("Tool path escapes the Runtime Box workspace.");
-			}
-		}
-
-		function isMissingPathError(error: unknown): boolean {
-			return (
-				error instanceof Error &&
-				"code" in error &&
-				(error.code === "ENOENT" || error.code === "ENOTDIR")
-			);
-		}
 		let executionSignal: ReturnType<typeof createActionExecutionSignal> | undefined;
 		try {
 			if (begun.replayResult !== undefined) {
@@ -173,9 +111,34 @@ export function createExecutorToolRequestHandler(
 			let result: ExecutorToolInvokeOutput;
 			try {
 				activeExecutionSignal.signal.throwIfAborted();
+				const policy = await resolveInvocationPolicy(input, deployment);
+				const executionInput = { ...input, cwd: policy.cwd };
+				let effectiveFilePath: string | undefined;
+				if (policy.containmentRoot !== undefined && input.call.tool !== "bash") {
+					try {
+						if (input.call.tool === "read" || input.call.tool === "edit") {
+							effectiveFilePath = await resolveReadPath(
+								input.call.arguments.path,
+								policy.cwd,
+								policy.containmentRoot,
+							);
+						}
+						await assertCallContained(executionInput, policy.containmentRoot);
+					} catch (error) {
+						throw new RpcHandlerError(
+							"RUNTIME_BOX_WORKSPACE_VIOLATION",
+							executionErrorMessage(error),
+						);
+					}
+				}
+				activeExecutionSignal.signal.throwIfAborted();
 				const execution = Promise.resolve().then(() =>
 					runtime.execute(executionInput, {
 						signal: activeExecutionSignal.signal,
+						...(policy.containmentRoot === undefined
+							? {}
+							: { containmentRoot: policy.containmentRoot }),
+						...(effectiveFilePath === undefined ? {} : { effectiveFilePath }),
 						onProgress: (event) => {
 							if (context.peer.isClosed) {
 								return;
@@ -240,6 +203,161 @@ export function createExecutorToolRequestHandler(
 	};
 }
 
+async function resolveInvocationPolicy(
+	input: ExecutorToolInvokeInput,
+	deployment: RuntimeBoxToolDeployment,
+): Promise<{ cwd: string; containmentRoot?: string }> {
+	const scope =
+		input.authorization?.executionScope ??
+		(deployment.kind === "remote" ? "runtime-box-workspace" : "request-cwd");
+	switch (scope) {
+		case "request-cwd":
+			return { cwd: input.cwd };
+		case "runtime-box-workspace": {
+			if (deployment.kind !== "remote") {
+				throw new RpcHandlerError(
+					"RUNTIME_BOX_EXECUTION_SCOPE_INCOMPATIBLE",
+					"runtime-box-workspace requires a Remote Runtime Box workspace.",
+				);
+			}
+			const containmentRoot = await realpath(deployment.workspacePath);
+			return { cwd: deployment.workspacePath, containmentRoot };
+		}
+		case "project-root": {
+			const cwd = await requireCanonicalProjectCwd(input.cwd);
+			return { cwd, containmentRoot: cwd };
+		}
+	}
+}
+
+async function requireCanonicalProjectCwd(requestedCwd: string): Promise<string> {
+	if (!isAbsolute(requestedCwd)) {
+		throw new RpcHandlerError(
+			"RUNTIME_BOX_PROJECT_CWD_NOT_CANONICAL",
+			"Project cwd must be an absolute canonical path.",
+		);
+	}
+	let canonicalCwd: string;
+	try {
+		canonicalCwd = await realpath(requestedCwd);
+	} catch (error) {
+		throw mapProjectCwdError(error);
+	}
+	if (canonicalCwd !== requestedCwd) {
+		throw new RpcHandlerError(
+			"RUNTIME_BOX_PROJECT_CWD_NOT_CANONICAL",
+			"Project cwd does not match its canonical path.",
+		);
+	}
+	let metadata: Awaited<ReturnType<typeof stat>>;
+	try {
+		metadata = await stat(canonicalCwd);
+	} catch (error) {
+		throw mapProjectCwdError(error);
+	}
+	if (!metadata.isDirectory()) {
+		throw new RpcHandlerError(
+			"RUNTIME_BOX_PROJECT_CWD_NOT_DIRECTORY",
+			"Project cwd is not a directory.",
+		);
+	}
+	try {
+		await access(canonicalCwd, constants.R_OK | constants.X_OK);
+	} catch {
+		throw new RpcHandlerError(
+			"RUNTIME_BOX_PROJECT_CWD_NOT_READABLE",
+			"Project cwd is not readable.",
+		);
+	}
+	return canonicalCwd;
+}
+
+function mapProjectCwdError(error: unknown): RpcHandlerError {
+	if (error instanceof Error && "code" in error) {
+		if (error.code === "ENOENT") {
+			return new RpcHandlerError(
+				"RUNTIME_BOX_PROJECT_CWD_NOT_FOUND",
+				"Project cwd does not exist.",
+			);
+		}
+		if (error.code === "ENOTDIR") {
+			return new RpcHandlerError(
+				"RUNTIME_BOX_PROJECT_CWD_NOT_DIRECTORY",
+				"Project cwd is not a directory.",
+			);
+		}
+		if (error.code === "EACCES" || error.code === "EPERM") {
+			return new RpcHandlerError(
+				"RUNTIME_BOX_PROJECT_CWD_NOT_READABLE",
+				"Project cwd is not readable.",
+			);
+		}
+	}
+	return new RpcHandlerError(
+		"RUNTIME_BOX_PROJECT_CWD_INVALID",
+		"Project cwd could not be validated.",
+	);
+}
+
+async function assertCallContained(input: ExecutorToolInvokeInput, root: string): Promise<void> {
+	const path =
+		input.call.tool === "read" ||
+		input.call.tool === "edit" ||
+		input.call.tool === "write" ||
+		input.call.tool === "grep" ||
+		input.call.tool === "find" ||
+		input.call.tool === "ls"
+			? (input.call.arguments.path ?? ".")
+			: ".";
+	const lexicalRoot = resolveToCwd(".", input.cwd);
+	const lexicalTarget = resolveToCwd(path, input.cwd);
+	assertPathContained(lexicalRoot, lexicalTarget);
+	const canonicalTarget = await resolveCanonicalTarget(lexicalTarget);
+	assertPathContained(root, canonicalTarget);
+}
+
+async function resolveCanonicalTarget(path: string, visited = new Set<string>()): Promise<string> {
+	const resolvedPath = resolve(path);
+	let metadata: Awaited<ReturnType<typeof lstat>> | undefined;
+	try {
+		metadata = await lstat(resolvedPath);
+	} catch (error) {
+		if (!isMissingPathError(error)) {
+			throw error;
+		}
+	}
+	if (metadata === undefined) {
+		const parent = dirname(resolvedPath);
+		if (parent === resolvedPath) {
+			throw new Error("Tool path has no existing canonical parent.");
+		}
+		return resolve(
+			await resolveCanonicalTarget(parent, visited),
+			resolvedPath.slice(parent.length + 1),
+		);
+	}
+	if (!metadata.isSymbolicLink()) {
+		return realpath(resolvedPath);
+	}
+	if (visited.has(resolvedPath)) {
+		throw new Error("Tool path contains a symbolic-link cycle.");
+	}
+	visited.add(resolvedPath);
+	const target = await readlink(resolvedPath);
+	return resolveCanonicalTarget(
+		isAbsolute(target) ? target : resolve(dirname(resolvedPath), target),
+		visited,
+	);
+}
+
+function isMissingPathError(error: unknown): boolean {
+	return (
+		error instanceof Error &&
+		"code" in error &&
+		(error.code === "ENOENT" || error.code === "ENOTDIR")
+	);
+}
+
 function defaultProgressErrorReporter(error: unknown): void {
 	console.error(
 		error instanceof Error
@@ -270,7 +388,9 @@ export function createActionExecutionSignal(
 		controller.abort(reason);
 	};
 	requestSignal.addEventListener("abort", abortFromRequest, { once: true });
-	lifecycleSignal?.addEventListener("abort", abortFromLifecycle, { once: true });
+	lifecycleSignal?.addEventListener("abort", abortFromLifecycle, {
+		once: true,
+	});
 	if (lifecycleSignal?.aborted) {
 		abortFromLifecycle();
 	} else if (requestSignal.aborted) {

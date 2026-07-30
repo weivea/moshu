@@ -88,6 +88,7 @@ export interface ActionRepository {
 	cancelUndispatched(invocationId: string, safeError: string): void;
 	recoverOnStartup(): { cancelled: number; outcomeUnknown: number };
 	hasUnacknowledgedForSession(sessionId: string): boolean;
+	hasUnacknowledgedForProject(projectId: string): boolean;
 	get(invocationId: string): ActionIntentRecord;
 }
 
@@ -470,6 +471,32 @@ export class SqliteActionRepository implements ActionRepository {
 				.where(
 					and(
 						eq(chatRunsTable.sessionId, sessionId),
+						or(
+							and(
+								eq(actionIntentsTable.targetKind, "runtime-box"),
+								isNull(actionIntentsTable.boxReceiptConfirmedAtMs),
+							),
+							and(
+								eq(actionIntentsTable.targetKind, "agent-server"),
+								isNull(actionIntentsTable.serverAckedAtMs),
+							),
+						),
+					),
+				)
+				.limit(1)
+				.get() !== undefined
+		);
+	}
+
+	hasUnacknowledgedForProject(projectId: string): boolean {
+		return (
+			this.orm
+				.select({ id: actionIntentsTable.id })
+				.from(actionIntentsTable)
+				.innerJoin(chatRunsTable, eq(chatRunsTable.id, actionIntentsTable.runId))
+				.where(
+					and(
+						eq(chatRunsTable.projectId, projectId),
 						or(
 							and(
 								eq(actionIntentsTable.targetKind, "runtime-box"),

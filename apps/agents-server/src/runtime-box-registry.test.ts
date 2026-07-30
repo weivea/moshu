@@ -1,16 +1,22 @@
 import { describe, expect, test } from "bun:test";
 import {
-	executorToolRpcTimeoutMs,
-	productRpcMethods,
 	type ExecutorToolInvokeInput,
 	type ExecutorToolProgressEvent,
+	executorToolRpcTimeoutMs,
+	productRpcMethods,
 } from "@moshu/contracts";
-import { type JsonValue, type RpcRequestOptions, rpcJsonValueSchema } from "@moshu/process-rpc";
 import { openAppDatabase } from "@moshu/database";
 import {
-	RuntimeBoxInvocationError,
+	type JsonValue,
+	RpcConnectionClosedError,
+	type RpcRequestOptions,
+	RpcTimeoutError,
+	rpcJsonValueSchema,
+} from "@moshu/process-rpc";
+import {
 	type RuntimeBoxActionAuthorizer,
 	type RuntimeBoxGatewayPeer,
+	RuntimeBoxInvocationError,
 	RuntimeBoxRegistry,
 	RuntimeBoxUnavailableError,
 } from "./runtime-box-registry";
@@ -34,6 +40,29 @@ const bashInvocation: ExecutorToolInvokeInput = {
 		arguments: { command: "printf progress" },
 	},
 };
+
+const projectRequestCases = [
+	[
+		"path validation",
+		productRpcMethods.runtimeBoxProjectValidatePath,
+		(registry: RuntimeBoxRegistry, signal?: AbortSignal) =>
+			registry.validateProjectPath(
+				"moshu-local-runtime-box",
+				{ path: "/workspace/project" },
+				signal,
+			),
+	],
+	[
+		"root AGENTS.md loading",
+		productRpcMethods.runtimeBoxProjectReadRootAgents,
+		(registry: RuntimeBoxRegistry, signal?: AbortSignal) =>
+			registry.readProjectRootAgents(
+				"moshu-local-runtime-box",
+				{ projectPath: "/workspace/project" },
+				signal,
+			),
+	],
+] as const;
 
 function readOutput() {
 	return rpcJsonValueSchema.parse({
@@ -98,8 +127,8 @@ describe("RuntimeBoxRegistry routing and invocation gateway", () => {
 		expect(gateway.listInfo()[0]).toMatchObject({
 			state: "upgrade_required",
 			compatibility: "upgrade_required",
-			requiredProtocolMinVersion: 3,
-			requiredProtocolMaxVersion: 3,
+			requiredProtocolMinVersion: 5,
+			requiredProtocolMaxVersion: 5,
 		});
 	});
 
@@ -160,7 +189,7 @@ describe("RuntimeBoxRegistry routing and invocation gateway", () => {
 					arch: "arm64",
 					capabilities: [],
 				},
-				{ protocolVersion: 3, transportSecurity: "noise-xx" },
+				{ protocolVersion: 5, transportSecurity: "noise-xx" },
 			),
 		).toThrow("was not negotiated");
 	});
@@ -309,12 +338,16 @@ describe("RuntimeBoxRegistry routing and invocation gateway", () => {
 			expect(payload).toEqual({ path: "/workspace/project" });
 			expect(options?.timeoutMs).toBe(30_000);
 			return rpcJsonValueSchema.parse({
+				status: "available",
 				normalizedPath: "/workspace/project",
 				displayName: "project",
 				gitRootPath: "/workspace/project",
 				gitBranch: "main",
+				rootAgents: { status: "missing" },
+				confirmationToken: "a".repeat(64),
 			});
 		});
+
 		registerRuntimeBox(gateway, peer);
 
 		await expect(
@@ -322,23 +355,139 @@ describe("RuntimeBoxRegistry routing and invocation gateway", () => {
 				path: "/workspace/project",
 			}),
 		).resolves.toEqual({
+			status: "available",
 			normalizedPath: "/workspace/project",
 			displayName: "project",
 			gitRootPath: "/workspace/project",
 			gitBranch: "main",
+			rootAgents: { status: "missing" },
+			confirmationToken: "a".repeat(64),
 		});
+	});
+
+	test("loads root AGENTS.md through the owning ready Box and propagates cancellation", async () => {
+		const gateway = new RuntimeBoxRegistry();
+		const controller = new AbortController();
+		const peer = new FakeRuntimeBoxPeer(async (method, payload, options) => {
+			expect(method).toBe(productRpcMethods.runtimeBoxProjectReadRootAgents);
+			expect(payload).toEqual({ projectPath: "/workspace/project" });
+			expect(options).toMatchObject({ timeoutMs: 30_000, signal: controller.signal });
+			return rpcJsonValueSchema.parse({ status: "loaded", body: "root guidance" });
+		});
+		registerRuntimeBox(gateway, peer);
+
+		await expect(
+			gateway.readProjectRootAgents(
+				"moshu-local-runtime-box",
+				{ projectPath: "/workspace/project" },
+				controller.signal,
+			),
+		).resolves.toEqual({ status: "loaded", body: "root guidance" });
+	});
+
+	test.each(projectRequestCases)(
+		"maps a disconnect or replacement during %s to Runtime Box unavailable",
+		async (_name, expectedMethod, invoke) => {
+			for (const transition of ["disconnect", "replacement"] as const) {
+				const gateway = new RuntimeBoxRegistry();
+				const requestStarted = deferred<void>();
+				const peer = new FakeRuntimeBoxPeer(async (method, _payload, options) => {
+					expect(method).toBe(expectedMethod);
+					requestStarted.resolve(undefined);
+					return rejectWhenAborted(new Promise<JsonValue>(() => undefined), options?.signal);
+				});
+				registerRuntimeBox(gateway, peer);
+				const pending = invoke(gateway);
+				await requestStarted.promise;
+
+				if (transition === "disconnect") {
+					gateway.clear(peer);
+				} else {
+					registerRuntimeBox(gateway, new FakeRuntimeBoxPeer(async () => readOutput()));
+				}
+
+				await expect(pending).rejects.toBeInstanceOf(RuntimeBoxUnavailableError);
+			}
+		},
+	);
+
+	test.each(projectRequestCases)(
+		"maps an RPC connection close during %s to Runtime Box unavailable",
+		async (_name, expectedMethod, invoke) => {
+			const gateway = new RuntimeBoxRegistry();
+			const peer = new FakeRuntimeBoxPeer(async (method) => {
+				expect(method).toBe(expectedMethod);
+				throw new RpcConnectionClosedError(1006, "peer closed");
+			});
+			registerRuntimeBox(gateway, peer);
+
+			await expect(invoke(gateway)).rejects.toBeInstanceOf(RuntimeBoxUnavailableError);
+		},
+	);
+
+	test.each(projectRequestCases)(
+		"preserves caller cancellation and deadlines during %s",
+		async (_name, expectedMethod, invoke) => {
+			const cancellationGateway = new RuntimeBoxRegistry();
+			const requestStarted = deferred<void>();
+			const cancellationPeer = new FakeRuntimeBoxPeer(async (method, _payload, options) => {
+				expect(method).toBe(expectedMethod);
+				requestStarted.resolve(undefined);
+				return rejectWhenAborted(new Promise<JsonValue>(() => undefined), options?.signal);
+			});
+			registerRuntimeBox(cancellationGateway, cancellationPeer);
+			const controller = new AbortController();
+			const cancellation = invoke(cancellationGateway, controller.signal);
+			await requestStarted.promise;
+			const cancellationReason = new Error("caller cancelled");
+			controller.abort(cancellationReason);
+			expect(await cancellation.catch((error: unknown) => error)).toBe(cancellationReason);
+
+			const deadlineGateway = new RuntimeBoxRegistry();
+			const deadlinePeer = new FakeRuntimeBoxPeer(async (method) => {
+				expect(method).toBe(expectedMethod);
+				throw new RpcTimeoutError("project-request", 30_000);
+			});
+			registerRuntimeBox(deadlineGateway, deadlinePeer);
+			await expect(invoke(deadlineGateway)).rejects.toBeInstanceOf(RpcTimeoutError);
+		},
+	);
+
+	test("does not inspect Project paths before the Runtime Box is ready", async () => {
+		const gateway = new RuntimeBoxRegistry();
+		const peer = new FakeRuntimeBoxPeer(async () => {
+			throw new Error("Path inspection must not dispatch before readiness.");
+		});
+		gateway.register(peer, {
+			schemaVersion: 1,
+			runtimeBoxId: peer.remoteIdentity.peerId,
+			kind: "local",
+			displayName: "Local Runtime Box",
+			runtimeBoxVersion: "0.0.1",
+			platform: "darwin",
+			arch: "arm64",
+			capabilities: [],
+		});
+
+		await expect(
+			gateway.validateProjectPath(peer.remoteIdentity.peerId, {
+				path: "/workspace/project",
+			}),
+		).rejects.toBeInstanceOf(RuntimeBoxUnavailableError);
 	});
 
 	test("authorizes, completes, and acknowledges a one-time Action grant", async () => {
 		const calls: string[] = [];
+		const executionContexts: unknown[] = [];
 		const authorizer = {
 			authorize(
 				runtimeBoxId: string,
 				input: ExecutorToolInvokeInput,
 				targetIdentity,
-				executionScope,
+				executionContext,
 			) {
 				calls.push("authorize");
+				executionContexts.push(executionContext);
 				return {
 					...input,
 					authorization: {
@@ -351,7 +500,7 @@ describe("RuntimeBoxRegistry routing and invocation gateway", () => {
 						targetRuntimeBoxId: runtimeBoxId,
 						targetInstanceId: targetIdentity.instanceId,
 						targetGeneration: targetIdentity.generation,
-						executionScope,
+						...executionContext,
 						expiresAt: new Date(Date.now() + 60_000).toISOString(),
 					},
 				};
@@ -384,7 +533,10 @@ describe("RuntimeBoxRegistry routing and invocation gateway", () => {
 				calls.push("receipt");
 			},
 		} satisfies RuntimeBoxActionAuthorizer;
-		const gateway = new RuntimeBoxRegistry({ actionAuthorizer: authorizer });
+		const gateway = new RuntimeBoxRegistry({
+			actionAuthorizer: authorizer,
+			isDeviceKeyActive: () => true,
+		});
 		const peer = new FakeRuntimeBoxPeer(async (method, payload) => {
 			if (method === productRpcMethods.runtimeBoxInvocationsAck) {
 				return rpcJsonValueSchema.parse({
@@ -398,14 +550,49 @@ describe("RuntimeBoxRegistry routing and invocation gateway", () => {
 		registerRuntimeBox(gateway, peer);
 
 		await gateway.invoke(invocation);
-		expect(calls).toEqual(["authorize", "complete", "ack", "receipt"]);
+		await gateway.invoke(invocation, {
+			executionContext: { executionScope: "project-root", projectPathRevision: 9 },
+		});
+		const remotePeer = new FakeRuntimeBoxPeer(
+			async (method) => {
+				if (method === productRpcMethods.runtimeBoxInvocationsAck) {
+					return rpcJsonValueSchema.parse({
+						ackedInvocationIds: [invocation.invocationId],
+					});
+				}
+				return readOutput();
+			},
+			"remote-box",
+			"remote-key",
+		);
+		registerRuntimeBox(gateway, remotePeer, "remote");
+		await gateway.invokeForRuntimeBox("remote-box", invocation);
+		expect(executionContexts).toEqual([
+			{ executionScope: "request-cwd" },
+			{ executionScope: "project-root", projectPathRevision: 9 },
+			{ executionScope: "runtime-box-workspace" },
+		]);
+		expect(calls).toEqual([
+			"authorize",
+			"complete",
+			"ack",
+			"receipt",
+			"authorize",
+			"complete",
+			"ack",
+			"receipt",
+			"authorize",
+			"complete",
+			"ack",
+			"receipt",
+		]);
 	});
 
 	test("cancels an authorized Action without dispatch when the caller aborts", async () => {
 		const controller = new AbortController();
 		const calls: string[] = [];
 		const authorizer = {
-			authorize(runtimeBoxId, input, targetIdentity, executionScope) {
+			authorize(runtimeBoxId, input, targetIdentity, executionContext) {
 				calls.push("authorize");
 				controller.abort(new Error("caller stopped"));
 				return {
@@ -420,7 +607,7 @@ describe("RuntimeBoxRegistry routing and invocation gateway", () => {
 						targetRuntimeBoxId: runtimeBoxId,
 						targetInstanceId: targetIdentity.instanceId,
 						targetGeneration: targetIdentity.generation,
-						executionScope,
+						...executionContext,
 						expiresAt: new Date(Date.now() + 60_000).toISOString(),
 					},
 				};

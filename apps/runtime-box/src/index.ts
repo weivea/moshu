@@ -3,17 +3,17 @@ import {
 	agentsRuntimeBoxRequestMethods,
 	companionBootstrapChannel,
 	companionControlVersion,
-	type RuntimeBoxReadyRecord,
+	currentRuntimeBoxProtocolVersion,
 	executorToolNames,
 	executorToolRpcTimeoutMs,
+	moshuReleaseVersion,
+	productRpcEvents,
 	productRpcMaxBufferedOutboundBytes,
 	productRpcMaxFrameBytes,
-	productRpcEvents,
 	productRpcMethods,
-	currentRuntimeBoxProtocolVersion,
+	type RuntimeBoxReadyRecord,
 	runtimeBoxRegisterInputSchema,
 	runtimeBoxRegisterOutputSchema,
-	moshuReleaseVersion,
 } from "@moshu/contracts";
 import {
 	type ConnectRpcClientOptions,
@@ -25,30 +25,32 @@ import {
 	rpcJsonValueSchema,
 } from "@moshu/process-rpc";
 import {
-	createExecutorToolRequestHandler,
-	createInvocationAcknowledgementHandler,
-} from "./tool-handler";
-import {
-	reconcileInvocationJournal,
-	RuntimeBoxInvocationJournal,
-	watchInvocationReconciliation,
-} from "./invocation-journal";
-import { validateProjectPathRequestHandler } from "./project-path";
-import { createRuntimeResourceRequestHandlers } from "./resource-handler";
-import { RuntimeResourceStore } from "./runtime-resource-store";
-import { createExecutorToolRuntime, type ExecutorToolRuntime } from "./tools/index";
-import { runRuntimeBoxCli } from "./cli";
-import { extractEmbeddedRuntimeBoxAssets, type EmbeddedRuntimeBoxAssets } from "./embedded-assets";
-import { configurePhotonWasmPath } from "./tools/photon";
-import { McpLifecycleManager } from "./mcp-lifecycle-manager";
-import { createMcpToolRequestHandler } from "./mcp-tool-handler";
-
-import {
 	type BootstrapControlChannel,
 	openBootstrapControlChannel,
 	parseRuntimeBoxBootstrapRecord,
 	serializeReadyRecord,
 } from "./bootstrap";
+import { runRuntimeBoxCli } from "./cli";
+import { type EmbeddedRuntimeBoxAssets, extractEmbeddedRuntimeBoxAssets } from "./embedded-assets";
+import {
+	RuntimeBoxInvocationJournal,
+	reconcileInvocationJournal,
+	watchInvocationReconciliation,
+} from "./invocation-journal";
+import { McpLifecycleManager } from "./mcp-lifecycle-manager";
+import { createMcpToolRequestHandler } from "./mcp-tool-handler";
+import {
+	readProjectRootAgentsRequestHandler,
+	validateProjectPathRequestHandler,
+} from "./project-path";
+import { createRuntimeResourceRequestHandlers } from "./resource-handler";
+import { RuntimeResourceStore } from "./runtime-resource-store";
+import {
+	createExecutorToolRequestHandler,
+	createInvocationAcknowledgementHandler,
+} from "./tool-handler";
+import { createExecutorToolRuntime, type ExecutorToolRuntime } from "./tools/index";
+import { configurePhotonWasmPath } from "./tools/photon";
 
 const PROCESS_VERSION = moshuReleaseVersion;
 
@@ -190,6 +192,7 @@ export async function runRuntimeBoxProcess(
 				? undefined
 				: createExecutorToolRequestHandler(options.toolRuntime, {
 						journal: invocationJournal,
+						deployment: { kind: "local", trustedRequestCwd: true },
 						activeExecutions,
 						lifecycleSignal: lifecycle.signal,
 					});
@@ -202,6 +205,7 @@ export async function runRuntimeBoxProcess(
 					});
 		const runtimeRequestHandlers: Record<string, RpcRequestHandler> = {
 			[productRpcMethods.runtimeBoxProjectValidatePath]: validateProjectPathRequestHandler,
+			[productRpcMethods.runtimeBoxProjectReadRootAgents]: readProjectRootAgentsRequestHandler,
 			[productRpcMethods.runtimeBoxInvocationsAck]:
 				createInvocationAcknowledgementHandler(invocationJournal),
 			...resourceHandlers,
@@ -220,7 +224,9 @@ export async function runRuntimeBoxProcess(
 				expectedServerIdentity: bootstrap.agentsServer.identity,
 				signal: lifecycle.signal,
 				getHandshakeHeaders: createRpcBearerHandshakeHeaders(bootstrap.credential),
-				methodAllowlist: { agents: { requests: agentsRuntimeBoxRequestMethods } },
+				methodAllowlist: {
+					agents: { requests: agentsRuntimeBoxRequestMethods },
+				},
 				handlers: { requests: runtimeRequestHandlers },
 				...(toolRequestHandler === undefined && mcpToolHandler === undefined
 					? {}

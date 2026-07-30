@@ -11,12 +11,16 @@ import {
 import type { ChatSession, ChatTransport } from "./chat/transport";
 import { EmptyState } from "./empty-state";
 import { type MessageKey, useI18n } from "./i18n";
+import { useProjectData } from "./projects/project-data";
+import { ProjectSettingsPage } from "./projects/project-settings";
+import { useProjectDetail } from "./projects/use-project-detail";
+import { ProjectDetailPage, ProjectsPage } from "./projects-page";
+import { useRuntimeBoxes } from "./runtime-boxes";
 import { DefaultModelSettingsPage } from "./settings/default-model-page";
 import { GeneralSettingsPage } from "./settings/general-page";
 import { ProvidersSettingsPage } from "./settings/providers/providers-page";
 import { RuntimeBoxesSettingsPage } from "./settings/runtime-boxes-page";
 import { McpServersSettingsPage, SkillsSettingsPage } from "./settings/runtime-resources-page";
-import { ProjectDetailPage, ProjectsPage } from "./projects-page";
 
 const lastChatSessionStorageKey = "moshu.lastChatSessionId";
 const initialHydrationRetryDelayMs = 100;
@@ -271,6 +275,96 @@ export function ProjectsRoutePage() {
 
 export function ProjectDetailRoutePage() {
 	return <ProjectDetailPage />;
+}
+
+export function ProjectSettingsRoutePage() {
+	return <ProjectSettingsPage />;
+}
+
+export function ProjectNewChatPage({
+	transport = chatTransport,
+}: {
+	transport?: ChatTransport;
+} = {}) {
+	return <ProjectChatRoute transport={transport} />;
+}
+
+export function ProjectChatSessionPage({
+	transport = chatTransport,
+}: {
+	transport?: ChatTransport;
+} = {}) {
+	const { sessionId } = useParams();
+	if (sessionId === undefined) {
+		throw new Error("Project Chat route is missing its Session ID.");
+	}
+	return <ProjectChatRoute transport={transport} sessionId={sessionId} />;
+}
+
+function ProjectChatRoute({
+	transport,
+	sessionId,
+}: {
+	transport: ChatTransport;
+	sessionId?: string;
+}) {
+	const { projectId } = useParams();
+	const { t } = useI18n();
+	const navigate = useNavigate();
+	const runtimeBoxes = useRuntimeBoxes();
+	const detail = useProjectDetail(projectId, true);
+	const { invalidateProject } = useProjectData();
+	if (projectId === undefined) {
+		throw new Error("Project Chat route is missing its Project ID.");
+	}
+	const project = detail.project;
+	const ownerRuntimeBox = runtimeBoxes.snapshot.items.find(
+		(item) => item.runtimeBox.runtimeBoxId === project?.runtimeBoxId,
+	);
+	const disabledReason =
+		detail.error !== undefined
+			? t("projects.chat.detailsUnavailable")
+			: project === undefined || detail.isCheckingPath
+				? t("projects.chat.checking")
+				: project.deletionRequestedAt !== undefined
+					? t("projects.chat.deleting")
+					: project.archivedAt !== undefined
+						? t("projects.chat.archived")
+						: !detail.runtimeReady
+							? t("projects.chat.runtimeOffline")
+							: detail.healthError !== undefined || project.pathStatus !== "available"
+								? t("projects.chat.pathUnavailable")
+								: undefined;
+	const projectContext = {
+		projectId,
+		...(project?.name === undefined ? {} : { name: project.name }),
+		...(project?.path === undefined ? {} : { path: project.path }),
+		...(project?.pathStatus === undefined ? {} : { pathStatus: project.pathStatus }),
+		...(ownerRuntimeBox === undefined
+			? {}
+			: { runtimeBoxName: ownerRuntimeBox.runtimeBox.displayName }),
+		overviewHref: `/projects/${projectId}`,
+		settingsHref: `/projects/${projectId}/settings`,
+		runtimeReady: detail.runtimeReady,
+		status: detail.error ? ("error" as const) : project ? ("ready" as const) : ("loading" as const),
+		...(disabledReason === undefined ? {} : { disabledReason }),
+	};
+	return (
+		<ChatPage
+			transport={transport}
+			{...(sessionId === undefined ? {} : { sessionId })}
+			routeProjectId={projectId}
+			projectContext={projectContext}
+			onSessionChange={(nextSessionId) => {
+				invalidateProject(projectId, project?.runtimeBoxId);
+				navigate(`/projects/${projectId}/chat/${nextSessionId}`, { replace: true });
+			}}
+			onSessionRetired={() => navigate(`/projects/${projectId}`, { replace: true })}
+			onNewSession={() => navigate(`/projects/${projectId}/chat/new`)}
+			onSelectSession={(nextSessionId) => navigate(`/projects/${projectId}/chat/${nextSessionId}`)}
+			onOpenProviderSettings={() => navigate("/settings/providers")}
+		/>
+	);
 }
 
 export function PlaceholderPage({ titleKey, icon }: { titleKey: MessageKey; icon: AppIconName }) {

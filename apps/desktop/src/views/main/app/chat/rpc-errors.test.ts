@@ -9,7 +9,11 @@ import {
 	chatSessionNotFoundMessagePrefix,
 	isAgentsUnavailableError,
 	isChatSessionNotFoundError,
+	isProjectPreviewStaleError,
 	normalizeDesktopRpcError,
+	ProjectPreviewStaleError,
+	projectPreviewStaleCode,
+	projectPreviewStaleMessagePrefix,
 } from "../../../../shared/rpc-errors";
 
 describe("desktop RPC unavailable errors", () => {
@@ -41,5 +45,16 @@ describe("desktop RPC unavailable errors", () => {
 		expect(normalized).toBeInstanceOf(ChatSessionNotFoundError);
 		expect((normalized as ChatSessionNotFoundError).code).toBe(chatSessionNotFoundCode);
 		expect(isAgentsUnavailableError(normalized)).toBe(false);
+	});
+
+	test("restores a stale Project preview code after Electrobun strips error properties", () => {
+		const serialized = new Error(
+			`${projectPreviewStaleMessagePrefix}The Project path preview is stale.`,
+		);
+		const normalized = normalizeDesktopRpcError(serialized);
+
+		expect(normalized).toBeInstanceOf(ProjectPreviewStaleError);
+		expect((normalized as ProjectPreviewStaleError).code).toBe(projectPreviewStaleCode);
+		expect(isProjectPreviewStaleError(normalized)).toBe(true);
 	});
 });

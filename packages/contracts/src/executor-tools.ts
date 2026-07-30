@@ -32,21 +32,44 @@ export const executionGrantTokenSchema = z
 	.regex(/^[A-Za-z0-9_-]+$/);
 export const actionParameterDigestSchema = z.string().regex(/^[a-f0-9]{64}$/);
 
-export const runtimeBoxToolAuthorizationSchema = z
-	.object({
-		actionId: actionIdSchema,
-		grantId: executionGrantIdSchema,
-		grantToken: executionGrantTokenSchema,
-		parameterDigest: actionParameterDigestSchema,
-		originInstanceId: z.string().min(1).max(256),
-		originGeneration: z.int().nonnegative().safe(),
-		targetRuntimeBoxId: z.string().min(1).max(128),
-		targetInstanceId: z.string().min(1).max(256),
-		targetGeneration: z.int().nonnegative().safe(),
-		executionScope: z.enum(["request-cwd", "runtime-box-workspace"]),
-		expiresAt: z.string().datetime({ offset: true }),
-	})
-	.strict();
+export const executorExecutionContextSchema = z.discriminatedUnion("executionScope", [
+	z.object({ executionScope: z.literal("request-cwd") }).strict(),
+	z.object({ executionScope: z.literal("runtime-box-workspace") }).strict(),
+	z
+		.object({
+			executionScope: z.literal("project-root"),
+			projectPathRevision: z.int().positive().safe(),
+		})
+		.strict(),
+]);
+
+const runtimeBoxToolAuthorizationBaseSchema = z.object({
+	actionId: actionIdSchema,
+	grantId: executionGrantIdSchema,
+	grantToken: executionGrantTokenSchema,
+	parameterDigest: actionParameterDigestSchema,
+	originInstanceId: z.string().min(1).max(256),
+	originGeneration: z.int().nonnegative().safe(),
+	targetRuntimeBoxId: z.string().min(1).max(128),
+	targetInstanceId: z.string().min(1).max(256),
+	targetGeneration: z.int().nonnegative().safe(),
+	expiresAt: z.string().datetime({ offset: true }),
+});
+
+export const runtimeBoxToolAuthorizationSchema = z.discriminatedUnion("executionScope", [
+	runtimeBoxToolAuthorizationBaseSchema
+		.extend({ executionScope: z.literal("request-cwd") })
+		.strict(),
+	runtimeBoxToolAuthorizationBaseSchema
+		.extend({ executionScope: z.literal("runtime-box-workspace") })
+		.strict(),
+	runtimeBoxToolAuthorizationBaseSchema
+		.extend({
+			executionScope: z.literal("project-root"),
+			projectPathRevision: z.int().positive().safe(),
+		})
+		.strict(),
+]);
 
 function boundedUtf8String(maxBytes: number, label: string, minimumBytes = 0) {
 	return z
@@ -454,15 +477,19 @@ export const acknowledgeRuntimeBoxInvocationsOutputSchema = z
 
 export function createExecutorToolParameterPayload(
 	input: Omit<ExecutorToolInvokeInput, "authorization">,
+	executionContext: ExecutorExecutionContext,
 ): string {
+	const parsedContext = executorExecutionContextSchema.parse(executionContext);
 	return JSON.stringify([
-		"moshu-executor-tool-parameters-v1",
+		"moshu-executor-tool-parameters-v2",
 		input.schemaVersion,
 		input.invocationId,
 		input.runId,
 		input.toolCallId,
 		input.cwd,
 		input.call,
+		parsedContext.executionScope,
+		parsedContext.executionScope === "project-root" ? parsedContext.projectPathRevision : undefined,
 	]);
 }
 
@@ -495,6 +522,7 @@ export type ExecutorFindToolArguments = z.infer<typeof executorFindToolArguments
 export type ExecutorLsToolArguments = z.infer<typeof executorLsToolArgumentsSchema>;
 export type ExecutorToolCall = z.infer<typeof executorToolCallSchema>;
 export type ExecutorToolInvokeInput = z.infer<typeof runtimeBoxToolInvokeInputSchema>;
+export type ExecutorExecutionContext = z.infer<typeof executorExecutionContextSchema>;
 export type RuntimeBoxToolAuthorization = z.infer<typeof runtimeBoxToolAuthorizationSchema>;
 export type ExecutorToolTextContent = z.infer<typeof executorToolTextContentSchema>;
 export type ExecutorToolImageContent = z.infer<typeof executorToolImageContentSchema>;

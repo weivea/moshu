@@ -1,10 +1,11 @@
 import {
+	type AgentMcpResource,
 	AskChatCancelledError,
+	type AskChatExecutionContext,
 	type AskChatMessage,
 	type AskChatRuntime,
-	type AskChatSkillResource,
-	type AgentMcpResource,
 	AskChatRuntimeError,
+	type AskChatSkillResource,
 	ProviderModelNotFoundError,
 	ProviderNotFoundError,
 	type ProviderRecord,
@@ -24,7 +25,6 @@ import {
 	type ChatSendAcceptedOutput,
 	type CreateChatSessionOutput,
 	type CreateProcessChatSessionInput,
-	defaultLocalRuntimeBoxId,
 	type CreateProviderInput,
 	chatMessageSchema,
 	chatSendAcceptedOutputSchema,
@@ -34,6 +34,7 @@ import {
 	type DeleteChatSessionOutput,
 	type DeleteProviderInput,
 	type DeleteProviderOutput,
+	defaultLocalRuntimeBoxId,
 	deleteChatSessionInputSchema,
 	deleteProviderInputSchema,
 	deleteProviderOutputSchema,
@@ -56,15 +57,21 @@ import {
 	type ListChatSessionsInput,
 	type ListChatSessionsOutput,
 	type ListProvidersOutput,
+	type ListRetiredChatSessionsInput,
+	type ListRetiredChatSessionsOutput,
 	listAvailableModelsOutputSchema,
 	listChatSessionsInputSchema,
 	listProvidersOutputSchema,
+	listRetiredChatSessionsInputSchema,
+	listRetiredChatSessionsOutputSchema,
 	maxAssistantMessageContentCharacters,
 	maxChatDeltaCharacters,
 	maxReplayEventBytesPerPage,
 	maxReplayEventsPerPage,
 	normalizeAppErrorSafeMessage,
 	type ProcessPeerIdentity,
+	type ProjectRootAgentsIssueCode,
+	type ProjectRunContext,
 	type ProviderModel,
 	type ProviderMutationOutput,
 	providerMutationOutputSchema,
@@ -97,17 +104,18 @@ import {
 	updateProviderInputSchema,
 } from "@moshu/contracts";
 import {
+	type ActionRepository,
 	ChatRunNotFoundError,
 	ChatSessionNotFoundError,
 	createUuidV7,
 	type ListRunPageOutput,
 	maxAgentSessionCleanupBatchSize,
 	maxRunEventPageSize,
+	ProjectNotFoundError,
 	type RunJournalPageItem,
 	type RunJournalRepository,
 	type RunPageCursor,
 	type SessionRepository,
-	type ActionRepository,
 } from "@moshu/database";
 
 const STREAMED_DELTA_FLUSH_LATENCY_MS = 20;
@@ -156,6 +164,22 @@ export interface ChatApplicationServiceOptions {
 	logger?: ChatServiceLogger;
 	isRuntimeReady?: (runtimeBoxId: string) => boolean;
 	getActiveRuntimeBoxId?: () => string;
+	withProjectSessionCreation?: <T>(
+		projectId: string,
+		createSession: () => T,
+		signal?: AbortSignal,
+	) => Promise<T>;
+	withProjectRunPreflight?: <T>(
+		projectId: string,
+		createRun: (preflight: {
+			projectContext: ProjectRunContext;
+			projectName: string;
+			runtimePlatform: "darwin" | "win32" | "linux";
+			rootAgentsBody?: string;
+			rootAgentsWarning?: ProjectRootAgentsIssueCode;
+		}) => T,
+		signal?: AbortSignal,
+	) => Promise<T>;
 	actions?: ActionRepository;
 	resolveRuntimeResources?: (
 		runtimeBoxId: string,
@@ -196,6 +220,7 @@ interface ActiveChatRun {
 	terminalCommitted: boolean;
 	persistenceFailure: unknown | undefined;
 	retainFence: boolean;
+	executionContext: AskChatExecutionContext;
 }
 
 export class ChatApplicationService {
@@ -208,6 +233,10 @@ export class ChatApplicationService {
 	readonly #logger: ChatServiceLogger;
 	readonly #isRuntimeReady: (runtimeBoxId: string) => boolean;
 	readonly #getActiveRuntimeBoxId: () => string;
+	readonly #withProjectSessionCreation:
+		| (<T>(projectId: string, createSession: () => T, signal?: AbortSignal) => Promise<T>)
+		| undefined;
+	readonly #withProjectRunPreflight: ChatApplicationServiceOptions["withProjectRunPreflight"];
 	readonly #actions: ActionRepository | undefined;
 	readonly #resolveRuntimeResources:
 		| ((
@@ -262,6 +291,8 @@ export class ChatApplicationService {
 		this.#logger = options.logger ?? console;
 		this.#isRuntimeReady = options.isRuntimeReady ?? (() => true);
 		this.#getActiveRuntimeBoxId = options.getActiveRuntimeBoxId ?? (() => defaultLocalRuntimeBoxId);
+		this.#withProjectSessionCreation = options.withProjectSessionCreation;
+		this.#withProjectRunPreflight = options.withProjectRunPreflight;
 		this.#actions = options.actions;
 		this.#resolveRuntimeResources = options.resolveRuntimeResources;
 		this.#agentSessionCleanupRetryBaseMs = requirePositiveSafeInteger(
@@ -487,7 +518,7 @@ export class ChatApplicationService {
 	setSessionModel(input: SetChatSessionModelInput): SetChatSessionModelOutput {
 		const parsedInput = setChatSessionModelInputSchema.parse(input);
 		this.#assertDataPlaneAvailable();
-		this.#assertSessionRuntimeReady(parsedInput.sessionId);
+		this.#assertMetadataRuntimeReadyWhenRequired(parsedInput.sessionId);
 		if (parsedInput.model !== null) {
 			this.#requireProviderModel(parsedInput.model.providerId, parsedInput.model.modelId);
 		}
@@ -507,14 +538,25 @@ export class ChatApplicationService {
 		});
 	}
 
-	createSessionIdempotently(
+	async createSessionIdempotently(
 		request: CreateProcessChatSessionInput,
 		origin: ProcessPeerIdentity,
-	): CreateChatSessionOutput {
+		signal?: AbortSignal,
+	): Promise<CreateChatSessionOutput> {
 		this.#assertDataPlaneAvailable();
 		const existing = this.#sessions.findIdempotent({ request, origin });
 		if (existing !== undefined) {
 			return existing;
+		}
+		if (request.projectId !== undefined) {
+			if (this.#withProjectSessionCreation === undefined) {
+				throw new Error("Project Session creation is not initialized.");
+			}
+			return this.#withProjectSessionCreation(
+				request.projectId,
+				() => this.#sessions.createIdempotently({ request, origin }),
+				signal,
+			);
 		}
 		this.#assertRuntimeReady(request.runtimeBoxId ?? this.#getActiveRuntimeBoxId());
 		return this.#sessions.createIdempotently({ request, origin });
@@ -525,11 +567,20 @@ export class ChatApplicationService {
 		return this.#sessions.list(listChatSessionsInputSchema.parse(input));
 	}
 
+	listRetiredSessions(input: ListRetiredChatSessionsInput): ListRetiredChatSessionsOutput {
+		this.#assertDataPlaneAvailable();
+		const parsedInput = listRetiredChatSessionsInputSchema.parse(input);
+		return listRetiredChatSessionsOutputSchema.parse({
+			schemaVersion: 1,
+			...this.#runs.listRetiredSessionPage(parsedInput),
+		});
+	}
+
 	updateSession(input: UpdateChatSessionInput): UpdateChatSessionOutput {
 		this.#assertDataPlaneAvailable();
 		const parsedInput = updateChatSessionInputSchema.parse(input);
 		this.#assertSessionNotDeleting(parsedInput.sessionId);
-		this.#assertSessionRuntimeReady(parsedInput.sessionId);
+		this.#assertMetadataRuntimeReadyWhenRequired(parsedInput.sessionId);
 		return this.#sessions.update(parsedInput);
 	}
 
@@ -537,7 +588,7 @@ export class ChatApplicationService {
 		this.#assertDataPlaneAvailable();
 		const parsedInput = setChatSessionArchivedInputSchema.parse(input);
 		this.#assertSessionNotDeleting(parsedInput.sessionId);
-		this.#assertSessionRuntimeReady(parsedInput.sessionId);
+		this.#assertMetadataRuntimeReadyWhenRequired(parsedInput.sessionId);
 		if (parsedInput.archived) {
 			this.#assertSessionCanBeRemovedFromActiveList(parsedInput.sessionId);
 		}
@@ -561,7 +612,7 @@ export class ChatApplicationService {
 				retryable: true,
 			});
 		}
-		this.#assertSessionRuntimeReady(parsedInput.sessionId);
+		this.#assertMetadataRuntimeReadyWhenRequired(parsedInput.sessionId);
 		this.#assertSessionCanBeRemovedFromActiveList(parsedInput.sessionId);
 		this.#deletingSessions.add(parsedInput.sessionId);
 		let deleted: { sessionId: string };
@@ -646,46 +697,80 @@ export class ChatApplicationService {
 		this.#assertDataPlaneAvailable();
 		this.#assertSessionNotDeleting(input.sessionId);
 		const clientRequestId = input.requestId ?? crypto.randomUUID();
-		const existing = this.#runs.getByClientRequestId(clientRequestId);
-		if (existing !== undefined) {
-			if (existing.run.sessionId !== input.sessionId || existing.userContent !== input.content) {
-				throw new AskChatRuntimeError({
-					kind: "duplicate_run_id",
-					message: "Chat send request ID was already used for different content.",
-					retryable: false,
-				});
-			}
-			let reservation: symbol | undefined;
-			try {
-				if (isNonTerminalRun(existing.run) && !this.#activeRuns.has(existing.run.id)) {
-					reservation = this.#reserveSessionStart(input.sessionId);
-					this.#finalizeOrphanedRun(existing.run);
-				}
-				const restored =
-					this.#runs.getByClientRequestId(clientRequestId) ??
-					fail(`Run for request ${clientRequestId} disappeared during recovery.`);
-				const chronologicalRuns = this.#runs.listBySession(input.sessionId).reverse();
-				const runIndex = chronologicalRuns.findIndex((run) => run.id === restored.run.id);
-				const sequence = Math.max(0, runIndex) * 2 + 1;
-				const assistantMessage =
-					this.#buildJournalMessages([restored]).find((message) => message.role === "assistant") ??
-					fail(`Run ${restored.run.id} has no assistant projection.`);
-				return chatSendAcceptedOutputSchema.parse({
-					run: restored.run,
-					userMessage: createUserMessage(restored.run, restored.userContent, sequence),
-					assistantMessage: { ...assistantMessage, sequence: sequence + 1 },
-				});
-			} finally {
-				if (reservation !== undefined) {
-					this.#releaseSessionStart(input.sessionId, reservation);
-				}
-			}
+		const restored = this.#restoreExistingSend(input, clientRequestId);
+		if (restored !== undefined) {
+			return restored;
+		}
+		const session = this.#sessions.get({ sessionId: input.sessionId });
+		if (session.projectId !== undefined) {
+			throw new AskChatRuntimeError({
+				kind: "provider_failure",
+				message: "Project chat sends require Project Run preflight.",
+				retryable: false,
+			});
+		}
+		const reservation = this.#reserveSessionStart(input.sessionId);
+		return this.#startReservedMessage(input, clientRequestId, reservation);
+	}
+
+	async sendMessageWithPreflight(
+		input: SendChatMessageInput,
+		signal?: AbortSignal,
+	): Promise<ChatSendAcceptedOutput> {
+		this.#assertDataPlaneAvailable();
+		this.#assertSessionNotDeleting(input.sessionId);
+		const clientRequestId = input.requestId ?? crypto.randomUUID();
+		const restored = this.#restoreExistingSend(input, clientRequestId);
+		if (restored !== undefined) {
+			return restored;
+		}
+		const session = this.#sessions.get({ sessionId: input.sessionId });
+		if (session.projectId === undefined) {
+			return this.sendMessage({ ...input, requestId: clientRequestId });
+		}
+		if (this.#withProjectRunPreflight === undefined) {
+			throw new AskChatRuntimeError({
+				kind: "provider_failure",
+				message: "Project Run preflight is unavailable.",
+				retryable: true,
+			});
 		}
 		const reservation = this.#reserveSessionStart(input.sessionId);
 		let convertedReservation = false;
 		try {
+			return await this.#withProjectRunPreflight(
+				session.projectId,
+				(preflight) => {
+					convertedReservation = true;
+					return this.#startReservedMessage(input, clientRequestId, reservation, preflight);
+				},
+				signal,
+			);
+		} finally {
+			if (!convertedReservation) {
+				this.#releaseSessionStart(input.sessionId, reservation);
+			}
+		}
+	}
+
+	#startReservedMessage(
+		input: SendChatMessageInput,
+		clientRequestId: string,
+		reservation: symbol,
+		projectPreflight?: {
+			projectContext: ProjectRunContext;
+			projectName: string;
+			runtimePlatform: "darwin" | "win32" | "linux";
+			rootAgentsBody?: string;
+			rootAgentsWarning?: ProjectRootAgentsIssueCode;
+		},
+	): ChatSendAcceptedOutput {
+		let convertedReservation = false;
+		try {
 			const currentSession = this.#sessions.get({ sessionId: input.sessionId });
-			this.#assertRuntimeReady(currentSession.runtimeBoxId);
+			if (projectPreflight === undefined) {
+				this.#assertRuntimeReady(currentSession.runtimeBoxId);
+			}
 			const provider = this.#resolveSessionProvider(input.sessionId);
 			const existingRuns = this.#runs.listBySession(input.sessionId);
 			for (const run of existingRuns) {
@@ -728,7 +813,39 @@ export class ChatApplicationService {
 				userMessageId,
 				userContent: input.content,
 				assistantMessageId,
+				...(projectPreflight === undefined
+					? {}
+					: {
+							projectContext: projectPreflight.projectContext,
+							...(projectPreflight.rootAgentsWarning === undefined
+								? {}
+								: { rootAgentsWarning: projectPreflight.rootAgentsWarning }),
+						}),
 			});
+			const executionContext: AskChatExecutionContext =
+				projectPreflight === undefined
+					? { kind: "session" }
+					: {
+							kind: "project",
+							projectId: projectPreflight.projectContext.projectId,
+							projectName: projectPreflight.projectName,
+							runtimeBoxId: projectPreflight.projectContext.runtimeBoxId,
+							runtimePlatform: projectPreflight.runtimePlatform,
+							projectPath: projectPreflight.projectContext.projectPath,
+							projectPathRevision: projectPreflight.projectContext.projectPathRevision,
+							...(projectPreflight.projectContext.gitRootPath === undefined
+								? {}
+								: { gitRootPath: projectPreflight.projectContext.gitRootPath }),
+							...(projectPreflight.projectContext.gitBranch === undefined
+								? {}
+								: { gitBranch: projectPreflight.projectContext.gitBranch }),
+							...(projectPreflight.projectContext.rootAgentsHash === undefined
+								? {}
+								: { rootAgentsHash: projectPreflight.projectContext.rootAgentsHash }),
+							...(projectPreflight.rootAgentsBody === undefined
+								? {}
+								: { rootAgentsBody: projectPreflight.rootAgentsBody }),
+						};
 			const activeRun: ActiveChatRun = {
 				runId: created.run.id,
 				sessionId: input.sessionId,
@@ -746,6 +863,7 @@ export class ChatApplicationService {
 				terminalCommitted: false,
 				persistenceFailure: undefined,
 				retainFence: false,
+				executionContext,
 			};
 
 			this.#activeRuns.set(activeRun.runId, activeRun);
@@ -781,6 +899,48 @@ export class ChatApplicationService {
 			});
 		} finally {
 			if (!convertedReservation) {
+				this.#releaseSessionStart(input.sessionId, reservation);
+			}
+		}
+	}
+
+	#restoreExistingSend(
+		input: SendChatMessageInput,
+		clientRequestId: string,
+	): ChatSendAcceptedOutput | undefined {
+		const existing = this.#runs.getByClientRequestId(clientRequestId);
+		if (existing === undefined) {
+			return undefined;
+		}
+		if (existing.run.sessionId !== input.sessionId || existing.userContent !== input.content) {
+			throw new AskChatRuntimeError({
+				kind: "duplicate_run_id",
+				message: "Chat send request ID was already used for different content.",
+				retryable: false,
+			});
+		}
+		let reservation: symbol | undefined;
+		try {
+			if (isNonTerminalRun(existing.run) && !this.#activeRuns.has(existing.run.id)) {
+				reservation = this.#reserveSessionStart(input.sessionId);
+				this.#finalizeOrphanedRun(existing.run);
+			}
+			const restored =
+				this.#runs.getByClientRequestId(clientRequestId) ??
+				fail(`Run for request ${clientRequestId} disappeared during recovery.`);
+			const chronologicalRuns = this.#runs.listBySession(input.sessionId).reverse();
+			const runIndex = chronologicalRuns.findIndex((run) => run.id === restored.run.id);
+			const sequence = Math.max(0, runIndex) * 2 + 1;
+			const assistantMessage =
+				this.#buildJournalMessages([restored]).find((message) => message.role === "assistant") ??
+				fail(`Run ${restored.run.id} has no assistant projection.`);
+			return chatSendAcceptedOutputSchema.parse({
+				run: restored.run,
+				userMessage: createUserMessage(restored.run, restored.userContent, sequence),
+				assistantMessage: { ...assistantMessage, sequence: sequence + 1 },
+			});
+		} finally {
+			if (reservation !== undefined) {
 				this.#releaseSessionStart(input.sessionId, reservation);
 			}
 		}
@@ -885,7 +1045,14 @@ export class ChatApplicationService {
 					try {
 						this.#sessions.get({ sessionId: cursor.sessionId });
 					} catch (sessionError) {
-						if (sessionError instanceof ChatSessionNotFoundError) {
+						if (
+							sessionError instanceof ChatSessionNotFoundError ||
+							sessionError instanceof ProjectNotFoundError
+						) {
+							if (sessionError instanceof ProjectNotFoundError) {
+								retiredSessionIds.push(cursor.sessionId);
+								continue;
+							}
 							resnapshotSessionIds.push(cursor.sessionId);
 							continue;
 						}
@@ -896,6 +1063,15 @@ export class ChatApplicationService {
 			}
 			if (run.sessionId !== cursor.sessionId) {
 				throw new Error(`Run ${run.id} does not belong to Session ${cursor.sessionId}.`);
+			}
+			try {
+				this.#sessions.get({ sessionId: cursor.sessionId });
+			} catch (error) {
+				if (error instanceof ChatSessionNotFoundError || error instanceof ProjectNotFoundError) {
+					retiredSessionIds.push(cursor.sessionId);
+					continue;
+				}
+				throw error;
 			}
 			if (isNonTerminalRun(run) && !this.#activeRuns.has(run.id)) {
 				this.#finalizeOrphanedRun(run, false);
@@ -1419,6 +1595,7 @@ export class ChatApplicationService {
 				threadId: activeRun.agentSessionId,
 				runtimeBoxId: activeRun.runtimeBoxId,
 				provider: activeRun.provider,
+				executionContext: activeRun.executionContext,
 				messages: activeRun.messages,
 				skills: runtimeResources.skills,
 				mcpResources: runtimeResources.mcpResources,
@@ -2143,8 +2320,11 @@ export class ChatApplicationService {
 		}
 	}
 
-	#assertSessionRuntimeReady(sessionId: string): void {
-		this.#assertRuntimeReady(this.#sessions.get({ sessionId }).runtimeBoxId);
+	#assertMetadataRuntimeReadyWhenRequired(sessionId: string): void {
+		const session = this.#sessions.get({ sessionId });
+		if (session.projectId === undefined) {
+			this.#assertRuntimeReady(session.runtimeBoxId);
+		}
 	}
 
 	#assertDataPlaneAvailable(): void {

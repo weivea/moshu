@@ -2,8 +2,15 @@ import { describe, expect, test } from "bun:test";
 
 import {
 	agentsRuntimeInfoSchema,
+	chatRunSchema,
 	createProviderInputSchema,
+	createExecutorToolParameterPayload,
+	executorExecutionContextSchema,
+	listChatSessionsInputSchema,
+	projectPathPreviewSchema,
+	projectSchema,
 	providerAuthAttemptOutputSchema,
+	runtimeBoxToolAuthorizationSchema,
 	runProviderConfigInputSchema,
 	sessionModelSelectionSchema,
 } from "../src";
@@ -90,5 +97,126 @@ describe("Pi-neutral backend contracts", () => {
 			},
 		});
 		expect(output.attempt.challenge).not.toHaveProperty("value");
+	});
+
+	test("strictly models Project health, previews, Session scope, and Run snapshots", () => {
+		const projectId = "018f47a2-9bcd-7def-8abc-1234567890ab";
+		const now = new Date().toISOString();
+		const project = projectSchema.parse({
+			schemaVersion: 1,
+			id: projectId,
+			runtimeBoxId: "project-box",
+			name: "Project",
+			path: "/workspace/project",
+			pathRevision: 2,
+			pathStatus: "unavailable",
+			pathCheckedAt: now,
+			pathIssueCode: "not_found",
+			createdAt: now,
+			updatedAt: now,
+		});
+		expect(project.pathRevision).toBe(2);
+		expect(
+			projectSchema.safeParse({ ...project, pathStatus: "available", pathIssueCode: "not_found" })
+				.success,
+		).toBe(false);
+
+		expect(
+			projectPathPreviewSchema.safeParse({
+				schemaVersion: 1,
+				runtimeBoxId: "project-box",
+				runtimeBoxDisplayName: "Project Box",
+				runtimeBoxPlatform: "linux",
+				inputPath: "~/project",
+				normalizedPath: "/workspace/project",
+				displayName: "Project",
+				rootAgents: { status: "missing" },
+				confirmationToken: "a".repeat(64),
+				rawError: "private host diagnostic",
+			}).success,
+		).toBe(false);
+		expect(
+			listChatSessionsInputSchema.parse({
+				scope: { kind: "project", projectId },
+			}).scope,
+		).toEqual({ kind: "project", projectId });
+		expect(
+			listChatSessionsInputSchema.safeParse({
+				runtimeBoxId: "project-box",
+				scope: { kind: "global" },
+			}).success,
+		).toBe(false);
+
+		const run = chatRunSchema.parse({
+			schemaVersion: 1,
+			id: "018f47a2-9bcd-7def-8abc-1234567890ac",
+			sessionId: "018f47a2-9bcd-7def-8abc-1234567890ad",
+			runtimeBoxId: "project-box",
+			projectContext: {
+				projectId,
+				runtimeBoxId: "project-box",
+				projectPath: "/workspace/project",
+				projectPathRevision: 2,
+				rootAgentsHash: "b".repeat(64),
+			},
+			mode: "ask",
+			status: "queued",
+			provider: {
+				schemaVersion: 1,
+				providerId: projectId,
+				name: "Provider",
+				source: "custom",
+				api: "openai-responses",
+				model: "model",
+				status: "ready",
+			},
+			userMessageId: "018f47a2-9bcd-7def-8abc-1234567890ae",
+			assistantMessageId: "018f47a2-9bcd-7def-8abc-1234567890af",
+			createdAt: now,
+			updatedAt: now,
+		});
+		expect(run.projectContext?.projectPath).toBe("/workspace/project");
+	});
+
+	test("requires and integrity-binds Project path revisions for project-root grants", () => {
+		expect(
+			executorExecutionContextSchema.safeParse({ executionScope: "project-root" }).success,
+		).toBe(false);
+		expect(
+			runtimeBoxToolAuthorizationSchema.safeParse({
+				actionId: crypto.randomUUID(),
+				grantId: crypto.randomUUID(),
+				grantToken: "a".repeat(32),
+				parameterDigest: "b".repeat(64),
+				originInstanceId: "agents",
+				originGeneration: 1,
+				targetRuntimeBoxId: "box",
+				targetInstanceId: "box-instance",
+				targetGeneration: 1,
+				executionScope: "request-cwd",
+				projectPathRevision: 1,
+				expiresAt: new Date(Date.now() + 60_000).toISOString(),
+			}).success,
+		).toBe(false);
+
+		const invocation = {
+			schemaVersion: 1 as const,
+			invocationId: crypto.randomUUID(),
+			runId: "018f47a2-9bcd-7def-8abc-1234567890ab",
+			toolCallId: "tool-call",
+			cwd: "/workspace/project",
+			call: { tool: "read" as const, arguments: { path: "README.md" } },
+		};
+		expect(
+			createExecutorToolParameterPayload(invocation, {
+				executionScope: "project-root",
+				projectPathRevision: 1,
+			}),
+		).not.toBe(
+			createExecutorToolParameterPayload(invocation, {
+				executionScope: "project-root",
+				projectPathRevision: 2,
+			}),
+		);
 	});
 });

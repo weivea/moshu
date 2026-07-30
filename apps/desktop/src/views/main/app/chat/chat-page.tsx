@@ -1,9 +1,11 @@
 import { Button } from "@heroui/react";
+import { AppIcon } from "@moshu/ui";
 import { useEffect, useRef } from "react";
 import { createPortal } from "react-dom";
+import { Link } from "react-router-dom";
 import { useI18n } from "../i18n";
-import { useAppShellContext } from "../shell-context";
 import { useRuntimeBoxes } from "../runtime-boxes";
+import { useAppShellContext } from "../shell-context";
 import { ChatComposer } from "./chat-composer";
 import { MessageList } from "./message-list";
 import { SessionSidebar } from "./session-sidebar";
@@ -28,6 +30,21 @@ export interface ChatPageProps {
 	onNewSession?(): void;
 	onSelectSession?(sessionId: string): void;
 	onOpenProviderSettings?(): void;
+	routeProjectId?: string;
+	projectContext?: ProjectChatContext;
+}
+
+export interface ProjectChatContext {
+	projectId: string;
+	name?: string;
+	path?: string;
+	pathStatus?: "unknown" | "available" | "unavailable";
+	runtimeBoxName?: string;
+	overviewHref: string;
+	settingsHref: string;
+	runtimeReady: boolean;
+	status: "loading" | "ready" | "error";
+	disabledReason?: string;
 }
 
 export function ChatPage({
@@ -40,6 +57,8 @@ export function ChatPage({
 	onNewSession = () => {},
 	onSelectSession = () => {},
 	onOpenProviderSettings = () => {},
+	routeProjectId,
+	projectContext,
 }: ChatPageProps) {
 	const { t } = useI18n();
 	const shell = useAppShellContext();
@@ -48,6 +67,9 @@ export function ChatPage({
 		transport,
 		sessionId,
 		initialSession,
+		projectId: routeProjectId,
+		expectedProjectId: routeProjectId,
+		interactionDisabledReason: projectContext?.disabledReason,
 		onSessionChange,
 		onSessionHydrated,
 		onSessionRetired,
@@ -61,9 +83,30 @@ export function ChatPage({
 	const title = controller.session?.title ?? t("chat.header.title");
 	const activeSessionId = controller.session?.id ?? sessionId;
 	const sessionRuntimeReady =
-		controller.session === null
-			? runtimeBoxes.isActiveReady
-			: runtimeBoxes.isRuntimeBoxReady(controller.session.runtimeBoxId);
+		projectContext !== undefined
+			? projectContext.runtimeReady
+			: controller.session === null
+				? runtimeBoxes.isActiveReady
+				: runtimeBoxes.isRuntimeBoxReady(controller.session.runtimeBoxId);
+	const ownershipMismatch = controller.ownershipMismatch;
+	const disabledReason = ownershipMismatch
+		? t("projects.chat.mismatch")
+		: (projectContext?.disabledReason ??
+			(isArchived
+				? t("chat.notice.archived")
+				: !sessionRuntimeReady
+					? t("projects.chat.runtimeOffline")
+					: undefined));
+	const projectPathStatus =
+		projectContext?.pathStatus === undefined
+			? undefined
+			: t(
+					projectContext.pathStatus === "available"
+						? "projects.status.available"
+						: projectContext.pathStatus === "unavailable"
+							? "projects.status.unavailable"
+							: "projects.status.unknown",
+				);
 	const updateSessionSummaryRef = useRef(controller.updateSessionSummary);
 	updateSessionSummaryRef.current = controller.updateSessionSummary;
 
@@ -104,7 +147,9 @@ export function ChatPage({
 
 	return (
 		<section className={shell === null ? "chat-page" : "chat-page chat-page--embedded"}>
-			{shell === null ? (
+			{shell === null &&
+			!ownershipMismatch &&
+			(sessionId === undefined || controller.session !== null) ? (
 				<SessionSidebar
 					transport={transport}
 					selectedSessionId={activeSessionId}
@@ -128,6 +173,36 @@ export function ChatPage({
 				{shell === null ? (
 					<header className="chat-page__header">
 						<h1>{title}</h1>
+					</header>
+				) : null}
+
+				{projectContext ? (
+					<header className="project-chat-header">
+						<Link to={projectContext.overviewHref}>
+							<AppIcon name="back" size={16} />
+							<span>{projectContext.name ?? t("page.project.title")}</span>
+						</Link>
+						<div className="project-chat-header__details">
+							<div className="project-chat-header__identity">
+								<strong>{projectContext.name ?? t("projects.chat.loadingProject")}</strong>
+								{projectContext.path ? <code>{projectContext.path}</code> : null}
+							</div>
+							{projectContext.status === "ready" ? (
+								<span className="project-chat-header__status">
+									{projectContext.runtimeBoxName ?? t("projects.runtime")} ·{" "}
+									{t(
+										projectContext.runtimeReady
+											? "projects.chat.runtimeReady"
+											: "projects.status.offline",
+									)}
+									{projectPathStatus === undefined ? "" : ` · ${projectPathStatus}`}
+								</span>
+							) : null}
+							<p className="project-chat-header__boundary">
+								<AppIcon name="terminal" size={14} />
+								{t("projects.chat.boundary")}
+							</p>
+						</div>
 					</header>
 				) : null}
 
@@ -178,14 +253,32 @@ export function ChatPage({
 							</div>
 						) : null}
 
-						{isArchived ? (
+						{isArchived && projectContext === undefined ? (
 							<div className="chat-notice chat-notice--info" role="status">
 								<span>{t("chat.notice.archived")}</span>
 							</div>
 						) : null}
-						{!sessionRuntimeReady ? (
+						{!sessionRuntimeReady && projectContext === undefined ? (
 							<div className="chat-notice chat-notice--info" role="status">
 								<span>{t("runtime.offlineReadOnly")}</span>
+							</div>
+						) : null}
+						{ownershipMismatch ? (
+							<div className="chat-notice chat-notice--danger" role="alert">
+								<span>{t("projects.chat.mismatch")}</span>
+								<Link
+									className="chat-button chat-button--inline"
+									to={projectContext?.overviewHref ?? "/projects"}
+								>
+									{t("projects.chat.return")}
+								</Link>
+							</div>
+						) : projectContext?.disabledReason ? (
+							<div className="chat-notice chat-notice--info" role="status">
+								<span>{projectContext.disabledReason}</span>
+								<Link className="chat-button chat-button--inline" to={projectContext.settingsHref}>
+									{t("projects.openSettings")}
+								</Link>
 							</div>
 						) : null}
 
@@ -197,7 +290,9 @@ export function ChatPage({
 						/>
 						{controller.hasConfiguredProvider ? (
 							<ChatComposer
-								canSend={controller.canSend && !isArchived && sessionRuntimeReady}
+								canSend={controller.canSend && disabledReason === undefined}
+								{...(disabledReason === undefined ? {} : { disabledReason })}
+								showDisabledReason={false}
 								draft={controller.draft}
 								isResponding={controller.isResponding}
 								isStopping={controller.isStopping}

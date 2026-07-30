@@ -10,13 +10,13 @@ import type {
 	GetChatSessionSnapshotOutput,
 	GetDefaultModelOutput,
 	ListAvailableModelsOutput,
+	ListChatSessionsInput,
 	ListChatSessionsOutput,
 	ListProvidersOutput,
-	ProviderMutationOutput,
 	ProviderAuthAttemptOutput,
-	RespondProviderAuthInput,
-	StartProviderAuthInput,
+	ProviderMutationOutput,
 	ProviderSummary,
+	RespondProviderAuthInput,
 	SetChatSessionArchivedOutput,
 	SetChatSessionModelInput,
 	SetChatSessionModelOutput,
@@ -24,6 +24,7 @@ import type {
 	SetDefaultModelOutput,
 	SetProviderModelsEnabledInput,
 	SetProviderModelsEnabledOutput,
+	StartProviderAuthInput,
 	TestProviderInput,
 	TestProviderOutput,
 	UpdateChatSessionOutput,
@@ -51,6 +52,7 @@ const runId = "01984df0-cf18-7c89-9d11-3686130434c8";
 const userMessageId = "01984df0-cf19-7bb2-a5cd-69e8a802db2f";
 const assistantMessageId = "01984df0-cf1a-7178-b174-42fc83c3e87d";
 const eventId = "01984df0-cf1b-7521-a4a5-40eef114ce9f";
+const projectId = "01984df0-cf1c-7521-a4a5-40eef114ce9f";
 const createdAt = "2026-07-25T04:15:28.349Z";
 
 function createAuthAttempt(
@@ -114,9 +116,19 @@ describe("RPC Chat transport", () => {
 		expect(client.cancelInputs).toEqual([{ sessionId, runId }]);
 
 		client.emit(createDeltaEvent("Hi"));
+		client.emit(createWarningEvent());
 		client.emit(createCompletedEvent());
-		expect(events.map((event) => event.type)).toEqual(["response.delta", "response.completed"]);
+		expect(events.map((event) => event.type)).toEqual([
+			"response.delta",
+			"run.warning",
+			"response.completed",
+		]);
 		expect(events[1]).toMatchObject({
+			type: "run.warning",
+			code: "ROOT_AGENTS_SKIPPED",
+			reason: "too_large",
+		});
+		expect(events[2]).toMatchObject({
 			type: "response.completed",
 			content: "Hi",
 		});
@@ -215,6 +227,7 @@ describe("RPC Chat transport", () => {
 			ok: true,
 			latencyMs: 12,
 		});
+
 		expect(await transport.listSessions()).toEqual([
 			{
 				id: sessionId,
@@ -227,6 +240,19 @@ describe("RPC Chat transport", () => {
 		expect((await transport.renameSession(sessionId, "Renamed")).title).toBe("Renamed");
 		expect((await transport.setSessionArchived(sessionId, true)).archivedAt).toBe(createdAt);
 		await expect(transport.deleteSession(sessionId)).resolves.toBeUndefined();
+	});
+
+	test("forwards Project Session ownership and explicit list scope", async () => {
+		const client = new FakeRpcChatClient();
+		const transport = createRpcChatTransport(client);
+
+		await expect(transport.createSession(undefined, projectId)).resolves.toMatchObject({
+			projectId,
+		});
+		await transport.listSessions({ scope: { kind: "project", projectId } });
+
+		expect(client.lastCreateProjectId).toBe(projectId);
+		expect(client.lastListInput).toEqual({ scope: { kind: "project", projectId } });
 	});
 
 	test("forwards Provider authentication and logout without retaining secret responses", async () => {
@@ -268,6 +294,8 @@ class FakeRpcChatClient implements RpcChatClient {
 	lastSetModelsInput?: SetProviderModelsEnabledInput;
 	lastSetDefaultInput?: SetDefaultModelInput;
 	lastSetSessionModelInput?: SetChatSessionModelInput;
+	lastCreateProjectId?: string;
+	lastListInput?: ListChatSessionsInput;
 	readonly sendInputs: Array<{ requestId: string; sessionId: string; content: string }> = [];
 	readonly cancelInputs: Array<{ sessionId: string; runId: string }> = [];
 	readonly authCalls: string[] = [];
@@ -374,9 +402,16 @@ class FakeRpcChatClient implements RpcChatClient {
 		};
 	}
 
-	async createChatSession(): Promise<CreateChatSessionOutput> {
+	async createChatSession(
+		_model?: SetChatSessionModelInput["model"],
+		createProjectId?: string,
+	): Promise<CreateChatSessionOutput> {
+		this.lastCreateProjectId = createProjectId;
 		return {
-			session: createContractSession(),
+			session: {
+				...createContractSession(),
+				...(createProjectId === undefined ? {} : { projectId: createProjectId }),
+			},
 		};
 	}
 
@@ -403,8 +438,16 @@ class FakeRpcChatClient implements RpcChatClient {
 		};
 	}
 
-	async listChatSessions(): Promise<ListChatSessionsOutput> {
-		return { items: [createContractSession()] };
+	async listChatSessions(input: ListChatSessionsInput = {}): Promise<ListChatSessionsOutput> {
+		this.lastListInput = input;
+		return {
+			items: [
+				{
+					...createContractSession(),
+					...(input.scope?.kind === "project" ? { projectId: input.scope.projectId } : {}),
+				},
+			],
+		};
 	}
 
 	async updateChatSession(_sessionId: string, title: string): Promise<UpdateChatSessionOutput> {
@@ -579,6 +622,24 @@ function createDeltaEvent(delta: string): ChatRunEvent {
 		payload: {
 			messageId: assistantMessageId,
 			delta,
+		},
+	};
+}
+
+function createWarningEvent(): ChatRunEvent {
+	return {
+		schemaVersion: 1,
+		id: crypto.randomUUID(),
+		runId,
+		sessionId,
+		seq: 5,
+		type: "run.warning",
+		source: { kind: "system" },
+		visibility: "user",
+		createdAt,
+		payload: {
+			code: "ROOT_AGENTS_SKIPPED",
+			reason: "too_large",
 		},
 	};
 }

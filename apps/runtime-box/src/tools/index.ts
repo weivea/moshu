@@ -2,18 +2,19 @@
  * Executor-owned implementations adapted from Pi coding-agent v0.82.1.
  * The agent process only receives RPC proxies and never executes these operations.
  */
+
+import { constants } from "node:fs";
+import { access, stat } from "node:fs/promises";
+import { dirname, join } from "node:path";
 import {
-	runtimeBoxToolInvokeOutputSchema,
-	runtimeBoxToolProgressEventSchema,
-	getExecutorToolBinaryFilename,
 	type ExecutorToolInvokeInput,
 	type ExecutorToolInvokeOutput,
 	type ExecutorToolName,
 	type ExecutorToolProgressEvent,
+	getExecutorToolBinaryFilename,
+	runtimeBoxToolInvokeOutputSchema,
+	runtimeBoxToolProgressEventSchema,
 } from "@moshu/contracts";
-import { constants } from "node:fs";
-import { access, stat } from "node:fs/promises";
-import { dirname, join } from "node:path";
 import { executeBashTool } from "./bash.ts";
 import { executeEditTool } from "./edit.ts";
 import { executeFindTool } from "./find.ts";
@@ -31,6 +32,8 @@ export interface ExecutorToolBinaryPaths {
 export interface ExecutorToolExecutionOptions {
 	signal?: AbortSignal;
 	onProgress?: (event: ExecutorToolProgressEvent) => void;
+	containmentRoot?: string;
+	effectiveFilePath?: string;
 }
 
 async function requireExecutable(path: string): Promise<void> {
@@ -70,7 +73,15 @@ export class ExecutorToolRuntime {
 		};
 		switch (input.call.tool) {
 			case "read": {
-				const result = await executeReadTool(input.call.arguments, input.cwd, options.signal);
+				const result = await executeReadTool(input.call.arguments, input.cwd, {
+					...(options.signal === undefined ? {} : { signal: options.signal }),
+					...(options.containmentRoot === undefined
+						? {}
+						: { containmentRoot: options.containmentRoot }),
+					...(options.effectiveFilePath === undefined
+						? {}
+						: { effectiveFilePath: options.effectiveFilePath }),
+				});
 				return runtimeBoxToolInvokeOutputSchema.parse({
 					...resultBase,
 					tool: "read",
@@ -100,7 +111,15 @@ export class ExecutorToolRuntime {
 				});
 			}
 			case "edit": {
-				const result = await executeEditTool(input.call.arguments, input.cwd, options.signal);
+				const result = await executeEditTool(input.call.arguments, input.cwd, {
+					...(options.signal === undefined ? {} : { signal: options.signal }),
+					...(options.containmentRoot === undefined
+						? {}
+						: { containmentRoot: options.containmentRoot }),
+					...(options.effectiveFilePath === undefined
+						? {}
+						: { effectiveFilePath: options.effectiveFilePath }),
+				});
 				return runtimeBoxToolInvokeOutputSchema.parse({
 					...resultBase,
 					tool: "edit",

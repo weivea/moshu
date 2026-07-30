@@ -13,20 +13,20 @@ import {
 	createRuntimeBoxAuthenticationPayload,
 	createRuntimeBoxCompatibilityReportPayload,
 	createRuntimeBoxServerChallengePayload,
+	currentRuntimeBoxProtocolVersion,
 	executorToolNames,
 	executorToolRpcTimeoutMs,
+	moshuReleaseVersion,
+	type ProcessPeerIdentity,
+	productRpcEvents,
 	productRpcMaxBufferedOutboundBytes,
 	productRpcMaxFrameBytes,
-	productRpcEvents,
 	productRpcMethods,
 	runtimeBoxChallengeOutputSchema,
 	runtimeBoxCompatibilityReportOutputSchema,
 	runtimeBoxPairingStatusOutputSchema,
 	runtimeBoxRegisterInputSchema,
 	runtimeBoxRegisterOutputSchema,
-	type ProcessPeerIdentity,
-	currentRuntimeBoxProtocolVersion,
-	moshuReleaseVersion,
 } from "@moshu/contracts";
 import {
 	type ConnectRpcClientOptions,
@@ -35,23 +35,25 @@ import {
 	type RpcPeer,
 	rpcJsonValueSchema,
 } from "@moshu/process-rpc";
-
+import {
+	RuntimeBoxInvocationJournal,
+	reconcileInvocationJournal,
+	watchInvocationReconciliation,
+} from "./invocation-journal";
+import { McpLifecycleManager } from "./mcp-lifecycle-manager";
+import { createMcpToolRequestHandler } from "./mcp-tool-handler";
+import {
+	readProjectRootAgentsRequestHandler,
+	validateProjectPathRequestHandler,
+} from "./project-path";
+import type { RemoteRuntimeBoxConfig, RemoteRuntimeBoxState } from "./remote-state";
+import { normalizeRuntimeBaseUrl } from "./remote-state";
+import { createRuntimeResourceRequestHandlers } from "./resource-handler";
+import { RuntimeResourceStore } from "./runtime-resource-store";
 import {
 	createExecutorToolRequestHandler,
 	createInvocationAcknowledgementHandler,
 } from "./tool-handler";
-import {
-	reconcileInvocationJournal,
-	RuntimeBoxInvocationJournal,
-	watchInvocationReconciliation,
-} from "./invocation-journal";
-import { validateProjectPathRequestHandler } from "./project-path";
-import { createRuntimeResourceRequestHandlers } from "./resource-handler";
-import type { RemoteRuntimeBoxConfig, RemoteRuntimeBoxState } from "./remote-state";
-import { normalizeRuntimeBaseUrl } from "./remote-state";
-import { RuntimeResourceStore } from "./runtime-resource-store";
-import { McpLifecycleManager } from "./mcp-lifecycle-manager";
-import { createMcpToolRequestHandler } from "./mcp-tool-handler";
 import type { ExecutorToolRuntime } from "./tools";
 
 const stableConnectionMs = 30_000;
@@ -274,9 +276,11 @@ export async function runRemoteRuntimeBox(options: RunRemoteRuntimeBoxOptions): 
 					journals.set(journalPath, invocationJournal);
 				}
 				const toolHandler = createExecutorToolRequestHandler(options.toolRuntime, {
-					cwd: options.state.workspacePath,
 					journal: invocationJournal,
-					enforceCwdContainment: true,
+					deployment: {
+						kind: "remote",
+						workspacePath: options.state.workspacePath,
+					},
 					activeExecutions,
 					lifecycleSignal: executionSignal,
 				});
@@ -332,12 +336,16 @@ export async function runRemoteRuntimeBox(options: RunRemoteRuntimeBoxOptions): 
 						"x-moshu-challenge-id": challenge.challengeId,
 						"x-moshu-signature": signature,
 					}),
-					methodAllowlist: { agents: { requests: agentsRuntimeBoxRequestMethods } },
+					methodAllowlist: {
+						agents: { requests: agentsRuntimeBoxRequestMethods },
+					},
 					handlers: {
 						requests: {
 							[productRpcMethods.runtimeBoxToolInvoke]: toolHandler,
 							[productRpcMethods.runtimeBoxMcpToolInvoke]: mcpToolHandler,
 							[productRpcMethods.runtimeBoxProjectValidatePath]: validateProjectPathRequestHandler,
+							[productRpcMethods.runtimeBoxProjectReadRootAgents]:
+								readProjectRootAgentsRequestHandler,
 							[productRpcMethods.runtimeBoxInvocationsAck]:
 								createInvocationAcknowledgementHandler(invocationJournal),
 							...resourceHandlers,

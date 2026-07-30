@@ -61,6 +61,7 @@ describe("Pi Agent runtime", () => {
 			const deltas: string[] = [];
 			const stream = first.stream({
 				runtimeBoxId: defaultLocalRuntimeBoxId,
+				executionContext: { kind: "session" },
 				runId: "run-1",
 				threadId: sessionId,
 				provider,
@@ -128,6 +129,7 @@ describe("Pi Agent runtime", () => {
 			try {
 				const result = await runtime.run({
 					runtimeBoxId,
+					executionContext: { kind: "session" },
 					runId: "018f47a2-9bcd-7def-8abc-1234567890ab",
 					threadId: "tool-thread",
 					provider,
@@ -152,6 +154,7 @@ describe("Pi Agent runtime", () => {
 				provider: "moshu-resource-test",
 				models: [{ id: "resource-model" }],
 			});
+
 			faux.setResponses([
 				fauxAssistantMessage(
 					[
@@ -204,6 +207,7 @@ describe("Pi Agent runtime", () => {
 			try {
 				const result = await runtime.run({
 					runtimeBoxId: defaultLocalRuntimeBoxId,
+					executionContext: { kind: "session" },
 					runId: "018f47a2-9bcd-7def-8abc-1234567890ab",
 					threadId: "resource-thread",
 					provider: {
@@ -275,6 +279,112 @@ describe("Pi Agent runtime", () => {
 		});
 	});
 
+	test("rebuilds Project resources on execution-context changes without persisting AGENTS.md", async () => {
+		await withAppData(async (agentDataDirectory) => {
+			const faux = fauxProvider({
+				provider: "moshu-project-context-test",
+				models: [{ id: "project-model" }],
+			});
+			faux.setResponses([
+				fauxAssistantMessage([fauxToolCall("read", { path: "README.md" })], {
+					stopReason: "toolUse",
+				}),
+				fauxAssistantMessage("first answer"),
+				fauxAssistantMessage([fauxToolCall("read", { path: "README.md" })], {
+					stopReason: "toolUse",
+				}),
+				fauxAssistantMessage("second answer"),
+			]);
+			const calls: Array<{
+				input: ExecutorToolInvokeInput;
+				executionContext: unknown;
+			}> = [];
+			const gateway: ExecutorToolGateway = {
+				async invoke(input, options) {
+					calls.push({ input, executionContext: options?.executionContext });
+					return {
+						schemaVersion: 1,
+						invocationId: input.invocationId,
+						tool: "read",
+						content: [{ type: "text", text: "project file" }],
+					};
+				},
+			};
+			const { runtime, provider } = await createRuntime(
+				agentDataDirectory,
+				faux,
+				gateway,
+				"project-box",
+			);
+			const marker = "PROJECT-ROOT-AGENTS-MUST-STAY-EPHEMERAL";
+			try {
+				await runtime.run({
+					runtimeBoxId: "project-box",
+					executionContext: {
+						kind: "project",
+						projectId: "0198a20c-6f76-7e18-92da-353e2fc25b3e",
+						projectName: "Project",
+						runtimeBoxId: "project-box",
+						runtimePlatform: "linux",
+						projectPath: "/srv/project-v1",
+						projectPathRevision: 1,
+						gitRootPath: "/srv/project-v1",
+						gitBranch: "main",
+						rootAgentsHash: "a".repeat(64),
+						rootAgentsBody: marker,
+					},
+					runId: "018f47a2-9bcd-7def-8abc-1234567890ab",
+					threadId: "project-context-thread",
+					provider,
+					messages: [{ role: "user", content: "First." }],
+				});
+				await runtime.run({
+					runtimeBoxId: "project-box",
+					executionContext: {
+						kind: "project",
+						projectId: "0198a20c-6f76-7e18-92da-353e2fc25b3e",
+						projectName: "Project",
+						runtimeBoxId: "project-box",
+						runtimePlatform: "linux",
+						projectPath: "/srv/project-v2",
+						projectPathRevision: 2,
+						gitRootPath: "/srv/project-v2",
+						gitBranch: "feature",
+						rootAgentsHash: "b".repeat(64),
+						rootAgentsBody: `${marker}-changed`,
+					},
+					runId: "018f47a2-9bcd-7def-8abc-1234567890ac",
+					threadId: "project-context-thread",
+					provider,
+					messages: [{ role: "user", content: "Second." }],
+				});
+				expect(calls).toEqual([
+					expect.objectContaining({
+						input: expect.objectContaining({ cwd: "/srv/project-v1" }),
+						executionContext: { executionScope: "project-root", projectPathRevision: 1 },
+					}),
+					expect.objectContaining({
+						input: expect.objectContaining({ cwd: "/srv/project-v2" }),
+						executionContext: { executionScope: "project-root", projectPathRevision: 2 },
+					}),
+				]);
+				expect(await runtime.getThreadMessages("project-context-thread")).toEqual([
+					{ role: "user", content: "First." },
+					{ role: "assistant", content: "first answer" },
+					{ role: "user", content: "Second." },
+					{ role: "assistant", content: "second answer" },
+				]);
+				const persisted = readdirSync(join(agentDataDirectory, "sessions"))
+					.map((filename) => readFileSync(join(agentDataDirectory, "sessions", filename), "utf8"))
+					.join("\n");
+				expect(persisted).not.toContain(marker);
+				expect(persisted).not.toContain("/srv/project-v2");
+			} finally {
+				await runtime.shutdown();
+			}
+		});
+	});
+
 	test("classifies cancellation and an already-aborted request without calling the provider", async () => {
 		await withAppData(async (agentDataDirectory) => {
 			const faux = fauxProvider({
@@ -289,6 +399,7 @@ describe("Pi Agent runtime", () => {
 				let cancelled = false;
 				const result = runtime.run({
 					runtimeBoxId: defaultLocalRuntimeBoxId,
+					executionContext: { kind: "session" },
 					runId: "cancel-run",
 					threadId: "cancel-thread",
 					provider,
@@ -311,6 +422,7 @@ describe("Pi Agent runtime", () => {
 				await expect(
 					runtime.run({
 						runtimeBoxId: defaultLocalRuntimeBoxId,
+						executionContext: { kind: "session" },
 						runId: "pre-aborted-run",
 						threadId: "pre-aborted-thread",
 						provider,
@@ -359,6 +471,7 @@ describe("Pi Agent runtime", () => {
 			try {
 				const run = runtime.run({
 					runtimeBoxId: defaultLocalRuntimeBoxId,
+					executionContext: { kind: "session" },
 					runId: "preflight-cancel-run",
 					threadId: "preflight-cancel-thread",
 					provider,
@@ -400,6 +513,7 @@ describe("Pi Agent runtime", () => {
 			try {
 				const first = runtime.run({
 					runtimeBoxId: defaultLocalRuntimeBoxId,
+					executionContext: { kind: "session" },
 					runId: "first-run",
 					threadId: "shared-thread",
 					provider,
@@ -409,6 +523,7 @@ describe("Pi Agent runtime", () => {
 				await expect(
 					runtime.run({
 						runtimeBoxId: defaultLocalRuntimeBoxId,
+						executionContext: { kind: "session" },
 						runId: "blocked-run",
 						threadId: "shared-thread",
 						provider,
@@ -418,6 +533,7 @@ describe("Pi Agent runtime", () => {
 
 				const second = runtime.run({
 					runtimeBoxId: defaultLocalRuntimeBoxId,
+					executionContext: { kind: "session" },
 					runId: "second-run",
 					threadId: "other-thread",
 					provider,
@@ -462,6 +578,7 @@ describe("Pi Agent runtime", () => {
 					const error = await runtime
 						.run({
 							runtimeBoxId: defaultLocalRuntimeBoxId,
+							executionContext: { kind: "session" },
 							runId: `error-run-${index}`,
 							threadId: `error-thread-${index}`,
 							provider,
@@ -488,6 +605,7 @@ describe("Pi Agent runtime", () => {
 			const { runtime, provider, modelRuntime } = await createRuntime(agentDataDirectory, faux);
 			await runtime.run({
 				runtimeBoxId: defaultLocalRuntimeBoxId,
+				executionContext: { kind: "session" },
 				runId: "containment-run",
 				threadId: "containment-thread",
 				provider,

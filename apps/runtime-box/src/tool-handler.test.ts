@@ -1,11 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { RpcConnectionClosedError, type RpcPeer, type RpcRequestContext } from "@moshu/process-rpc";
-import type { ExecutorToolRuntime } from "./tools/index";
 import { InvocationJournalPrepareFailedError } from "./invocation-journal";
 import { createExecutorToolRequestHandler } from "./tool-handler";
+import { ExecutorToolRuntime } from "./tools/index";
 
 const testJournal = {
 	begin: () => ({}),
@@ -13,8 +13,18 @@ const testJournal = {
 	fail() {},
 	cancel() {},
 };
+const localDeployment = { kind: "local", trustedRequestCwd: true } as const;
 
 describe("Runtime Box tool request handler", () => {
+	test("rejects a Remote deployment without an absolute daemon workspace", () => {
+		expect(() =>
+			createExecutorToolRequestHandler({} as ExecutorToolRuntime, {
+				journal: testJournal,
+				deployment: { kind: "remote", workspacePath: "relative/workspace" },
+			}),
+		).toThrow("absolute path");
+	});
+
 	test("uses the Runtime Box-owned cwd when configured", async () => {
 		let receivedCwd: string | undefined;
 		const runtime = {
@@ -30,7 +40,10 @@ describe("Runtime Box tool request handler", () => {
 		};
 		const handler = createExecutorToolRequestHandler(
 			runtime as unknown as Parameters<typeof createExecutorToolRequestHandler>[0],
-			{ cwd: "/remote/workspace", journal: testJournal },
+			{
+				deployment: { kind: "remote", workspacePath: process.cwd() },
+				journal: testJournal,
+			},
 		);
 		await handler(
 			{
@@ -43,7 +56,7 @@ describe("Runtime Box tool request handler", () => {
 			},
 			createRequestContext(),
 		);
-		expect(receivedCwd).toBe("/remote/workspace");
+		expect(receivedCwd).toBe(process.cwd());
 	});
 
 	function createRequestContext(): RpcRequestContext {
@@ -68,7 +81,10 @@ describe("Runtime Box tool request handler", () => {
 				throw new Error(`failure:${"x".repeat(4_096)}`);
 			},
 		} as unknown as ExecutorToolRuntime;
-		const handler = createExecutorToolRequestHandler(runtime, { journal: testJournal });
+		const handler = createExecutorToolRequestHandler(runtime, {
+			journal: testJournal,
+			deployment: localDeployment,
+		});
 		const input = {
 			schemaVersion: 1,
 			invocationId: crypto.randomUUID(),
@@ -112,7 +128,10 @@ describe("Runtime Box tool request handler", () => {
 				);
 			},
 		} as unknown as ExecutorToolRuntime;
-		const handler = createExecutorToolRequestHandler(runtime, { journal: testJournal });
+		const handler = createExecutorToolRequestHandler(runtime, {
+			journal: testJournal,
+			deployment: localDeployment,
+		});
 		const context: RpcRequestContext = {
 			peer: { emitEvent() {} } as unknown as RpcPeer,
 			remoteIdentity: {
@@ -169,6 +188,7 @@ describe("Runtime Box tool request handler", () => {
 		} as unknown as ExecutorToolRuntime;
 		const handler = createExecutorToolRequestHandler(runtime, {
 			journal: testJournal,
+			deployment: localDeployment,
 			onProgressError(error) {
 				reportedError = error;
 			},
@@ -223,7 +243,10 @@ describe("Runtime Box tool request handler", () => {
 				};
 			},
 		} as unknown as ExecutorToolRuntime;
-		const handler = createExecutorToolRequestHandler(runtime, { journal });
+		const handler = createExecutorToolRequestHandler(runtime, {
+			journal,
+			deployment: localDeployment,
+		});
 		const input = {
 			schemaVersion: 1,
 			invocationId: crypto.randomUUID(),
@@ -237,7 +260,9 @@ describe("Runtime Box tool request handler", () => {
 			code: "RUNTIME_BOX_INVOCATION_JOURNAL_PREPARE_FAILED",
 		});
 
-		await expect(handler(input, context)).resolves.toMatchObject({ tool: "read" });
+		await expect(handler(input, context)).resolves.toMatchObject({
+			tool: "read",
+		});
 	});
 
 	test("keeps a started Action alive across transport loss until its lease", async () => {
@@ -255,7 +280,10 @@ describe("Runtime Box tool request handler", () => {
 				};
 			},
 		} as unknown as ExecutorToolRuntime;
-		const handler = createExecutorToolRequestHandler(runtime, { journal: testJournal });
+		const handler = createExecutorToolRequestHandler(runtime, {
+			journal: testJournal,
+			deployment: localDeployment,
+		});
 		const requestController = new AbortController();
 		const execution = handler(
 			{
@@ -305,6 +333,7 @@ describe("Runtime Box tool request handler", () => {
 					cancellationReason = reason;
 				},
 			},
+			deployment: localDeployment,
 			lifecycleSignal: lifecycle.signal,
 			activeExecutions,
 		});
@@ -323,7 +352,9 @@ describe("Runtime Box tool request handler", () => {
 		expect(activeExecutions.size).toBe(1);
 
 		lifecycle.abort(new Error("Runtime Box is shutting down."));
-		await expect(execution).rejects.toMatchObject({ code: "RUNTIME_BOX_TOOL_CANCELLED" });
+		await expect(execution).rejects.toMatchObject({
+			code: "RUNTIME_BOX_TOOL_CANCELLED",
+		});
 		expect(executionSignal?.aborted).toBe(true);
 		expect(activeExecutions.size).toBe(0);
 		expect(cancellationReason).toBe("Runtime Box is shutting down.");
@@ -354,9 +385,8 @@ describe("Runtime Box tool request handler", () => {
 			},
 		} as unknown as ExecutorToolRuntime;
 		const handler = createExecutorToolRequestHandler(runtime, {
-			cwd: root,
 			journal,
-			enforceCwdContainment: true,
+			deployment: { kind: "remote", workspacePath: root },
 		});
 		try {
 			await expect(
@@ -385,10 +415,351 @@ describe("Runtime Box tool request handler", () => {
 					createRequestContext(),
 				),
 			).resolves.toMatchObject({ tool: "bash" });
-			expect(beginCalls).toBe(1);
+			expect(beginCalls).toBe(2);
 		} finally {
 			rmSync(root, { recursive: true, force: true });
 			rmSync(outside, { force: true });
 		}
 	});
+
+	test("selects Remote cwd per invocation without changing trusted Local request-cwd", async () => {
+		const root = realpathSync(mkdtempSync(join(tmpdir(), "moshu-per-invocation-cwd-")));
+		const workspace = join(root, "workspace");
+		const project = join(root, "project");
+		mkdirSync(workspace);
+		mkdirSync(project);
+		const received: string[] = [];
+		const runtime = {
+			async execute(input: { invocationId: string; cwd: string; call: { tool: string } }) {
+				received.push(input.cwd);
+				return {
+					schemaVersion: 1 as const,
+					invocationId: input.invocationId,
+					tool: input.call.tool,
+					content: [{ type: "text" as const, text: "ok" }],
+				};
+			},
+		} as unknown as ExecutorToolRuntime;
+		const handler = createExecutorToolRequestHandler(runtime, {
+			journal: testJournal,
+			deployment: { kind: "remote", workspacePath: workspace },
+		});
+		try {
+			await handler(createBashInput("/ignored/server/cwd"), createRequestContext());
+			await handler(
+				{
+					...createBashInput(project),
+					authorization: projectAuthorization(),
+				},
+				createRequestContext(),
+			);
+			const localHandler = createExecutorToolRequestHandler(runtime, {
+				journal: testJournal,
+				deployment: { kind: "local", trustedRequestCwd: true },
+			});
+			await localHandler(createReadInput(project, workspace), createRequestContext());
+			expect(received).toEqual([workspace, project, project]);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("contains every Project file path while explicitly exempting bash", async () => {
+		const root = realpathSync(mkdtempSync(join(tmpdir(), "moshu-project-containment-")));
+		const project = join(root, "project");
+		const outside = join(root, "outside");
+		mkdirSync(project);
+		mkdirSync(outside);
+		writeFileSync(join(outside, "secret.txt"), "secret");
+		symlinkSync(outside, join(project, "escape"));
+		symlinkSync(join(outside, "missing-target"), join(project, "dangling"));
+		let beginCalls = 0;
+		const received: Array<{ cwd: string; tool: string; path: string | undefined }> = [];
+		const runtime = {
+			async execute(input: {
+				invocationId: string;
+				cwd: string;
+				call: { tool: string; arguments: { path?: string } };
+			}) {
+				received.push({
+					cwd: input.cwd,
+					tool: input.call.tool,
+					path: input.call.arguments.path,
+				});
+				return {
+					schemaVersion: 1 as const,
+					invocationId: input.invocationId,
+					tool: input.call.tool,
+					content: [{ type: "text" as const, text: "ok" }],
+				};
+			},
+		} as unknown as ExecutorToolRuntime;
+		const handler = createExecutorToolRequestHandler(runtime, {
+			journal: {
+				...testJournal,
+				begin() {
+					beginCalls += 1;
+					return {};
+				},
+			},
+			deployment: { kind: "local", trustedRequestCwd: true },
+		});
+		try {
+			const escapingPaths = [
+				"../outside/secret.txt",
+				join(outside, "secret.txt"),
+				"escape/secret.txt",
+				"escape/new.txt",
+				"dangling",
+				"dangling/new.txt",
+				"file:///etc/hosts",
+				"~/definitely-outside-project",
+				`@${join(outside, "secret.txt")}`,
+				"@../outside/secret.txt",
+				...["\u00a0", "\u202f", "\u3000"].map((space) => `unicode${space}escape/secret.txt`),
+			];
+			symlinkSync(outside, join(project, "unicode escape"));
+			for (const tool of ["read", "edit", "write", "grep", "find", "ls"] as const) {
+				for (const [index, path] of escapingPaths.entries()) {
+					await expect(
+						handler(
+							{
+								...createReadInput(project, path),
+								toolCallId: `escape-${tool}-${index}`,
+								call: createFileToolCall(tool, path),
+								authorization: projectAuthorization(),
+							},
+							createRequestContext(),
+						),
+					).rejects.toMatchObject({ code: "RUNTIME_BOX_WORKSPACE_VIOLATION" });
+				}
+			}
+			for (const tool of ["grep", "find", "ls"] as const) {
+				const call =
+					tool === "grep"
+						? { tool, arguments: { pattern: "needle" } }
+						: tool === "find"
+							? { tool, arguments: { pattern: "*" } }
+							: { tool, arguments: {} };
+				await handler(
+					{
+						...createReadInput(project, "."),
+						invocationId: crypto.randomUUID(),
+						toolCallId: `default-${tool}`,
+						call,
+						authorization: projectAuthorization(),
+					},
+					createRequestContext(),
+				);
+			}
+			await handler(
+				{
+					...createBashInput(project),
+					call: { tool: "bash", arguments: { command: `cat ${join(outside, "secret.txt")}` } },
+					authorization: projectAuthorization(),
+				},
+				createRequestContext(),
+			);
+			expect(received).toEqual([
+				{ cwd: project, tool: "grep", path: undefined },
+				{ cwd: project, tool: "find", path: undefined },
+				{ cwd: project, tool: "ls", path: undefined },
+				{ cwd: project, tool: "bash", path: undefined },
+			]);
+			expect(beginCalls).toBe(escapingPaths.length * 6 + 4);
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("rejects read and edit fallbacks that resolve to symlinks outside the Project", async () => {
+		const root = realpathSync(mkdtempSync(join(tmpdir(), "moshu-project-fallback-containment-")));
+		const project = join(root, "project");
+		const outside = join(root, "outside");
+		mkdirSync(project);
+		mkdirSync(outside);
+		const secret = join(outside, "secret.txt");
+		writeFileSync(secret, "secret");
+		const fallbacks = [
+			["smart'quote.txt", "smart\u2019quote.txt"],
+			["caf\u00e9.txt", "cafe\u0301.txt"],
+			["report AM.txt", "report\u202fAM.txt"],
+		] as const;
+		for (const [, fallback] of fallbacks) {
+			symlinkSync(secret, join(project, fallback));
+		}
+		const handler = createExecutorToolRequestHandler(
+			{
+				async execute() {
+					throw new Error("Escaping fallback must not execute.");
+				},
+			} as unknown as ExecutorToolRuntime,
+			{
+				journal: testJournal,
+				deployment: { kind: "local", trustedRequestCwd: true },
+			},
+		);
+		try {
+			for (const [primary] of fallbacks) {
+				for (const tool of ["read", "edit"] as const) {
+					await expect(
+						handler(
+							{
+								...createReadInput(project, primary),
+								invocationId: crypto.randomUUID(),
+								toolCallId: `fallback-${tool}-${primary}`,
+								call: createFileToolCall(tool, primary),
+								authorization: projectAuthorization(),
+							},
+							createRequestContext(),
+						),
+					).rejects.toMatchObject({ code: "RUNTIME_BOX_WORKSPACE_VIOLATION" });
+				}
+			}
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("keeps Unicode read and edit fallbacks inside the Project", async () => {
+		const root = realpathSync(mkdtempSync(join(tmpdir(), "moshu-project-unicode-fallbacks-")));
+		const project = join(root, "project");
+		mkdirSync(project);
+		const fallbacks = [
+			["smart'quote.txt", "smart\u2019quote.txt"],
+			["caf\u00e9.txt", "cafe\u0301.txt"],
+			["report AM.txt", "report\u202fAM.txt"],
+		] as const;
+		for (const [, fallback] of fallbacks) {
+			writeFileSync(join(project, fallback), "old");
+		}
+		const handler = createExecutorToolRequestHandler(new ExecutorToolRuntime({ rg: "", fd: "" }), {
+			journal: testJournal,
+			deployment: { kind: "local", trustedRequestCwd: true },
+		});
+		try {
+			for (const [primary, fallback] of fallbacks) {
+				const read = await handler(
+					{
+						...createReadInput(project, primary),
+						invocationId: crypto.randomUUID(),
+						toolCallId: `unicode-read-${primary}`,
+						authorization: projectAuthorization(),
+					},
+					createRequestContext(),
+				);
+				expect(read).toMatchObject({ tool: "read", content: [{ type: "text", text: "old" }] });
+				await handler(
+					{
+						...createReadInput(project, primary),
+						invocationId: crypto.randomUUID(),
+						toolCallId: `unicode-edit-${primary}`,
+						call: createFileToolCall("edit", primary),
+						authorization: projectAuthorization(),
+					},
+					createRequestContext(),
+				);
+				await expect(Bun.file(join(project, fallback)).text()).resolves.toBe("new");
+			}
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	test("returns stable Project cwd validation errors", async () => {
+		const root = realpathSync(mkdtempSync(join(tmpdir(), "moshu-project-cwd-errors-")));
+		const project = join(root, "project");
+		const projectLink = join(root, "project-link");
+		const file = join(root, "file");
+		mkdirSync(project);
+		symlinkSync(project, projectLink);
+		writeFileSync(file, "not a directory");
+		const runtime = {
+			async execute() {
+				throw new Error("invalid cwd must not execute");
+			},
+		} as unknown as ExecutorToolRuntime;
+		const handler = createExecutorToolRequestHandler(runtime, {
+			journal: testJournal,
+			deployment: { kind: "local", trustedRequestCwd: true },
+		});
+		try {
+			for (const [cwd, code] of [
+				[projectLink, "RUNTIME_BOX_PROJECT_CWD_NOT_CANONICAL"],
+				[file, "RUNTIME_BOX_PROJECT_CWD_NOT_DIRECTORY"],
+				[join(root, "missing"), "RUNTIME_BOX_PROJECT_CWD_NOT_FOUND"],
+			] as const) {
+				await expect(
+					handler(
+						{
+							...createBashInput(cwd),
+							authorization: projectAuthorization(),
+						},
+						createRequestContext(),
+					),
+				).rejects.toMatchObject({ code });
+			}
+		} finally {
+			rmSync(root, { recursive: true, force: true });
+		}
+	});
 });
+
+function createBashInput(cwd: string) {
+	return {
+		schemaVersion: 1 as const,
+		invocationId: crypto.randomUUID(),
+		runId: "018f47a2-9bcd-7def-8abc-1234567890ab",
+		toolCallId: "bash-tool-call",
+		cwd,
+		call: { tool: "bash" as const, arguments: { command: "pwd" } },
+	};
+}
+
+function createReadInput(cwd: string, path: string) {
+	return {
+		schemaVersion: 1 as const,
+		invocationId: crypto.randomUUID(),
+		runId: "018f47a2-9bcd-7def-8abc-1234567890ab",
+		toolCallId: "read-tool-call",
+		cwd,
+		call: { tool: "read" as const, arguments: { path } },
+	};
+}
+
+function createFileToolCall(
+	tool: "read" | "edit" | "write" | "grep" | "find" | "ls",
+	path: string,
+) {
+	switch (tool) {
+		case "read":
+			return { tool, arguments: { path } };
+		case "edit":
+			return { tool, arguments: { path, edits: [{ oldText: "old", newText: "new" }] } };
+		case "write":
+			return { tool, arguments: { path, content: "content" } };
+		case "grep":
+			return { tool, arguments: { path, pattern: "needle" } };
+		case "find":
+			return { tool, arguments: { path, pattern: "*" } };
+		case "ls":
+			return { tool, arguments: { path } };
+	}
+}
+
+function projectAuthorization() {
+	return {
+		actionId: crypto.randomUUID(),
+		grantId: crypto.randomUUID(),
+		grantToken: Buffer.alloc(32, 7).toString("base64url"),
+		parameterDigest: "a".repeat(64),
+		originInstanceId: "agents-instance",
+		originGeneration: 1,
+		targetRuntimeBoxId: "runtime-box",
+		targetInstanceId: "runtime-instance",
+		targetGeneration: 1,
+		executionScope: "project-root" as const,
+		projectPathRevision: 1,
+		expiresAt: new Date(Date.now() + 60_000).toISOString(),
+	};
+}
