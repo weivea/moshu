@@ -161,7 +161,7 @@ export function ProviderAuthPanel({
 					className={
 						provider.credential.configured
 							? "provider-status provider-status--ready"
-							: "provider-status"
+							: "provider-status provider-status--warning"
 					}
 				>
 					{provider.credential.configured

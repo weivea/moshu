@@ -25,6 +25,7 @@ describe("ProviderAuthPanel", () => {
 		const fake = new FakeAuthTransport();
 		const changed = vi.fn();
 		renderPanel(fake, changed);
+		expect(screen.getByText("Authentication required")).toHaveClass("provider-status--warning");
 
 		fireEvent.click(screen.getByRole("button", { name: "Connect with API key" }));
 		await screen.findByLabelText("API key");

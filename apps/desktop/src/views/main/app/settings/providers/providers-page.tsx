@@ -203,9 +203,11 @@ export function ProvidersSettingsPage({ transport }: ProvidersSettingsPageProps)
 											</span>
 											<span
 												className={
-													provider.enabled
-														? "provider-status provider-status--ready"
-														: "provider-status"
+													!provider.enabled
+														? "provider-status"
+														: provider.credential.configured
+															? "provider-status provider-status--ready"
+															: "provider-status provider-status--warning"
 												}
 											>
 												{!provider.enabled

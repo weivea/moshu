@@ -178,6 +178,27 @@ describe("ProvidersSettingsPage", () => {
 		expect(within(form).getByRole("heading", { name: "OpenAI" })).toBeVisible();
 	});
 
+	test("uses distinct status tones for ready, authentication-required, and disabled providers", async () => {
+		const transport = new FakeProvidersTransport([
+			makeProvider({ id: providerAId, displayName: "Configured provider", apiKeyMask: "****" }),
+			makeProvider({ id: providerBId, displayName: "Needs auth" }),
+			makeProvider({ id: createdProviderId, displayName: "Inactive provider", enabled: false }),
+		]);
+		renderPage(transport);
+
+		const ready = await screen.findByRole("button", { name: /Configured provider/ });
+		const needsAuth = screen.getByRole("button", { name: /Needs auth/ });
+		const disabled = screen.getByRole("button", { name: /Inactive provider/ });
+		expect(within(ready).getByText("Ready")).toHaveClass("provider-status--ready");
+		expect(within(needsAuth).getByText("Authentication required")).toHaveClass(
+			"provider-status--warning",
+		);
+		expect(within(disabled).getByText("Disabled")).not.toHaveClass(
+			"provider-status--ready",
+			"provider-status--warning",
+		);
+	});
+
 	test("adds a provider with the parsed custom headers and chosen type", async () => {
 		const transport = new FakeProvidersTransport([makeProvider({ id: providerAId })]);
 		renderPage(transport);

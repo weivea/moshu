@@ -1964,6 +1964,16 @@ a {
 	color: #18794e;
 }
 
+.provider-status--warning {
+	background: rgba(183, 121, 31, 0.14);
+	color: #8a5a00;
+}
+
+:root[data-theme="dark"] .provider-status--warning {
+	background: rgba(230, 176, 65, 0.18);
+	color: #e6b041;
+}
+
 .provider-form__actions {
 	display: flex;
 	justify-content: flex-end;
