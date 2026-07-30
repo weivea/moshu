@@ -416,6 +416,17 @@ interface AppRunEvent<T extends RunEventType = RunEventType> {
 
 server 分配 durable `seq` 并先落库。Runtime Box notification 只有在 server 验证当前 instance/generation、关联 invocation 和 Schema 后，才转换为 `AppRunEvent`。
 
+### 9.1 多 Client 事件订阅（Mobile 协议基础）
+
+Live delivery 从「单 request-owner」模型演进为 Session/Run/seq scoped 的事件 hub（`ProductEventRouter`，见 `apps/agents-server/src/product-event-hub.ts`），为未来多 Client（Desktop 与 Mobile）观察同一 Session 铺路：
+
+- `chat.event` delivery 的 `clientRequestId` 现为**可选 origin echo**（`chatEventDeliverySchema.clientRequestId` optional）。接收 Client 不再需要持有原始 `clientRequestId` 即可观察其订阅的 Session；发起 Client 仍会收到自身 request id 回显用于本地关联。
+- 新增 `moshu.v1.chat.subscribe` / `moshu.v1.chat.unsubscribe`（input `{ sessionId }`）。二者是 **authorization-aware** 合同：handler 从 authenticated peer 解析 client identity（`role === "client"`），不信任调用方传入任意身份；非 client 角色被拒绝。
+- 发起 Client 通过 `chat.send` 的 request-owner 绑定接收自身 Run 的 live event（保持幂等/恢复与 generation fencing 语义不变）；其他已认证 Client 通过显式 `chat.subscribe` 观察同一 Session。实际投递是「request-owner ∪ 显式 subscriber」的并集，按连接去重。
+- 订阅按稳定 `peerId` 记录，重连（新连接 generation）后订阅保持；连接断开时按精确身份清理，不影响其他 Client。
+- 单用户 MVP 下授权边界按 Session **结构化**，不做全局裸 broadcast 调试事件。Desktop 当前不主动 subscribe（其自身 Run 仍走 request-owner 路径），投递行为与既有实现完全一致。
+- 本层不实现 Mobile ingress/pairing 与 approvals（属于后续层）。
+
 ## 10. Policy、Approval 与 Execution Grant
 
 ### 10.1 ActionRequest

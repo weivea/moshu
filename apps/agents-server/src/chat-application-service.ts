@@ -164,6 +164,7 @@ export interface ChatApplicationServiceOptions {
 	logger?: ChatServiceLogger;
 	isRuntimeReady?: (runtimeBoxId: string) => boolean;
 	getActiveRuntimeBoxId?: () => string;
+	getActiveRuntimeBoxIdForClient?: (clientId: string) => string;
 	withProjectSessionCreation?: <T>(
 		projectId: string,
 		createSession: () => T,
@@ -233,6 +234,7 @@ export class ChatApplicationService {
 	readonly #logger: ChatServiceLogger;
 	readonly #isRuntimeReady: (runtimeBoxId: string) => boolean;
 	readonly #getActiveRuntimeBoxId: () => string;
+	readonly #getActiveRuntimeBoxIdForClient: (clientId: string) => string;
 	readonly #withProjectSessionCreation:
 		| (<T>(projectId: string, createSession: () => T, signal?: AbortSignal) => Promise<T>)
 		| undefined;
@@ -291,6 +293,8 @@ export class ChatApplicationService {
 		this.#logger = options.logger ?? console;
 		this.#isRuntimeReady = options.isRuntimeReady ?? (() => true);
 		this.#getActiveRuntimeBoxId = options.getActiveRuntimeBoxId ?? (() => defaultLocalRuntimeBoxId);
+		this.#getActiveRuntimeBoxIdForClient =
+			options.getActiveRuntimeBoxIdForClient ?? (() => defaultLocalRuntimeBoxId);
 		this.#withProjectSessionCreation = options.withProjectSessionCreation;
 		this.#withProjectRunPreflight = options.withProjectRunPreflight;
 		this.#actions = options.actions;
@@ -558,8 +562,13 @@ export class ChatApplicationService {
 				signal,
 			);
 		}
-		this.#assertRuntimeReady(request.runtimeBoxId ?? this.#getActiveRuntimeBoxId());
-		return this.#sessions.createIdempotently({ request, origin });
+		const runtimeBoxId =
+			request.runtimeBoxId ?? this.#getActiveRuntimeBoxIdForClient(origin.peerId);
+		this.#assertRuntimeReady(runtimeBoxId);
+		return this.#sessions.createIdempotently({
+			request: { ...request, runtimeBoxId },
+			origin,
+		});
 	}
 
 	listSessions(input: ListChatSessionsInput = {}): ListChatSessionsOutput {

@@ -56,7 +56,7 @@ class FakeDevTunnelAdapter implements DevTunnelAdapter {
 		};
 	}
 
-	ensureTunnel(tunnelId: string, _port: number, _signal: AbortSignal): Promise<string> {
+	ensureTunnel(tunnelId: string, _ports: readonly number[], _signal: AbortSignal): Promise<string> {
 		this.ensureCalls += 1;
 		return Promise.resolve(tunnelId.includes(".") ? tunnelId : `${tunnelId}.euw`);
 	}
@@ -117,7 +117,11 @@ class DelayedDeleteAdapter extends FakeDevTunnelAdapter {
 class DelayedEnsureAdapter extends FakeDevTunnelAdapter {
 	firstTunnelId: string | undefined;
 
-	override ensureTunnel(tunnelId: string, _port: number, signal: AbortSignal): Promise<string> {
+	override ensureTunnel(
+		tunnelId: string,
+		_ports: readonly number[],
+		signal: AbortSignal,
+	): Promise<string> {
 		this.ensureCalls += 1;
 		if (this.firstTunnelId !== undefined) {
 			return Promise.resolve(tunnelId.includes(".") ? tunnelId : `${tunnelId}.euw`);
@@ -139,7 +143,11 @@ class DelayedEnsureAdapter extends FakeDevTunnelAdapter {
 class DelayedReplacementAdapter extends FakeDevTunnelAdapter {
 	readonly replacementGate = Promise.withResolvers<string>();
 
-	override ensureTunnel(tunnelId: string, _port: number, signal: AbortSignal): Promise<string> {
+	override ensureTunnel(
+		tunnelId: string,
+		_ports: readonly number[],
+		signal: AbortSignal,
+	): Promise<string> {
 		this.ensureCalls += 1;
 		if (this.ensureCalls === 1) {
 			return Promise.resolve(tunnelId.includes(".") ? tunnelId : `${tunnelId}.euw`);
@@ -288,9 +296,9 @@ describe("DevTunnelService", () => {
 			throw new Error(`Unexpected command: ${command}`);
 		});
 
-		expect(await adapter.ensureTunnel("moshu-test.euw", 41_000, new AbortController().signal)).toBe(
-			"moshu-test.euw",
-		);
+		expect(
+			await adapter.ensureTunnel("moshu-test.euw", [41_000], new AbortController().signal),
+		).toBe("moshu-test.euw");
 		expect(commands.some(([command]) => command === "create")).toBe(false);
 		expect(
 			commands.some(
@@ -320,9 +328,9 @@ describe("DevTunnelService", () => {
 			throw new Error(`Unexpected command: ${command}`);
 		});
 
-		expect(await adapter.ensureTunnel("moshu-test.euw", 41_000, new AbortController().signal)).toBe(
-			"moshu-test.euw",
-		);
+		expect(
+			await adapter.ensureTunnel("moshu-test.euw", [41_000], new AbortController().signal),
+		).toBe("moshu-test.euw");
 		expect(commands.some(([command]) => command === "create")).toBe(false);
 		expect(commands).toContainEqual(["port", "delete", "moshu-test.euw", "-p", "42000"]);
 		expect(commands).toContainEqual([
@@ -334,6 +342,65 @@ describe("DevTunnelService", () => {
 			"--protocol",
 			"http",
 		]);
+	});
+
+	test("reconciles an expected port set without deleting a second Moshu ingress", async () => {
+		const commands: string[][] = [];
+		const adapter = new DevTunnelCliAdapter("devtunnel", async (_executable, args) => {
+			commands.push([...args]);
+			const command = args.join(" ");
+			if (command === "list --json") {
+				return commandResult('{"value":[{"tunnelId":"moshu-test","clusterId":"euw"}]}');
+			}
+			if (command === "port list moshu-test.euw --json") {
+				return commandResult(
+					'{"value":[{"portNumber":41000},{"portNumber":42000},{"portNumber":43000}]}',
+				);
+			}
+			if (command === "port show moshu-test.euw -p 41000 --json") {
+				return commandResult('{"portNumber":41000,"protocol":"http"}');
+			}
+			if (command === "port show moshu-test.euw -p 42000 --json") {
+				return commandResult('{"portNumber":42000,"protocol":"http"}');
+			}
+			if (args[0] === "port" || args[0] === "access") {
+				return commandResult();
+			}
+			throw new Error(`Unexpected command: ${command}`);
+		});
+
+		expect(
+			await adapter.ensureTunnel("moshu-test.euw", [41_000, 42_000], new AbortController().signal),
+		).toBe("moshu-test.euw");
+		// The stale port that no expected ingress claims is removed...
+		expect(commands).toContainEqual(["port", "delete", "moshu-test.euw", "-p", "43000"]);
+		// ...but neither expected Moshu ingress port is ever deleted (no cross-deletion).
+		expect(commands).not.toContainEqual(["port", "delete", "moshu-test.euw", "-p", "41000"]);
+		expect(commands).not.toContainEqual(["port", "delete", "moshu-test.euw", "-p", "42000"]);
+		// Each expected port keeps its own anonymous access grant.
+		expect(commands).toContainEqual([
+			"access",
+			"create",
+			"moshu-test.euw",
+			"--port-number",
+			"41000",
+			"--anonymous",
+		]);
+		expect(commands).toContainEqual([
+			"access",
+			"create",
+			"moshu-test.euw",
+			"--port-number",
+			"42000",
+			"--anonymous",
+		]);
+	});
+
+	test("rejects an empty expected port set", async () => {
+		const adapter = new DevTunnelCliAdapter("devtunnel", async () => commandResult());
+		await expect(
+			adapter.ensureTunnel("moshu-test.euw", [], new AbortController().signal),
+		).rejects.toThrow("at least one expected ingress port");
 	});
 
 	test("creates a tunnel only after a successful inventory confirms it is absent", async () => {
@@ -359,7 +426,7 @@ describe("DevTunnelService", () => {
 			throw new Error(`Unexpected command: ${command}`);
 		});
 
-		expect(await adapter.ensureTunnel("moshu-new", 41_000, new AbortController().signal)).toBe(
+		expect(await adapter.ensureTunnel("moshu-new", [41_000], new AbortController().signal)).toBe(
 			"moshu-new.euw",
 		);
 		expect(commands).toContainEqual(["list", "--json"]);
@@ -374,7 +441,7 @@ describe("DevTunnelService", () => {
 		});
 
 		await expect(
-			adapter.ensureTunnel("moshu-test.euw", 41_000, new AbortController().signal),
+			adapter.ensureTunnel("moshu-test.euw", [41_000], new AbortController().signal),
 		).rejects.toThrow("Tunnel inventory request failed.");
 		expect(commands).toEqual([["list", "--json"]]);
 	});

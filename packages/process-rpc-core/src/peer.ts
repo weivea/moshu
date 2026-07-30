@@ -28,6 +28,7 @@ import {
 	rpcEnvelopeSchema,
 	rpcJsonValueSchema,
 } from "./protocol";
+import type { RpcSocketTransport } from "./transport";
 import { truncateWebSocketCloseReason } from "./websocket-utils";
 
 export interface RpcRequestContext {
@@ -103,13 +104,6 @@ export interface RpcRequestOptions {
 export interface RpcEventOptions {
 	readonly eventId?: string;
 	readonly traceId?: string;
-}
-
-export interface RpcSocketTransport {
-	send(text: string): void;
-	close(code: number, reason: string): void;
-	terminate(): void;
-	isOpen(): boolean;
 }
 
 export interface RpcPeerInternalOptions extends RpcEndpointOptions {

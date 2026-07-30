@@ -3,6 +3,7 @@ import {
 	type ActiveRuntimeBoxSelection,
 	activeRuntimeBoxSelectionSchema,
 	type RuntimeBoxDescriptor,
+	runtimeBoxClientIdSchema,
 	runtimeBoxDescriptorSchema,
 	type SwitchRuntimeBoxInput,
 	switchRuntimeBoxInputSchema,
@@ -10,7 +11,12 @@ import {
 import { asc, eq, isNull } from "drizzle-orm";
 
 import type { AppDrizzleDatabase } from "./database";
-import { appSettingsTable, runtimeBoxGenerationFencesTable, runtimeBoxesTable } from "./schema";
+import {
+	appSettingsTable,
+	clientRuntimeBoxPreferencesTable,
+	runtimeBoxesTable,
+	runtimeBoxGenerationFencesTable,
+} from "./schema";
 
 interface RepositoryClock {
 	now(): number;
@@ -66,6 +72,7 @@ export interface RuntimeBoxRepository {
 	list(): RuntimeBoxDescriptor[];
 	get(runtimeBoxId: string): RuntimeBoxDescriptor;
 	getActive(): ActiveRuntimeBoxSelection;
+	getActiveForClient(clientId: string): ActiveRuntimeBoxSelection;
 	getActionJournalEpoch(): string;
 	listCompatibility(): RuntimeBoxCompatibility[];
 	markUpgradeRequired(
@@ -75,6 +82,7 @@ export interface RuntimeBoxRepository {
 		protocolVersion: number,
 	): RuntimeBoxGenerationAcceptance;
 	switchActive(input: SwitchRuntimeBoxInput): ActiveRuntimeBoxSelection;
+	switchActiveForClient(clientId: string, input: SwitchRuntimeBoxInput): ActiveRuntimeBoxSelection;
 	acceptGeneration(
 		runtimeBoxId: string,
 		instanceId: string,
@@ -156,6 +164,30 @@ export class SqliteRuntimeBoxRepository implements RuntimeBoxRepository {
 		return activeRuntimeBoxSelectionSchema.parse({
 			runtimeBoxId: row.activeRuntimeBoxId,
 			revision: row.activeRuntimeRevision,
+		});
+	}
+
+	getActiveForClient(clientIdValue: string): ActiveRuntimeBoxSelection {
+		const clientId = runtimeBoxClientIdSchema.parse(clientIdValue);
+		return this.orm.transaction((transaction) => {
+			const existing = transaction
+				.select()
+				.from(clientRuntimeBoxPreferencesTable)
+				.where(eq(clientRuntimeBoxPreferencesTable.clientId, clientId))
+				.get();
+			if (existing !== undefined) {
+				return activeRuntimeBoxSelectionSchema.parse({
+					runtimeBoxId: existing.runtimeBoxId,
+					revision: existing.revision,
+				});
+			}
+			// Lazily seed a client's first preference from the global default so every client that has
+			// queried once holds a stable revision to compare against on switch.
+			const seeded = this.#seedClientPreference(transaction, clientId);
+			return activeRuntimeBoxSelectionSchema.parse({
+				runtimeBoxId: seeded.runtimeBoxId,
+				revision: seeded.revision,
+			});
 		});
 	}
 
@@ -274,6 +306,77 @@ export class SqliteRuntimeBoxRepository implements RuntimeBoxRepository {
 				revision,
 			});
 		});
+	}
+
+	switchActiveForClient(
+		clientIdValue: string,
+		inputValue: SwitchRuntimeBoxInput,
+	): ActiveRuntimeBoxSelection {
+		const clientId = runtimeBoxClientIdSchema.parse(clientIdValue);
+		const input = switchRuntimeBoxInputSchema.parse(inputValue);
+		return this.orm.transaction((transaction) => {
+			const target = transaction
+				.select()
+				.from(runtimeBoxesTable)
+				.where(eq(runtimeBoxesTable.id, input.runtimeBoxId))
+				.get();
+			if (target === undefined) {
+				throw new RuntimeBoxNotFoundError(input.runtimeBoxId);
+			}
+			if (target.archivedAtMs !== null) {
+				throw new RuntimeBoxArchivedError(input.runtimeBoxId);
+			}
+			const current =
+				transaction
+					.select()
+					.from(clientRuntimeBoxPreferencesTable)
+					.where(eq(clientRuntimeBoxPreferencesTable.clientId, clientId))
+					.get() ?? this.#seedClientPreference(transaction, clientId);
+			if (current.revision !== input.expectedRevision) {
+				throw new ActiveRuntimeRevisionConflictError(input.expectedRevision, current.revision);
+			}
+			if (current.runtimeBoxId === input.runtimeBoxId) {
+				return activeRuntimeBoxSelectionSchema.parse({
+					runtimeBoxId: current.runtimeBoxId,
+					revision: current.revision,
+				});
+			}
+			const revision = current.revision + 1;
+			transaction
+				.update(clientRuntimeBoxPreferencesTable)
+				.set({
+					runtimeBoxId: input.runtimeBoxId,
+					revision,
+					updatedAtMs: this.clock.now(),
+				})
+				.where(eq(clientRuntimeBoxPreferencesTable.clientId, clientId))
+				.run();
+			return activeRuntimeBoxSelectionSchema.parse({
+				runtimeBoxId: input.runtimeBoxId,
+				revision,
+			});
+		});
+	}
+
+	#seedClientPreference(
+		transaction: AppDatabaseTransaction,
+		clientId: string,
+	): { runtimeBoxId: string; revision: number } {
+		const global = transaction.select().from(appSettingsTable).get();
+		if (global === undefined) {
+			throw new Error("Active Runtime Box setting has not been initialized.");
+		}
+		const seed = { runtimeBoxId: global.activeRuntimeBoxId, revision: 1 };
+		transaction
+			.insert(clientRuntimeBoxPreferencesTable)
+			.values({
+				clientId,
+				runtimeBoxId: seed.runtimeBoxId,
+				revision: seed.revision,
+				updatedAtMs: this.clock.now(),
+			})
+			.run();
+		return seed;
 	}
 
 	acceptGeneration(

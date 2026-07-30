@@ -2,7 +2,8 @@ import { createHash, randomBytes } from "node:crypto";
 import { connect as connectTcp, type Socket } from "node:net";
 import { connect as connectTls } from "node:tls";
 
-import { RpcHandshakeError } from "./errors";
+import { RpcHandshakeError } from "@moshu/process-rpc-core";
+
 import {
 	RpcWebSocketClient,
 	type RpcWebSocketClient as RpcWebSocketClientInstance,

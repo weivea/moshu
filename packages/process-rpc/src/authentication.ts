@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 
-import { type RpcPeerIdentity, rpcPeerIdentitySchema } from "./protocol";
+import { type RpcPeerIdentity, rpcPeerIdentitySchema } from "@moshu/process-rpc-core";
 
 /** Minimum decoded entropy-bearing byte length for a bootstrap credential. */
 export const MIN_RPC_BOOTSTRAP_CREDENTIAL_BYTES = 32;

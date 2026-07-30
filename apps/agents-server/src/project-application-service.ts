@@ -214,21 +214,32 @@ export class ProjectApplicationService {
 		}
 	}
 
+	// A Project inherits the creating client's currently selected Runtime Box when the caller does not
+	// pin one explicitly. Selection is a per-client preference keyed by the authenticated peer id;
+	// callers never supply a raw client id. Falls back to the global default for internal callers.
+	#resolveActiveRuntimeBoxId(clientId: string | undefined): string {
+		return clientId === undefined
+			? this.#runtimeBoxes.getActive().runtimeBoxId
+			: this.#runtimeBoxes.getActiveForClient(clientId).runtimeBoxId;
+	}
+
 	previewPath(
 		inputValue: PreviewProjectPathInput,
+		clientId?: string,
 		signal?: AbortSignal,
 	): Promise<PreviewProjectPathOutput> {
 		const input = previewProjectPathInputSchema.parse(inputValue);
-		const runtimeBoxId = input.runtimeBoxId ?? this.#runtimeBoxes.getActive().runtimeBoxId;
+		const runtimeBoxId = input.runtimeBoxId ?? this.#resolveActiveRuntimeBoxId(clientId);
 		return this.#inspectPreview(runtimeBoxId, input.path, signal);
 	}
 
 	async create(
 		inputValue: ConfirmCreateProjectInput,
+		clientId?: string,
 		signal?: AbortSignal,
 	): Promise<ConfirmCreateProjectOutput> {
 		const input = confirmCreateProjectInputSchema.parse(inputValue);
-		const runtimeBoxId = input.runtimeBoxId ?? this.#runtimeBoxes.getActive().runtimeBoxId;
+		const runtimeBoxId = input.runtimeBoxId ?? this.#resolveActiveRuntimeBoxId(clientId);
 		const inspection = await this.#inspectAvailable(runtimeBoxId, input.path, signal);
 		if (
 			createProjectConfirmationToken(runtimeBoxId, input.path, inspection) !==

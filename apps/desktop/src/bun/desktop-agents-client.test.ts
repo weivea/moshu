@@ -2531,6 +2531,38 @@ describe("DesktopAgentsClient", () => {
 		client.close();
 	});
 
+	test("delivers a live event correlated by Run id without the origin request id echo", async () => {
+		const peer = new FakePeer((method) =>
+			method === productRpcMethods.chatSend ? createAcceptedPayload() : { events: [] },
+		);
+		let activeOptions: ConnectRpcClientOptions | undefined;
+		const client = new DesktopAgentsClient(async (options) => {
+			activeOptions = options;
+			return peer;
+		});
+		const receivedSeqs: number[] = [];
+		client.subscribeChatEvents((event) => {
+			receivedSeqs.push(event.seq);
+		});
+		await client.connect(createConnectOptions());
+		await client.request(
+			productRpcMethods.chatSend,
+			{ requestId: clientRequestId, sessionId, content: "hello" },
+			sendAskChatMessageInputSchema,
+			chatSendAcceptedOutputSchema,
+		);
+		const handler = activeOptions?.handlers?.events?.[agentsProductEventMethods[0]];
+		if (handler === undefined) {
+			throw new Error("Active chat event handler was not installed.");
+		}
+		await handler(
+			rpcJsonValueSchema.parse({ event: createDeltaEventPayload(1, "echo-less live") }),
+			{} as RpcEventContext,
+		);
+		expect(receivedSeqs).toEqual([1]);
+		client.close();
+	});
+
 	test.each([
 		["event count", { maxProvisionalEvents: 1, maxProvisionalBytes: 1_000_000 }],
 		["encoded bytes", { maxProvisionalEvents: 10, maxProvisionalBytes: 10 }],

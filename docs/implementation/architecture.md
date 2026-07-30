@@ -282,6 +282,23 @@ interface RpcEnvelope<T> {
 当前范围包含基于 Anonymous Dev Tunnel 的 Remote Runtime Box 和 Moshu 设备配对；Mobile Client、多租户、
 云调度和容器编排仍后置。Runtime ingress 不能弱化 Product RPC 的 loopback 和最小权限默认值。
 
+### 7.4 Browser-safe RPC core（Mobile stack Layer 1）
+
+为给未来 Mobile Client（WKWebView / Capacitor）预留 transport，RPC 实现拆成两层，保持现有 Bun
+server/client 行为与 API 完全兼容：
+
+- `@moshu/process-rpc-core`：transport-neutral、**无任何 Node/Bun 依赖**的核心。包含 protocol/envelope
+  的 Zod schema、`RpcPeer`、limits、JSON structure guard、errors/callback helper、generation fence、
+  WebSocket close-reason util，以及 `RpcSocketTransport` transport 接口。该包用一个 browser tsconfig
+  （`lib: ["ES2023","DOM"]`、`types: []`）编译，并有运行期源码扫描测试，双重证明核心不引入
+  `node:*` import、`Bun.*`、`Buffer`、`process.*` 或 raw `ws`。
+- `@moshu/process-rpc`：Node/Bun **adapter**。保留 authentication（`node:crypto`）、raw TCP/TLS/ws
+  client、Bun `serve` server，并从 core re-export 全部公共符号，因此所有现有 consumer 仍从
+  `@moshu/process-rpc` import，零改动。
+- `RpcSocketTransport` 是 core 与具体传输之间的唯一缝：Bun server、Node/Bun raw client 各自实现它；
+  未来 Swift/Capacitor bridge 只需实现同一个 `send/close/terminate/isOpen` 契约即可承载 RPC 帧，无需
+  引入原生 socket/crypto/WebSocket 库。本层**不**实现 iOS plugin。
+
 ## 8. Agent runtime、Provider 与持久化
 
 ### 8.1 Agent runtime

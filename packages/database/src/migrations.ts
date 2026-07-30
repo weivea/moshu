@@ -1,6 +1,6 @@
 import type Database from "bun:sqlite";
 
-export const currentAppDatabaseVersion = 21;
+export const currentAppDatabaseVersion = 22;
 
 export class AppDatabaseResetRequiredError extends Error {
 	readonly currentVersion: number;
@@ -80,6 +80,7 @@ export function applyAppMigrations(client: Database): void {
 			DROP TABLE IF EXISTS runtime_box_device_keys;
 			DROP TABLE IF EXISTS runtime_box_pairing_sessions;
 			DROP TABLE IF EXISTS projects;
+			DROP TABLE IF EXISTS client_runtime_box_preferences;
 			DROP TABLE IF EXISTS app_settings;
 			DROP TABLE IF EXISTS remote_access_settings;
 			DROP TABLE IF EXISTS runtime_boxes;
@@ -230,6 +231,13 @@ export function applyAppMigrations(client: Database): void {
 				active_runtime_box_id TEXT NOT NULL REFERENCES runtime_boxes(id),
 				active_runtime_revision INTEGER NOT NULL,
 				action_journal_epoch TEXT NOT NULL
+			);
+
+			CREATE TABLE client_runtime_box_preferences (
+				client_id TEXT PRIMARY KEY NOT NULL,
+				runtime_box_id TEXT NOT NULL REFERENCES runtime_boxes(id),
+				revision INTEGER NOT NULL,
+				updated_at_ms INTEGER NOT NULL
 			);
 
 			CREATE TABLE remote_access_settings (

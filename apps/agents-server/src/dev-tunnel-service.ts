@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import {
 	type RemoteAccessAuthAttempt,
+	type RemoteAccessIngress,
 	type RemoteAccessStatusOutput,
 	remoteAccessAuthAttemptSchema,
 	remoteAccessStatusOutputSchema,
@@ -24,10 +25,29 @@ export interface DevTunnelAuthenticationProcess {
 	stop(): void;
 }
 
+/**
+ * A single Moshu-owned tunnel ingress. Today only the Runtime ingress exists; a future Mobile
+ * ingress (Layer 3) adds a second descriptor with its own port. Modelling the ingresses as a set of
+ * typed descriptors — rather than a single scalar port — is what lets the tunnel reconcile against
+ * an expected port set instead of destroying every other forwarded port.
+ */
+export type DevTunnelIngressKind = "runtime";
+
+export interface DevTunnelIngress {
+	readonly kind: DevTunnelIngressKind;
+	readonly port: number;
+}
+
 export interface DevTunnelAdapter {
 	isAuthenticated(signal: AbortSignal): Promise<boolean>;
 	startAuthentication(): DevTunnelAuthenticationProcess;
-	ensureTunnel(tunnelId: string, port: number, signal: AbortSignal): Promise<string>;
+	/**
+	 * Reconciles the tunnel so that exactly the expected `ports` are forwarded with anonymous HTTP
+	 * access. Ports already present that are not in the expected set are removed; expected ports that
+	 * are missing or misconfigured are repaired. Ports belonging to other Moshu ingresses in the same
+	 * expected set are preserved — they must never be cross-deleted.
+	 */
+	ensureTunnel(tunnelId: string, ports: readonly number[], signal: AbortSignal): Promise<string>;
 	deleteTunnel(tunnelId: string, signal: AbortSignal): Promise<void>;
 	startHost(tunnelId: string, port: number): DevTunnelHostProcess;
 }
@@ -64,6 +84,7 @@ class DevTunnelAuthenticationRequiredError extends Error {
 export class DevTunnelService {
 	readonly #repository: RemoteAccessRepository;
 	readonly #runtimeIngressPort: number;
+	readonly #ingresses: readonly DevTunnelIngress[];
 	readonly #adapter: DevTunnelAdapter;
 	readonly #reportDiagnostic: (message: string) => void;
 	readonly #now: () => number;
@@ -93,6 +114,7 @@ export class DevTunnelService {
 	constructor(options: DevTunnelServiceOptions) {
 		this.#repository = options.repository;
 		this.#runtimeIngressPort = options.runtimeIngressPort;
+		this.#ingresses = [{ kind: "runtime", port: options.runtimeIngressPort }];
 		this.#adapter =
 			options.adapter ??
 			new DevTunnelCliAdapter(process.env.MOSHU_DEVTUNNEL_PATH?.trim() || "devtunnel");
@@ -137,6 +159,13 @@ export class DevTunnelService {
 			settings.enabled || this.#state === "stopping" || this.#host !== undefined
 				? this.#state
 				: "disabled";
+		const ingresses: RemoteAccessIngress[] = this.#ingresses.map((ingress) => ({
+			kind: ingress.kind,
+			port: ingress.port,
+			...(ingress.kind === "runtime" && settings.publicUrl !== undefined
+				? { publicUrl: settings.publicUrl }
+				: {}),
+		}));
 		return remoteAccessStatusOutputSchema.parse({
 			enabled: settings.enabled,
 			authenticated: this.#authenticated,
@@ -144,6 +173,7 @@ export class DevTunnelService {
 			runtimeIngressPort: this.#runtimeIngressPort,
 			...(settings.tunnelId === undefined ? {} : { tunnelId: settings.tunnelId }),
 			...(settings.publicUrl === undefined ? {} : { publicUrl: settings.publicUrl }),
+			ingresses,
 			...(this.#lastError === undefined ? {} : { lastError: this.#lastError }),
 			trafficEstimate: {
 				month,
@@ -618,7 +648,11 @@ export class DevTunnelService {
 				this.#repository.setTunnel(tunnelId);
 			}
 			const qualifiedTunnelId = await withAbortTimeout(
-				this.#adapter.ensureTunnel(tunnelId, this.#runtimeIngressPort, startAbortController.signal),
+				this.#adapter.ensureTunnel(
+					tunnelId,
+					this.#ingresses.map((ingress) => ingress.port),
+					startAbortController.signal,
+				),
 				30_000,
 				"Dev Tunnel setup",
 				startAbortController,
@@ -841,7 +875,15 @@ export class DevTunnelCliAdapter implements DevTunnelAdapter {
 		return createStreamingAuthenticationProcess(child);
 	}
 
-	async ensureTunnel(tunnelId: string, port: number, signal: AbortSignal): Promise<string> {
+	async ensureTunnel(
+		tunnelId: string,
+		ports: readonly number[],
+		signal: AbortSignal,
+	): Promise<string> {
+		const expectedPorts = [...new Set(ports)];
+		if (expectedPorts.length === 0) {
+			throw new Error("Dev Tunnel setup requires at least one expected ingress port.");
+		}
 		const tunnelList = await this.commandRunner(this.executable, ["list", "--json"], false, signal);
 		let qualifiedTunnelId = findListedTunnelId(tunnelList.stdout, tunnelId);
 		if (qualifiedTunnelId === undefined) {
@@ -853,7 +895,8 @@ export class DevTunnelCliAdapter implements DevTunnelAdapter {
 			);
 			qualifiedTunnelId = parseQualifiedTunnelId(tunnelResult.stdout, tunnelId);
 		}
-		const ports = parseTunnelPorts(
+		const expected = new Set(expectedPorts);
+		const existingPorts = parseTunnelPorts(
 			(
 				await this.commandRunner(
 					this.executable,
@@ -863,8 +906,10 @@ export class DevTunnelCliAdapter implements DevTunnelAdapter {
 				)
 			).stdout,
 		);
-		for (const existingPort of ports) {
-			if (existingPort !== port) {
+		// Reconcile against the expected set: drop only ports that no Moshu ingress claims. Ports for a
+		// second Moshu ingress (e.g. a future Mobile listener) stay in `expected` and are never deleted.
+		for (const existingPort of existingPorts) {
+			if (!expected.has(existingPort)) {
 				await this.commandRunner(
 					this.executable,
 					["port", "delete", qualifiedTunnelId, "-p", String(existingPort)],
@@ -873,29 +918,31 @@ export class DevTunnelCliAdapter implements DevTunnelAdapter {
 				);
 			}
 		}
-		const targetPort = await this.commandRunner(
-			this.executable,
-			["port", "show", qualifiedTunnelId, "-p", String(port), "--json"],
-			true,
-			signal,
-		);
-		const targetProtocol =
-			targetPort.exitCode === 0 ? parseTunnelPortProtocol(targetPort.stdout) : undefined;
-		if (targetProtocol !== undefined && targetProtocol !== "http") {
-			await this.commandRunner(
+		for (const expectedPort of expectedPorts) {
+			const targetPort = await this.commandRunner(
 				this.executable,
-				["port", "delete", qualifiedTunnelId, "-p", String(port)],
-				false,
+				["port", "show", qualifiedTunnelId, "-p", String(expectedPort), "--json"],
+				true,
 				signal,
 			);
-		}
-		if (targetPort.exitCode !== 0 || targetProtocol !== "http") {
-			await this.commandRunner(
-				this.executable,
-				["port", "create", qualifiedTunnelId, "-p", String(port), "--protocol", "http"],
-				false,
-				signal,
-			);
+			const targetProtocol =
+				targetPort.exitCode === 0 ? parseTunnelPortProtocol(targetPort.stdout) : undefined;
+			if (targetProtocol !== undefined && targetProtocol !== "http") {
+				await this.commandRunner(
+					this.executable,
+					["port", "delete", qualifiedTunnelId, "-p", String(expectedPort)],
+					false,
+					signal,
+				);
+			}
+			if (targetPort.exitCode !== 0 || targetProtocol !== "http") {
+				await this.commandRunner(
+					this.executable,
+					["port", "create", qualifiedTunnelId, "-p", String(expectedPort), "--protocol", "http"],
+					false,
+					signal,
+				);
+			}
 		}
 		await this.commandRunner(
 			this.executable,
@@ -903,18 +950,27 @@ export class DevTunnelCliAdapter implements DevTunnelAdapter {
 			false,
 			signal,
 		);
-		await this.commandRunner(
-			this.executable,
-			["access", "reset", qualifiedTunnelId, "--port-number", String(port)],
-			false,
-			signal,
-		);
-		await this.commandRunner(
-			this.executable,
-			["access", "create", qualifiedTunnelId, "--port-number", String(port), "--anonymous"],
-			false,
-			signal,
-		);
+		for (const expectedPort of expectedPorts) {
+			await this.commandRunner(
+				this.executable,
+				["access", "reset", qualifiedTunnelId, "--port-number", String(expectedPort)],
+				false,
+				signal,
+			);
+			await this.commandRunner(
+				this.executable,
+				[
+					"access",
+					"create",
+					qualifiedTunnelId,
+					"--port-number",
+					String(expectedPort),
+					"--anonymous",
+				],
+				false,
+				signal,
+			);
+		}
 		return qualifiedTunnelId;
 	}
 

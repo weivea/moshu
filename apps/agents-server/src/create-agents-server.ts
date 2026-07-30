@@ -219,17 +219,19 @@ export async function createAgentsServer(
 			if (server === undefined) {
 				return;
 			}
-			const payload = rpcJsonValueSchema.parse(
-				createRuntimeBoxesSnapshot(
-					database.runtimeBoxes,
-					runtimeBoxRegistry,
-					database.runtimeBoxPairings,
-				),
-			);
 			for (const peer of server.peers) {
 				if (peer.remoteIdentity.role !== "client") {
 					continue;
 				}
+				// The snapshot's `active` selection is per-client, so build it for each client peer.
+				const payload = rpcJsonValueSchema.parse(
+					createRuntimeBoxesSnapshot(
+						database.runtimeBoxes,
+						runtimeBoxRegistry,
+						database.runtimeBoxPairings,
+						peer.remoteIdentity.peerId,
+					),
+				);
 				try {
 					peer.emitEvent(productRpcEvents.runtimeBoxesChanged, payload);
 				} catch (error) {
@@ -312,6 +314,8 @@ export async function createAgentsServer(
 				: { fetchProviderModels: options.fetchProviderModels }),
 			isRuntimeReady: (runtimeBoxId) => runtimeBoxRegistry.isReady(runtimeBoxId),
 			getActiveRuntimeBoxId: () => database.runtimeBoxes.getActive().runtimeBoxId,
+			getActiveRuntimeBoxIdForClient: (clientId) =>
+				database.runtimeBoxes.getActiveForClient(clientId).runtimeBoxId,
 			withProjectSessionCreation: (projectId, createSession, signal) =>
 				initializedProjectService.withSessionCreation(projectId, createSession, signal),
 			withProjectRunPreflight: (projectId, createRun, signal) =>

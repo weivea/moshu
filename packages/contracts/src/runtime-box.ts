@@ -101,6 +101,20 @@ export const switchRuntimeBoxOutputSchema = z
 	})
 	.strict();
 
+// A stable client identity (the authenticated peer's `peerId`). Runtime Box selection is a
+// per-client preference keyed by this identity so Desktop and a future Mobile client can each
+// hold their own active Runtime Box; the server derives it from the authenticated peer and never
+// trusts a caller-supplied value. Mirrors the RPC identifier bounds used for peer identities.
+export const runtimeBoxClientIdSchema = z.string().min(1).max(256);
+
+export const clientRuntimeBoxPreferenceSchema = z
+	.object({
+		clientId: runtimeBoxClientIdSchema,
+		runtimeBoxId: runtimeBoxIdSchema,
+		revision: z.int().positive().safe(),
+	})
+	.strict();
+
 const pairingSecretSchema = z
 	.string()
 	.min(22)
@@ -283,6 +297,16 @@ export const remoteAccessStateSchema = z.enum([
 	"repair_required",
 ]);
 
+export const remoteAccessIngressKindSchema = z.enum(["runtime"]);
+
+export const remoteAccessIngressSchema = z
+	.object({
+		kind: remoteAccessIngressKindSchema,
+		port: z.int().min(1).max(65_535),
+		publicUrl: z.string().url().optional(),
+	})
+	.strict();
+
 export const remoteAccessStatusOutputSchema = z
 	.object({
 		enabled: z.boolean(),
@@ -291,6 +315,7 @@ export const remoteAccessStatusOutputSchema = z
 		runtimeIngressPort: z.int().min(1).max(65_535),
 		tunnelId: z.string().min(3).max(60).optional(),
 		publicUrl: z.string().url().optional(),
+		ingresses: z.array(remoteAccessIngressSchema).min(1).max(10),
 		lastError: z.string().min(1).max(1_024).optional(),
 		trafficEstimate: z
 			.object({
@@ -386,6 +411,8 @@ export type ActiveRuntimeBoxSelection = z.infer<typeof activeRuntimeBoxSelection
 export type ListRuntimeBoxesOutput = z.infer<typeof listRuntimeBoxesOutputSchema>;
 export type SwitchRuntimeBoxInput = z.infer<typeof switchRuntimeBoxInputSchema>;
 export type SwitchRuntimeBoxOutput = z.infer<typeof switchRuntimeBoxOutputSchema>;
+export type RuntimeBoxClientId = z.infer<typeof runtimeBoxClientIdSchema>;
+export type ClientRuntimeBoxPreference = z.infer<typeof clientRuntimeBoxPreferenceSchema>;
 export type CreateRuntimeBoxPairingOutput = z.infer<typeof createRuntimeBoxPairingOutputSchema>;
 export type ClaimRuntimeBoxPairingInput = z.infer<typeof claimRuntimeBoxPairingInputSchema>;
 export type ClaimRuntimeBoxPairingOutput = z.infer<typeof claimRuntimeBoxPairingOutputSchema>;
@@ -409,6 +436,8 @@ export type RuntimeBoxCompatibilityReportOutput = z.infer<
 	typeof runtimeBoxCompatibilityReportOutputSchema
 >;
 export type RemoteAccessStatusOutput = z.infer<typeof remoteAccessStatusOutputSchema>;
+export type RemoteAccessIngress = z.infer<typeof remoteAccessIngressSchema>;
+export type RemoteAccessIngressKind = z.infer<typeof remoteAccessIngressKindSchema>;
 export type RemoteAccessAuthAttempt = z.infer<typeof remoteAccessAuthAttemptSchema>;
 export type RemoteAccessMutationOutput = z.infer<typeof remoteAccessMutationOutputSchema>;
 export type RuntimeDiagnosticsOutput = z.infer<typeof runtimeDiagnosticsOutputSchema>;

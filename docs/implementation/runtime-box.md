@@ -78,7 +78,7 @@ credential、公开 URL、Runtime ingress 端口和 Remote Box 状态不能由 D
 | Tunnel 配置、Microsoft Host credential、Host 连接 | Agent Server | credential 存 Agent Server Secret Vault |
 | Product DB、Session、Project、Run/event | Agent Server | 所有记录绑定 `runtimeBoxId` |
 | Agent、Provider、Policy、Approval、Action intent/result | Agent Server | Provider Secret 永不发送 Box |
-| 全局 `activeRuntimeBoxId` | Agent Server | revision/CAS 更新并广播 |
+| 每个 Client 的 active Runtime 偏好 | Agent Server | 由稳定 client identity（Desktop `clientId`，未来 `mobileClientId`）持有的 revision/CAS 偏好；Session/Project/Run 仍持久归属 `runtimeBoxId` |
 | MCP config/credential/OAuth/lifecycle | owning Runtime Box | Agent Server 只有脱敏投影与稳定引用 |
 | Box-owned Skill installation/version/content/resources/scripts | owning Runtime Box | Agent Server 不保存可恢复正文 |
 | 文件、命令、Git、MCP Tool、Skill script | Runtime Box 内部 Executor | 每次副作用需要 Server grant |
@@ -116,6 +116,13 @@ interface DevTunnelService {
 
 Agent Server 持久化 `tunnelId`、cluster、Runtime ingress port、public URL、enabled、lastHostedAt 和
 lastError。Microsoft 登录 token 只能写入 Agent Server Secret Vault。
+
+`DevTunnelService`/`DevTunnelAdapter` 管理一个**期望端口集合（typed ingress descriptors）**而非单一 scalar 端口：
+`ensureTunnel` 按期望端口集合 reconcile，只增删属于本 Service 期望之外的端口，**不再删除同属 Moshu 的其他 ingress**
+（历史根因：旧 `ensureTunnel(tunnelId, port)` 会删除所有其他端口）。每个端口按需单独配置 anonymous access，并各自
+收集 public URL / readiness / traffic。`getStatus` 暴露 `ingresses` 列表（typed descriptor）。当前仍只有 Runtime
+ingress 一个实例；未来 Mobile ingress 作为**第二个端口**接入时无需再改根因逻辑。本层不实际新增 Mobile listener
+或 pairing（属于后续层）。
 
 启动顺序：
 
@@ -266,26 +273,28 @@ invocation IDs、lastSeen 和 lastError。
 
 调度不变量：
 
-- 新 Session/Project 默认使用当时的 `activeRuntimeBoxId`。
+- 新 Session/Project 默认使用**发起 Client 当前的 active Runtime 偏好**（由其稳定 client identity 解析），而非全局单值。
 - Session/Project 创建后永久绑定该 Box。
 - Run、cancel、Tool、恢复都按 Session 持久化的 `runtimeBoxId` 路由。
-- 切换 active Runtime 不停止、不迁移、不拒绝其他 Box 上的既有 Run。
+- 切换 active Runtime 只影响该 Client 后续的默认放置，不停止、不迁移、不拒绝其他 Box 上的既有 Run。
 - Runtime Box offline 时不能创建可执行 Run。
 - 内置 Tool 在注册成功后即可具备基础 readiness；依赖 MCP/Skill 的 Run 才要求 inventory full sync。
 
-全局选择使用 CAS：
+Client-scoped 选择使用 CAS，按稳定 client identity 持有：
 
 ```ts
-interface ActiveRuntimeSetting {
+interface ActiveRuntimeBoxSelection {
   runtimeBoxId: string;
   revision: number;
 }
 
+// client identity 由 authenticated peer 解析（Desktop clientId，未来 mobileClientId），
+// 不信任调用方传入任意 clientId。
 runtimeBoxes.switch({ runtimeBoxId, expectedRevision })
 ```
 
-Server 成功持久化后广播带 revision 的 `runtimeBoxes.activeChanged`。Client 只应用更高 revision，避免多个
-窗口或未来 Client 的乱序更新。
+Server 成功持久化后广播带 revision 的 `runtimeBoxes.activeChanged`（针对该 Client 自身的偏好）。Client 只应用更高
+revision，避免同一 Client 的多个窗口或未来 Client 的乱序更新。不同 Client 的偏好相互独立。
 
 任务中心全局展示所有 Box 的 Run；Sessions/Projects 主列表只展示 active Box。从任务中心打开其他 Box 的
 Session 时，先原子切换 active Box，再导航。
@@ -302,10 +311,14 @@ runtime_box_generation_fences
 runtime_box_pairing_sessions
 runtime_box_inventory_state
 runtime_box_inventory_cache
+client_runtime_box_preferences
 app_settings
 projects
 agent_runtime_profiles
 ```
+
+`client_runtime_box_preferences` 按稳定 client identity 保存该 Client 当前 active Runtime Box 与 revision（取代
+全局单值放置）；Session/Project/Run 仍持久归属 `runtimeBoxId`。
 
 现有表增加：
 

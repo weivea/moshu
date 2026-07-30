@@ -195,6 +195,19 @@ export const appSettingsTable = sqliteTable("app_settings", {
 	actionJournalEpoch: text("action_journal_epoch").notNull(),
 });
 
+// Per-client active Runtime Box preference keyed by the authenticated client identity (the peer's
+// `peerId`). `app_settings.active_runtime_box_id` remains the global default that seeds a client's
+// first read; each client thereafter revisions its own selection independently. Session/Project/Run
+// still persist their own `runtime_box_id`, so this table only records UI selection, not routing.
+export const clientRuntimeBoxPreferencesTable = sqliteTable("client_runtime_box_preferences", {
+	clientId: text("client_id").primaryKey(),
+	runtimeBoxId: text("runtime_box_id")
+		.notNull()
+		.references(() => runtimeBoxesTable.id),
+	revision: integer("revision").notNull(),
+	updatedAtMs: integer("updated_at_ms").notNull(),
+});
+
 export const remoteAccessSettingsTable = sqliteTable("remote_access_settings", {
 	id: integer("id").primaryKey(),
 	enabled: integer("enabled", { mode: "boolean" }).notNull(),
@@ -541,6 +554,7 @@ export const appSchema = {
 	agentServerSkillPendingContentDeletionsTable,
 	agentServerSkillVersionsTable,
 	appSettingsTable,
+	clientRuntimeBoxPreferencesTable,
 	remoteAccessSettingsTable,
 	projectsTable,
 	projectDeletionJobsTable,

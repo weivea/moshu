@@ -159,6 +159,66 @@ describe("application database", () => {
 		}
 	});
 
+	test("keeps Runtime Box selection per client without disturbing other clients", () => {
+		const database = openAppDatabase(":memory:");
+		try {
+			database.runtimeBoxes.upsertRegistration({
+				schemaVersion: 1,
+				runtimeBoxId: "remote-linux",
+				kind: "remote",
+				displayName: "Remote Linux",
+				runtimeBoxVersion: "0.0.1",
+				platform: "linux",
+				arch: "x64",
+				capabilities: ["tool.read"],
+			});
+
+			// Both clients seed lazily from the global default at revision 1.
+			const desktopInitial = database.runtimeBoxes.getActiveForClient("moshu-desktop-client");
+			expect(desktopInitial).toEqual({ runtimeBoxId: defaultLocalRuntimeBoxId, revision: 1 });
+			// Re-reading is idempotent: it does not bump the revision.
+			expect(database.runtimeBoxes.getActiveForClient("moshu-desktop-client")).toEqual({
+				runtimeBoxId: defaultLocalRuntimeBoxId,
+				revision: 1,
+			});
+
+			const desktopSwitched = database.runtimeBoxes.switchActiveForClient("moshu-desktop-client", {
+				runtimeBoxId: "remote-linux",
+				expectedRevision: desktopInitial.revision,
+			});
+			expect(desktopSwitched).toEqual({ runtimeBoxId: "remote-linux", revision: 2 });
+
+			// A second client is unaffected by the first client's switch.
+			expect(database.runtimeBoxes.getActiveForClient("moshu-mobile-client")).toEqual({
+				runtimeBoxId: defaultLocalRuntimeBoxId,
+				revision: 1,
+			});
+			// The global default preference is likewise untouched by a client-scoped switch.
+			expect(database.runtimeBoxes.getActive()).toEqual({
+				runtimeBoxId: defaultLocalRuntimeBoxId,
+				revision: 1,
+			});
+
+			// Optimistic concurrency is scoped to the client's own revision sequence.
+			expect(() =>
+				database.runtimeBoxes.switchActiveForClient("moshu-desktop-client", {
+					runtimeBoxId: defaultLocalRuntimeBoxId,
+					expectedRevision: 1,
+				}),
+			).toThrow("revision conflict");
+
+			// Switching to a missing or archived Box is rejected before the preference mutates.
+			expect(() =>
+				database.runtimeBoxes.switchActiveForClient("moshu-mobile-client", {
+					runtimeBoxId: "does-not-exist",
+					expectedRevision: 1,
+				}),
+			).toThrow("was not found");
+		} finally {
+			database.close();
+		}
+	});
+
 	test("persists Runtime Box generation high-water marks", () => {
 		withTempDatabase((databasePath) => {
 			const database = openAppDatabase(databasePath);

@@ -7,12 +7,7 @@ import {
 	probeAgentRuntime,
 } from "@moshu/agent-runtime";
 import {
-	agentsProductEventMethods,
 	agentsRuntimeInfoSchema,
-	type ChatRunEvent,
-	chatEventDeliverySchema,
-	chatRunEventSchema,
-	chatSessionsRetiredEventSchema,
 	clientProductRequestMethods,
 	currentRuntimeBoxProtocolVersion,
 	getAgentGlobalProfileOutputSchema,
@@ -74,7 +69,6 @@ import {
 	SkillResourceVersionConflictError,
 } from "@moshu/database";
 import {
-	isSameRpcPeerIdentity,
 	type JsonValue,
 	RpcHandlerError,
 	type RpcHandlers,
@@ -88,6 +82,11 @@ import { ZodError, type ZodType, type z } from "zod";
 
 import type { ChatApplicationService } from "./chat-application-service";
 import type { DevTunnelService } from "./dev-tunnel-service";
+import {
+	ProductEventRouter,
+	publishChatEvent,
+	publishRetiredChatSessions,
+} from "./product-event-hub";
 import {
 	type ProjectApplicationService,
 	ProjectArchivedError,
@@ -127,110 +126,8 @@ export interface ProductRpcDependencies {
 	getRuntimeDiagnostics?: () => RuntimeDiagnosticsOutput;
 }
 
-interface ProductEventRouteBinding {
-	readonly peerId: string;
-	readonly peerIdentity: RpcPeer["remoteIdentity"];
-}
-
-export interface ProductEventRouteLease {
-	readonly requestId: string;
-	readonly binding: ProductEventRouteBinding;
-	readonly created: boolean;
-	readonly previousBinding: ProductEventRouteBinding | undefined;
-}
-
-export class ProductEventRouter {
-	readonly #bindingsByRequestId = new Map<string, ProductEventRouteBinding>();
-
-	bind(requestId: string, peer: RpcPeer): ProductEventRouteLease {
-		const existing = this.#bindingsByRequestId.get(requestId);
-		if (existing !== undefined && existing.peerId !== peer.remoteIdentity.peerId) {
-			throw new RpcHandlerError(
-				"REQUEST_OWNER_MISMATCH",
-				"Chat send request belongs to another client peer.",
-			);
-		}
-		if (existing !== undefined) {
-			return {
-				requestId,
-				binding: createRouteBinding(peer),
-				created: false,
-				previousBinding: existing,
-			};
-		}
-		if (this.#bindingsByRequestId.size >= 1_024) {
-			throw new RpcHandlerError("REQUEST_OWNER_LIMIT", "Too many active Chat send request owners.");
-		}
-		const binding = createRouteBinding(peer);
-		this.#bindingsByRequestId.set(requestId, binding);
-		return { requestId, binding, created: true, previousBinding: undefined };
-	}
-
-	commit(lease: ProductEventRouteLease): boolean {
-		const current = this.#bindingsByRequestId.get(lease.requestId);
-		if (lease.created) {
-			return current === lease.binding;
-		}
-		if (current === lease.previousBinding) {
-			this.#bindingsByRequestId.set(lease.requestId, lease.binding);
-			return true;
-		}
-		return current === lease.binding;
-	}
-
-	rollback(lease: ProductEventRouteLease): void {
-		if (lease.created && this.#bindingsByRequestId.get(lease.requestId) === lease.binding) {
-			this.#bindingsByRequestId.delete(lease.requestId);
-		}
-	}
-
-	release(lease: ProductEventRouteLease): void {
-		if (this.#bindingsByRequestId.get(lease.requestId) === lease.binding) {
-			this.#bindingsByRequestId.delete(lease.requestId);
-		}
-	}
-
-	releasePeer(peer: RpcPeer): void {
-		for (const [requestId, binding] of this.#bindingsByRequestId) {
-			if (isSameRpcPeerIdentity(binding.peerIdentity, peer.remoteIdentity)) {
-				this.#bindingsByRequestId.delete(requestId);
-			}
-		}
-	}
-
-	publish(peers: readonly RpcPeer[], event: ChatRunEvent, clientRequestId: string): void {
-		const binding = this.#bindingsByRequestId.get(clientRequestId);
-		if (binding === undefined) {
-			return;
-		}
-		publishChatEvent(
-			peers.filter(
-				(peer) =>
-					peer.remoteIdentity.role === "client" &&
-					isSameRpcPeerIdentity(peer.remoteIdentity, binding.peerIdentity),
-			),
-			event,
-			clientRequestId,
-		);
-		if (
-			event.type === "run.status" &&
-			(event.payload.status === "completed" ||
-				event.payload.status === "failed" ||
-				event.payload.status === "cancelled")
-		) {
-			if (this.#bindingsByRequestId.get(clientRequestId) === binding) {
-				this.#bindingsByRequestId.delete(clientRequestId);
-			}
-		}
-	}
-}
-
-function createRouteBinding(peer: RpcPeer): ProductEventRouteBinding {
-	return {
-		peerId: peer.remoteIdentity.peerId,
-		peerIdentity: peer.remoteIdentity,
-	};
-}
+export type { ProductEventRouteLease } from "./product-event-hub";
+export { ProductEventRouter, publishChatEvent, publishRetiredChatSessions };
 
 export const agentsServerClientMethodAllowlist: RpcMethodAllowlist = {
 	client: { requests: clientProductRequestMethods },
@@ -335,7 +232,7 @@ export function createProductRpcHandlers(dependencies: ProductRpcDependencies): 
 		requests: {
 			[productRpcMethods.runtimeGet]: createRequestHandler(
 				productRpcRequestSchemas[productRpcMethods.runtimeGet],
-				() =>
+				(_input, peer) =>
 					agentsRuntimeInfoSchema.parse({
 						apiVersion: 3,
 						serverVersion: dependencies.serverVersion,
@@ -343,18 +240,25 @@ export function createProductRpcHandlers(dependencies: ProductRpcDependencies): 
 						platform: process.platform,
 						arch: process.arch,
 						agentRuntime: probeAgentRuntime(),
-						activeRuntimeBoxId: runtimeBoxes.getActive().runtimeBoxId,
+						activeRuntimeBoxId: runtimeBoxes.getActiveForClient(resolveProductClientId(peer))
+							.runtimeBoxId,
 						runtimeBoxes: runtimeBoxRegistry.listInfo(),
 					}),
 			),
 			[productRpcMethods.runtimeBoxesList]: createRequestHandler(
 				productRpcRequestSchemas[productRpcMethods.runtimeBoxesList],
-				() => createRuntimeBoxesSnapshot(runtimeBoxes, runtimeBoxRegistry, runtimeBoxPairings),
+				(_input, peer) =>
+					createRuntimeBoxesSnapshot(
+						runtimeBoxes,
+						runtimeBoxRegistry,
+						runtimeBoxPairings,
+						resolveProductClientId(peer),
+					),
 			),
 			[productRpcMethods.runtimeBoxesSwitch]: createRequestHandler(
 				productRpcRequestSchemas[productRpcMethods.runtimeBoxesSwitch],
-				(input) => {
-					const active = runtimeBoxes.switchActive(input);
+				(input, peer) => {
+					const active = runtimeBoxes.switchActiveForClient(resolveProductClientId(peer), input);
 					runtimeBoxRegistry.setActiveRuntimeBoxId(active.runtimeBoxId);
 					return switchRuntimeBoxOutputSchema.parse({ active });
 				},
@@ -445,11 +349,13 @@ export function createProductRpcHandlers(dependencies: ProductRpcDependencies): 
 			),
 			[productRpcMethods.projectsPreviewPath]: createRequestHandler(
 				productRpcRequestSchemas[productRpcMethods.projectsPreviewPath],
-				(input, _peer, context) => getProjectService().previewPath(input, context.signal),
+				(input, peer, context) =>
+					getProjectService().previewPath(input, resolveProductClientId(peer), context.signal),
 			),
 			[productRpcMethods.projectsCreate]: createRequestHandler(
 				productRpcRequestSchemas[productRpcMethods.projectsCreate],
-				(input, _peer, context) => getProjectService().create(input, context.signal),
+				(input, peer, context) =>
+					getProjectService().create(input, resolveProductClientId(peer), context.signal),
 			),
 			[productRpcMethods.projectsList]: createRequestHandler(
 				productRpcRequestSchemas[productRpcMethods.projectsList],
@@ -1027,6 +933,28 @@ export function createProductRpcHandlers(dependencies: ProductRpcDependencies): 
 				productRpcRequestSchemas[productRpcMethods.chatReplay],
 				(input) => chatService.replayEvents(input),
 			),
+			[productRpcMethods.chatSubscribe]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.chatSubscribe],
+				(input, peer) => {
+					eventRouter.subscribe(peer, input.sessionId);
+					return {
+						schemaVersion: 1 as const,
+						sessionId: input.sessionId,
+						subscribed: true as const,
+					};
+				},
+			),
+			[productRpcMethods.chatUnsubscribe]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.chatUnsubscribe],
+				(input, peer) => {
+					eventRouter.unsubscribe(peer, input.sessionId);
+					return {
+						schemaVersion: 1 as const,
+						sessionId: input.sessionId,
+						subscribed: false as const,
+					};
+				},
+			),
 			[productRpcMethods.chatRetiredSessionsList]: createRequestHandler(
 				productRpcRequestSchemas[productRpcMethods.chatRetiredSessionsList],
 				(input) => chatService.listRetiredSessions(input),
@@ -1111,9 +1039,11 @@ export function createRuntimeBoxesSnapshot(
 	runtimeBoxes: RuntimeBoxRepository,
 	registry: RuntimeBoxRegistry,
 	pairings?: RuntimeBoxPairingRepository,
+	clientId?: string,
 ): ListRuntimeBoxesOutput {
 	return listRuntimeBoxesOutputSchema.parse({
-		active: runtimeBoxes.getActive(),
+		active:
+			clientId === undefined ? runtimeBoxes.getActive() : runtimeBoxes.getActiveForClient(clientId),
 		items: registry.listInfo().map((item) => ({
 			...item,
 			deviceKeyIds:
@@ -1122,56 +1052,17 @@ export function createRuntimeBoxesSnapshot(
 	});
 }
 
-export function publishChatEvent(
-	peers: readonly RpcPeer[],
-	event: ChatRunEvent,
-	clientRequestId: string,
-): void {
-	const payload = encodeJsonValue(
-		chatEventDeliverySchema.parse({
-			clientRequestId,
-			event: chatRunEventSchema.parse(event),
-		}),
-	);
-	for (const peer of peers) {
-		if (peer.remoteIdentity.role === "client") {
-			try {
-				peer.emitEvent(agentsProductEventMethods[0], payload, { eventId: event.id });
-			} catch (error) {
-				peer.close(1011, "Chat event publication failed.");
-				console.error(
-					`Failed to publish chat event to client ${peer.remoteIdentity.peerId}.`,
-					error,
-				);
-			}
-		}
+// Runtime Box selection is a per-client preference. The client identity is the authenticated peer's
+// stable `peerId`; the server never trusts a caller-supplied client id. Only product clients (the
+// Desktop app today, a Mobile client in a later layer) hold a selection.
+function resolveProductClientId(peer: RpcPeer): string {
+	if (peer.remoteIdentity.role !== "client") {
+		throw new RpcHandlerError(
+			"CLIENT_IDENTITY_REQUIRED",
+			"Runtime Box selection is only available to authenticated product clients.",
+		);
 	}
-}
-
-export function publishRetiredChatSessions(
-	peers: readonly RpcPeer[],
-	sessionIds: readonly string[],
-	reportDiagnostic: (message: string) => void = console.error,
-): void {
-	const payload = encodeJsonValue(
-		chatSessionsRetiredEventSchema.parse({
-			schemaVersion: 1,
-			sessionIds,
-		}),
-	);
-	for (const peer of peers) {
-		if (peer.remoteIdentity.role !== "client") {
-			continue;
-		}
-		try {
-			peer.emitEvent(productRpcEvents.chatSessionsRetired, payload);
-		} catch {
-			peer.close(1011, "Session retirement publication failed.");
-			reportDiagnostic(
-				`Failed to publish Session retirement to client ${peer.remoteIdentity.peerId}; replay will recover it.`,
-			);
-		}
-	}
+	return peer.remoteIdentity.peerId;
 }
 
 function createRequestHandler<TInputSchema extends ZodType, TOutputSchema extends ZodType>(

@@ -233,6 +233,8 @@ export const productRpcMethods = {
 	chatSend: "moshu.v1.chat.send",
 	chatCancel: "moshu.v1.chat.cancel",
 	chatReplay: "moshu.v1.chat.replay",
+	chatSubscribe: "moshu.v1.chat.subscribe",
+	chatUnsubscribe: "moshu.v1.chat.unsubscribe",
 	chatRetiredSessionsList: "moshu.v1.chat.retiredSessions.list",
 	runtimeBoxRegister: "moshu.v1.runtimeBox.register",
 	runtimeBoxReady: "moshu.v1.runtimeBox.ready",
@@ -323,8 +325,33 @@ export const runtimeBoxRegisterOutputSchema = z
 
 export const chatEventDeliverySchema = z
 	.object({
-		clientRequestId: z.string().uuid(),
+		// Optional origin echo. Live delivery is scoped to the Session (see chat.subscribe), so a
+		// receiving client no longer needs to hold the originating request id to observe events. The
+		// originating client still receives its own request id echoed back for local correlation.
+		clientRequestId: z.string().uuid().optional(),
 		event: chatRunEventSchema,
+	})
+	.strict();
+
+export const chatSubscribeInputSchema = z
+	.object({
+		sessionId: uuidV7Schema,
+	})
+	.strict();
+
+export const chatSubscribeOutputSchema = z
+	.object({
+		schemaVersion: z.literal(1),
+		sessionId: uuidV7Schema,
+		subscribed: z.literal(true),
+	})
+	.strict();
+
+export const chatUnsubscribeOutputSchema = z
+	.object({
+		schemaVersion: z.literal(1),
+		sessionId: uuidV7Schema,
+		subscribed: z.literal(false),
 	})
 	.strict();
 
@@ -718,6 +745,14 @@ export const productRpcRequestSchemas = {
 		input: replayChatEventsInputSchema,
 		output: replayChatEventsOutputSchema,
 	},
+	[productRpcMethods.chatSubscribe]: {
+		input: chatSubscribeInputSchema,
+		output: chatSubscribeOutputSchema,
+	},
+	[productRpcMethods.chatUnsubscribe]: {
+		input: chatSubscribeInputSchema,
+		output: chatUnsubscribeOutputSchema,
+	},
 	[productRpcMethods.chatRetiredSessionsList]: {
 		input: listRetiredChatSessionsInputSchema,
 		output: listRetiredChatSessionsOutputSchema,
@@ -886,6 +921,8 @@ export const clientProductRequestMethods = [
 	productRpcMethods.chatSend,
 	productRpcMethods.chatCancel,
 	productRpcMethods.chatReplay,
+	productRpcMethods.chatSubscribe,
+	productRpcMethods.chatUnsubscribe,
 	productRpcMethods.chatRetiredSessionsList,
 ] as const;
 

@@ -855,12 +855,7 @@ export class DesktopAgentsClient {
 		if (this.#sessionRetirements.has(delivery.event.sessionId)) {
 			return null;
 		}
-		const retainedCursor = this.#activeRunCursors.get(delivery.event.runId);
-		const reservation =
-			this.#sendReservations.get(delivery.clientRequestId) ??
-			(retainedCursor?.reservation.requestId === delivery.clientRequestId
-				? retainedCursor.reservation
-				: undefined);
+		const reservation = this.#correlateDeliveryReservation(delivery);
 		if (reservation === undefined) {
 			throw new Error("Chat event correlation did not match an active send reservation.");
 		}
@@ -882,6 +877,28 @@ export class DesktopAgentsClient {
 			});
 		}
 		return delivery.event;
+	}
+
+	#correlateDeliveryReservation(
+		delivery: z.output<typeof chatEventDeliverySchema>,
+	): SendReservation | undefined {
+		// Correlate live events by their stable Run id first. This keeps delivery working without the
+		// originating request id, which the Session-scoped event hub now treats as an optional echo.
+		const runReservation = this.#runReservations.get(delivery.event.runId);
+		if (runReservation !== undefined) {
+			return runReservation;
+		}
+		const retainedCursor = this.#activeRunCursors.get(delivery.event.runId);
+		if (retainedCursor !== undefined) {
+			return retainedCursor.reservation;
+		}
+		// Fall back to the optional origin echo for the race where the first live event arrives before
+		// the chat.send accept response has bound the Run id locally.
+		const clientRequestId = delivery.clientRequestId;
+		if (clientRequestId !== undefined) {
+			return this.#sendReservations.get(clientRequestId);
+		}
+		return undefined;
 	}
 
 	#bindReservationRun(reservation: SendReservation, runId: string, sessionId: string): void {

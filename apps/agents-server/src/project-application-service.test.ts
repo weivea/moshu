@@ -137,6 +137,50 @@ describe("Project application service", () => {
 		}
 	});
 
+	test("creates a Project on the requesting client's selected Runtime Box", async () => {
+		const database = openAppDatabase(":memory:");
+		const clientRuntimeBoxId = "remote-client-selected";
+		database.runtimeBoxes.upsertRegistration({
+			schemaVersion: 1,
+			runtimeBoxId: clientRuntimeBoxId,
+			kind: "remote",
+			displayName: "Remote Client Selected",
+			runtimeBoxVersion: "0.0.1",
+			platform: "linux",
+			arch: "x64",
+			capabilities: [],
+		});
+		const clientId = "moshu-desktop-client";
+		database.runtimeBoxes.switchActiveForClient(clientId, {
+			runtimeBoxId: clientRuntimeBoxId,
+			expectedRevision: database.runtimeBoxes.getActiveForClient(clientId).revision,
+		});
+		const inspectedRuntimeBoxes: string[] = [];
+		const service = createService(database, {
+			async validateProjectPath(runtimeBoxId, input) {
+				inspectedRuntimeBoxes.push(runtimeBoxId);
+				return availableInspection(input.path, tokenA);
+			},
+		});
+		try {
+			const preview = await service.previewPath({ path: "/workspace/client-scoped" }, clientId);
+			const created = await service.create(
+				{
+					path: "/workspace/client-scoped",
+					confirmationToken: preview.preview.confirmationToken,
+				},
+				clientId,
+			);
+			expect(created.project.runtimeBoxId).toBe(clientRuntimeBoxId);
+			expect(inspectedRuntimeBoxes).toEqual([clientRuntimeBoxId, clientRuntimeBoxId]);
+			// The global default is untouched; only the client's preference drove placement.
+			expect(database.runtimeBoxes.getActive().runtimeBoxId).toBe(defaultLocalRuntimeBoxId);
+		} finally {
+			await service.shutdown();
+			database.close();
+		}
+	});
+
 	test("marks canonical path changes unavailable without silently replacing the path", async () => {
 		const database = openAppDatabase(":memory:");
 		const project = database.projects.create({
