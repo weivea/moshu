@@ -976,6 +976,138 @@ describe("DevTunnelService", () => {
 		}
 	});
 
+	test("shutdown re-terminates a rejected-termination orphan while a replacement runs unaffected", async () => {
+		const database = openAppDatabase(":memory:");
+
+		// The first host's first stop rejects (it refuses to exit), but a later stop succeeds and confirms
+		// exit; replacement hosts stop cleanly. This lets a rejected termination orphan the first host and a
+		// later shutdown drive that exact orphan to a real exit.
+		class ControllableHost implements DevTunnelHostProcess {
+			readonly gates = new Map<
+				number,
+				ReturnType<typeof Promise.withResolvers<{ publicUrl: string }>>
+			>();
+			readonly exit = Promise.withResolvers<number>();
+			readonly exited = this.exit.promise;
+			stopCalls = 0;
+
+			constructor(
+				ports: readonly number[],
+				readonly rejectFirstStop: boolean,
+			) {
+				for (const port of ports) {
+					this.gates.set(port, Promise.withResolvers<{ publicUrl: string }>());
+				}
+			}
+
+			waitForPort(port: number): Promise<{ publicUrl: string }> {
+				const gate = this.gates.get(port);
+				return gate?.promise ?? Promise.reject(new Error(`Unexpected port ${port}.`));
+			}
+
+			stop(): void {
+				this.stopCalls += 1;
+				if (this.rejectFirstStop && this.stopCalls === 1) {
+					throw new Error("Dev Tunnel host refused the first stop.");
+				}
+				this.exit.resolve(0);
+			}
+		}
+
+		try {
+			const adapter = new (class extends FakeDevTunnelAdapter {
+				startedHosts: ControllableHost[] = [];
+				override startHost(tunnelId: string, ports: readonly number[]): DevTunnelHostProcess {
+					this.hostedTunnelIds.push(tunnelId);
+					// Only the first host refuses its first stop; the replacement stops cleanly.
+					const host = new ControllableHost(ports, this.startedHosts.length === 0);
+					this.startedHosts.push(host);
+					return host;
+				}
+			})();
+			const service = new DevTunnelService({
+				repository: database.remoteAccess,
+				runtimeIngressPort: 41_000,
+				mobileIngressPort: 42_000,
+				adapter,
+			});
+			const enabled = service.enable();
+			while (adapter.startedHosts.length < 1) {
+				await Bun.sleep(0);
+			}
+			const firstHost = adapter.startedHosts[0];
+			if (firstHost === undefined) throw new Error("first host missing");
+			firstHost.gates
+				.get(41_000)
+				?.resolve({ publicUrl: "https://moshu-41000.first.devtunnels.ms" });
+			firstHost.gates
+				.get(42_000)
+				?.resolve({ publicUrl: "https://moshu-42000.first.devtunnels.ms" });
+			await enabled;
+			expect(service.getStatus().state).toBe("online");
+
+			// Disable fails because the first host's stop() rejects, orphaning it (handle retained in
+			// #terminatingHosts, #host cleared) rather than dropping the only reference.
+			await expect(service.disable()).rejects.toThrow();
+			expect(firstHost.stopCalls).toBe(1);
+			let firstHostExited = false;
+			void firstHost.exited.then(() => {
+				firstHostExited = true;
+			});
+			await Bun.sleep(0);
+			// The orphan is still live — its exit was never confirmed by the rejected termination.
+			expect(firstHostExited).toBe(false);
+
+			// Re-enable brings up a replacement that comes online with its own per-port URLs, entirely
+			// unaffected by the lingering orphan.
+			const reEnabled = service.enable();
+			while (adapter.startedHosts.length < 2) {
+				await Bun.sleep(0);
+			}
+			const secondHost = adapter.startedHosts[1];
+			if (secondHost === undefined) throw new Error("second host missing");
+			secondHost.gates
+				.get(41_000)
+				?.resolve({ publicUrl: "https://moshu-41000.second.devtunnels.ms" });
+			secondHost.gates
+				.get(42_000)
+				?.resolve({ publicUrl: "https://moshu-42000.second.devtunnels.ms" });
+			await reEnabled;
+			expect(service.getStatus().state).toBe("online");
+			expect(service.getIngressReadiness()).toEqual([
+				{
+					kind: "runtime",
+					port: 41_000,
+					ready: true,
+					publicUrl: "https://moshu-41000.second.devtunnels.ms",
+				},
+				{
+					kind: "mobile",
+					port: 42_000,
+					ready: true,
+					publicUrl: "https://moshu-42000.second.devtunnels.ms",
+				},
+			]);
+
+			// Shutdown must re-terminate BOTH the live replacement and the retained orphan. The orphan's
+			// second stop succeeds and confirms its exit, so the old public host is provably gone.
+			await service.shutdown();
+			expect(firstHost.stopCalls).toBe(2);
+			expect(await firstHost.exited).toBe(0);
+			expect(await secondHost.exited).toBe(0);
+			expect(secondHost.stopCalls).toBe(1);
+			// No dead ingress keeps reporting ready or a stale public URL once both hosts are gone.
+			expect(service.getIngressReadiness()).toEqual([
+				{ kind: "runtime", port: 41_000, ready: false },
+				{ kind: "mobile", port: 42_000, ready: false },
+			]);
+			// The shutdown latch fences further work.
+			await expect(service.enable()).rejects.toThrow("shutting down");
+		} finally {
+			database.close();
+		}
+	});
+
 	test("monitorHostPorts resolves a per-port public URL from a single host stream", async () => {
 		const stream = new ReadableStream<Uint8Array>({
 			start(controller) {
