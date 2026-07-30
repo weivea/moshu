@@ -297,22 +297,12 @@ export const remoteAccessStateSchema = z.enum([
 	"repair_required",
 ]);
 
-// "runtime" is the only ingress instantiated today. "mobile" is a forward-looking descriptor kind
-// for a future Mobile ingress port (Layer 3); modelling it here lets the tunnel service manage and
-// report a second expected ingress without implying any Mobile listener/pairing exists yet.
-export const remoteAccessIngressKindSchema = z.enum(["runtime", "mobile"]);
-
-export const remoteAccessIngressSchema = z
-	.object({
-		kind: remoteAccessIngressKindSchema,
-		port: z.int().min(1).max(65_535),
-		// Whether this ingress is currently forwarded and has published its public URL. Remote Access
-		// only reaches "online" once every required ingress is ready.
-		ready: z.boolean(),
-		publicUrl: z.string().url().optional(),
-	})
-	.strict();
-
+// The Remote Access status wire contract stays at v1: a single scalar Runtime ingress
+// (runtimeIngressPort + top-level publicUrl). The tunnel service manages an expected ingress *set*
+// internally (see DevTunnelService.getIngressReadiness), but Layer 1 deliberately does NOT expose
+// the second/typed ingress descriptors over the wire. A future Mobile ingress (Layer 3) will add
+// multi-ingress readiness through an explicit versioned status method rather than widening this
+// strict v1 schema, so existing Desktop clients keep parsing unchanged status payloads.
 export const remoteAccessStatusOutputSchema = z
 	.object({
 		enabled: z.boolean(),
@@ -321,7 +311,6 @@ export const remoteAccessStatusOutputSchema = z
 		runtimeIngressPort: z.int().min(1).max(65_535),
 		tunnelId: z.string().min(3).max(60).optional(),
 		publicUrl: z.string().url().optional(),
-		ingresses: z.array(remoteAccessIngressSchema).min(1).max(10),
 		lastError: z.string().min(1).max(1_024).optional(),
 		trafficEstimate: z
 			.object({
@@ -442,8 +431,6 @@ export type RuntimeBoxCompatibilityReportOutput = z.infer<
 	typeof runtimeBoxCompatibilityReportOutputSchema
 >;
 export type RemoteAccessStatusOutput = z.infer<typeof remoteAccessStatusOutputSchema>;
-export type RemoteAccessIngress = z.infer<typeof remoteAccessIngressSchema>;
-export type RemoteAccessIngressKind = z.infer<typeof remoteAccessIngressKindSchema>;
 export type RemoteAccessAuthAttempt = z.infer<typeof remoteAccessAuthAttemptSchema>;
 export type RemoteAccessMutationOutput = z.infer<typeof remoteAccessMutationOutputSchema>;
 export type RuntimeDiagnosticsOutput = z.infer<typeof runtimeDiagnosticsOutputSchema>;

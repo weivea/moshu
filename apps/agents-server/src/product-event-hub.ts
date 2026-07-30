@@ -33,16 +33,20 @@ import {
 // Subscription lifecycle (connection-scoped, client re-subscribes on reconnect):
 //   Subscriptions are dropped when a connection closes (`releasePeer`). They are NOT a durable
 //   server-side registration that outlives the socket, so the hub never delivers to a stale/closed
-//   connection. A client that wants to keep observing a Session across a reconnect owns the recovery
-//   loop: on the fresh connection it (a) replays from its per-Run cursors (chat.replay), then
-//   (b) re-subscribes (chat.subscribe), and only marks itself "live" once the replay -> live handoff
-//   is complete (it de-duplicates the small overlap by monotonic `(runId, seq)`), so there is no gap
-//   and no duplicate. The transport generation fence guarantees at most one live connection per
-//   client identity (peerId); subscriptions are keyed by that stable `peerId` but each records the
-//   full identity (including `generation`). This makes cleanup reconnect-safe: a late close of an
-//   older generation cannot remove a newer generation's re-subscription (the identity/generation
-//   guard in `releasePeer` skips it), and a subscription the newer generation did not renew is still
-//   reclaimed when its owning generation finally closes.
+//   connection. A client that wants to keep observing a Session across a reconnect owns a gap-free
+//   recovery loop, and installs its subscription BEFORE replay so no event is missed:
+//   on the fresh connection it (a) re-subscribes (chat.subscribe) so the hub starts routing live
+//   events into the client's provisional buffer, then (b) replays from its per-Run cursors
+//   (chat.replay), then (c) de-duplicates/merges the overlap by monotonic `(runId, seq)`, then
+//   (d) flushes the buffered live events, and only then marks itself "live". Because the subscription
+//   is armed at-or-before the replay snapshot boundary, any event committed between the subscribe and
+//   the replay response is delivered live into the buffer and merged exactly once — no gap, no
+//   duplicate. The transport generation fence guarantees at most one live connection per client
+//   identity (peerId); subscriptions are keyed by that stable `peerId` but each records the full
+//   identity (including `generation`). This makes cleanup reconnect-safe: a late close of an older
+//   generation cannot remove a newer generation's re-subscription (the identity/generation guard in
+//   `releasePeer` skips it), and a subscription the newer generation did not renew is still reclaimed
+//   when its owning generation finally closes.
 
 const maxActiveRequestOwners = 1_024;
 // Structured authorization bounds for session subscriptions. A single client cannot pin an unbounded

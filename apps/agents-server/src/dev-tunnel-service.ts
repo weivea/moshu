@@ -1,7 +1,6 @@
 import { randomUUID } from "node:crypto";
 import {
 	type RemoteAccessAuthAttempt,
-	type RemoteAccessIngress,
 	type RemoteAccessStatusOutput,
 	remoteAccessAuthAttemptSchema,
 	remoteAccessStatusOutputSchema,
@@ -41,6 +40,20 @@ export type DevTunnelIngressKind = "runtime" | "mobile";
 export interface DevTunnelIngress {
 	readonly kind: DevTunnelIngressKind;
 	readonly port: number;
+}
+
+/**
+ * Live per-ingress readiness for the currently online host. This is an INTERNAL descriptor: Layer 1
+ * does not expose the ingress set over the wire (see remoteAccessStatusOutputSchema, which stays at
+ * v1). It lets callers inside the server observe per-port readiness/URL — a future Mobile ingress
+ * (Layer 3) will surface this through an explicit versioned status method. `publicUrl` is present
+ * only while the port is live and has published a URL; it is never a stale/persisted value.
+ */
+export interface DevTunnelIngressStatus {
+	readonly kind: DevTunnelIngressKind;
+	readonly port: number;
+	readonly ready: boolean;
+	readonly publicUrl?: string;
 }
 
 export interface DevTunnelAdapter {
@@ -182,17 +195,6 @@ export class DevTunnelService {
 			settings.enabled || this.#state === "stopping" || this.#host !== undefined
 				? this.#state
 				: "disabled";
-		const ingresses: RemoteAccessIngress[] = this.#ingresses.map((ingress) => {
-			const readiness = this.#ingressReadiness.get(ingress.port);
-			const publicUrl =
-				readiness?.publicUrl ?? (ingress.kind === "runtime" ? settings.publicUrl : undefined);
-			return {
-				kind: ingress.kind,
-				port: ingress.port,
-				ready: readiness !== undefined,
-				...(publicUrl === undefined ? {} : { publicUrl }),
-			};
-		});
 		return remoteAccessStatusOutputSchema.parse({
 			enabled: settings.enabled,
 			authenticated: this.#authenticated,
@@ -200,7 +202,6 @@ export class DevTunnelService {
 			runtimeIngressPort: this.#runtimeIngressPort,
 			...(settings.tunnelId === undefined ? {} : { tunnelId: settings.tunnelId }),
 			...(settings.publicUrl === undefined ? {} : { publicUrl: settings.publicUrl }),
-			ingresses,
 			...(this.#lastError === undefined ? {} : { lastError: this.#lastError }),
 			trafficEstimate: {
 				month,
@@ -216,6 +217,25 @@ export class DevTunnelService {
 				maxPortsPerTunnel: 10,
 				maxBytesPerSecond: 20 * 1024 * 1024,
 			},
+		});
+	}
+
+	/**
+	 * Internal (non-wire) per-ingress readiness snapshot. Each expected ingress reports whether it is
+	 * currently live and, if so, its published public URL. Pending ports report `ready: false` with no
+	 * `publicUrl` — never a stale/persisted URL. Overall Remote Access only reaches "online" once every
+	 * required ingress is ready (see getStatus().state), but this getter reflects incremental per-port
+	 * progress while some ports are still pending.
+	 */
+	getIngressReadiness(): readonly DevTunnelIngressStatus[] {
+		return this.#ingresses.map((ingress) => {
+			const readiness = this.#ingressReadiness.get(ingress.port);
+			return {
+				kind: ingress.kind,
+				port: ingress.port,
+				ready: readiness !== undefined,
+				...(readiness?.publicUrl === undefined ? {} : { publicUrl: readiness.publicUrl }),
+			};
 		});
 	}
 
@@ -701,11 +721,24 @@ export class DevTunnelService {
 			const ingresses = this.#ingresses;
 			// Every required ingress must publish its public URL before Remote Access is online. A single
 			// laggard or never-ready port keeps the whole service out of the "online" state.
+			const portPromises = ingresses.map((ingress) => host.waitForPort(ingress.port));
+			// Publish each ingress URL incrementally the moment its port resolves, so getIngressReadiness
+			// reflects partial progress (one ready, one still pending) rather than flipping every port at
+			// once. Guarded by host identity + generation so a superseded start never mutates live state.
+			// This runs off separate promise chains and does not feed the awaited path below, preserving
+			// the readiness/cancellation microtask ordering.
+			ingresses.forEach((ingress, index) => {
+				void portPromises[index]?.then(
+					(result) => {
+						if (this.#host === ownedHost && this.#isCurrent(generation)) {
+							this.#ingressReadiness.set(ingress.port, { publicUrl: result.publicUrl });
+						}
+					},
+					() => undefined,
+				);
+			});
 			const ingressUrls = await withAbortTimeout(
-				withAbortSignal(
-					Promise.all(ingresses.map((ingress) => host.waitForPort(ingress.port))),
-					startAbortController.signal,
-				),
+				withAbortSignal(Promise.all(portPromises), startAbortController.signal),
 				15_000,
 				"Dev Tunnel host readiness",
 				startAbortController,
@@ -736,8 +769,8 @@ export class DevTunnelService {
 				),
 			);
 			// Persist the Runtime public URL for backward compatibility (top-level status.publicUrl and
-			// the persisted Remote Runtime Box URL). Additional ingress URLs are surfaced per-port in
-			// status.ingresses.
+			// the persisted Remote Runtime Box URL). Additional ingress URLs are surfaced per-port via
+			// the internal getIngressReadiness() getter, not over the v1 status wire contract.
 			this.#repository.setPublicUrl(runtimeReadiness.publicUrl);
 			this.#state = "online";
 			this.#stableTimer = setTimeout(() => {

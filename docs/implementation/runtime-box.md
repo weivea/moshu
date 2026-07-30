@@ -121,12 +121,16 @@ lastError。Microsoft 登录 token 只能写入 Agent Server Secret Vault。
 `ensureTunnel` 按期望端口集合 reconcile，只增删属于本 Service 期望之外的端口，**不再删除同属 Moshu 的其他 ingress**
 （历史根因：旧 `ensureTunnel(tunnelId, port)` 会删除所有其他端口）。每个端口按需单独配置 anonymous access，并各自
 收集 public URL / readiness / traffic。单个 host 进程转发全部期望端口，`waitForPort(port)` 按端口解析各自的
-public URL；**只有当所有 required ingress 都 ready 后 Service 才进入 `online`**，任一端口迟迟不 ready 会让整个
-Service 保持非 online。`getStatus` 暴露 `ingresses` 列表（typed descriptor），每个条目携带 `kind`、`port`、
-`ready` 和该端口自己的 `publicUrl`；顶层 `publicUrl` 继续向后兼容地映射到 Runtime ingress URL。当前仍只有 Runtime
-ingress 一个实例；契约已建模一个前瞻性的 `mobile` ingress descriptor（`remoteAccessIngressKindSchema` 含
-`"mobile"`），并可通过 `mobileIngressPort` 选项演练多 ingress reconcile/readiness 路径，但本层**不实际实例化**
-Mobile ingress、listener 或 pairing（属于后续层）。未来 Mobile ingress 作为**第二个端口**接入时无需再改根因逻辑。
+public URL；每个端口一旦 ready 就**增量**发布自己的 `publicUrl`（逐端口可观测：一个 ready、另一个 pending 时状态如实反映），
+但**只有当所有 required ingress 都 ready 后 Service 才进入 `online`**，任一端口迟迟不 ready 会让整个 Service 保持非
+online。**对外 status 线协议保持 v1**：`getStatus()` 仍是既有 v1 形状（scalar `runtimeIngressPort` + 顶层
+`publicUrl`），**不**在严格的 `remoteAccessStatusOutputSchema` 上新增 `ingresses` 字段——旧 Client 继续无改动解析。
+per-ingress readiness 只经**内部（非线协议）** getter `DevTunnelService.getIngressReadiness()` 暴露，返回 typed
+descriptor（`kind`/`port`/`ready`/仅在 live 时携带的 `publicUrl`，pending 端口不回退到陈旧/持久 URL）。顶层 `publicUrl`
+继续向后兼容地映射到 Runtime ingress URL。当前仍只有 Runtime ingress 一个实例；`DevTunnelIngressKind` 已建模一个前瞻性的
+`mobile` descriptor，并可通过 `mobileIngressPort` 选项演练多 ingress reconcile/readiness 路径，但本层**不实际实例化**
+Mobile ingress、listener 或 pairing（属于后续层）。未来 Mobile ingress 作为**第二个端口**接入时无需再改根因逻辑，并将通过
+显式 versioned status method（v2）或协议 bump 暴露多 ingress readiness，而非放宽当前 v1 严格 schema。
 
 启动顺序：
 

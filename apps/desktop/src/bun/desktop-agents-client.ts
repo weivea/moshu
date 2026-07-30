@@ -8,6 +8,8 @@ import {
 	chatEventDeliverySchema,
 	chatSendAcceptedOutputSchema,
 	chatSessionsRetiredEventSchema,
+	chatSubscribeInputSchema,
+	chatSubscribeOutputSchema,
 	createChatSessionOutputSchema,
 	createProcessChatSessionInputSchema,
 	deleteChatSessionInputSchema,
@@ -379,6 +381,7 @@ export class DesktopAgentsClient {
 			await this.#readCursorSupport(peer, recoveryDeadline);
 			await this.#recoverRetiredSessions(peer, recoveryDeadline, connectionGeneration);
 			await this.#retryPendingSessionRetirements(recoveryDeadline, connectionGeneration);
+			await this.#installLiveSubscriptions(peer, recoveryDeadline, connectionGeneration);
 			await this.#replayProgressively(peer, recoveryDeadline, connectionGeneration, deliver);
 			await this.#flushProvisionalEvents(provisionalQueue, recoveryDeadline, deliver);
 			this.#deleteCommittedTerminalCursors();
@@ -1013,6 +1016,58 @@ export class DesktopAgentsClient {
 		this.#readyListeners.clear();
 		closeActiveConnection?.();
 		provisionalPeer?.close(1000, "Provisional desktop agents client shutting down.");
+	}
+
+	/**
+	 * Installs live Session subscriptions on the freshly connected peer BEFORE replay so the server
+	 * routes live ChatRunEvents for every recovering Session into the provisional buffer while replay
+	 * is still in flight. This is the head of the gap-free recovery loop:
+	 * subscribe -> buffer live -> replay from durable cursor -> dedupe/merge by (runId, seq) -> flush
+	 * -> ready. Because the subscription is armed at-or-before the replay snapshot boundary, any event
+	 * committed after the snapshot is delivered live into the buffer, and any overlap with the replay
+	 * response is deduplicated by the per-run cursor in #deliverThenCommit — so no event committed
+	 * between the subscribe and the replay response is ever lost or double-delivered.
+	 *
+	 * A Session that has been retired since the last connection answers with SESSION_NOT_FOUND; that is
+	 * expected and handled by the per-Run replay path below, so we skip it here rather than failing
+	 * recovery.
+	 */
+	async #installLiveSubscriptions(
+		peer: DesktopAgentsRpcPeer,
+		deadline: number,
+		connectionGeneration: number,
+	): Promise<void> {
+		const sessionIds = new Set<string>();
+		for (const cursor of this.#activeRunCursors.values()) {
+			if (!this.#sessionRetirements.has(cursor.sessionId)) {
+				sessionIds.add(cursor.sessionId);
+			}
+		}
+		for (const sessionId of sessionIds) {
+			this.#assertRecoveryDeadline(deadline);
+			if (this.#shutdown) {
+				throw new AgentsUnavailableError("The desktop agents client is shutting down.");
+			}
+			const input = chatSubscribeInputSchema.parse({ sessionId });
+			const encoded = rpcJsonValueSchema.parse(JSON.parse(JSON.stringify(input)));
+			const remainingMs = Math.max(1, deadline - this.now());
+			try {
+				const response = await peer.request(productRpcMethods.chatSubscribe, encoded, {
+					timeoutMs: remainingMs,
+				});
+				chatSubscribeOutputSchema.parse(response);
+			} catch (error) {
+				if (error instanceof RpcRemoteError && error.code === chatSessionNotFoundCode) {
+					await this.#invalidatePendingSessionRetirement(
+						this.#stagePendingSessionRetirement(sessionId),
+						deadline,
+						connectionGeneration,
+					);
+					continue;
+				}
+				throw error;
+			}
+		}
 	}
 
 	async #replayProgressively(

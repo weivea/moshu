@@ -7,6 +7,7 @@ import {
 	cancelChatRunInputSchema,
 	cancelChatRunOutputSchema,
 	chatSendAcceptedOutputSchema,
+	chatSubscribeInputSchema,
 	confirmCreateProjectInputSchema,
 	confirmCreateProjectOutputSchema,
 	createChatSessionOutputSchema,
@@ -2563,6 +2564,77 @@ describe("DesktopAgentsClient", () => {
 		client.close();
 	});
 
+	test("subscribes before replay and merges an event committed in between exactly once, in order", async () => {
+		const firstPeer = new FakePeer((method) =>
+			method === productRpcMethods.chatSend ? createAcceptedPayload() : { events: [] },
+		);
+		let resolveReplay: ((payload: JsonValue) => void) | undefined;
+		let replayStarted: (() => void) | undefined;
+		const replayStartedPromise = new Promise<void>((resolve) => {
+			replayStarted = resolve;
+		});
+		const callOrder: string[] = [];
+		const recoveredPeer = new FakePeer((method) => {
+			if (method === productRpcMethods.chatReplay) {
+				callOrder.push("replay");
+				replayStarted?.();
+				return new Promise<JsonValue>((resolve) => {
+					resolveReplay = resolve;
+				});
+			}
+			return { events: [] };
+		});
+		recoveredPeer.chatSubscribeHandler = (payload) => {
+			callOrder.push("subscribe");
+			const parsed = chatSubscribeInputSchema.parse(payload);
+			return { schemaVersion: 1, sessionId: parsed.sessionId, subscribed: true };
+		};
+		const peers = [firstPeer, recoveredPeer];
+		let index = 0;
+		let recoveredOptions: ConnectRpcClientOptions | undefined;
+		const client = new DesktopAgentsClient(async (options) => {
+			recoveredOptions = options;
+			const peer = peers[index];
+			index += 1;
+			return peer ?? Promise.reject(new Error("No fake peer available."));
+		});
+		const receivedSeqs: number[] = [];
+		client.subscribeChatEvents((event) => {
+			receivedSeqs.push(event.seq);
+		});
+		const firstConnection = await client.connect(createConnectOptions());
+		await client.request(
+			productRpcMethods.chatSend,
+			{ requestId: clientRequestId, sessionId, content: "hello" },
+			sendAskChatMessageInputSchema,
+			chatSendAcceptedOutputSchema,
+		);
+		firstConnection.close();
+
+		const reconnect = client.connect(createConnectOptions());
+		await replayStartedPromise;
+		// The live subscription is installed BEFORE replay so the server can route live events into the
+		// provisional buffer while replay is still in flight.
+		expect(callOrder).toEqual(["subscribe", "replay"]);
+
+		const handler = recoveredOptions?.handlers?.events?.[agentsProductEventMethods[0]];
+		if (handler === undefined) {
+			throw new Error("Provisional chat event handler was not installed.");
+		}
+		// seq 2 is committed AFTER subscribe but BEFORE the replay response — it only reaches the client
+		// live, via the buffer. seq 1 is delivered BOTH live (overlap) and in the replay snapshot.
+		await handler(createDeliveryPayload(2, "live after subscribe"), {} as RpcEventContext);
+		await handler(createDeliveryPayload(1, "live overlap"), {} as RpcEventContext);
+
+		// The replay snapshot only carries seq 1 (seq 2 committed after the snapshot was taken).
+		resolveReplay?.({ events: [createDeltaEventPayload(1, "replayed")] });
+
+		await reconnect;
+		// No gap and no duplicate: seq 1 (from replay) then seq 2 (merged from the live buffer), each once.
+		expect(receivedSeqs).toEqual([1, 2]);
+		client.close();
+	});
+
 	test.each([
 		["event count", { maxProvisionalEvents: 1, maxProvisionalBytes: 1_000_000 }],
 		["encoded bytes", { maxProvisionalEvents: 10, maxProvisionalBytes: 10 }],
@@ -3336,6 +3408,9 @@ class FakePeer implements DesktopAgentsRpcPeer {
 	retiredSessionPageHandler:
 		| ((payload: JsonValue, options?: RpcRequestOptions) => JsonValue | Promise<JsonValue>)
 		| undefined;
+	chatSubscribeHandler:
+		| ((payload: JsonValue, options?: RpcRequestOptions) => JsonValue | Promise<JsonValue>)
+		| undefined;
 
 	constructor(
 		private readonly onRequest: (
@@ -3361,6 +3436,22 @@ class FakePeer implements DesktopAgentsRpcPeer {
 			return this.retiredSessionPageHandler === undefined
 				? { schemaVersion: 1, sessionIds: [] }
 				: this.retiredSessionPageHandler(payload, options);
+		}
+		if (method === productRpcMethods.chatSubscribe) {
+			if (this.chatSubscribeHandler !== undefined) {
+				return this.chatSubscribeHandler(payload, options);
+			}
+			const sessionId =
+				typeof payload === "object" &&
+				payload !== null &&
+				!Array.isArray(payload) &&
+				typeof payload.sessionId === "string"
+					? payload.sessionId
+					: undefined;
+			if (sessionId === undefined) {
+				throw new Error("chat.subscribe requires a sessionId payload.");
+			}
+			return { schemaVersion: 1, sessionId, subscribed: true };
 		}
 		if (
 			method === productRpcMethods.chatReplay &&

@@ -268,6 +268,24 @@ export async function createAgentsServer(
 			},
 		});
 		const eventRouter = new ProductEventRouter();
+		// Centralized retirement notification: every Session delete/retire path (Project retirement AND
+		// direct product-rpc session.delete) funnels through here so live event subscriptions are always
+		// torn down and retired-session invalidations are always published. Patching only one handler
+		// would leave the other path leaking subscriptions.
+		const notifySessionsRetired = (sessionIds: readonly string[]): void => {
+			eventRouter.retireSessions(sessionIds);
+			const server = productRpcServer;
+			if (server !== undefined) {
+				try {
+					publishRetiredChatSessions(server.peers, sessionIds, reportDiagnostic);
+				} catch (error) {
+					const message = error instanceof Error ? error.message.slice(0, 256) : "Unknown failure.";
+					reportDiagnostic(
+						`Session retirement publication failed; replay will recover it: ${message}`,
+					);
+				}
+			}
+		};
 		const runtimeIngressAuth = new RuntimeIngressAuth({
 			pairings: database.runtimeBoxPairings,
 			runtimeBoxes: database.runtimeBoxes,
@@ -286,19 +304,7 @@ export async function createAgentsServer(
 			runtimeBoxes: database.runtimeBoxes,
 			pathInspector: runtimeBoxRegistry,
 			onSessionsRetired: (sessionIds) => {
-				eventRouter.retireSessions(sessionIds);
-				const server = productRpcServer;
-				if (server !== undefined) {
-					try {
-						publishRetiredChatSessions(server.peers, sessionIds, reportDiagnostic);
-					} catch (error) {
-						const message =
-							error instanceof Error ? error.message.slice(0, 256) : "Unknown failure.";
-						reportDiagnostic(
-							`Session retirement publication failed; replay will recover it: ${message}`,
-						);
-					}
-				}
+				notifySessionsRetired(sessionIds);
 				void chatService?.drainPendingAgentSessionCleanups({ batchSize: 64 });
 			},
 			reportDiagnostic,
@@ -317,6 +323,7 @@ export async function createAgentsServer(
 			getActiveRuntimeBoxId: () => database.runtimeBoxes.getActive().runtimeBoxId,
 			getActiveRuntimeBoxIdForClient: (clientId) =>
 				database.runtimeBoxes.getActiveForClient(clientId).runtimeBoxId,
+			onSessionsRetired: notifySessionsRetired,
 			withProjectSessionCreation: (projectId, createSession, signal) =>
 				initializedProjectService.withSessionCreation(projectId, createSession, signal),
 			withProjectRunPreflight: (projectId, createRun, signal) =>

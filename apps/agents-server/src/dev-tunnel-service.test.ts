@@ -542,6 +542,17 @@ describe("DevTunnelService", () => {
 				?.resolve({ publicUrl: "https://moshu-41000.test.devtunnels.ms" });
 			await Bun.sleep(0);
 			expect(service.getStatus().state).toBe("starting");
+			// Incremental readiness: the Runtime ingress is ready with its URL while the Mobile ingress is
+			// still pending with no (stale) URL — per-port progress is observable before the whole set is up.
+			expect(service.getIngressReadiness()).toEqual([
+				{
+					kind: "runtime",
+					port: 41_000,
+					ready: true,
+					publicUrl: "https://moshu-41000.test.devtunnels.ms",
+				},
+				{ kind: "mobile", port: 42_000, ready: false },
+			]);
 			// Once every expected ingress publishes its URL, the service comes online.
 			adapter.host.gates
 				.get(42_000)
@@ -550,7 +561,9 @@ describe("DevTunnelService", () => {
 			expect(enabled.state).toBe("online");
 			// Top-level publicUrl stays backward compatible with the Runtime ingress URL.
 			expect(enabled.publicUrl).toBe("https://moshu-41000.test.devtunnels.ms");
-			expect(service.getStatus().ingresses).toEqual([
+			// The v1 status wire contract does not carry the ingress set; per-port readiness is exposed
+			// through the internal getIngressReadiness() getter instead.
+			expect(service.getIngressReadiness()).toEqual([
 				{
 					kind: "runtime",
 					port: 41_000,

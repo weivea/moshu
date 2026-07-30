@@ -153,7 +153,6 @@ describe("Runtime Box product RPC", () => {
 					authenticated: false,
 					state: "disabled",
 					runtimeIngressPort: 41_000,
-					ingresses: [{ kind: "runtime", port: 41_000, ready: false }],
 					trafficEstimate: {
 						month: new Date().toISOString().slice(0, 7),
 						receivedBytes: 0,
