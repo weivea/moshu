@@ -2,15 +2,26 @@ import { describe, expect, test } from "bun:test";
 import { openAppDatabase } from "@moshu/database";
 
 import {
+	type DevTunnelAdapter,
+	type DevTunnelAuthenticationProcess,
+	DevTunnelCliAdapter,
+	type DevTunnelHostProcess,
 	DevTunnelService,
+	findListedTunnelId,
 	parseDevTunnelLoginStatus,
 	parseQualifiedTunnelId,
 	parseTunnelPortProtocol,
 	parseTunnelPorts,
-	type DevTunnelAdapter,
-	type DevTunnelAuthenticationProcess,
-	type DevTunnelHostProcess,
 } from "./dev-tunnel-service";
+
+function commandResult(stdout = "", exitCode = 0) {
+	return {
+		exitCode,
+		stdout,
+		stderr: "",
+		message: exitCode === 0 ? stdout : "Command failed.",
+	};
+}
 
 class FakeHost implements DevTunnelHostProcess {
 	readonly ready = Promise.resolve({ publicUrl: "https://moshu-41000.test.devtunnels.ms" });
@@ -231,12 +242,141 @@ describe("DevTunnelService", () => {
 			),
 		).toBe("moshu-test.jpe1");
 		expect(
+			findListedTunnelId(
+				'{"value":[{"tunnelId":"moshu-other","clusterId":"use"},{"tunnelId":"moshu-test","clusterId":"euw"}]}',
+				"moshu-test.euw",
+			),
+		).toBe("moshu-test.euw");
+		expect(
+			findListedTunnelId('{"value":[{"tunnelId":"moshu-test","clusterId":"euw"}]}', "moshu-test"),
+		).toBe("moshu-test.euw");
+		expect(
+			findListedTunnelId(
+				'{"value":[{"tunnelId":"moshu-test","clusterId":"use"}]}',
+				"moshu-test.euw",
+			),
+		).toBeUndefined();
+		expect(
 			parseTunnelPorts(
 				'{"value":[{"portNumber":41000},{"portNumber":42000},{"portNumber":41000}]}',
 			),
 		).toEqual([41000, 42000]);
 		expect(parseTunnelPortProtocol('{"portNumber":41000,"protocol":"http"}')).toBe("http");
 		expect(() => parseTunnelPorts('warning\n{"value":[]}')).toThrow("JSON is invalid");
+		expect(() => findListedTunnelId("not-json", "moshu-test.euw")).toThrow(
+			"inventory JSON is invalid",
+		);
+	});
+
+	test("reuses a listed tunnel when its port already matches", async () => {
+		const commands: string[][] = [];
+		const adapter = new DevTunnelCliAdapter("devtunnel", async (_executable, args) => {
+			commands.push([...args]);
+			const command = args.join(" ");
+			if (command === "list --json") {
+				return commandResult('{"value":[{"tunnelId":"moshu-test","clusterId":"euw"}]}');
+			}
+			if (command === "port list moshu-test.euw --json") {
+				return commandResult('{"value":[{"portNumber":41000}]}');
+			}
+			if (command === "port show moshu-test.euw -p 41000 --json") {
+				return commandResult('{"portNumber":41000,"protocol":"http"}');
+			}
+			if (args[0] === "access") {
+				return commandResult();
+			}
+			throw new Error(`Unexpected command: ${command}`);
+		});
+
+		expect(await adapter.ensureTunnel("moshu-test.euw", 41_000, new AbortController().signal)).toBe(
+			"moshu-test.euw",
+		);
+		expect(commands.some(([command]) => command === "create")).toBe(false);
+		expect(
+			commands.some(
+				([command, operation]) =>
+					command === "port" && (operation === "create" || operation === "delete"),
+			),
+		).toBe(false);
+	});
+
+	test("repairs ports on a listed tunnel instead of replacing it", async () => {
+		const commands: string[][] = [];
+		const adapter = new DevTunnelCliAdapter("devtunnel", async (_executable, args) => {
+			commands.push([...args]);
+			const command = args.join(" ");
+			if (command === "list --json") {
+				return commandResult('{"value":[{"tunnelId":"moshu-test","clusterId":"euw"}]}');
+			}
+			if (command === "port list moshu-test.euw --json") {
+				return commandResult('{"value":[{"portNumber":42000}]}');
+			}
+			if (command === "port show moshu-test.euw -p 41000 --json") {
+				return commandResult("", 1);
+			}
+			if (args[0] === "port" || args[0] === "access") {
+				return commandResult();
+			}
+			throw new Error(`Unexpected command: ${command}`);
+		});
+
+		expect(await adapter.ensureTunnel("moshu-test.euw", 41_000, new AbortController().signal)).toBe(
+			"moshu-test.euw",
+		);
+		expect(commands.some(([command]) => command === "create")).toBe(false);
+		expect(commands).toContainEqual(["port", "delete", "moshu-test.euw", "-p", "42000"]);
+		expect(commands).toContainEqual([
+			"port",
+			"create",
+			"moshu-test.euw",
+			"-p",
+			"41000",
+			"--protocol",
+			"http",
+		]);
+	});
+
+	test("creates a tunnel only after a successful inventory confirms it is absent", async () => {
+		const commands: string[][] = [];
+		const adapter = new DevTunnelCliAdapter("devtunnel", async (_executable, args) => {
+			commands.push([...args]);
+			const command = args.join(" ");
+			if (command === "list --json") {
+				return commandResult('{"value":[]}');
+			}
+			if (command === "create moshu-new --json") {
+				return commandResult('{"tunnel":{"tunnelId":"moshu-new","clusterId":"euw"}}');
+			}
+			if (command === "port list moshu-new.euw --json") {
+				return commandResult('{"value":[]}');
+			}
+			if (command === "port show moshu-new.euw -p 41000 --json") {
+				return commandResult("", 1);
+			}
+			if (args[0] === "port" || args[0] === "access") {
+				return commandResult();
+			}
+			throw new Error(`Unexpected command: ${command}`);
+		});
+
+		expect(await adapter.ensureTunnel("moshu-new", 41_000, new AbortController().signal)).toBe(
+			"moshu-new.euw",
+		);
+		expect(commands).toContainEqual(["list", "--json"]);
+		expect(commands).toContainEqual(["create", "moshu-new", "--json"]);
+	});
+
+	test("does not create a tunnel when listing fails", async () => {
+		const commands: string[][] = [];
+		const adapter = new DevTunnelCliAdapter("devtunnel", async (_executable, args) => {
+			commands.push([...args]);
+			throw new Error("Tunnel inventory request failed.");
+		});
+
+		await expect(
+			adapter.ensureTunnel("moshu-test.euw", 41_000, new AbortController().signal),
+		).rejects.toThrow("Tunnel inventory request failed.");
+		expect(commands).toEqual([["list", "--json"]]);
 	});
 
 	test("persists tunnel identity, hosts the fixed Runtime port, and disables cleanly", async () => {
@@ -266,6 +406,30 @@ describe("DevTunnelService", () => {
 			expect(adapter.hostedTunnelIds).toEqual([enabled.tunnelId]);
 			expect((await service.disable()).state).toBe("disabled");
 			expect(adapter.hosts[0]?.stopped).toBe(true);
+		} finally {
+			database.close();
+		}
+	});
+
+	test("reuses the persisted tunnel identity after disable and enable", async () => {
+		const database = openAppDatabase(":memory:");
+		try {
+			const adapter = new FakeDevTunnelAdapter();
+			const service = new DevTunnelService({
+				repository: database.remoteAccess,
+				runtimeIngressPort: 41_000,
+				adapter,
+			});
+			const first = await service.enable();
+			if (first.tunnelId === undefined) {
+				throw new Error("Expected a persisted Dev Tunnel ID.");
+			}
+			await service.disable();
+			const second = await service.enable();
+			expect(second.tunnelId).toBe(first.tunnelId);
+			expect(adapter.hostedTunnelIds).toEqual([first.tunnelId, first.tunnelId]);
+			expect(adapter.ensureCalls).toBe(2);
+			await service.shutdown();
 		} finally {
 			database.close();
 		}

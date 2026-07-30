@@ -1,9 +1,9 @@
 import { randomUUID } from "node:crypto";
 import {
-	remoteAccessAuthAttemptSchema,
-	remoteAccessStatusOutputSchema,
 	type RemoteAccessAuthAttempt,
 	type RemoteAccessStatusOutput,
+	remoteAccessAuthAttemptSchema,
+	remoteAccessStatusOutputSchema,
 } from "@moshu/contracts";
 import type { RemoteAccessRepository } from "@moshu/database";
 
@@ -821,10 +821,18 @@ export class DevTunnelService {
 }
 
 export class DevTunnelCliAdapter implements DevTunnelAdapter {
-	constructor(private readonly executable: string) {}
+	constructor(
+		private readonly executable: string,
+		private readonly commandRunner: DevTunnelCommandRunner = runCommand,
+	) {}
 
 	async isAuthenticated(signal: AbortSignal): Promise<boolean> {
-		const result = await runCommand(this.executable, ["user", "show", "--json"], true, signal);
+		const result = await this.commandRunner(
+			this.executable,
+			["user", "show", "--json"],
+			true,
+			signal,
+		);
 		return result.exitCode === 0 && parseDevTunnelLoginStatus(result.stdout);
 	}
 
@@ -834,34 +842,38 @@ export class DevTunnelCliAdapter implements DevTunnelAdapter {
 	}
 
 	async ensureTunnel(tunnelId: string, port: number, signal: AbortSignal): Promise<string> {
-		let tunnelResult = await runCommand(
-			this.executable,
-			["show", tunnelId, "--json"],
-			true,
-			signal,
-		);
-		if (tunnelResult.exitCode !== 0) {
-			tunnelResult = await requireSuccess(
+		const tunnelList = await this.commandRunner(this.executable, ["list", "--json"], false, signal);
+		let qualifiedTunnelId = findListedTunnelId(tunnelList.stdout, tunnelId);
+		if (qualifiedTunnelId === undefined) {
+			const tunnelResult = await this.commandRunner(
 				this.executable,
 				["create", tunnelId.split(".", 1)[0] ?? tunnelId, "--json"],
+				false,
 				signal,
 			);
+			qualifiedTunnelId = parseQualifiedTunnelId(tunnelResult.stdout, tunnelId);
 		}
-		const qualifiedTunnelId = parseQualifiedTunnelId(tunnelResult.stdout, tunnelId);
 		const ports = parseTunnelPorts(
-			(await requireSuccess(this.executable, ["port", "list", qualifiedTunnelId, "--json"], signal))
-				.stdout,
+			(
+				await this.commandRunner(
+					this.executable,
+					["port", "list", qualifiedTunnelId, "--json"],
+					false,
+					signal,
+				)
+			).stdout,
 		);
 		for (const existingPort of ports) {
 			if (existingPort !== port) {
-				await requireSuccess(
+				await this.commandRunner(
 					this.executable,
 					["port", "delete", qualifiedTunnelId, "-p", String(existingPort)],
+					false,
 					signal,
 				);
 			}
 		}
-		const targetPort = await runCommand(
+		const targetPort = await this.commandRunner(
 			this.executable,
 			["port", "show", qualifiedTunnelId, "-p", String(port), "--json"],
 			true,
@@ -870,35 +882,44 @@ export class DevTunnelCliAdapter implements DevTunnelAdapter {
 		const targetProtocol =
 			targetPort.exitCode === 0 ? parseTunnelPortProtocol(targetPort.stdout) : undefined;
 		if (targetProtocol !== undefined && targetProtocol !== "http") {
-			await requireSuccess(
+			await this.commandRunner(
 				this.executable,
 				["port", "delete", qualifiedTunnelId, "-p", String(port)],
+				false,
 				signal,
 			);
 		}
 		if (targetPort.exitCode !== 0 || targetProtocol !== "http") {
-			await requireSuccess(
+			await this.commandRunner(
 				this.executable,
 				["port", "create", qualifiedTunnelId, "-p", String(port), "--protocol", "http"],
+				false,
 				signal,
 			);
 		}
-		await requireSuccess(this.executable, ["access", "reset", qualifiedTunnelId], signal);
-		await requireSuccess(
+		await this.commandRunner(
 			this.executable,
-			["access", "reset", qualifiedTunnelId, "--port-number", String(port)],
+			["access", "reset", qualifiedTunnelId],
+			false,
 			signal,
 		);
-		await requireSuccess(
+		await this.commandRunner(
+			this.executable,
+			["access", "reset", qualifiedTunnelId, "--port-number", String(port)],
+			false,
+			signal,
+		);
+		await this.commandRunner(
 			this.executable,
 			["access", "create", qualifiedTunnelId, "--port-number", String(port), "--anonymous"],
+			false,
 			signal,
 		);
 		return qualifiedTunnelId;
 	}
 
 	async deleteTunnel(tunnelId: string, signal: AbortSignal): Promise<void> {
-		await requireSuccess(this.executable, ["delete", tunnelId, "--force"], signal);
+		await this.commandRunner(this.executable, ["delete", tunnelId, "--force"], false, signal);
 	}
 
 	startHost(tunnelId: string, port: number): DevTunnelHostProcess {
@@ -993,20 +1014,19 @@ async function runCommand(
 	return result;
 }
 
-async function requireSuccess(
-	executable: string,
-	args: readonly string[],
-	signal?: AbortSignal,
-): Promise<CommandResult> {
-	return runCommand(executable, args, false, signal);
-}
-
 interface CommandResult {
 	exitCode: number;
 	stdout: string;
 	stderr: string;
 	message: string;
 }
+
+type DevTunnelCommandRunner = (
+	executable: string,
+	args: readonly string[],
+	allowFailure?: boolean,
+	signal?: AbortSignal,
+) => Promise<CommandResult>;
 
 async function collectChild(child: CommandChild): Promise<CommandResult> {
 	const [exitCode, stdout, stderr] = await Promise.all([
@@ -1240,6 +1260,36 @@ export function parseDevTunnelLoginStatus(message: string): boolean {
 	);
 }
 
+export function findListedTunnelId(message: string, requestedTunnelId: string): string | undefined {
+	let value: unknown;
+	try {
+		value = JSON.parse(message);
+	} catch (error) {
+		throw new Error("Dev Tunnel inventory JSON is invalid.", { cause: error });
+	}
+	const requested = splitTunnelId(requestedTunnelId);
+	const tunnels: Array<{ tunnelId: string; clusterId?: string }> = [];
+	collectTunnelEntries(value, tunnels);
+	for (const tunnel of tunnels) {
+		const listed = splitTunnelId(tunnel.tunnelId, tunnel.clusterId);
+		if (listed.tunnelId.toLowerCase() !== requested.tunnelId.toLowerCase()) {
+			continue;
+		}
+		if (
+			requested.clusterId !== undefined &&
+			listed.clusterId !== undefined &&
+			listed.clusterId.toLowerCase() !== requested.clusterId.toLowerCase()
+		) {
+			continue;
+		}
+		if (listed.clusterId !== undefined) {
+			return `${listed.tunnelId}.${listed.clusterId}`;
+		}
+		return requestedTunnelId;
+	}
+	return undefined;
+}
+
 export function parseQualifiedTunnelId(message: string, fallback: string): string {
 	let value: unknown;
 	try {
@@ -1263,6 +1313,23 @@ export function parseQualifiedTunnelId(message: string, fallback: string): strin
 		return fallback;
 	}
 	throw new Error("Dev Tunnel metadata omitted its tunnel or cluster ID.");
+}
+
+function splitTunnelId(
+	tunnelId: string,
+	fallbackClusterId?: string,
+): { tunnelId: string; clusterId?: string } {
+	const separator = tunnelId.indexOf(".");
+	if (separator === -1) {
+		return {
+			tunnelId,
+			...(fallbackClusterId === undefined ? {} : { clusterId: fallbackClusterId }),
+		};
+	}
+	return {
+		tunnelId: tunnelId.slice(0, separator),
+		clusterId: tunnelId.slice(separator + 1),
+	};
 }
 
 export function parseTunnelPorts(message: string): number[] {
@@ -1292,6 +1359,31 @@ export function parseTunnelPortProtocol(message: string): string {
 		throw new Error("Dev Tunnel port metadata omitted its protocol.");
 	}
 	return protocol;
+}
+
+function collectTunnelEntries(
+	value: unknown,
+	output: Array<{ tunnelId: string; clusterId?: string }>,
+): void {
+	if (Array.isArray(value)) {
+		for (const item of value) collectTunnelEntries(item, output);
+		return;
+	}
+	if (typeof value !== "object" || value === null) return;
+	const entries = Object.entries(value);
+	const tunnelId = entries.find(
+		([key, item]) => key.toLowerCase() === "tunnelid" && typeof item === "string",
+	)?.[1];
+	const clusterId = entries.find(
+		([key, item]) => key.toLowerCase() === "clusterid" && typeof item === "string",
+	)?.[1];
+	if (typeof tunnelId === "string") {
+		output.push({
+			tunnelId,
+			...(typeof clusterId === "string" ? { clusterId } : {}),
+		});
+	}
+	for (const [, item] of entries) collectTunnelEntries(item, output);
 }
 
 function collectNamedStrings(value: unknown, name: string, output: string[]): void {
