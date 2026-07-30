@@ -143,6 +143,13 @@ export class DevTunnelService {
 	// startup fails/cancels/is superseded — always guarded by host identity so a replacement host's
 	// readiness is never wiped.
 	#ingressReadiness = new Map<number, { publicUrl: string }>();
+	// Hosts we have asked to stop but whose process exit is not yet confirmed — e.g. terminateHost()
+	// threw synchronously or its forced-shutdown timeout rejected. Tracked separately from #host so a
+	// rejected/timed-out termination never drops the only handle to a possibly-still-live public host:
+	// disable/shutdown re-terminate every tracked orphan until its `exited` resolves. Kept disjoint from
+	// the live #host, so a replacement host's ownership and readiness are never affected by an orphan's
+	// lingering cleanup, and a failed termination never blocks a replacement's start guard.
+	readonly #terminatingHosts = new Set<DevTunnelHostProcess>();
 
 	constructor(options: DevTunnelServiceOptions) {
 		this.#repository = options.repository;
@@ -748,13 +755,15 @@ export class DevTunnelService {
 			throwIfAborted(startAbortController.signal);
 			if (this.#host !== ownedHost || !this.#isCurrent(generation)) {
 				if (this.#host === ownedHost) {
-					// Clear the incremental readiness this superseded host published SYNCHRONOUSLY, before
-					// awaiting terminate: if terminate rejects or times out, a partially-ready ingress must
-					// not linger as ready. Guarded by host identity (this.#host === ownedHost) so a
-					// replacement host — which resets readiness on its own start — is never wiped.
+					// Clear readiness and release the live handle SYNCHRONOUSLY, before awaiting terminate:
+					// a rejected or timed-out stop must not leave a dead ingress reporting ready, nor block a
+					// replacement's start guard. The handle is retained in #terminatingHosts so a later
+					// disable/shutdown can re-terminate this exact orphan if its stop rejects. Guarded by host
+					// identity (this.#host === ownedHost) so a replacement host — which resets readiness on
+					// its own start — is never wiped.
 					this.#host = undefined;
 					this.#ingressReadiness = new Map();
-					await terminateHost(ownedHost);
+					await this.#terminateTrackedHost(ownedHost);
 				}
 				return;
 			}
@@ -790,14 +799,15 @@ export class DevTunnelService {
 		} catch (error) {
 			let failure = error;
 			if (ownedHost !== undefined && this.#host === ownedHost) {
-				// Clear the incremental readiness this dead host published SYNCHRONOUSLY, before awaiting
-				// terminate: a partial-startup failure or cancellation whose stop then rejects/times out
-				// must not leave an already-resolved ingress port reporting ready. Guarded by host identity
-				// so a replacement host's freshly-reset readiness is never clobbered.
+				// Clear readiness and release the live handle SYNCHRONOUSLY, before awaiting terminate: a
+				// partial-startup failure or cancellation whose stop then rejects/times out must not leave an
+				// already-resolved ingress reporting ready, nor block a replacement's start guard. The handle
+				// is retained in #terminatingHosts so a later disable/shutdown can re-terminate this exact
+				// orphan. Guarded by host identity so a replacement's freshly-reset readiness is untouched.
 				this.#host = undefined;
 				this.#ingressReadiness = new Map();
 				try {
-					await terminateHost(ownedHost);
+					await this.#terminateTrackedHost(ownedHost);
 				} catch (stopError) {
 					failure = stopError;
 				}
@@ -880,13 +890,54 @@ export class DevTunnelService {
 	async #stopHost(): Promise<void> {
 		this.#clearRestartTimers(true);
 		this.#ingressReadiness = new Map();
-		const host = this.#host;
-		if (host !== undefined) {
-			await terminateHost(host);
-			if (this.#host === host) {
-				this.#host = undefined;
-			}
+		const current = this.#host;
+		// Release the live handle up front so a rejected termination never blocks a replacement's start
+		// guard; the handle is retained in #terminatingHosts (via #terminateTrackedHost) until its exit
+		// is confirmed.
+		this.#host = undefined;
+		const targets = new Set<DevTunnelHostProcess>(this.#terminatingHosts);
+		if (current !== undefined) {
+			targets.add(current);
 		}
+		if (targets.size === 0) {
+			return;
+		}
+		// Re-terminate the live host plus any orphan whose earlier termination rejected or timed out, so a
+		// failed stop never strands a still-live public host beyond the reach of disable/shutdown.
+		const outcomes = await Promise.allSettled(
+			[...targets].map((host) => this.#terminateTrackedHost(host)),
+		);
+		const rejected = outcomes.find(
+			(outcome): outcome is PromiseRejectedResult => outcome.status === "rejected",
+		);
+		if (rejected !== undefined) {
+			throw rejected.reason;
+		}
+	}
+
+	/**
+	 * Terminates a host and tracks it in #terminatingHosts until its process exit is confirmed.
+	 *
+	 * The host is added to the orphan set before the (potentially rejecting) terminate is awaited and is
+	 * removed the moment its `exited` promise settles — however terminateHost() itself settles. So if the
+	 * stop throws or its forced-shutdown times out, the exact handle stays tracked and a later
+	 * disable/shutdown can drive it to a real exit, rather than the only reference being dropped while the
+	 * public host is still live. Callers must have already released ownership (cleared #host/readiness
+	 * under a host-identity guard) so this never touches a replacement host.
+	 */
+	async #terminateTrackedHost(host: DevTunnelHostProcess): Promise<void> {
+		this.#terminatingHosts.add(host);
+		void host.exited.then(
+			() => {
+				this.#terminatingHosts.delete(host);
+			},
+			() => {
+				this.#terminatingHosts.delete(host);
+			},
+		);
+		await terminateHost(host);
+		// terminateHost only resolves after `exited` resolves, so the process is confirmed gone.
+		this.#terminatingHosts.delete(host);
 	}
 
 	#assertRunning(): void {

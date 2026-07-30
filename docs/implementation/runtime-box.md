@@ -125,7 +125,7 @@ public URL；每个端口一旦 ready 就**增量**发布自己的 `publicUrl`�
 但**只有当所有 required ingress 都 ready 后 Service 才进入 `online`**，任一端口迟迟不 ready 会让整个 Service 保持非
 online。逐端口 readiness 绑定**拥有该 host 的身份/generation**：当 owning host 因失败、取消、detach、disable 或被
 replace 而终止时，按 host 身份清空对应 ingress readiness（`ready=false`、不留陈旧 URL），因此 partial-startup 失败不会让
-已 ready 的死端口继续显示 online；**该清空在 await 终止之前同步完成**，故即使 owning host 的 `stop()`/terminate 超时或 reject，也不会残留把死端口报成 ready 的陈旧 readiness；清理只针对被终止的 host，**不会误清**接管的 replacement host readiness。**对外 status 线协议保持 v1**：`getStatus()` 仍是既有 v1 形状（scalar `runtimeIngressPort` + 顶层
+已 ready 的死端口继续显示 online；**该清空在 await 终止之前同步完成**，故即使 owning host 的 `stop()`/terminate 超时或 reject，也不会残留把死端口报成 ready 的陈旧 readiness；清理只针对被终止的 host，**不会误清**接管的 replacement host readiness。此外，因为在 await 终止前会同步释放 `#host` 句柄，一次 reject/timeout 的终止**不会丢失该 host 句柄**：待终止但退出未确认的 host 被登记到独立的 `#terminatingHosts` 集合（与 live `#host` 解耦），后续 `disable`/`shutdown` 会**重试终止该 exact orphan** 直到其 `exited` 确认，从而既不阻塞 replacement 启动的 state guard，也不会遗留无法回收的存活公开 host。**对外 status 线协议保持 v1**：`getStatus()` 仍是既有 v1 形状（scalar `runtimeIngressPort` + 顶层
 `publicUrl`），**不**在严格的 `remoteAccessStatusOutputSchema` 上新增 `ingresses` 字段——旧 Client 继续无改动解析。
 per-ingress readiness 只经**内部（非线协议）** getter `DevTunnelService.getIngressReadiness()` 暴露，返回 typed
 descriptor（`kind`/`port`/`ready`/仅在 live 时携带的 `publicUrl`，pending 端口不回退到陈旧/持久 URL）。顶层 `publicUrl`

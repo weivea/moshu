@@ -757,6 +757,225 @@ describe("DevTunnelService", () => {
 		}
 	});
 
+	test("retains a rejected-termination host handle so a later disable re-terminates and confirms exit", async () => {
+		const database = openAppDatabase(":memory:");
+
+		class FlakyStopHost implements DevTunnelHostProcess {
+			readonly gates = new Map<
+				number,
+				ReturnType<typeof Promise.withResolvers<{ publicUrl: string }>>
+			>();
+			readonly exit = Promise.withResolvers<number>();
+			readonly exited = this.exit.promise;
+			stopCalls = 0;
+
+			constructor(ports: readonly number[]) {
+				for (const port of ports) {
+					this.gates.set(port, Promise.withResolvers<{ publicUrl: string }>());
+				}
+			}
+
+			waitForPort(port: number): Promise<{ publicUrl: string }> {
+				const gate = this.gates.get(port);
+				return gate?.promise ?? Promise.reject(new Error(`Unexpected port ${port}.`));
+			}
+
+			stop(): void {
+				this.stopCalls += 1;
+				// The first stop rejects (the process refuses to exit); only a later stop succeeds.
+				if (this.stopCalls === 1) {
+					throw new Error("Dev Tunnel host refused the first stop.");
+				}
+				this.exit.resolve(0);
+			}
+		}
+
+		class GatedAdapter extends FakeDevTunnelAdapter {
+			host: FlakyStopHost | undefined;
+
+			override startHost(tunnelId: string, ports: readonly number[]): DevTunnelHostProcess {
+				this.hostedTunnelIds.push(tunnelId);
+				this.host = new FlakyStopHost(ports);
+				return this.host;
+			}
+		}
+
+		try {
+			const adapter = new GatedAdapter();
+			const service = new DevTunnelService({
+				repository: database.remoteAccess,
+				runtimeIngressPort: 41_000,
+				mobileIngressPort: 42_000,
+				adapter,
+			});
+			const outcome = service.enable().then(
+				(status) => ({ status, error: undefined }),
+				(error: unknown) => ({ status: undefined, error }),
+			);
+			while (adapter.host === undefined) {
+				await Bun.sleep(0);
+			}
+			const host = adapter.host;
+			// A partial-startup failure (Mobile never binds) drives the catch path to terminate the host,
+			// and that first stop rejects — the round-4 relinquish nulled #host *before* awaiting terminate,
+			// so a rejected stop dropped the only handle to a possibly-still-live public host.
+			host.gates.get(41_000)?.resolve({ publicUrl: "https://moshu-41000.test.devtunnels.ms" });
+			await Bun.sleep(0);
+			host.gates.get(42_000)?.reject(new Error("Mobile ingress failed to bind."));
+			await outcome;
+			await Bun.sleep(0);
+			expect(host.stopCalls).toBe(1);
+			// Readiness is cleared even though termination rejected; no ingress reports ready or a stale URL.
+			expect(service.getIngressReadiness()).toEqual([
+				{ kind: "runtime", port: 41_000, ready: false },
+				{ kind: "mobile", port: 42_000, ready: false },
+			]);
+			expect(service.getStatus().state).not.toBe("online");
+			// The process has not actually exited yet — its handle must still be tracked for retry.
+			let exitedEarly = false;
+			void host.exited.then(() => {
+				exitedEarly = true;
+			});
+			await Bun.sleep(0);
+			expect(exitedEarly).toBe(false);
+
+			// disable() must re-terminate the exact retained orphan handle; this stop succeeds and confirms
+			// exit. If the handle had been dropped (round-4), #stopHost would find nothing and stop() would
+			// never be called a second time.
+			await service.disable();
+			expect(host.stopCalls).toBe(2);
+			expect(await host.exited).toBe(0);
+			expect(service.getIngressReadiness()).toEqual([
+				{ kind: "runtime", port: 41_000, ready: false },
+				{ kind: "mobile", port: 42_000, ready: false },
+			]);
+			expect(service.getStatus().state).not.toBe("online");
+			await service.shutdown();
+		} finally {
+			database.close();
+		}
+	});
+
+	test("a lingering rejected-termination orphan does not wipe a replacement host's readiness", async () => {
+		const database = openAppDatabase(":memory:");
+
+		class RejectFirstStopHost implements DevTunnelHostProcess {
+			readonly gates = new Map<
+				number,
+				ReturnType<typeof Promise.withResolvers<{ publicUrl: string }>>
+			>();
+			readonly exit = Promise.withResolvers<number>();
+			readonly exited = this.exit.promise;
+			stopCalls = 0;
+
+			constructor(ports: readonly number[]) {
+				for (const port of ports) {
+					this.gates.set(port, Promise.withResolvers<{ publicUrl: string }>());
+				}
+			}
+
+			waitForPort(port: number): Promise<{ publicUrl: string }> {
+				const gate = this.gates.get(port);
+				return gate?.promise ?? Promise.reject(new Error(`Unexpected port ${port}.`));
+			}
+
+			stop(): void {
+				this.stopCalls += 1;
+				// This host's termination always rejects; it stays a tracked orphan until its own exit fires.
+				throw new Error("Dev Tunnel host refused to stop.");
+			}
+		}
+
+		try {
+			const adapter = new (class extends FakeDevTunnelAdapter {
+				startedHosts: RejectFirstStopHost[] = [];
+				override startHost(tunnelId: string, ports: readonly number[]): DevTunnelHostProcess {
+					this.hostedTunnelIds.push(tunnelId);
+					const host = new RejectFirstStopHost(ports);
+					this.startedHosts.push(host);
+					return host;
+				}
+			})();
+			const service = new DevTunnelService({
+				repository: database.remoteAccess,
+				runtimeIngressPort: 41_000,
+				mobileIngressPort: 42_000,
+				adapter,
+			});
+			const enabled = service.enable();
+			while (adapter.startedHosts.length < 1) {
+				await Bun.sleep(0);
+			}
+			const firstHost = adapter.startedHosts[0];
+			if (firstHost === undefined) throw new Error("first host missing");
+			firstHost.gates
+				.get(41_000)
+				?.resolve({ publicUrl: "https://moshu-41000.first.devtunnels.ms" });
+			firstHost.gates
+				.get(42_000)
+				?.resolve({ publicUrl: "https://moshu-42000.first.devtunnels.ms" });
+			await enabled;
+			expect(service.getStatus().state).toBe("online");
+
+			// Disable fails because the first host's stop() rejects, orphaning it (handle retained, #host cleared).
+			await expect(service.disable()).rejects.toThrow();
+			expect(firstHost.stopCalls).toBe(1);
+
+			// Re-enable starts a fresh replacement host that comes online with its own per-port URLs.
+			const reEnabled = service.enable();
+			while (adapter.startedHosts.length < 2) {
+				await Bun.sleep(0);
+			}
+			const secondHost = adapter.startedHosts[1];
+			if (secondHost === undefined) throw new Error("second host missing");
+			secondHost.gates
+				.get(41_000)
+				?.resolve({ publicUrl: "https://moshu-41000.second.devtunnels.ms" });
+			secondHost.gates
+				.get(42_000)
+				?.resolve({ publicUrl: "https://moshu-42000.second.devtunnels.ms" });
+			await reEnabled;
+			expect(service.getStatus().state).toBe("online");
+			expect(service.getIngressReadiness()).toEqual([
+				{
+					kind: "runtime",
+					port: 41_000,
+					ready: true,
+					publicUrl: "https://moshu-41000.second.devtunnels.ms",
+				},
+				{
+					kind: "mobile",
+					port: 42_000,
+					ready: true,
+					publicUrl: "https://moshu-42000.second.devtunnels.ms",
+				},
+			]);
+
+			// The orphaned first host finally exits; its deferred cleanup must NOT wipe the replacement's readiness.
+			firstHost.exit.resolve(0);
+			expect(await firstHost.exited).toBe(0);
+			await Bun.sleep(0);
+			expect(service.getStatus().state).toBe("online");
+			expect(service.getIngressReadiness()).toEqual([
+				{
+					kind: "runtime",
+					port: 41_000,
+					ready: true,
+					publicUrl: "https://moshu-41000.second.devtunnels.ms",
+				},
+				{
+					kind: "mobile",
+					port: 42_000,
+					ready: true,
+					publicUrl: "https://moshu-42000.second.devtunnels.ms",
+				},
+			]);
+			await service.shutdown();
+		} finally {
+			database.close();
+		}
+	});
+
 	test("monitorHostPorts resolves a per-port public URL from a single host stream", async () => {
 		const stream = new ReadableStream<Uint8Array>({
 			start(controller) {
