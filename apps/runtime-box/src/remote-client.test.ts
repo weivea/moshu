@@ -160,7 +160,7 @@ describe("Remote Runtime Box client", () => {
 							runtimeBoxId: "remote-box",
 							deviceKeyId: "device-key",
 							generation: 1,
-							protocolVersion: 1,
+							protocolVersion: 2,
 						});
 						expect(
 							verify(
@@ -285,7 +285,7 @@ describe("Remote Runtime Box client", () => {
 						agentServerId: string;
 						rpcIdentity: typeof rpcIdentity;
 						actionJournalEpoch: string;
-						negotiatedProtocolVersion: 1;
+						negotiatedProtocolVersion: 2;
 						transportSecurity: "relay-tls";
 						supportedTransportSecurity: Array<"relay-tls" | "noise-xx">;
 				  }
@@ -303,7 +303,7 @@ describe("Remote Runtime Box client", () => {
 					agentServerId: config.agentServerId,
 					rpcIdentity,
 					actionJournalEpoch: "550e8400-e29b-41d4-a716-446655440099",
-					negotiatedProtocolVersion: 1,
+					negotiatedProtocolVersion: 2,
 					transportSecurity: "relay-tls",
 					supportedTransportSecurity: ["relay-tls"],
 				};
@@ -444,7 +444,7 @@ describe("Remote Runtime Box client", () => {
 					agentServerId: config.agentServerId,
 					rpcIdentity,
 					actionJournalEpoch: "550e8400-e29b-41d4-a716-446655440099",
-					negotiatedProtocolVersion: 1,
+					negotiatedProtocolVersion: 2,
 					transportSecurity: "relay-tls",
 					supportedTransportSecurity: ["relay-tls"],
 				});

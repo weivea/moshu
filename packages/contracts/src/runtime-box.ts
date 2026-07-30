@@ -2,8 +2,8 @@ import { z } from "zod";
 import { actionJournalEpochSchema, processPeerIdentitySchema } from "./companion-bootstrap";
 
 export const defaultLocalRuntimeBoxId = "moshu-local-runtime-box" as const;
-export const runtimeBoxProtocolMinVersion = 1 as const;
-export const runtimeBoxProtocolMaxVersion = 1 as const;
+export const runtimeBoxProtocolMinVersion = 2 as const;
+export const runtimeBoxProtocolMaxVersion = 2 as const;
 export const currentRuntimeBoxProtocolVersion = runtimeBoxProtocolMaxVersion;
 export const runtimeBoxProtocolVersionSchema = z.int().positive().max(65_535);
 export const runtimeBoxTransportSecuritySchema = z.enum(["relay-tls", "noise-xx"]);

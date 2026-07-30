@@ -53,6 +53,15 @@ import {
 	upsertRuntimeBoxMcpServerInputSchema,
 	deleteRuntimeBoxMcpServerInputSchema,
 	runtimeBoxResourceMutationResultSchema,
+	listMcpServersInputSchema,
+	listMcpServersOutputSchema,
+	upsertMcpServerInputSchema,
+	setMcpServerEnabledInputSchema,
+	deleteMcpServerInputSchema,
+	mcpServerMutationResultSchema,
+	getAgentGlobalProfileInputSchema,
+	getAgentGlobalProfileOutputSchema,
+	updateAgentGlobalProfileInputSchema,
 	listRuntimeBoxSkillsInputSchema,
 	listRuntimeBoxSkillsOutputSchema,
 	installRuntimeBoxSkillInputSchema,
@@ -301,6 +310,48 @@ export function createDesktopRpc({ agentsClient }: DesktopRpcDependencies) {
 						params,
 						deleteRuntimeBoxMcpServerInputSchema,
 						runtimeBoxResourceMutationResultSchema,
+					),
+				listOwnedMcpServers: (params) =>
+					agentsClient.request(
+						productRpcMethods.mcpList,
+						params,
+						listMcpServersInputSchema,
+						listMcpServersOutputSchema,
+					),
+				upsertOwnedMcpServer: (params) =>
+					agentsClient.request(
+						productRpcMethods.mcpUpsert,
+						params,
+						upsertMcpServerInputSchema,
+						mcpServerMutationResultSchema,
+					),
+				setOwnedMcpServerEnabled: (params) =>
+					agentsClient.request(
+						productRpcMethods.mcpSetEnabled,
+						params,
+						setMcpServerEnabledInputSchema,
+						mcpServerMutationResultSchema,
+					),
+				deleteOwnedMcpServer: (params) =>
+					agentsClient.request(
+						productRpcMethods.mcpDelete,
+						params,
+						deleteMcpServerInputSchema,
+						mcpServerMutationResultSchema,
+					),
+				getAgentGlobalProfile: (params) =>
+					agentsClient.request(
+						productRpcMethods.agentGlobalProfileGet,
+						params,
+						getAgentGlobalProfileInputSchema,
+						getAgentGlobalProfileOutputSchema,
+					),
+				updateAgentGlobalProfile: (params) =>
+					agentsClient.request(
+						productRpcMethods.agentGlobalProfileUpdate,
+						params,
+						updateAgentGlobalProfileInputSchema,
+						getAgentGlobalProfileOutputSchema,
 					),
 				listSkills: (params) =>
 					agentsClient.request(

@@ -24,7 +24,7 @@
 | 时间 | 数据库使用 UTC epoch milliseconds；RPC 返回 ISO 8601 |
 | JSON | 写入或发送前由共享 Zod schema 校验，并包含版本 |
 | Revision | 从 1 开始单调递增；更新使用 compare-and-swap |
-| Secret | 公共 RPC 只返回掩码；server DB 只保存 Provider/model `secretRef`，Runtime Box 私有 store 持有 MCP credential/OAuth state |
+| Secret | 公共 RPC 只返回掩码；Provider 与 MCP credential 分别只在其 owner 的 SecretStore 中持久化 |
 | Path | server 保存产品范围；Runtime Box 执行前解析 canonical path 并验证 scope |
 | Error | 失败使用 error response/result，不包装成 success |
 
@@ -84,12 +84,14 @@ interface AppError {
 | Provider/model config/credential、Agent definitions/versions | agents server | Runtime Box 读取 Provider secret 或自行修改 Agent |
 | Session/Run/event、Provider access、Agent runtime | agents server | client/Runtime Box 直接调用 Provider/Pi runtime |
 | Policy、approval、Action intent/result、grant audit | agents server | Runtime Box 自行批准 Action |
-| MCP config/credential/OAuth/lifecycle、Skill install/version/content/resource | owning Runtime Box | server 保存 recoverable copy 或 client 绕过 server 路由 |
+| Agent Server-owned MCP config/credential/lifecycle | agents server | client 绕过 server API 或 credential 进入普通 query/event |
+| Runtime Box-owned MCP config/credential/OAuth/lifecycle、Skill install/version/content/resource | owning Runtime Box | server 保存 recoverable copy 或 client 绕过 server 路由 |
 | redacted Runtime Box inventory cache | agents server projection | 当作 MCP/Skill 恢复源、授权依据或权威状态 |
-| Tool/MCP invocation、Skill scripts、进程树 | Runtime Box | server/client 直接执行 |
+| Tool/Box-owned MCP invocation、Skill scripts、进程树 | Runtime Box | server/client 直接执行 |
+| Server-owned MCP invocation/进程树 | agents server MCP dispatcher | Agent runtime/Product RPC 绕过 Action dispatcher |
 | UI state、窗口、Updater、companion supervisor | client | server/Runtime Box 操作桌面框架 |
 | Provider/model Secret | agents server `SecretVault` | client/WebView/Runtime Box 读取 |
-| MCP Secret | Runtime Box `ExecutorSecretStore` | server DB/Pi Session JSONL/snapshot/backup 保存副本 |
+| MCP Secret | 显式 owner 的 MCP SecretStore | 跨 owner 复制或进入 Pi Session/snapshot/query/log |
 
 ### 4.2 业务表
 
@@ -102,6 +104,8 @@ interface AppError {
 | `agent_versions` | id, agent_id, version, config_json, config_hash | 不可变配置快照 |
 | `agent_runtime_profiles` | id, agent_id, runtime_box_id, revision, disabled_at | 每个 `agentId + runtimeBoxId` 一份 Box-specific profile |
 | `agent_resource_refs` | runtime_profile_id, kind, resource_id, resource_version, content_hash | 只保存 profile 所属 Box 的稳定 MCP/Skill 引用 |
+| `agent_global_profiles` | agent_id, revision, server_mcp_refs_json | Agent 全局 Server-owned MCP refs |
+| `agent_server_mcp_servers` | id, config_revision, version, content_hash, transport_json, health, tools_json | Agent Server-owned MCP authority；transport 不含 secret value |
 | `provider_connections` | id, type, endpoint, secret_ref, status | 规划中的正式产品表；当前 Provider metadata/preference 存于 app-owned schema v5 registry，secret 独立存入 vault |
 | `runtime_box_inventory_snapshots` | runtime_box_id, generation, inventory_epoch, inventory_revision, stale, redacted_json, observed_at | 原子替换、可丢弃、非权威的 capability/inventory cache |
 | `projects` | id, runtime_box_id, name, path, availability, revision | Box 上的目录实体 |
@@ -110,11 +114,11 @@ interface AppError {
 | `run_events` | id, run_id, seq, type, payload_json, created_at | durable append-only 轨迹 |
 | `approval_requests` | id, run_id, tool_call_id, state, action_snapshot_json | server 的不可变审批请求 |
 | `approval_decisions` | id, approval_request_id, decision, decided_at | server 持久化决定 |
-| `action_executions` | id, run_id, tool_call_id, runtime_box_id, state, intent_json, result_json | server 的 Action 事实 |
-| `execution_grants` | id, action_id, invocation_id, runtime_box_id, instance_id, generation, digest, state, expires_at | 只存 grant 元数据/使用状态 |
+| `action_executions` | id, run_id, tool_call_id, target_kind, target_id, state, intent_json, result_json | server 的 Action 事实；target 为 agent-server 或 runtime-box |
+| `execution_grants` | id, action_id, invocation_id, target_kind, target_id, instance_id, generation, digest, state, expires_at | 只存 grant 元数据/使用状态 |
 | `invocation_results` | invocation_id, action_id, state, result_json, received_at | Runtime Box typed result 的 server 投影 |
 
-agents server 不保存 recoverable MCP/Skill config、MCP credential/OAuth state、Skill content/resource 或 Runtime Box secret handle。inventory cache 可随时丢弃并从 Runtime Box 重建，不能作为 Runtime Box 恢复输入。
+agents server 不保存 recoverable **Runtime Box-owned** MCP/Skill config、credential/OAuth state、Skill content/resource 或 Runtime Box secret handle。Server-owned MCP state 是 server authority；Box inventory cache 仍可随时丢弃，不能作为 Runtime Box 恢复输入。
 
 ### 4.3 Runtime Box-owned local data
 
@@ -137,9 +141,11 @@ agents server 不保存 recoverable MCP/Skill config、MCP credential/OAuth stat
 ### 5.1 Runtime Profile 关系
 
 - Agent definitions/versions 和 Provider 全局共享，不直接绑定 Runtime Box。
+- Agent global profile 保存 Server-owned MCP stable refs，不带 `runtimeBoxId`。
 - 每个 `agentId + runtimeBoxId` 最多有一份 active Runtime Profile。
 - Session/Project 永久保存 `runtimeBoxId`；启动 Run 时解析该 Agent 在同一 Box 上的 Runtime Profile。
 - Profile 的每个 MCP/Skill ref 都必须属于 profile 的 `runtimeBoxId`，并包含 stable resource ID、version 与 hash。
+- Run 有效 MCP 集合为 Agent global Server refs 与 Session Box Runtime Profile MCP refs 的并集；两类都 live 校验。
 - client 通过 server 查询 registry，不硬编码 Runtime Box 在线。
 - Runtime Box 新连接先处于 `syncing`；只有 full inventory sync 原子替换成功后才进入 online/runnable。
 
@@ -491,15 +497,15 @@ Runtime Box 验证：
 
 grant 单次使用。Runtime Box 先原子标记 nonce 已消费，再执行；旧连接或 restart 后的 grant 不再有效。
 
-### 10.4 Runtime Box-owned MCP credential
+### 10.4 Owner-scoped MCP credential
 
 - Provider/model credential 只存在于 agents server `SecretVault`，供 Provider adapter 使用，永不发送 Runtime Box。
-- MCP credential、token 和 OAuth state 只由 owning Runtime Box 的 `ExecutorSecretStore` 持久化和解析；server 无 Secret Ref 或 recoverable copy。
-- client 的设置 command 经 server 授权后路由到 selected Runtime Box；secret 只可存在于不落盘、强制脱敏且
+- Server-owned MCP credential 只由 Agent Server MCP SecretStore 持久化；Box-owned MCP credential/token/OAuth state 只由 owning Runtime Box 的 `ExecutorSecretStore` 持久化和解析。
+- client 的设置 command 经 server 授权后按 owner 本地处理或路由到 selected Runtime Box；secret 只可存在于不落盘、强制脱敏且
   relay 后释放的 command payload，不能进入 server DB/Pi Session JSONL/event/audit payload、snapshot、
   backup 或 log。
-- Runtime Box query/result/inventory 永不返回 secret、secret handle 或 recoverable auth config，只返回 redacted 状态。
-- Runtime Box 可在 connection/process lifetime 将 credential 加载到内存；stdio MCP 只向目标 child 注入最小环境，不修改 Runtime Box 全局环境，也不传给无关 child/Agent。
+- query/result/inventory 永不返回 secret、secret handle 或 recoverable auth config，只返回 redacted 状态。
+- owner 可在 connection/process lifetime 将 credential 加载到内存；stdio MCP 只向目标 child 注入最小环境，不修改进程全局环境，也不传给无关 child/Agent。
 - HTTP MCP 可在可行时按 request 注入 credential，但不是 universal requirement。
 - revocation、expiry 或 MCP shutdown 必须关闭对应 connection/process 并释放 runtime references；不宣称 JavaScript 可可靠清零 string memory。
 - credential 只认证 MCP connection；每个 MCP Tool invocation 仍需要新的 `ExecutionGrant`。
@@ -526,7 +532,18 @@ Runtime Box 不得自行假设 server 已收到结果；重连时使用 `invocat
 
 ## 12. MCP 与 Skill 契约
 
-### 12.1 stable Runtime Box resource reference
+### 12.1 stable MCP/Runtime Box resource reference
+
+Agent global profile 的 Server-owned MCP ref 保存：
+
+```ts
+interface AgentServerMcpResourceRef {
+  owner: { kind: "agent-server" };
+  stableResourceId: string;
+  version: string;
+  contentHash: string;
+}
+```
 
 Runtime Profile 不复制 Runtime Box config 或 content，只保存：
 
@@ -540,7 +557,8 @@ interface RuntimeBoxResourceRef {
 }
 ```
 
-`runtimeBoxId` 必须等于 Runtime Profile 和 Session 所属 Box。server 构建或恢复 Agent 时向该 Box 解析引用；
+Server 构建或恢复 Agent 时先从本地 authority 解析 global refs，再从 Session Box 解析 Runtime Profile refs。
+`runtimeBoxId` 必须等于 Runtime Profile 和 Session 所属 Box。Box ref
 offline、missing、wrong owner、version/hash mismatch 都 fail closed，不得用 inventory snapshot 或旧 prompt
 payload 回退。
 
@@ -618,7 +636,9 @@ snapshot/change/cache 只允许 stable resource ID、version/hash、MCP Tool sch
 
 ### 12.3 MCP
 
-MCP config、auth state、connection/process 和 Tool inventory 都由 Runtime Box 持久化/管理。client 的完整配置 UI 使用第 8 节 routed API；mutation 必须带 `commandId` 与 expected version，Runtime Box 原子持久化后返回：
+MCP config、auth state、connection/process 和 Tool inventory 由显式 owner 持久化/管理。Server-owned MCP
+使用 Product DB metadata + 独立 MCP SecretStore；Box-owned MCP 使用第 8 节 routed API。mutation 必须带
+`commandId` 与 expected config revision；Agent ref 继续绑定独立的 resource version/hash。Box 原子持久化后返回：
 
 ```ts
 interface RuntimeBoxResourceMutationResult {

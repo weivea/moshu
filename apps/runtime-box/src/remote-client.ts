@@ -582,7 +582,7 @@ function verifyServerChallenge(
 		deviceKeyId: string;
 		instanceId: string;
 		generation: number;
-		protocolVersion: 1;
+		protocolVersion: 2;
 	},
 	challenge: {
 		challengeId: string;

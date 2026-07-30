@@ -84,6 +84,55 @@ export const agentRuntimeProfilesTable = sqliteTable(
 	(table) => [primaryKey({ columns: [table.agentId, table.runtimeBoxId] })],
 );
 
+export const agentServerMcpServersTable = sqliteTable("agent_server_mcp_servers", {
+	id: text("id").primaryKey(),
+	configRevision: integer("config_revision").notNull(),
+	version: text("version").notNull(),
+	contentHash: text("content_hash").notNull(),
+	displayName: text("display_name").notNull(),
+	enabled: integer("enabled", { mode: "boolean" }).notNull(),
+	transportJson: text("transport_json").notNull(),
+	secretLocator: text("secret_locator"),
+	credentialConfigured: integer("credential_configured", { mode: "boolean" }).notNull(),
+	health: text("health", { enum: ["ready", "stopped", "error"] }).notNull(),
+	toolsJson: text("tools_json").notNull(),
+	createdAtMs: integer("created_at_ms").notNull(),
+	updatedAtMs: integer("updated_at_ms").notNull(),
+});
+
+export const agentServerMcpRetainedSecretsTable = sqliteTable("agent_server_mcp_retained_secrets", {
+	id: text("id").primaryKey(),
+	secretLocator: text("secret_locator").notNull(),
+});
+
+export const agentServerMcpPendingSecretDeletionsTable = sqliteTable(
+	"agent_server_mcp_pending_secret_deletions",
+	{
+		secretLocator: text("secret_locator").primaryKey(),
+		createdAtMs: integer("created_at_ms").notNull(),
+	},
+);
+
+export const agentServerMcpCommandResultsTable = sqliteTable(
+	"agent_server_mcp_command_results",
+	{
+		commandId: text("command_id").primaryKey(),
+		operation: text("operation").notNull(),
+		requestDigest: text("request_digest").notNull(),
+		resultJson: text("result_json").notNull(),
+		createdAtMs: integer("created_at_ms").notNull(),
+	},
+	(table) => [index("agent_server_mcp_command_results_created_idx").on(table.createdAtMs)],
+);
+
+export const agentGlobalProfilesTable = sqliteTable("agent_global_profiles", {
+	agentId: text("agent_id").primaryKey(),
+	revision: integer("revision").notNull(),
+	serverMcpRefsJson: text("server_mcp_refs_json").notNull(),
+	createdAtMs: integer("created_at_ms").notNull(),
+	updatedAtMs: integer("updated_at_ms").notNull(),
+});
+
 export const appSettingsTable = sqliteTable("app_settings", {
 	id: integer("id").primaryKey(),
 	activeRuntimeBoxId: text("active_runtime_box_id")
@@ -270,9 +319,8 @@ export const actionIntentsTable = sqliteTable(
 	{
 		id: text("id").primaryKey(),
 		invocationId: text("invocation_id").notNull(),
-		runtimeBoxId: text("runtime_box_id")
-			.notNull()
-			.references(() => runtimeBoxesTable.id),
+		targetKind: text("target_kind", { enum: ["agent-server", "runtime-box"] }).notNull(),
+		targetId: text("target_id").notNull(),
 		runId: text("run_id")
 			.notNull()
 			.references(() => chatRunsTable.id, { onDelete: "cascade" }),
@@ -302,7 +350,7 @@ export const actionIntentsTable = sqliteTable(
 	},
 	(table) => [
 		uniqueIndex("action_intents_invocation_unique").on(table.invocationId),
-		index("action_intents_runtime_state_idx").on(table.runtimeBoxId, table.state),
+		index("action_intents_target_state_idx").on(table.targetKind, table.targetId, table.state),
 		index("action_intents_run_idx").on(table.runId),
 	],
 );
@@ -378,7 +426,12 @@ export const agentSessionCleanupOutboxTable = sqliteTable(
 );
 
 export const appSchema = {
+	agentGlobalProfilesTable,
 	agentRuntimeProfilesTable,
+	agentServerMcpCommandResultsTable,
+	agentServerMcpPendingSecretDeletionsTable,
+	agentServerMcpRetainedSecretsTable,
+	agentServerMcpServersTable,
 	appSettingsTable,
 	remoteAccessSettingsTable,
 	projectsTable,

@@ -11,3 +11,5 @@ export * from "./runtime-box-pairing-repository";
 export * from "./runtime-profile-repository";
 export * from "./schema";
 export * from "./session-repository";
+export * from "./agent-global-profile-repository";
+export * from "./agent-server-mcp-repository";

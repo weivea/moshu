@@ -1807,6 +1807,136 @@ a {
 	align-content: start;
 }
 
+.mcp-settings {
+	display: grid;
+	gap: 18px;
+}
+
+.mcp-settings__owner,
+.mcp-settings__create,
+.mcp-settings__empty,
+.mcp-server-card {
+	box-shadow: none;
+}
+
+.mcp-settings__owner [data-slot="content"] {
+	max-width: 720px;
+}
+
+.mcp-settings__form,
+.mcp-settings__json {
+	display: grid;
+	gap: 18px;
+	padding-top: 6px;
+}
+
+.mcp-settings__form-grid {
+	display: grid;
+	grid-template-columns: repeat(2, minmax(0, 1fr));
+	gap: 18px;
+	align-items: start;
+}
+
+.mcp-settings__wide-field {
+	grid-column: 1 / -1;
+}
+
+.mcp-settings__form-actions {
+	display: flex;
+	justify-content: flex-end;
+	gap: 10px;
+}
+
+.mcp-settings__json-input {
+	min-height: 260px;
+	font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+	font-size: 12px;
+	line-height: 1.55;
+	tab-size: 2;
+}
+
+.mcp-settings__feedback {
+	margin: 0;
+	color: #18794e;
+	font-size: 13px;
+}
+
+.mcp-settings__feedback.is-error {
+	color: #c9372c;
+}
+
+.mcp-settings__servers {
+	display: grid;
+	gap: 14px;
+}
+
+.mcp-settings__section-heading {
+	display: flex;
+	align-items: flex-end;
+	justify-content: space-between;
+	gap: 16px;
+}
+
+.mcp-settings__section-heading h2 {
+	margin: 0;
+	font-size: 18px;
+}
+
+.mcp-settings__section-heading p {
+	margin: 5px 0 0;
+	color: var(--text-muted);
+	font-size: 13px;
+	line-height: 1.5;
+}
+
+.mcp-settings__server-grid {
+	display: grid;
+	grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+	gap: 14px;
+}
+
+.mcp-server-card {
+	min-width: 0;
+}
+
+.mcp-server-card__title {
+	display: flex;
+	min-width: 0;
+	align-items: center;
+	justify-content: space-between;
+	gap: 12px;
+}
+
+.mcp-server-card__title h3 {
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.mcp-server-card code {
+	overflow-wrap: anywhere;
+	color: var(--text-muted);
+	font-size: 11px;
+	user-select: all;
+}
+
+.mcp-server-card__content {
+	display: grid;
+	gap: 12px;
+}
+
+.mcp-server-card__chips,
+.mcp-server-card__actions {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 8px;
+}
+
+.mcp-server-card__actions {
+	align-items: center;
+	justify-content: flex-end;
+}
+
 .provider-status-row {
 	display: flex;
 	align-items: center;
@@ -2367,6 +2497,18 @@ a {
 
 	.chat-message {
 		max-width: 100%;
+	}
+
+	.mcp-settings__form-grid {
+		grid-template-columns: 1fr;
+	}
+
+	.mcp-settings__wide-field {
+		grid-column: auto;
+	}
+
+	.mcp-settings__server-grid {
+		grid-template-columns: 1fr;
 	}
 
 	.providers-settings__layout,

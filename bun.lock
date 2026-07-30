@@ -18,6 +18,7 @@
         "@moshu/agent-runtime": "workspace:*",
         "@moshu/contracts": "workspace:*",
         "@moshu/database": "workspace:*",
+        "@moshu/mcp-runtime": "workspace:*",
         "@moshu/process-rpc": "workspace:*",
         "zod": "4.4.3",
       },
@@ -58,6 +59,7 @@
       "dependencies": {
         "@silvia-odwyer/photon-node": "0.3.4",
         "@moshu/contracts": "workspace:*",
+        "@moshu/mcp-runtime": "workspace:*",
         "@moshu/process-rpc": "workspace:*",
         "diff": "8.0.4",
         "zod": "4.4.3",
@@ -96,6 +98,14 @@
       "dependencies": {
         "@moshu/contracts": "workspace:*",
         "drizzle-orm": "0.45.2",
+      },
+    },
+    "packages/mcp-runtime": {
+      "name": "@moshu/mcp-runtime",
+      "version": "0.0.1",
+      "dependencies": {
+        "@moshu/contracts": "workspace:*",
+        "@moshu/process-rpc": "workspace:*",
       },
     },
     "packages/domain": {
@@ -221,6 +231,7 @@
     "@moshu/agents-server": ["@moshu/agents-server@workspace:apps/agents-server"],
     "@moshu/contracts": ["@moshu/contracts@workspace:packages/contracts"],
     "@moshu/database": ["@moshu/database@workspace:packages/database"],
+    "@moshu/mcp-runtime": ["@moshu/mcp-runtime@workspace:packages/mcp-runtime"],
     "@moshu/desktop": ["@moshu/desktop@workspace:apps/desktop"],
     "@moshu/domain": ["@moshu/domain@workspace:packages/domain"],
     "@moshu/runtime-box": ["@moshu/runtime-box@workspace:apps/runtime-box"],

@@ -98,8 +98,8 @@ describe("RuntimeBoxRegistry routing and invocation gateway", () => {
 		expect(gateway.listInfo()[0]).toMatchObject({
 			state: "upgrade_required",
 			compatibility: "upgrade_required",
-			requiredProtocolMinVersion: 1,
-			requiredProtocolMaxVersion: 1,
+			requiredProtocolMinVersion: 2,
+			requiredProtocolMaxVersion: 2,
 		});
 	});
 
@@ -160,7 +160,7 @@ describe("RuntimeBoxRegistry routing and invocation gateway", () => {
 					arch: "arm64",
 					capabilities: [],
 				},
-				{ protocolVersion: 1, transportSecurity: "noise-xx" },
+				{ protocolVersion: 2, transportSecurity: "noise-xx" },
 			),
 		).toThrow("was not negotiated");
 	});

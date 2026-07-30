@@ -17,11 +17,7 @@ import {
 	createExecutorToolDefinitions,
 	type RuntimeBoxToolGateway,
 } from "./executor-tools";
-import {
-	createMcpToolDefinitions,
-	type AgentMcpResource,
-	type RuntimeBoxMcpToolGateway,
-} from "./mcp-tools";
+import { createMcpToolDefinitions, type AgentMcpResource, type McpToolGateway } from "./mcp-tools";
 
 export interface AskChatMessage {
 	role: "user" | "assistant";
@@ -84,7 +80,8 @@ export interface AskChatRuntime {
 export interface AskChatRuntimeOptions {
 	agentDataDirectory: string;
 	modelRuntime: ModelRuntime;
-	runtimeBoxGateway: RuntimeBoxToolGateway & Partial<RuntimeBoxMcpToolGateway>;
+	runtimeBoxGateway: RuntimeBoxToolGateway;
+	mcpToolGateway?: McpToolGateway;
 	workspaceDirectory?: string;
 }
 
@@ -148,7 +145,8 @@ interface ActiveRun {
 
 export class PiAgentRuntime implements AskChatRuntime {
 	readonly #modelRuntime: ModelRuntime;
-	readonly #runtimeBoxGateway: RuntimeBoxToolGateway & Partial<RuntimeBoxMcpToolGateway>;
+	readonly #runtimeBoxGateway: RuntimeBoxToolGateway;
+	readonly #mcpToolGateway: McpToolGateway | undefined;
 	readonly #agentDirectory: string;
 	readonly #sessionDirectory: string;
 	readonly #workspaceDirectory: string;
@@ -163,6 +161,7 @@ export class PiAgentRuntime implements AskChatRuntime {
 	constructor(options: AskChatRuntimeOptions) {
 		this.#modelRuntime = options.modelRuntime;
 		this.#runtimeBoxGateway = options.runtimeBoxGateway;
+		this.#mcpToolGateway = options.mcpToolGateway;
 		this.#agentDirectory = resolve(options.agentDataDirectory);
 		this.#sessionDirectory = join(this.#agentDirectory, "sessions");
 		this.#workspaceDirectory = resolve(
@@ -455,23 +454,15 @@ export class PiAgentRuntime implements AskChatRuntime {
 			getRunId: () => this.#runIdByThread.get(threadId),
 		});
 		assertExecutorToolDefinitions(customTools);
-		const invokeMcpForRuntimeBox = this.#runtimeBoxGateway.invokeMcpForRuntimeBox;
-		if (mcpResources.length > 0 && invokeMcpForRuntimeBox === undefined) {
-			throw runtimeError(
-				"runtime_box_unavailable",
-				"The Runtime Box MCP Tool gateway is unavailable.",
-				false,
-			);
+		if (mcpResources.length > 0 && this.#mcpToolGateway === undefined) {
+			throw runtimeError("runtime_box_unavailable", "The MCP Tool gateway is unavailable.", false);
 		}
 		const mcpTools =
-			invokeMcpForRuntimeBox === undefined
+			this.#mcpToolGateway === undefined
 				? []
 				: createMcpToolDefinitions({
 						resources: mcpResources,
-						runtimeBoxId,
-						gateway: {
-							invokeMcpForRuntimeBox: invokeMcpForRuntimeBox.bind(this.#runtimeBoxGateway),
-						},
+						gateway: this.#mcpToolGateway,
 						getRunId: () => this.#runIdByThread.get(threadId),
 					});
 		customTools.push(...mcpTools);
@@ -527,6 +518,7 @@ function createResourceFingerprint(
 	return JSON.stringify([
 		skills.map((skill) => [skill.stableResourceId, skill.version, skill.contentHash]),
 		mcpResources.map((resource) => [
+			resource.owner,
 			resource.stableResourceId,
 			resource.version,
 			resource.contentHash,
@@ -547,9 +539,11 @@ function createResourceSystemPrompt(
 	];
 	if (mcpResources.length > 0) {
 		sections.push(
-			`You also have these Runtime Box-owned MCP tools: ${mcpResources
+			`You also have these explicitly assigned MCP tools: ${mcpResources
 				.flatMap((resource) =>
-					resource.tools.map((tool) => `${resource.stableResourceId}/${tool.name}`),
+					resource.tools.map(
+						(tool) => `${resource.owner.kind}/${resource.stableResourceId}/${tool.name}`,
+					),
 				)
 				.join(", ")}. MCP connectivity does not grant additional permissions.`,
 		);

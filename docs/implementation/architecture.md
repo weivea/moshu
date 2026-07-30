@@ -19,8 +19,8 @@
 | 角色 | 可执行程序 | 核心职责 |
 | --- | --- | --- |
 | Electrobun client | 桌面应用 | UI、系统集成、companion supervisor |
-| agents server | Bun compiled binary | 业务数据、Provider、Agent runtime、Run、Policy/approval |
-| Runtime Box | Bun compiled binary | 设备级 Tool、MCP、Skill；内部 Executor 管理实际进程 |
+| agents server | Bun compiled binary | 业务数据、Provider、Agent runtime、Run、Policy/approval、Server-owned MCP |
+| Runtime Box | Bun compiled binary | 设备级 Tool、Box-owned MCP、Skill；内部 Executor 管理实际进程 |
 
 Electrobun 可另有 launcher、application worker 和 WebView 等框架进程，因此不能用 PID 数量判断架构是否正确。
 
@@ -117,15 +117,16 @@ agents server 是业务事实来源，独占：
 - Policy Engine、审批、Allow all、Action intent/result 和 recovery decision。
 - execution grant 的签发、使用状态和审计。
 - Agent 对 Runtime Box resource 的稳定引用，以及从 Runtime Box 同步得到的可替换、非权威、可丢弃 inventory/capability cache。
+- Agent Server-owned MCP config、credential、Tool inventory、连接/子进程生命周期和 Agent global refs。
 
-agents server 不保存可恢复 MCP/Skill config、MCP credential/OAuth state 或 Skill 内容副本，也不直接执行文件、命令、Git、MCP Tool 或 Skill 脚本。
+agents server 不保存可恢复的 **Runtime Box-owned** MCP/Skill config、credential/OAuth state 或 Skill 内容副本，也不直接执行文件、命令、Git 或 Skill 脚本。Server-owned MCP Tool 只能通过本地 Action dispatcher 调用。
 
 ### 4.3 Runtime Box 与内部 Executor
 
 Runtime Box 是其安装设备上的执行与扩展资源事实来源，内部 Executor 独占：
 
 - 内置 Tool 的实际文件、命令、Git、网络或其他 host 操作。
-- MCP config、credential/token/OAuth state、stdio/HTTP/SSE 连接和子进程生命周期。
+- Box-owned MCP config、credential/token/OAuth state、stdio/HTTP/SSE 连接和子进程生命周期。
 - Skill installation、immutable versions、content/hash、metadata、资源和脚本。
 - Runtime Box private DB、Skill data root、`ExecutorSecretStore` 和相关设备数据。
 - 持久化 `inventoryEpoch`、单调递增 `inventoryRevision`，以及带 deletion tombstone 的有界 inventory change log。
@@ -133,7 +134,7 @@ Runtime Box 是其安装设备上的执行与扩展资源事实来源，内部 E
 - 本 Runtime Box 的能力、健康状态和运行中 invocation registry。
 
 Runtime Box 不拥有产品 DB/Pi Session JSONL、Agent definitions、Agent runtime、Provider 访问、Provider/model
-credential 或 Policy/approval。未来它拥有自身 MCP credential 并可在 connection/process 生命周期内加载到
+credential 或 Policy/approval。它拥有自身 Box-owned MCP credential 并可在 connection/process 生命周期内加载到
 内存或目标 MCP child 的最小环境；每次 Tool action 仍需 server 的一次性 execution grant。
 
 Remote Runtime Box、Tunnel、配对、切换和跨设备恢复以
@@ -304,7 +305,7 @@ interface RpcEnvelope<T> {
 - API Key/OAuth 由 public `Models` auth 操作和异步 auth attempt 驱动，不占用交互式 RPC。
 - Provider credential 从 app-owned `SecretVaultCredentialStore` 按 Run scope 读取，不进入 client 或 Runtime Box。
 - `ThinkingLevel` 按当前模型能力验证；能力刷新后不再支持的已保存档位在运行时安全省略。
-- MCP credential/token/OAuth state 由 owning Runtime Box 的 `ExecutorSecretStore` 管理；server 只路由不落盘的设置 command，不保存 recoverable copy。
+- Server-owned MCP credential 由 server MCP SecretStore 管理；Box-owned credential/token/OAuth state 由 owning Runtime Box `ExecutorSecretStore` 管理，二者不跨 owner 复制。
 
 ### 8.3 数据所有权
 
@@ -313,6 +314,8 @@ agentDataDirectory/
 ├── product.db               # agents server Product DB
 ├── sessions/                # Pi SessionManager JSONL
 ├── credentials.json         # Provider credential vault，0600
+├── mcp-secrets/             # Agent Server-owned MCP SecretStore，0600
+├── mcp-workspaces/          # Agent Server-owned stdio MCP 默认 cwd，0700
 ├── provider-registry.json   # secret-free builtin/custom preferences
 ├── attachments/             # agents server 管理的产品资产
 ├── change-blobs/            # agents server 管理的 Action 记录
@@ -410,16 +413,16 @@ Runtime Box 必须拒绝过期、重复、目标不匹配、参数摘要变化�
 
 ### 10.1 MCP
 
-- Runtime Box 是其 MCP config、credential/token/OAuth state、lifecycle、Tool inventory 和本地数据的唯一 source of truth。
-- client 提供完整 MCP UI；command 先到 server 做 client/Runtime Box identity、Agent binding 和产品授权校验，再路由到选定 Runtime Box。Runtime Box 持久化后返回 redacted result 与新的 inventory epoch/revision，server 立即按第 6.4 节拉取到该 revision。
-- Runtime Box offline 时 command 明确失败；server 可展示标为 stale 的 inventory cache，但不能据此编辑、恢复配置或返回 success。
-- server 只保存 Agent resource refs 和可替换、非权威、可丢弃的 redacted inventory/capability cache，不保存 MCP config、Secret Ref、credential 或 OAuth state。
-- Agent runtime 只从 server 获得规范化 ToolDefinition；每次调用仍经过 Policy/approval、Action intent 和 execution grant。
-- Runtime Box 从自己的 `ExecutorSecretStore` 加载 credential；stdio MCP 只向目标 child 注入最小环境，不修改 Runtime Box 全局环境，也不传给无关 child/Agent。
+- MCP 使用显式双 owner：Agent Server-owned MCP 的 config/credential/inventory/lifecycle 归 agents server；Runtime Box-owned MCP 的对应状态归 owning Box。
+- client 的 owner-explicit command 在 server 完成授权。Server-owned mutation 直接写 server authority；Box-owned mutation 路由到 Box，并按第 6.4 节 read-own-write reconciliation。
+- Agent global profile 保存 Server-owned stable refs；`agentId + runtimeBoxId` Runtime Profile 保存该 Box 的 MCP refs。Run 合并两者并 live 校验 version/hash/schema。
+- Runtime Box offline 时 Box mutation 明确失败；Server-owned MCP 仍可管理和保持连接，但当前 Session Run gate 仍要求所属 Box online。
+- Agent runtime 只获得脱敏、规范化 ToolDefinition；两类调用都经过 Policy/Action。Box 调用继续使用跨进程 grant/journal/evidence，Server 调用使用绑定当前 server instance/generation 的本地单次 grant。
+- credential 由 owner 的 SecretStore 加载；stdio MCP 只向目标 child 注入最小环境，不修改全局环境，也不传给无关 child/Agent。
 - HTTP MCP 可在可行时按 request 注入凭证，但这是优化，不是所有 transport 的统一要求。
 - query RPC、inventory、UI、prompt、日志、诊断和 export 永不返回 MCP credential。
-- Runtime Box 可在 connection/process 生命周期内持有 credential reference；撤销、过期或 MCP shutdown 必须关闭资源并释放引用。JavaScript runtime 不保证可靠清零 string memory。
-- Runtime Box-owned credential 只解决 MCP 认证，不授予 Tool 权限；连接保持 authenticated 时，每次 Tool execution 仍需新的、一次性 execution grant。
+- owner 可在 connection/process 生命周期内持有 credential reference；撤销、过期或 MCP shutdown 必须关闭资源并释放引用。JavaScript runtime 不保证可靠清零 string memory。
+- MCP credential 只解决连接认证，不授予 Tool 权限；连接保持 authenticated 时，每次 Tool execution 仍需独立 Action 授权。
 
 ### 10.2 Skills
 
@@ -475,7 +478,7 @@ Runtime Box 必须拒绝过期、重复、目标不匹配、参数摘要变化�
 | ARC-003 | desktop server 只绑定动态 loopback；未认证本机进程不能注册或调用 |
 | ARC-004 | stable ID 在重连/重启后保持，旧 instance/generation 的消息、result 和 grant 被拒绝 |
 | ARC-005 | agents server 是产品 DB/Pi Session JSONL、Provider/model、Agent、Run/event、Policy/approval/Action 的唯一写入所有者 |
-| ARC-006 | 每个 Runtime Box 是其 MCP config/credential/OAuth/lifecycle、Skill immutable content/resources、Tool/进程树和 private data 的唯一 source of truth |
+| ARC-006 | MCP config/credential/lifecycle 归显式 owner；每个 Runtime Box 仍是其 Box-owned MCP、Skill immutable content/resources、Tool/进程树和 private data 的唯一 source of truth |
 | ARC-007 | 一个本地 Runtime Box 可承载多个 Agent；offline 时相关 Agent 不能启动新 Run |
 | ARC-008 | policy/approval/intent 先持久化，Runtime Box 只执行有效的一次性 grant，重复或篡改 grant 被拒绝 |
 | ARC-009 | Agent 只引用 assigned Runtime Box 的稳定 MCP/Skill resource；server 按 version/hash 获取 Skill metadata/`SKILL.md`，missing/mismatch fail closed |
@@ -483,7 +486,7 @@ Runtime Box 必须拒绝过期、重复、目标不匹配、参数摘要变化�
 | ARC-012 | server/Runtime Box 分别被 kill 后，Run/Action 能进入确定的 completed/interrupted/outcome_unknown 状态，不盲目重复副作用 |
 | ARC-013 | 两个 TypeScript + Bun companion 在签名产物中可执行、可握手、可更新，终端用户无需安装 runtime |
 | ARC-014 | 当前实现与目标差距始终在 progress 文档中明确，不用当前可信直连七工具测试替代未来 Policy/grant/MCP 架构验收 |
-| ARC-015 | Provider/model credential 从不进入 Runtime Box；MCP credential 只在 Runtime Box private store/目标 process memory 中使用，永不经 query/UI/prompt/log/diagnostic/export 暴露 |
+| ARC-015 | Provider/model credential 从不进入 Runtime Box；MCP credential 只在 owner private store/目标 process memory 中使用，永不经 query/UI/prompt/log/diagnostic/export 暴露 |
 | ARC-016 | client MCP/Skill command 经 server 校验后路由；Runtime Box offline 或持久化失败时不返回成功，server snapshot 不能恢复 Runtime Box config |
 | ARC-017 | 每次 Runtime Box 注册/重连先 full inventory sync；epoch/revision、hint、60 秒 ±20% poll、delta/tombstone 和 snapshot fallback 可收敛且 cache 可丢弃 |
 | ARC-018 | syncing/offline cache 标为 stale 且失败 poll 不代表删除；Run start/restore 仍 live 验证 resource/version/hash，inventory 不构成授权 |

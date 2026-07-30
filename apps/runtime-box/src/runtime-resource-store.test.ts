@@ -1,3 +1,4 @@
+import Database from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import {
@@ -11,7 +12,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-
+import { ExecutorSecretStore } from "./executor-secret-store";
 import { RuntimeResourceStore } from "./runtime-resource-store";
 
 const runtimeBoxId = "runtime-box-test";
@@ -91,9 +92,10 @@ describe("RuntimeResourceStore", () => {
 			const databaseBytes = readFileSync(join(directory, "resources", "runtime-box.db"));
 			expect(databaseBytes.includes(Buffer.from("secret-value-never-project"))).toBe(false);
 			const secretFiles = readdirSync(join(directory, "resources", "secrets"));
-			expect(secretFiles).toHaveLength(1);
+			const credentialFiles = secretFiles.filter((filename) => filename.endsWith(".json"));
+			expect(credentialFiles).toHaveLength(1);
 			expect(
-				readFileSync(join(directory, "resources", "secrets", secretFiles[0] ?? ""), "utf8"),
+				readFileSync(join(directory, "resources", "secrets", credentialFiles[0] ?? ""), "utf8"),
 			).toContain("secret-value-never-project");
 			expect(hints).toEqual([
 				{
@@ -124,14 +126,23 @@ describe("RuntimeResourceStore", () => {
 				},
 				secret: { headers: { Authorization: "secret-value-never-project" } },
 			});
+
+			if (created.configRevision === undefined) {
+				throw new Error("Expected an MCP config revision.");
+			}
 			const commandId = crypto.randomUUID();
 			const toggled = store.setMcpServerEnabled({
 				commandId,
 				stableResourceId: created.stableResourceId,
-				expectedVersion: created.version,
+				expectedConfigRevision: created.configRevision,
 				enabled: false,
 			});
-			expect(toggled).toMatchObject({ deleted: false });
+			expect(toggled).toMatchObject({
+				deleted: false,
+				configRevision: created.configRevision + 1,
+				version: created.version,
+				contentHash: created.contentHash,
+			});
 			expect(store.listMcpServers(runtimeBoxId).items[0]).toMatchObject({
 				enabled: false,
 				credentialConfigured: true,
@@ -145,11 +156,159 @@ describe("RuntimeResourceStore", () => {
 				store.setMcpServerEnabled({
 					commandId,
 					stableResourceId: created.stableResourceId,
-					expectedVersion: created.version,
+					expectedConfigRevision: created.configRevision,
 					enabled: false,
 				}),
 			).toEqual(toggled);
+			expect(() =>
+				store.setMcpServerEnabled({
+					commandId: crypto.randomUUID(),
+					stableResourceId: created.stableResourceId,
+					expectedConfigRevision: created.configRevision,
+					enabled: true,
+				}),
+			).toThrow("configuration changed");
 			store.close();
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+
+	test("replays committed secret cleanup and forces credential rotations through reconnect", () => {
+		const directory = mkdtempSync(join(tmpdir(), "moshu-resource-store-secret-retry-"));
+		try {
+			const backingSecrets = new ExecutorSecretStore(join(directory, "injected-secrets"));
+			let failNextDelete = false;
+			const secretStore = {
+				put: backingSecrets.put.bind(backingSecrets),
+				read: backingSecrets.read.bind(backingSecrets),
+				cleanupOrphans: backingSecrets.cleanupOrphans.bind(backingSecrets),
+				fingerprint: backingSecrets.fingerprint.bind(backingSecrets),
+				delete(locator: string) {
+					if (failNextDelete) {
+						failNextDelete = false;
+						throw new Error("simulated Runtime Box secret cleanup failure");
+					}
+					backingSecrets.delete(locator);
+				},
+			};
+			const store = new RuntimeResourceStore(join(directory, "resources"), { secretStore });
+			let lifecycleNotifications = 0;
+			store.setMcpConfigChangedListener(() => {
+				lifecycleNotifications += 1;
+			});
+			const created = store.upsertMcpServer({
+				commandId: crypto.randomUUID(),
+				stableResourceId: "credential-rotation",
+				displayName: "Credential rotation",
+				enabled: true,
+				transport: {
+					type: "streamable-http",
+					url: "https://mcp.example.test/rpc",
+					timeoutMs: 30_000,
+				},
+				secret: { headers: { Authorization: "first" } },
+			});
+			store.updateMcpRuntimeState(created.stableResourceId, "ready", []);
+			const ready = store.listMcpServers(runtimeBoxId).items[0];
+			if (ready === undefined) {
+				throw new Error("Expected an MCP Server ready for credential rotation.");
+			}
+			lifecycleNotifications = 0;
+			const rotation = {
+				commandId: crypto.randomUUID(),
+				stableResourceId: ready.stableResourceId,
+				expectedConfigRevision: ready.configRevision,
+				displayName: ready.displayName,
+				enabled: true,
+				transport: ready.transport,
+				secret: { headers: { Authorization: "second" } },
+			};
+			failNextDelete = true;
+			expect(() => store.upsertMcpServer(rotation)).toThrow(
+				"simulated Runtime Box secret cleanup failure",
+			);
+			expect(store.listMcpServers(runtimeBoxId).items[0]).toMatchObject({
+				configRevision: ready.configRevision + 1,
+				version: ready.version,
+				contentHash: ready.contentHash,
+				health: "stopped",
+			});
+			expect(store.getMcpConnectionConfig(ready.stableResourceId).secret).toEqual({
+				headers: { Authorization: "second" },
+			});
+			expect(lifecycleNotifications).toBe(0);
+			expect(store.upsertMcpServer(rotation)).toMatchObject({
+				configRevision: ready.configRevision + 1,
+			});
+			expect(lifecycleNotifications).toBe(1);
+			store.close();
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+
+	test("purges legacy secret digests and preserves migrated version/hash pairs", () => {
+		const directory = mkdtempSync(join(tmpdir(), "moshu-resource-store-v3-migration-"));
+		try {
+			const root = join(directory, "resources");
+			const initial = new RuntimeResourceStore(root);
+			const created = initial.upsertMcpServer({
+				commandId: crypto.randomUUID(),
+				stableResourceId: "migrated-server",
+				displayName: "Before migration",
+				enabled: false,
+				transport: {
+					type: "streamable-http",
+					url: "https://mcp.example.test/rpc",
+					timeoutMs: 30_000,
+				},
+			});
+			initial.close();
+			const databaseFile = join(root, "runtime-box.db");
+			const legacy = new Database(databaseFile);
+			legacy.exec(`
+				DROP TABLE mcp_pending_secret_deletions;
+				UPDATE mcp_configs SET content_hash = '${"f".repeat(64)}';
+				PRAGMA user_version = 3;
+			`);
+			legacy.close();
+
+			const migrated = new RuntimeResourceStore(root);
+			const beforeUpdate = migrated.listMcpServers(runtimeBoxId).items[0];
+			if (beforeUpdate === undefined) {
+				throw new Error("Expected a migrated MCP Server.");
+			}
+			expect(beforeUpdate).toMatchObject({
+				version: created.version,
+				contentHash: "f".repeat(64),
+			});
+			const updated = migrated.upsertMcpServer({
+				commandId: crypto.randomUUID(),
+				stableResourceId: beforeUpdate.stableResourceId,
+				expectedConfigRevision: beforeUpdate.configRevision,
+				displayName: "After migration",
+				enabled: false,
+				transport: beforeUpdate.transport,
+			});
+			expect(updated).toMatchObject({
+				version: created.version,
+				contentHash: "f".repeat(64),
+			});
+			migrated.close();
+
+			const inspected = new Database(databaseFile, { readonly: true });
+			expect(
+				inspected
+					.query<{ count: number }, []>(
+						"SELECT count(*) AS count FROM command_results WHERE operation = 'mcp.upsert'",
+					)
+					.get()?.count,
+			).toBe(1);
+			expect(
+				inspected.query<{ user_version: number }, []>("PRAGMA user_version").get()?.user_version,
+			).toBe(4);
+			inspected.close();
 		} finally {
 			rmSync(directory, { recursive: true, force: true });
 		}
@@ -264,7 +423,7 @@ describe("RuntimeResourceStore", () => {
 				expectedVersion: restored.version,
 				deleteCredentials: true,
 			});
-			expect(readdirSync(join(root, "secrets"))).toEqual([]);
+			expect(readdirSync(join(root, "secrets"))).toEqual(["idempotency.key"]);
 			store.close();
 		} finally {
 			rmSync(directory, { recursive: true, force: true });

@@ -131,7 +131,7 @@ authenticated RPC 和 Provider registry 已实现，Agent/Runtime Box inventory 
 - MCP Bearer/API Key、OAuth 2.1、连接测试和配置导入。
 - MCP Server/Tool 的全局、Project 和 Agent 作用域。
 - Agent Skills 本地安装、验证、启停、冲突处理、导入导出。
-- MCP config/credential/OAuth/lifecycle 和 Skill installations/immutable content 都由 selected Runtime Box 持久化；client UI command 经 server 校验后路由，offline 不伪装成功。
+- MCP config/credential/lifecycle 由显式 owner 持久化；Skill installations/immutable content 由 selected Runtime Box 持久化。client UI command 经 server 校验后按 owner 处理，offline 不伪装成功。
 - server 只保存 assigned Runtime Box stable resource refs 与 replaceable/disposable redacted inventory cache；registration full sync、hint + jittered poll 和 delta/snapshot fallback 保持对账。
 - cache 只含 ID/version/hash、Tool schema、health/capability 和 credential-configured boolean；Run start/restore 仍向 live Runtime Box 验证。
 - 文件/目录知识库、本地索引、云端 Embedding 和来源引用。
@@ -255,7 +255,7 @@ authenticated RPC 和 Provider registry 已实现，Agent/Runtime Box inventory 
 4. client command 经 server 校验后由 selected Runtime Box 持久化并返回 epoch/revision；server 立即 read-own-write，offline/冲突/写入失败保持失败语义。
 5. 丢失 `inventory.changed` 后，48–72 秒 poll 拉到 delta；revision gap/compaction/epoch reset/invalid cursor 自动 full snapshot。
 6. Runtime Box offline 时 cache 标 stale 且不误删；reconnect full sync 完成前 Agent 不能运行。
-7. server DB/backup/cache 无 recoverable config/credential/Skill body；MCP credential 只在 Runtime Box private store 与目标 connection/process 可达。
+7. server 对 Box-owned inventory/cache 无 recoverable config/credential/Skill body；MCP credential 只在显式 owner private store 与目标 connection/process 可达。
 8. Run start live 验证 resource/version/hash/schema；有副作用 Tool 仍逐次使用 execution grant。
 
 ### E2E-10：Skill

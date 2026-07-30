@@ -31,10 +31,14 @@ import {
 	runtimeBoxInventoryChangedHintSchema,
 	listRuntimeBoxInventoryOutputSchema,
 	listRuntimeBoxMcpServerSummariesOutputSchema,
+	listMcpServersOutputSchema,
+	mcpServerMutationResultSchema,
 	listRuntimeBoxSkillsOutputSchema,
 	runtimeBoxResourceMutationResultSchema,
 	getRuntimeProfileOutputSchema,
+	getAgentGlobalProfileOutputSchema,
 	updateRuntimeProfileOutputSchema,
+	updateAgentGlobalProfileOutputSchema,
 	productRpcInternalHandlerErrorCode,
 	productRpcEvents,
 	productRpcMethods,
@@ -56,6 +60,11 @@ import {
 	type RuntimeBoxInventoryRepository,
 	type RuntimeProfileRepository,
 	RuntimeProfileRevisionConflictError,
+	type AgentGlobalProfileRepository,
+	AgentGlobalProfileRevisionConflictError,
+	type AgentServerMcpRepository,
+	McpResourceNotFoundError,
+	McpResourceVersionConflictError,
 	type ProjectRepository,
 	ProjectNotFoundError,
 	ProjectPathConflictError,
@@ -89,6 +98,8 @@ export interface ProductRpcDependencies {
 	projects?: ProjectRepository;
 	runtimeBoxInventory?: RuntimeBoxInventoryRepository;
 	runtimeProfiles?: RuntimeProfileRepository;
+	agentGlobalProfiles?: AgentGlobalProfileRepository;
+	agentServerMcps?: AgentServerMcpRepository;
 	runtimeIngressAuth: RuntimeIngressAuth;
 	getDevTunnelService: () => DevTunnelService;
 	eventRouter: ProductEventRouter;
@@ -222,6 +233,8 @@ export function createProductRpcHandlers(dependencies: ProductRpcDependencies): 
 		projects,
 		runtimeBoxInventory,
 		runtimeProfiles,
+		agentGlobalProfiles,
+		agentServerMcps,
 		runtimeIngressAuth,
 		getDevTunnelService,
 		eventRouter,
@@ -245,6 +258,18 @@ export function createProductRpcHandlers(dependencies: ProductRpcDependencies): 
 			throw new Error("Runtime Profile repository is not initialized.");
 		}
 		return runtimeProfiles;
+	};
+	const getAgentGlobalProfiles = (): AgentGlobalProfileRepository => {
+		if (agentGlobalProfiles === undefined) {
+			throw new Error("Agent global profile repository is not initialized.");
+		}
+		return agentGlobalProfiles;
+	};
+	const getAgentServerMcps = (): AgentServerMcpRepository => {
+		if (agentServerMcps === undefined) {
+			throw new Error("Agent Server MCP repository is not initialized.");
+		}
+		return agentServerMcps;
 	};
 	const resolveRuntimeBoxId = (runtimeBoxId: string | undefined): string =>
 		runtimeBoxId ?? runtimeBoxes.getActive().runtimeBoxId;
@@ -470,6 +495,7 @@ export function createProductRpcHandlers(dependencies: ProductRpcDependencies): 
 						runtimeBoxId: output.runtimeBoxId,
 						items: output.items.map((server) => ({
 							stableResourceId: server.stableResourceId,
+							configRevision: server.configRevision,
 							version: server.version,
 							contentHash: server.contentHash,
 							displayName: server.displayName,
@@ -514,6 +540,139 @@ export function createProductRpcHandlers(dependencies: ProductRpcDependencies): 
 						);
 					});
 				},
+			),
+			[productRpcMethods.mcpList]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.mcpList],
+				async (input, _peer, context) => {
+					if (input.owner.kind === "agent-server") {
+						return listMcpServersOutputSchema.parse(getAgentServerMcps().list());
+					}
+					const output = await runtimeBoxRegistry.listMcpServers(
+						input.owner.runtimeBoxId,
+						context.signal,
+					);
+					return listMcpServersOutputSchema.parse({
+						owner: input.owner,
+						items: output.items.map((server) => ({
+							owner: input.owner,
+							stableResourceId: server.stableResourceId,
+							configRevision: server.configRevision,
+							version: server.version,
+							contentHash: server.contentHash,
+							displayName: server.displayName,
+							enabled: server.enabled,
+							credentialConfigured: server.credentialConfigured,
+							health: server.health,
+							tools: server.tools,
+							stale: false,
+						})),
+					});
+				},
+			),
+			[productRpcMethods.mcpUpsert]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.mcpUpsert],
+				async (input, _peer, context) => {
+					if (input.owner.kind === "agent-server") {
+						return serializeRuntimeResourceMutation("agent-server", async () =>
+							mcpServerMutationResultSchema.parse(getAgentServerMcps().upsert(input)),
+						);
+					}
+					const runtimeBoxId = input.owner.runtimeBoxId;
+					const { owner: _owner, ...command } = input;
+					return serializeRuntimeResourceMutation(runtimeBoxId, async () => {
+						const result = await runtimeBoxRegistry.upsertMcpServer(
+							runtimeBoxId,
+							{ ...command, runtimeBoxId },
+							context.signal,
+						);
+						return mcpServerMutationResultSchema.parse({
+							owner: input.owner,
+							stableResourceId: result.stableResourceId,
+							configRevision: requireMcpConfigRevision(result.configRevision),
+							version: result.version,
+							contentHash: result.contentHash,
+							deleted: result.deleted,
+						});
+					});
+				},
+			),
+			[productRpcMethods.mcpSetEnabled]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.mcpSetEnabled],
+				async (input, _peer, context) => {
+					if (input.owner.kind === "agent-server") {
+						return serializeRuntimeResourceMutation("agent-server", async () =>
+							mcpServerMutationResultSchema.parse(getAgentServerMcps().setEnabled(input)),
+						);
+					}
+					const runtimeBoxId = input.owner.runtimeBoxId;
+					const { owner: _owner, ...command } = input;
+					return serializeRuntimeResourceMutation(runtimeBoxId, async () => {
+						const result = await runtimeBoxRegistry.setMcpServerEnabled(
+							runtimeBoxId,
+							{ ...command, runtimeBoxId },
+							context.signal,
+						);
+						return mcpServerMutationResultSchema.parse({
+							owner: input.owner,
+							stableResourceId: result.stableResourceId,
+							configRevision: requireMcpConfigRevision(result.configRevision),
+							version: result.version,
+							contentHash: result.contentHash,
+							deleted: result.deleted,
+						});
+					});
+				},
+			),
+			[productRpcMethods.mcpDelete]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.mcpDelete],
+				async (input, _peer, context) => {
+					if (input.owner.kind === "agent-server") {
+						return serializeRuntimeResourceMutation("agent-server", async () => {
+							if (getAgentGlobalProfiles().isResourceReferenced(input.stableResourceId)) {
+								throw new RpcHandlerError(
+									"MCP_RESOURCE_IN_USE",
+									"Remove the MCP Server from every Agent before deleting it.",
+								);
+							}
+							return mcpServerMutationResultSchema.parse(getAgentServerMcps().delete(input));
+						});
+					}
+					const runtimeBoxId = input.owner.runtimeBoxId;
+					const { owner: _owner, ...command } = input;
+					return serializeRuntimeResourceMutation(runtimeBoxId, async () => {
+						assertResourceNotReferenced(runtimeBoxId, "mcp", input.stableResourceId);
+						const result = await runtimeBoxRegistry.deleteMcpServer(
+							runtimeBoxId,
+							{ ...command, runtimeBoxId },
+							context.signal,
+						);
+						return mcpServerMutationResultSchema.parse({
+							owner: input.owner,
+							stableResourceId: result.stableResourceId,
+							configRevision: requireMcpConfigRevision(result.configRevision),
+							version: result.version,
+							contentHash: result.contentHash,
+							deleted: result.deleted,
+						});
+					});
+				},
+			),
+			[productRpcMethods.agentGlobalProfileGet]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.agentGlobalProfileGet],
+				(input) =>
+					getAgentGlobalProfileOutputSchema.parse({
+						profile: getAgentGlobalProfiles().getOrCreate(input.agentId),
+					}),
+			),
+			[productRpcMethods.agentGlobalProfileUpdate]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.agentGlobalProfileUpdate],
+				(input) =>
+					serializeRuntimeResourceMutation("agent-server", async () => {
+						getAgentServerMcps().resolveRefs(input.serverMcpRefs);
+						return updateAgentGlobalProfileOutputSchema.parse({
+							profile: getAgentGlobalProfiles().update(input),
+						});
+					}),
 			),
 			[productRpcMethods.skillsList]: createRequestHandler(
 				productRpcRequestSchemas[productRpcMethods.skillsList],
@@ -908,6 +1067,17 @@ function rethrowProductHandlerError(error: unknown): never {
 			actualRevision: error.actualRevision,
 		});
 	}
+	if (error instanceof AgentGlobalProfileRevisionConflictError) {
+		throw new RpcHandlerError("AGENT_GLOBAL_PROFILE_REVISION_CONFLICT", error.message, {
+			actualRevision: error.actualRevision,
+		});
+	}
+	if (error instanceof McpResourceNotFoundError) {
+		throw new RpcHandlerError("MCP_NOT_READY", error.message);
+	}
+	if (error instanceof McpResourceVersionConflictError) {
+		throw new RpcHandlerError("MCP_RESOURCE_VERSION_CONFLICT", error.message);
+	}
 	if (error instanceof RpcRemoteError) {
 		if (
 			[
@@ -957,5 +1127,13 @@ function encodeJsonValue(value: unknown): JsonValue {
 	if (encoded === undefined) {
 		throw new RpcHandlerError("INTERNAL_ERROR", "Product RPC output is not JSON serializable.");
 	}
+
 	return rpcJsonValueSchema.parse(JSON.parse(encoded));
+}
+
+function requireMcpConfigRevision(value: number | undefined): number {
+	if (value === undefined) {
+		throw new Error("Runtime Box MCP mutation omitted its config revision.");
+	}
+	return value;
 }

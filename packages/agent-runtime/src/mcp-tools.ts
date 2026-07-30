@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import { Type } from "@earendil-works/pi-ai";
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
@@ -5,20 +6,22 @@ import {
 	mcpToolArgumentsSchema,
 	runtimeBoxMcpToolInvokeInputSchema,
 	type McpToolDescriptor,
+	type McpOwner,
 	type RuntimeBoxMcpToolInvokeInput,
 	type RuntimeBoxMcpToolInvokeOutput,
 } from "@moshu/contracts";
 
 export interface AgentMcpResource {
+	owner: McpOwner;
 	stableResourceId: string;
 	version: string;
 	contentHash: string;
 	tools: readonly McpToolDescriptor[];
 }
 
-export interface RuntimeBoxMcpToolGateway {
-	invokeMcpForRuntimeBox(
-		runtimeBoxId: string,
+export interface McpToolGateway {
+	invokeMcp(
+		owner: McpOwner,
 		input: RuntimeBoxMcpToolInvokeInput,
 		options?: { signal?: AbortSignal },
 	): Promise<RuntimeBoxMcpToolInvokeOutput>;
@@ -26,15 +29,18 @@ export interface RuntimeBoxMcpToolGateway {
 
 export function createMcpToolDefinitions(input: {
 	resources: readonly AgentMcpResource[];
-	runtimeBoxId: string;
-	gateway: RuntimeBoxMcpToolGateway;
+	gateway: McpToolGateway;
 	getRunId: () => string | undefined;
 }): ToolDefinition[] {
 	const names = new Set<string>();
 	const definitions: ToolDefinition[] = [];
 	for (const resource of input.resources) {
 		for (const tool of resource.tools) {
-			const name = createAgentMcpToolName(resource.stableResourceId, tool.stableToolId);
+			const name = createAgentMcpToolName(
+				resource.owner,
+				resource.stableResourceId,
+				tool.stableToolId,
+			);
 			if (names.has(name)) {
 				throw new Error("MCP Tool names collide after normalization.");
 			}
@@ -43,16 +49,17 @@ export function createMcpToolDefinitions(input: {
 				name,
 				label: tool.name,
 				description:
-					tool.description ?? `Invoke ${tool.name} from MCP Server ${resource.stableResourceId}.`,
-				promptSnippet: `Use ${tool.name} from MCP Server ${resource.stableResourceId}`,
+					tool.description ??
+					`Invoke ${tool.name} from ${ownerLabel(resource.owner)} MCP Server ${resource.stableResourceId}.`,
+				promptSnippet: `Use ${tool.name} from ${ownerLabel(resource.owner)} MCP Server ${resource.stableResourceId}`,
 				parameters: Type.Unsafe(tool.inputSchema),
 				async execute(toolCallId, params, signal): Promise<AgentToolResult<unknown>> {
 					const runId = input.getRunId();
 					if (runId === undefined) {
 						throw new Error("MCP Tool call is not associated with an active Agent run.");
 					}
-					const output = await input.gateway.invokeMcpForRuntimeBox(
-						input.runtimeBoxId,
+					const output = await input.gateway.invokeMcp(
+						resource.owner,
 						runtimeBoxMcpToolInvokeInputSchema.parse({
 							schemaVersion: 1,
 							invocationId: crypto.randomUUID(),
@@ -84,14 +91,33 @@ export function createMcpToolDefinitions(input: {
 	return definitions;
 }
 
-function createAgentMcpToolName(serverId: string, stableToolId: string): string {
+export function createAgentMcpToolName(
+	owner: McpOwner,
+	serverId: string,
+	stableToolId: string,
+): string {
 	const normalize = (value: string): string =>
 		value
 			.toLowerCase()
 			.replace(/[^a-z0-9_]+/g, "_")
-			.replace(/^_+|_+$/g, "")
-			.slice(0, 48);
-	return `mcp_${normalize(serverId)}_${normalize(stableToolId)}`.slice(0, 120);
+			.replace(/^_+|_+$/g, "");
+	const fullServerSlug = normalize(serverId);
+	const fullToolSlug = normalize(stableToolId);
+	const serverSlugLength = Math.min(
+		fullServerSlug.length,
+		24 + Math.max(0, 29 - fullToolSlug.length),
+	);
+	const toolSlugLength = Math.min(fullToolSlug.length, 53 - serverSlugLength);
+	const ownerId = owner.kind === "runtime-box" ? owner.runtimeBoxId : "";
+	const hash = createHash("sha256")
+		.update(`${owner.kind}\0${ownerId}\0${serverId}\0${stableToolId}`)
+		.digest("base64url")
+		.slice(0, 4);
+	return `mcp_${fullServerSlug.slice(0, serverSlugLength)}_${fullToolSlug.slice(0, toolSlugLength)}_${hash}`;
+}
+
+function ownerLabel(owner: McpOwner): string {
+	return owner.kind === "agent-server" ? "Agent Server-owned" : "Runtime Box-owned";
 }
 
 function normalizeMcpResult(

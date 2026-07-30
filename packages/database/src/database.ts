@@ -10,6 +10,15 @@ import {
 	getDatabaseUserVersion,
 } from "./migrations";
 import { type ActionRepository, SqliteActionRepository } from "./action-repository";
+import {
+	type AgentGlobalProfileRepository,
+	SqliteAgentGlobalProfileRepository,
+} from "./agent-global-profile-repository";
+import {
+	type AgentServerMcpRepository,
+	type AgentServerMcpSecretStorePort,
+	SqliteAgentServerMcpRepository,
+} from "./agent-server-mcp-repository";
 import { createRunJournalRepository, type RunJournalRepository } from "./run-journal-repository";
 import { type ProjectRepository, SqliteProjectRepository } from "./project-repository";
 import {
@@ -46,6 +55,8 @@ export interface AppDatabase {
 	remoteAccess: RemoteAccessRepository;
 	runtimeBoxInventory: RuntimeBoxInventoryRepository;
 	runtimeProfiles: RuntimeProfileRepository;
+	agentGlobalProfiles: AgentGlobalProfileRepository;
+	agentServerMcps: AgentServerMcpRepository;
 	close(): void;
 }
 
@@ -102,7 +113,13 @@ export function configureAppDatabase(client: Database): void {
 	`);
 }
 
-export function openAppDatabase(filename: string): AppDatabase {
+export function openAppDatabase(
+	filename: string,
+	options: {
+		agentServerMcpSecrets?: AgentServerMcpSecretStorePort;
+		prepareAgentServerMcpStdioCwd?: (stableResourceId: string) => string;
+	} = {},
+): AppDatabase {
 	const normalized = requireDatabaseFilename(filename);
 	mkdirSync(dirname(normalized), { recursive: true, mode: 0o700 });
 	chmodSync(dirname(normalized), 0o700);
@@ -116,6 +133,7 @@ export function openAppDatabase(filename: string): AppDatabase {
 	}
 	const orm = drizzle(client, { schema: appSchema });
 	const runtimeBoxes = new SqliteRuntimeBoxRepository(orm);
+	const agentServerMcpSecrets = options.agentServerMcpSecrets ?? createUnavailableMcpSecretStore();
 	const platform = requireSupportedPlatform(process.platform);
 	runtimeBoxes.initializeDefault({
 		schemaVersion: 1,
@@ -133,6 +151,13 @@ export function openAppDatabase(filename: string): AppDatabase {
 		runtimeBoxes,
 		runtimeBoxInventory: new SqliteRuntimeBoxInventoryRepository(orm, runtimeBoxes),
 		runtimeProfiles: new SqliteRuntimeProfileRepository(orm, runtimeBoxes),
+		agentGlobalProfiles: new SqliteAgentGlobalProfileRepository(orm),
+		agentServerMcps: new SqliteAgentServerMcpRepository(
+			orm,
+			agentServerMcpSecrets,
+			{ now: Date.now },
+			options.prepareAgentServerMcpStdioCwd,
+		),
 		projects: new SqliteProjectRepository(orm, runtimeBoxes),
 		runtimeBoxPairings: new SqliteRuntimeBoxPairingRepository(orm),
 		remoteAccess: new SqliteRemoteAccessRepository(orm),
@@ -140,6 +165,23 @@ export function openAppDatabase(filename: string): AppDatabase {
 		runs: createRunJournalRepository({ client, orm }),
 		actions: new SqliteActionRepository(orm),
 		close: () => client.close(),
+	};
+}
+
+function createUnavailableMcpSecretStore(): AgentServerMcpSecretStorePort {
+	return {
+		put() {
+			throw new Error("Agent Server MCP SecretStore is not configured.");
+		},
+		read() {
+			throw new Error("Agent Server MCP SecretStore is not configured.");
+		},
+		delete() {
+			throw new Error("Agent Server MCP SecretStore is not configured.");
+		},
+		fingerprint() {
+			throw new Error("Agent Server MCP SecretStore is not configured.");
+		},
 	};
 }
 

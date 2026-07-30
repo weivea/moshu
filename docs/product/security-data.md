@@ -33,7 +33,7 @@
 - `clientId`/`runtimeBoxId` 是稳定身份；每次启动/注册使用新的 `instanceId` 和 `generation`。旧实例的消息、result 和 grant 必须被拒绝。
 - agents server 独占产品 DB/Pi Session JSONL、Provider、Agent runtime；未来也独占 Policy/approval 和
   Action intent/result。
-- Runtime Box 独占实际 Tool、MCP/Skill、取消和进程树；它不能打开业务 DB 或自行授予权限。
+- Runtime Box 独占设备 Tool、Box-owned MCP/Skill、取消和进程树；Agent Server-owned MCP 由 server 的独立 dispatcher/SecretStore 执行，两类都不能绕过 Policy/Action。
 - WebSocket/RPC 的传输保护不代替身份、Schema、capability、参数摘要、状态和授权校验。
 - Canvas 使用 `sandbox: true` 的独立 `BrowserView`/partition，不注册应用 RPC；sandbox 只减少应用桥接面，不保证子资源断网。
 - 两个 TypeScript + Bun companion 必须随 desktop 同一 release 打包、签名和更新，不能运行时下载未知 binary。
@@ -153,9 +153,9 @@ default tools 和 TUI 全部禁用；意外 Tool activity 直接失败。未来�
 ### 8.1 MCP
 
 - 安装/添加时展示 Server 来源、Transport、命令/域名和 Tool 清单。
-- selected Runtime Box 是 MCP config、credential/token/OAuth state、lifecycle 和 Tool inventory 的唯一 source of truth。
-- client 配置 command 经 agents server 做 client/Runtime Box identity 与授权检查后路由；只有 Runtime Box 持久化成功才返回 redacted result/inventory epoch/revision，offline 或失败不能伪装成功。
-- agents server 只可保存 Agent stable resource ref 与 replaceable、non-authoritative、disposable redacted inventory cache，不保存 recoverable config、credential、OAuth state 或 Runtime Box secret locator。
+- MCP 使用显式 owner：Server-owned config/credential/lifecycle/inventory 归 agents server；Box-owned 对应状态归 selected Runtime Box。
+- client 配置 command 经 agents server 做 identity 与授权检查后按 owner 本地处理或路由；只有 owner 持久化成功才返回 redacted result，offline 或失败不能伪装成功。
+- agents server 对 Box-owned MCP 只可保存 stable ref 与 disposable redacted inventory cache，不保存 recoverable config、credential、OAuth state 或 Runtime Box secret locator。
 - 每次 Runtime Box 注册/重连先 full snapshot，成功前保持 syncing；运行期由 revision/category-only hint 和 60 秒 ±20% jitter poll 触发增量拉取。
 - gap、compaction、epoch reset 或 invalid cursor 回退 full snapshot。offline/failed poll 只把 cache 标 stale，不得解释为 resource deletion。
 - inventory allowlist 只有 stable ID、version/hash、MCP Tool schema、health/capability 和 `credentialConfigured` boolean；token、sensitive env、recoverable config、完整 `SKILL.md`/resources 一律禁止。
@@ -163,7 +163,7 @@ default tools 和 TUI 全部禁用；意外 Tool activity 直接失败。未来�
 - 用户或应用可覆盖风险标签，但保留来源。
 - MCP 返回内容不能授予新 Tool 或改变权限。
 - OAuth Scope 在授权前展示；Token 按 Server 隔离。
-- MCP credential 可由 owning Runtime Box 从自己的 `ExecutorSecretStore` 加载，并在目标 connection/process 生命周期内保留 runtime reference；不进入全局环境或无关 child/Agent。
+- MCP credential 由 owner 的 SecretStore 加载，并在目标 connection/process 生命周期内保留 runtime reference；不进入全局环境或无关 child/Agent。
 - revocation、expiry 或 MCP shutdown 必须关闭对应连接/进程并释放 runtime reference；不宣称 JavaScript 可可靠清零 string memory。
 - MCP Tool 仍使用普通 Action/execution grant；连接已建立不等于预授权。
 
@@ -186,9 +186,9 @@ default tools 和 TUI 全部禁用；意外 Tool activity 直接失败。未来�
 - agents server 的 `SecretVaultCredentialStore` 只保存 Provider/model credential；当前 app-owned file adapter
   使用 parent `0700`、file `0600`、跨进程 lock、fresh read/apply、atomic rename 和 fsync。
 - Provider/model credential 只在 agents server 按 Run scope 读取，永不发送 Runtime Box。
-- MCP credential/token/OAuth state 只由 owning Runtime Box 的 `ExecutorSecretStore` 保存和读取；server 无 MCP Secret Ref 或 recoverable copy。
-- local desktop 首个 `ExecutorSecretStore` 可使用 Runtime Box-private files；future Runtime Box 可使用 Keychain、Docker Secret 或 cloud secret manager。
-- stdio 只把 credential 注入目标 MCP child 的最小环境，不修改 Runtime Box 全局环境。
+- Server-owned MCP credential 由 Agent Server MCP SecretStore 保存；Box-owned MCP credential/token/OAuth state 由 owning Runtime Box `ExecutorSecretStore` 保存。二者不跨 owner 复制。
+- local desktop 两类 SecretStore 均可使用 owner-private files；future adapter 可使用 Keychain、Docker Secret 或 cloud secret manager。
+- stdio 只把 credential 注入目标 MCP child 的最小环境，不修改 owner 进程全局环境。
 - HTTP MCP 可在可行时按 request 注入 credential，但不是所有 transport 的统一要求。
 - credential 不通过 query RPC、UI、prompt、日志、诊断或 export 暴露，也不传给无关 child process 或 Agent。
 - `inventory.changed`、snapshot、delta、cache 和 mutation result 都不能携带 credential value、sensitive env 或 Runtime Box secret locator。
@@ -209,9 +209,10 @@ default tools 和 TUI 全部禁用；意外 Tool activity 直接失败。未来�
 | Conversation context | `agentDataDirectory/sessions` 下的 Pi `SessionManager` JSONL |
 | Provider/model config、Agent definitions/versions、resource refs | agents server 本地业务数据；resource ref 不含 Runtime Box config/content |
 | redacted Runtime Box inventory cache | agents server disposable projection；offline 时标 stale，可删除后从 Runtime Box 重建 |
-| MCP config/inventory、Skill metadata/versions | Runtime Box-owned DB |
+| Server-owned MCP config/inventory | agents server Product DB metadata；secret 独立存储 |
+| Box-owned MCP config/inventory、Skill metadata/versions | Runtime Box-owned DB |
 | Skill immutable content/resources/scripts | Runtime Box-private Skills 目录 |
-| 密钥与 Token | Provider/model credential 在 server `SecretVaultCredentialStore`；未来 MCP credential/OAuth 在 Runtime Box `ExecutorSecretStore` |
+| 密钥与 Token | Provider/model credential 在 server `SecretVaultCredentialStore`；MCP credential 在显式 owner 的 MCP SecretStore |
 | Canvas 与版本 | 本地应用数据目录 |
 | 知识原文元数据、切分和向量 | 本地索引目录 |
 | Project 文件 | 保持在原目录，不自动复制 |
@@ -269,13 +270,13 @@ local desktop Runtime Box data root 使用 `0700`，credential file 使用 `0600
 | SEC-005 | Shell 使用独立策略层和最小环境 | P0 |
 | SEC-006 | 文件路径防穿越、符号链接绕过和并发覆盖 | P0 |
 | SEC-007 | 所有副作用关联 Run、审批和结果 | P0 |
-| SEC-008 | Provider credential 只在 server SecretVault；MCP credential 只在 Runtime Box `ExecutorSecretStore`，均不进入 WebView/query/log/export | P0 |
+| SEC-008 | Provider credential 只在 server SecretVault；MCP credential 只在显式 owner 的 MCP SecretStore，均不进入 WebView/query/log/export | P0 |
 | SEC-009 | Canvas、MCP、Skill 和网页内容按不可信处理 | P0 |
 | SEC-010 | 遥测默认关闭，日志和导出默认脱敏 | P0 |
 | SEC-011 | stable ID、instance/generation、角色认证、取消、durable interrupt 和进程树清理可验证 | P0 |
 | SEC-012 | Canvas 默认子资源断网在真实网络测试中成立；否则不得执行任意 Web 内容 | P0 |
 | SEC-013 | server 先持久化 Policy/approval/intent，Runtime Box 只执行有效的一次性 grant | P0 |
-| SEC-014 | server 不保存 recoverable MCP/Skill config/content/credential；Runtime Box private root 的 mode/owner/atomic/no-follow 与诚实威胁边界可验证 | P0 |
+| SEC-014 | server 不保存 recoverable Box-owned MCP/Skill config/content/credential；两类 owner private root 的 mode/owner/atomic/no-follow 与诚实威胁边界可验证 | P0 |
 | SEC-015 | client 对两个 companion 使用 cooperative shutdown、capped backoff 和明确 recovery UX | P0 |
 | SEC-016 | MCP/Skill command 只有 owning Runtime Box 持久化后成功；Agent resource missing/mismatch 时 fail closed | P0 |
 | SEC-017 | registration full sync、epoch/revision delta/tombstone、hint + jittered poll 和 snapshot fallback 不泄密、不误删；Run 仍 live 验证 | P0 |

@@ -107,7 +107,7 @@ Project Chat、Plan/Agent、Tool、审批、Diff、MCP、Skills 和 subagent 仍
 - 当前代码只实现本地 supervisor 路径；已批准的下一目标包含 Agent Server 管理的 Anonymous Dev Tunnel、
   Remote Runtime Box 配对和设备认证。Mobile Client、多租户、Docker 和 cloud VM 后置。
 - stable ID 用于逻辑绑定；新的 `instanceId`/`generation` 用于拒绝 restart/reconnect 后的迟到消息。
-- agents server 是产品业务与授权事实来源；每个 Runtime Box 是自身 MCP/Skill 数据和实际 host execution 的事实来源。拆分角色不是完整 OS 沙箱，仍需路径、命令、网络和 grant 校验。
+- agents server 是产品业务、授权和 Server-owned MCP 的事实来源；每个 Runtime Box 是自身 Box-owned MCP/Skill 数据和实际 host execution 的事实来源。拆分角色不是完整 OS sandbox，仍需路径、命令、网络和 grant 校验。
 - 每次 Runtime Box 注册/重连先 full sync redacted inventory；成功前状态为 syncing。运行期使用 revision hint、60 秒 ±20% jitter poll 和 delta/snapshot fallback；cache stale/failed poll 不代表删除。
 - Agent 只保存 assigned Runtime Box stable resource ref；server 按 version/hash 获取 Skill metadata 与 `SKILL.md`，resources/scripts 仍通过 Runtime Box。
 - Runtime Box-owned MCP credential 与 execution grant 分离：连接可保持认证，但每次 Tool 仍需 server 的一次性授权；runtime teardown 不宣称 JavaScript 可可靠清零 string memory。

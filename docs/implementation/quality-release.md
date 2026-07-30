@@ -11,7 +11,7 @@
 | 协议 | 版本、角色、身份、Schema、错误、取消、背压和重连行为确定 |
 | 可恢复 | client、server、Runtime Box 或 Tool 异常后不盲目重复副作用 |
 | 授权 | server 先持久化 Policy/approval；Runtime Box 只执行有效一次性 grant |
-| Secret | Provider/model credential 不进入 Runtime Box；MCP credential 只在 Runtime Box private store 与目标 connection/process 可达 |
+| Secret | Provider/model credential 不进入 Runtime Box；MCP credential 只在显式 owner private store 与目标 connection/process 可达 |
 | 性能 | 三个应用角色和 3 个并发 Run 下 UI、RPC、取消保持可交互 |
 | 可发布 | 两个 Bun companion 随 Electrobun client 正确构建、签名、公证和更新 |
 

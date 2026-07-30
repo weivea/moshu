@@ -183,8 +183,8 @@ A4 先交付 backend ownership、协议和安全 gate，默认保持 feature fla
 
 ### 7.2 A4 出口
 
-- [ ] 每个 Runtime Box 是自身 MCP config/credential/OAuth/lifecycle 与 Skill immutable content/resources 的唯一 source of truth。
-- [ ] server 只保存 Agent resource refs 和 replaceable/non-authoritative/disposable redacted inventory cache；产品 DB/backup 不含 recoverable MCP/Skill config、content 或 credential。
+- [ ] MCP config/credential/lifecycle 归显式 owner；每个 Runtime Box 是自身 Box-owned MCP 与 Skill immutable content/resources 的唯一 source of truth。
+- [ ] server 对 Box-owned MCP/Skill 只保存 Agent resource refs 和 disposable redacted inventory cache；Server-owned MCP 使用独立 authority/SecretStore。
 - [ ] Runtime Box 持久化 epoch/revision 与有界 change log/deletion tombstone；每次注册/重连 full sync 成功前 Agent 不 runnable。
 - [ ] `inventory.changed` 只含 revision/category；server 去抖增量拉取，并每 60 秒 ±20% jitter 独立 polling。
 - [ ] gap、compaction、epoch reset 或 invalid cursor 触发 full snapshot atomic replace；offline/failed poll 只标 stale，不解释为 deletion。
@@ -193,7 +193,7 @@ A4 先交付 backend ownership、协议和安全 gate，默认保持 feature fla
 - [ ] MCP Tool 与 Skill script 使用 A3 的 grant，不建立扩展专用旁路。
 - [ ] Agent 只能引用 assigned Runtime Box 的稳定 resource version/hash；Run start/restore live 验证，polling 不替代授权；server 按 ref 获取并校验 Skill metadata/`SKILL.md`。
 - [ ] Runtime Box offline、resource missing/hash mismatch 或 MCP Schema 变化会 fail closed。
-- [ ] Provider/model credential 不进入 Runtime Box；MCP credential 只在 Runtime Box private secret store 和目标 connection/process 可达，不进入 query/UI/prompt/log/diagnostic/export、全局环境或无关 child/Agent。
+- [ ] Provider/model credential 不进入 Runtime Box；MCP credential 只在显式 owner private secret store 和目标 connection/process 可达，不进入 query/UI/prompt/log/diagnostic/export、全局环境或无关 child/Agent。
 - [ ] local root/credential file 权限、owner、atomic replacement、symlink/no-follow 通过测试，并明确不能防同账户 malware、root 或 disk snapshot/backup。
 - [ ] Runtime Box-owned MCP credential 不替代一次性 execution grant；保持认证的 connection 上每次 Tool 仍独立授权。
 

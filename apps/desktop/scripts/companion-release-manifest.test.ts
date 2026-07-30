@@ -54,7 +54,7 @@ describe("companion release manifest", () => {
 			);
 			expect(manifest.releaseVersion).toBe(moshuReleaseVersion);
 			expect(manifest.companions).toHaveLength(2);
-			expect(manifest.protocols.runtimeBox).toEqual({ current: 1, min: 1, max: 1 });
+			expect(manifest.protocols.runtimeBox).toEqual({ current: 2, min: 2, max: 2 });
 		} finally {
 			rmSync(directory, { recursive: true, force: true });
 		}

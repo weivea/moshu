@@ -88,7 +88,8 @@ export class DurableActionAuthorizationService implements RuntimeBoxActionAuthor
 			grantId,
 			grantTokenHash: sha256(grantToken),
 			invocationId: input.invocationId,
-			runtimeBoxId,
+			targetKind: "runtime-box",
+			targetId: runtimeBoxId,
 			runId: input.runId,
 			toolCallId: input.toolCallId,
 			tool: input.call.tool,
@@ -149,7 +150,8 @@ export class DurableActionAuthorizationService implements RuntimeBoxActionAuthor
 			grantId,
 			grantTokenHash: sha256(grantToken),
 			invocationId: input.invocationId,
-			runtimeBoxId,
+			targetKind: "runtime-box",
+			targetId: runtimeBoxId,
 			runId: input.runId,
 			toolCallId: input.toolCallId,
 			tool: `mcp:${input.mcpServerId}:${input.stableToolId}`,
@@ -167,6 +169,55 @@ export class DurableActionAuthorizationService implements RuntimeBoxActionAuthor
 		});
 		this.actions.consumeGrant(actionId, grantId, sha256(grantToken));
 		return authorizedInput;
+	}
+
+	async authorizeAgentServerMcp(
+		agentServerId: string,
+		input: RuntimeBoxMcpToolInvokeInput,
+	): Promise<RuntimeBoxMcpToolInvokeInput> {
+		if (input.authorization !== undefined) {
+			throw new ActionPolicyDeniedError("MCP Tool authorization is Server-owned.");
+		}
+		if (!this.#allowMcpTools) {
+			throw new ActionPolicyDeniedError("MCP Tool execution is denied by policy.");
+		}
+		const actionId = randomUUID();
+		const grantId = randomUUID();
+		const grantToken = randomBytes(32).toString("base64url");
+		const parameterDigest = sha256(createMcpToolParameterPayload(input));
+		const expiresAtMs = Date.now() + executionGrantLifetimeMs;
+		this.actions.createGrant({
+			actionId,
+			grantId,
+			grantTokenHash: sha256(grantToken),
+			invocationId: input.invocationId,
+			targetKind: "agent-server",
+			targetId: agentServerId,
+			runId: input.runId,
+			toolCallId: input.toolCallId,
+			tool: `mcp:${input.mcpServerId}:${input.stableToolId}`,
+			parameterDigest,
+			riskClass: "critical",
+			sideEffectClass: "external",
+			idempotencyClass: "non_idempotent",
+			policyRule: "poc.trusted-agent-server.mcp",
+			originInstanceId: this.authority.instanceId,
+			originGeneration: this.authority.generation,
+			targetInstanceId: this.authority.instanceId,
+			targetGeneration: this.authority.generation,
+			executionScope: "agent-server-mcp",
+			expiresAtMs,
+		});
+		this.actions.consumeGrant(actionId, grantId, sha256(grantToken));
+		return input;
+	}
+
+	completeAgentServerMcp(
+		agentServerId: string,
+		input: RuntimeBoxMcpToolInvokeInput,
+		result: RuntimeBoxMcpToolInvokeOutput,
+	): void {
+		this.actions.completeLocal(agentServerId, input.invocationId, result);
 	}
 
 	complete(

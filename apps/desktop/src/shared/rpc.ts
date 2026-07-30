@@ -71,6 +71,15 @@ import {
 	type UpsertRuntimeBoxMcpServerInput,
 	type DeleteRuntimeBoxMcpServerInput,
 	type RuntimeBoxResourceMutationResult,
+	type ListMcpServersInput,
+	type ListMcpServersOutput,
+	type UpsertMcpServerInput,
+	type SetMcpServerEnabledInput,
+	type DeleteMcpServerInput,
+	type McpServerMutationResult,
+	type GetAgentGlobalProfileInput,
+	type GetAgentGlobalProfileOutput,
+	type UpdateAgentGlobalProfileInput,
 	type ListRuntimeBoxSkillsInput,
 	type ListRuntimeBoxSkillsOutput,
 	type InstallRuntimeBoxSkillInput,
@@ -231,6 +240,30 @@ export type DesktopRpc = {
 			deleteMcpServer: {
 				params: DeleteRuntimeBoxMcpServerInput;
 				response: RuntimeBoxResourceMutationResult;
+			};
+			listOwnedMcpServers: {
+				params: ListMcpServersInput;
+				response: ListMcpServersOutput;
+			};
+			upsertOwnedMcpServer: {
+				params: UpsertMcpServerInput;
+				response: McpServerMutationResult;
+			};
+			setOwnedMcpServerEnabled: {
+				params: SetMcpServerEnabledInput;
+				response: McpServerMutationResult;
+			};
+			deleteOwnedMcpServer: {
+				params: DeleteMcpServerInput;
+				response: McpServerMutationResult;
+			};
+			getAgentGlobalProfile: {
+				params: GetAgentGlobalProfileInput;
+				response: GetAgentGlobalProfileOutput;
+			};
+			updateAgentGlobalProfile: {
+				params: UpdateAgentGlobalProfileInput;
+				response: GetAgentGlobalProfileOutput;
 			};
 			listSkills: {
 				params: ListRuntimeBoxSkillsInput;

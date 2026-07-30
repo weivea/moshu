@@ -8,6 +8,9 @@
 本文定义 `apps/runtime-box` 的产品边界、远程连接、安全模型、数据所有权和实施依赖。`Executor` 只表示
 Runtime Box 内部 Tool/进程执行组件；产品级稳定身份统一使用 `runtimeBoxId`。
 
+本文中的 MCP 均指 **Runtime Box-owned MCP**。Agent Server-owned MCP 的全局连接、Agent 绑定和本地 Action
+链路见 [MCP 双归属接入技术设计](./mcp-integration.md)。
+
 ## 1. 已确认决策
 
 | 主题 | 决策 |
@@ -448,7 +451,7 @@ skills.list / get / install / update / remove / readPrompt / readResource
 Remote Box 独立更新，因此 Runtime ingress 使用独立 protocol version range 和 `upgrade_required`，不能假设
 Desktop、Agent Server 与 Box 永远锁步发布。
 
-当前 protocol v1 在 challenge、Server 签名、device 签名、WebSocket header 和 registration 中端到端绑定；
+当前 protocol v2 在 challenge、Server 签名、device 签名、WebSocket header 和 registration 中端到端绑定，并要求 MCP config revision；
 不兼容版本在建立 WebSocket 前返回 HTTP 426。匿名 426 是无状态响应，不能降级一个健康 Box；
 Box 随后用已配对 Ed25519 key 提交带 timestamp/report ID/generation fence 的短时兼容性报告；
 只有报告验签、设备未吊销且 generation 被接受后才原子持久化并投影 `upgrade_required`、fence 旧 peer；
@@ -523,7 +526,7 @@ RB-07 已实现 durable Action intent、单次 execution grant、Box fsync journ
 RB-08 已实现 Runtime Box 私有 MCP/Skill/Secret store、epoch/revision/delta inventory、Server stale projection、
 Runtime Profile、live version/hash/schema validation、Skill 内存 prompt，以及 MCP stdio/HTTP/SSE 生命周期和
 复用 Action grant/journal/reconciliation 的 Tool bridge。
-RB-09 已实现 protocol v1/HTTP 426、`online/syncing/offline/upgrade_required` 投影、Runtime RPC 月度流量估算、
+RB-09 已实现 protocol v2/HTTP 426、`online/syncing/offline/upgrade_required` 投影、Runtime RPC 月度流量估算、
 5 GiB 告警、公开 Dev Tunnels 限制、脱敏诊断、丢 hint/压缩/网络/磁盘/进程故障矩阵，以及同 release
 companion 哈希清单。stable 构建 fail closed：macOS 要求 Developer ID、公证、staple 与 Gatekeeper，
 Windows 要求 Authenticode SHA-256/RFC 3161，所有平台要求 Ed25519 签名的完整更新产物清单。

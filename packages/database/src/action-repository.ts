@@ -8,7 +8,7 @@ import {
 	runtimeBoxInvocationEvidenceSchema,
 	type RuntimeBoxInvocationEvidence,
 } from "@moshu/contracts";
-import { and, eq, inArray, isNull } from "drizzle-orm";
+import { and, eq, inArray, isNull, or } from "drizzle-orm";
 import type { AppDrizzleDatabase } from "./database";
 import { actionIntentsTable, chatRunsTable, executionGrantsTable } from "./schema";
 
@@ -25,7 +25,8 @@ export interface CreateActionGrantInput {
 	grantId: string;
 	grantTokenHash: string;
 	invocationId: string;
-	runtimeBoxId: string;
+	targetKind: "agent-server" | "runtime-box";
+	targetId: string;
 	runId: string;
 	toolCallId: string;
 	tool: string;
@@ -46,7 +47,8 @@ export interface ActionIntentRecord {
 	actionId: string;
 	grantId: string;
 	invocationId: string;
-	runtimeBoxId: string;
+	targetKind: "agent-server" | "runtime-box";
+	targetId: string;
 	runId: string;
 	tool: string;
 	parameterDigest: string;
@@ -80,6 +82,7 @@ export interface ActionRepository {
 	markCancelled(invocationId: string, safeError: string): void;
 	markOutcomeUnknown(invocationId: string, safeError: string): void;
 	complete(runtimeBoxId: string, evidence: RuntimeBoxInvocationEvidence): void;
+	completeLocal(targetId: string, invocationId: string, result: RuntimeBoxActionResult): void;
 	markServerAcked(invocationIds: readonly string[]): void;
 	markReceiptConfirmed(runtimeBoxId: string, invocationIds: readonly string[]): void;
 	cancelUndispatched(invocationId: string, safeError: string): void;
@@ -108,7 +111,8 @@ export class SqliteActionRepository implements ActionRepository {
 				.values({
 					id: actionId,
 					invocationId: input.invocationId,
-					runtimeBoxId: input.runtimeBoxId,
+					targetKind: input.targetKind,
+					targetId: input.targetId,
 					runId: input.runId,
 					toolCallId: input.toolCallId,
 					tool: input.tool,
@@ -203,12 +207,15 @@ export class SqliteActionRepository implements ActionRepository {
 		if (isTerminal(action.state)) {
 			return;
 		}
+		const now = this.clock.now();
 		this.orm
 			.update(actionIntentsTable)
 			.set({
 				state: "outcome_unknown",
 				safeError: boundSafeError(safeError),
-				updatedAtMs: this.clock.now(),
+				updatedAtMs: now,
+				completedAtMs: now,
+				...(action.targetKind === "agent-server" ? { serverAckedAtMs: now } : {}),
 			})
 			.where(eq(actionIntentsTable.invocationId, invocationId))
 			.run();
@@ -218,12 +225,13 @@ export class SqliteActionRepository implements ActionRepository {
 		const evidence = runtimeBoxInvocationEvidenceSchema.parse(evidenceValue);
 		const action = this.#select(evidence.invocationId);
 		if (
-			action.runtimeBoxId !== runtimeBoxId ||
+			action.targetKind !== "runtime-box" ||
+			action.targetId !== runtimeBoxId ||
 			action.id !== evidence.actionId ||
 			action.parameterDigest !== evidence.parameterDigest ||
 			action.originInstanceId !== evidence.originInstanceId ||
 			action.originGeneration !== evidence.originGeneration ||
-			action.runtimeBoxId !== evidence.targetRuntimeBoxId ||
+			action.targetId !== evidence.targetRuntimeBoxId ||
 			action.targetInstanceId !== evidence.targetInstanceId ||
 			action.targetGeneration !== evidence.targetGeneration
 		) {
@@ -283,6 +291,61 @@ export class SqliteActionRepository implements ActionRepository {
 			.run();
 	}
 
+	completeLocal(targetId: string, invocationId: string, resultValue: RuntimeBoxActionResult): void {
+		const action = this.#select(invocationId);
+		if (action.targetKind !== "agent-server" || action.targetId !== targetId) {
+			throw new ActionEvidenceConflictError(
+				"Agent Server MCP result did not match its Action target.",
+			);
+		}
+		const result = runtimeBoxActionResultSchema.parse(resultValue);
+		const resultTool =
+			"tool" in result ? result.tool : `mcp:${result.mcpServerId}:${result.stableToolId}`;
+		if (result.invocationId !== action.invocationId || resultTool !== action.tool) {
+			throw new ActionEvidenceConflictError(
+				"Agent Server MCP result did not match the Action invocation or tool.",
+			);
+		}
+		const resultJson = JSON.stringify(result);
+		const resultHash = sha256(resultJson);
+		const grant = this.orm
+			.select()
+			.from(executionGrantsTable)
+			.where(eq(executionGrantsTable.actionId, action.id))
+			.get();
+		if (grant === undefined || grant.consumedAtMs === null) {
+			throw new ActionEvidenceConflictError(
+				"Agent Server MCP Action grant was not consumed before completion.",
+			);
+		}
+		if (isTerminal(action.state)) {
+			if (action.state === "succeeded" && action.resultHash === resultHash) {
+				return;
+			}
+			throw new ActionEvidenceConflictError(
+				"Agent Server MCP result conflicts with the terminal Action state.",
+			);
+		}
+		if (action.state !== "running") {
+			throw new ActionEvidenceConflictError(
+				"Agent Server MCP Action is not awaiting a local result.",
+			);
+		}
+		const now = this.clock.now();
+		this.orm
+			.update(actionIntentsTable)
+			.set({
+				state: "succeeded",
+				resultJson,
+				resultHash,
+				updatedAtMs: now,
+				completedAtMs: now,
+				serverAckedAtMs: now,
+			})
+			.where(eq(actionIntentsTable.id, action.id))
+			.run();
+	}
+
 	markServerAcked(invocationIds: readonly string[]): void {
 		const now = this.clock.now();
 		for (const invocationId of new Set(invocationIds)) {
@@ -312,7 +375,7 @@ export class SqliteActionRepository implements ActionRepository {
 			if (action === undefined) {
 				continue;
 			}
-			if (action.runtimeBoxId !== runtimeBoxId) {
+			if (action.targetKind !== "runtime-box" || action.targetId !== runtimeBoxId) {
 				throw new ActionEvidenceConflictError(
 					"Box receipt confirmation did not match the Runtime Box.",
 				);
@@ -355,6 +418,7 @@ export class SqliteActionRepository implements ActionRepository {
 			.select({
 				id: actionIntentsTable.id,
 				state: actionIntentsTable.state,
+				targetKind: actionIntentsTable.targetKind,
 			})
 			.from(actionIntentsTable)
 			.where(inArray(actionIntentsTable.state, ["granted", "running"]))
@@ -386,6 +450,8 @@ export class SqliteActionRepository implements ActionRepository {
 							state: "outcome_unknown",
 							safeError: "Agent Server restarted before the Action outcome was confirmed.",
 							updatedAtMs: now,
+							completedAtMs: now,
+							...(row.targetKind === "agent-server" ? { serverAckedAtMs: now } : {}),
 						})
 						.where(eq(actionIntentsTable.id, row.id))
 						.run();
@@ -404,7 +470,16 @@ export class SqliteActionRepository implements ActionRepository {
 				.where(
 					and(
 						eq(chatRunsTable.sessionId, sessionId),
-						isNull(actionIntentsTable.boxReceiptConfirmedAtMs),
+						or(
+							and(
+								eq(actionIntentsTable.targetKind, "runtime-box"),
+								isNull(actionIntentsTable.boxReceiptConfirmedAtMs),
+							),
+							and(
+								eq(actionIntentsTable.targetKind, "agent-server"),
+								isNull(actionIntentsTable.serverAckedAtMs),
+							),
+						),
 					),
 				)
 				.limit(1)
@@ -426,7 +501,8 @@ export class SqliteActionRepository implements ActionRepository {
 			actionId: action.id,
 			grantId: grant.id,
 			invocationId: action.invocationId,
-			runtimeBoxId: action.runtimeBoxId,
+			targetKind: action.targetKind,
+			targetId: action.targetId,
 			runId: action.runId,
 			tool: action.tool,
 			parameterDigest: action.parameterDigest,
@@ -456,6 +532,7 @@ export class SqliteActionRepository implements ActionRepository {
 				safeError: boundSafeError(safeError),
 				updatedAtMs: now,
 				completedAtMs: now,
+				...(action.targetKind === "agent-server" ? { serverAckedAtMs: now } : {}),
 			})
 			.where(eq(actionIntentsTable.invocationId, invocationId))
 			.run();

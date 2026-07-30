@@ -17,6 +17,7 @@ import {
 import {
 	AskChatCancelledError,
 	AskChatRuntimeError,
+	createAgentMcpToolName,
 	type ExecutorToolGateway,
 	PiAgentRuntime,
 	type RuntimeBoxToolGateway,
@@ -154,9 +155,14 @@ describe("Pi Agent runtime", () => {
 			faux.setResponses([
 				fauxAssistantMessage(
 					[
-						fauxToolCall("mcp_database_tools_tool_query", {
-							sql: "select 1",
-						}),
+						fauxToolCall(
+							createAgentMcpToolName(
+								{ kind: "runtime-box", runtimeBoxId: defaultLocalRuntimeBoxId },
+								"database-tools",
+								"tool-query",
+							),
+							{ sql: "select 1" },
+						),
 					],
 					{ stopReason: "toolUse" },
 				),
@@ -175,8 +181,13 @@ describe("Pi Agent runtime", () => {
 					async invokeForRuntimeBox() {
 						throw new Error("Executor Tool should not be called.");
 					},
-					async invokeMcpForRuntimeBox(runtimeBoxId, input) {
-						expect(runtimeBoxId).toBe(defaultLocalRuntimeBoxId);
+				},
+				mcpToolGateway: {
+					async invokeMcp(owner, input) {
+						expect(owner).toEqual({
+							kind: "runtime-box",
+							runtimeBoxId: defaultLocalRuntimeBoxId,
+						});
 						mcpCalls.push(input);
 						return {
 							schemaVersion: 1,
@@ -213,6 +224,10 @@ describe("Pi Agent runtime", () => {
 					],
 					mcpResources: [
 						{
+							owner: {
+								kind: "runtime-box",
+								runtimeBoxId: defaultLocalRuntimeBoxId,
+							},
 							stableResourceId: "database-tools",
 							version: "550e8400-e29b-41d4-a716-446655440001",
 							contentHash: "c".repeat(64),

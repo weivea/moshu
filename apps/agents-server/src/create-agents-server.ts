@@ -1,4 +1,4 @@
-import { mkdirSync } from "node:fs";
+import { chmodSync, mkdirSync } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
 import {
 	type AskChatRuntime,
@@ -28,6 +28,7 @@ import {
 	prepareCoordinatedDatabaseReset,
 } from "@moshu/database";
 import { PairingSessionNotFoundError } from "@moshu/database";
+import { FileMcpSecretStore, McpLifecycleManager } from "@moshu/mcp-runtime";
 import {
 	createRpcBearerAuthenticator,
 	createRpcServer,
@@ -44,6 +45,7 @@ import { RuntimeBoxRegistry } from "./runtime-box-registry";
 import { RuntimeBoxGenerationFence } from "./runtime-box-generation-fence";
 import { RuntimeIngressAuth } from "./runtime-ingress-auth";
 import { FileProviderRegistryStore } from "./file-provider-registry-store";
+import { McpActionDispatcher } from "./mcp-action-dispatcher";
 import { createProviderAuthDiagnosticLog } from "./provider-auth-diagnostic-log";
 import {
 	agentsServerClientMethodAllowlist,
@@ -106,7 +108,26 @@ export async function createAgentsServer(
 		);
 	}
 
-	const database = openAppDatabase(options.bootstrap.paths.productDatabase);
+	const agentServerMcpSecrets = new FileMcpSecretStore(
+		join(options.bootstrap.paths.agentDataDirectory, "mcp-secrets"),
+	);
+	const agentServerMcpWorkspaces = join(
+		options.bootstrap.paths.agentDataDirectory,
+		"mcp-workspaces",
+	);
+	mkdirSync(agentServerMcpWorkspaces, { recursive: true, mode: 0o700 });
+	chmodSync(agentServerMcpWorkspaces, 0o700);
+	const database = openAppDatabase(options.bootstrap.paths.productDatabase, {
+		agentServerMcpSecrets,
+		prepareAgentServerMcpStdioCwd(stableResourceId) {
+			const directory = join(agentServerMcpWorkspaces, stableResourceId);
+			mkdirSync(directory, { recursive: true, mode: 0o700 });
+			chmodSync(directory, 0o700);
+			return directory;
+		},
+	});
+	agentServerMcpSecrets.cleanupOrphans(new Set(database.agentServerMcps.listSecretLocators()));
+	database.agentServerMcps.drainPendingSecretDeletions();
 	const recoveredActions = database.actions.recoverOnStartup();
 	if (recoveredActions.cancelled > 0 || recoveredActions.outcomeUnknown > 0) {
 		reportDiagnostic(
@@ -120,6 +141,7 @@ export async function createAgentsServer(
 	let devTunnelService: DevTunnelService | undefined;
 	let unsubscribe: (() => void) | undefined;
 	let authController: HeadlessAuthController | undefined;
+	let agentServerMcpLifecycle: McpLifecycleManager | undefined;
 	try {
 		const agentDataDirectory = options.bootstrap.paths.agentDataDirectory;
 		const credentials = new SecretVaultCredentialStore(
@@ -136,6 +158,11 @@ export async function createAgentsServer(
 			credentials,
 		);
 		await providers.initialize();
+		const serverMcpLifecycle = new McpLifecycleManager(database.agentServerMcps, {
+			reportDiagnostic,
+		});
+		agentServerMcpLifecycle = serverMcpLifecycle;
+		await serverMcpLifecycle.start();
 		const activeRuntimeBox = database.runtimeBoxes.getActive();
 		let publishRuntimeBoxesChanged = () => undefined;
 		const actionAuthorizer = new DurableActionAuthorizationService(
@@ -187,12 +214,22 @@ export async function createAgentsServer(
 				}
 			}
 		};
+		const agentServerIdentity = AgentServerIdentity.open(
+			join(agentDataDirectory, "runtime-ingress", "identity.json"),
+		);
+		const mcpActionDispatcher = new McpActionDispatcher(
+			agentServerIdentity.agentServerId,
+			runtimeBoxRegistry,
+			serverMcpLifecycle,
+			actionAuthorizer,
+		);
 		const runtime =
 			options.createRuntime?.(providers, modelRuntime, runtimeBoxRegistry) ??
 			new PiAgentRuntime({
 				agentDataDirectory,
 				modelRuntime,
 				runtimeBoxGateway: runtimeBoxRegistry,
+				mcpToolGateway: mcpActionDispatcher,
 			});
 		const writeAuthDiagnostic = createProviderAuthDiagnosticLog(
 			join(agentDataDirectory, "diagnostics", "provider-auth.jsonl"),
@@ -208,9 +245,7 @@ export async function createAgentsServer(
 		const runtimeIngressAuth = new RuntimeIngressAuth({
 			pairings: database.runtimeBoxPairings,
 			runtimeBoxes: database.runtimeBoxes,
-			identity: AgentServerIdentity.open(
-				join(agentDataDirectory, "runtime-ingress", "identity.json"),
-			),
+			identity: agentServerIdentity,
 			rpcIdentity: options.bootstrap.serverIdentity,
 			actionJournalEpoch: database.runtimeBoxes.getActionJournalEpoch(),
 			localAuthenticator: createRpcBearerAuthenticator(
@@ -231,6 +266,7 @@ export async function createAgentsServer(
 			getActiveRuntimeBoxId: () => database.runtimeBoxes.getActive().runtimeBoxId,
 			resolveRuntimeResources: async (runtimeBoxId, signal) => {
 				const profile = database.runtimeProfiles.getOrCreate("moshu.default", runtimeBoxId);
+				const globalProfile = database.agentGlobalProfiles.getOrCreate("moshu.default");
 				const validation = await runtimeBoxRegistry.validateResources(
 					runtimeBoxId,
 					{ refs: profile.resources },
@@ -260,15 +296,25 @@ export async function createAgentsServer(
 							};
 						}),
 				);
-				const mcpResources = validation.resources
+				const serverMcpResources = database.agentServerMcps
+					.resolveRefs(globalProfile.serverMcpRefs)
+					.map((resource) => ({
+						owner: { kind: "agent-server" as const },
+						stableResourceId: resource.stableResourceId,
+						version: resource.version,
+						contentHash: resource.contentHash,
+						tools: resource.tools,
+					}));
+				const runtimeBoxMcpResources = validation.resources
 					.filter((resource) => resource.resourceKind === "mcp")
 					.map((resource) => ({
+						owner: { kind: "runtime-box" as const, runtimeBoxId },
 						stableResourceId: resource.stableResourceId,
 						version: resource.version,
 						contentHash: resource.contentHash,
 						tools: resource.mcpTools,
 					}));
-				return { skills, mcpResources };
+				return { skills, mcpResources: [...serverMcpResources, ...runtimeBoxMcpResources] };
 			},
 			logger: {
 				error(message, error) {
@@ -318,6 +364,8 @@ export async function createAgentsServer(
 			projects: database.projects,
 			runtimeBoxInventory: database.runtimeBoxInventory,
 			runtimeProfiles: database.runtimeProfiles,
+			agentGlobalProfiles: database.agentGlobalProfiles,
+			agentServerMcps: database.agentServerMcps,
 			runtimeIngressAuth,
 			getDevTunnelService: requireDevTunnelService,
 			eventRouter,
@@ -466,7 +514,7 @@ export async function createAgentsServer(
 				if (shutdownPromise !== undefined) {
 					return shutdownPromise;
 				}
-				shutdownPromise = (async () => {
+				const execution = (async () => {
 					unsubscribe?.();
 					productRpcServer?.stop();
 					runtimeRpcServer?.stop();
@@ -474,9 +522,16 @@ export async function createAgentsServer(
 					await authController?.dispose();
 					await chatService?.shutdown();
 					await runtimeBoxRegistry.shutdown();
+					await agentServerMcpLifecycle?.shutdown();
 					database.close();
 				})();
-				return shutdownPromise;
+				shutdownPromise = execution;
+				void execution.catch(() => {
+					if (shutdownPromise === execution) {
+						shutdownPromise = undefined;
+					}
+				});
+				return execution;
 			},
 		};
 	} catch (error) {
@@ -486,6 +541,7 @@ export async function createAgentsServer(
 		runtimeRpcServer?.stop();
 		await authController?.dispose();
 		await chatService?.shutdown();
+		await agentServerMcpLifecycle?.shutdown();
 		database.close();
 		throw error;
 	}

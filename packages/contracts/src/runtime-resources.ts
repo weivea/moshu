@@ -300,6 +300,7 @@ export const mcpSecretInputSchema = z
 export const runtimeBoxMcpServerSchema = z
 	.object({
 		stableResourceId: runtimeResourceIdSchema,
+		configRevision: z.int().positive().safe(),
 		version: runtimeResourceVersionSchema,
 		contentHash: runtimeResourceContentHashSchema,
 		displayName: z.string().trim().min(1).max(128),
@@ -348,6 +349,7 @@ export const upsertRuntimeBoxMcpServerInputSchema = z
 		runtimeBoxId: runtimeBoxIdSchema.optional(),
 		commandId: z.string().uuid(),
 		stableResourceId: runtimeResourceIdSchema.optional(),
+		expectedConfigRevision: z.int().positive().safe().optional(),
 		expectedVersion: runtimeResourceVersionSchema.optional(),
 		displayName: z.string().trim().min(1).max(128),
 		enabled: z.boolean(),
@@ -366,7 +368,8 @@ export const setRuntimeBoxMcpServerEnabledInputSchema = z
 		runtimeBoxId: runtimeBoxIdSchema.optional(),
 		commandId: z.string().uuid(),
 		stableResourceId: runtimeResourceIdSchema,
-		expectedVersion: runtimeResourceVersionSchema,
+		expectedConfigRevision: z.int().positive().safe().optional(),
+		expectedVersion: runtimeResourceVersionSchema.optional(),
 		enabled: z.boolean(),
 	})
 	.strict();
@@ -376,7 +379,8 @@ export const deleteRuntimeBoxMcpServerInputSchema = z
 		runtimeBoxId: runtimeBoxIdSchema.optional(),
 		commandId: z.string().uuid(),
 		stableResourceId: runtimeResourceIdSchema,
-		expectedVersion: runtimeResourceVersionSchema,
+		expectedConfigRevision: z.int().positive().safe().optional(),
+		expectedVersion: runtimeResourceVersionSchema.optional(),
 		deleteCredentials: z.boolean(),
 	})
 	.strict();
@@ -384,6 +388,7 @@ export const deleteRuntimeBoxMcpServerInputSchema = z
 export const runtimeBoxResourceMutationResultSchema = z
 	.object({
 		stableResourceId: runtimeResourceIdSchema,
+		configRevision: z.int().positive().safe().optional(),
 		version: runtimeResourceVersionSchema,
 		contentHash: runtimeResourceContentHashSchema,
 		inventoryEpoch: runtimeInventoryEpochSchema,
@@ -677,6 +682,167 @@ export const listRuntimeBoxInventoryOutputSchema = z
 	})
 	.strict();
 
+export const agentServerMcpOwnerSchema = z.object({ kind: z.literal("agent-server") }).strict();
+export const runtimeBoxMcpOwnerSchema = z
+	.object({
+		kind: z.literal("runtime-box"),
+		runtimeBoxId: runtimeBoxIdSchema,
+	})
+	.strict();
+export const mcpOwnerSchema = z.discriminatedUnion("kind", [
+	agentServerMcpOwnerSchema,
+	runtimeBoxMcpOwnerSchema,
+]);
+
+export const mcpServerSummarySchema = z
+	.object({
+		owner: mcpOwnerSchema,
+		stableResourceId: runtimeResourceIdSchema,
+		configRevision: z.int().positive().safe(),
+		version: runtimeResourceVersionSchema,
+		contentHash: runtimeResourceContentHashSchema,
+		displayName: z.string().trim().min(1).max(128),
+		enabled: z.boolean(),
+		credentialConfigured: z.boolean(),
+		health: runtimeResourceHealthSchema,
+		tools: z.array(mcpToolDescriptorSchema).max(maxMcpToolsPerServer),
+		stale: z.boolean(),
+	})
+	.strict();
+
+export const listMcpServersInputSchema = z.object({ owner: mcpOwnerSchema }).strict();
+export const listMcpServersOutputSchema = z
+	.object({
+		owner: mcpOwnerSchema,
+		items: z.array(mcpServerSummarySchema).max(maxRuntimeBoxInventoryResources),
+	})
+	.strict()
+	.superRefine((value, context) => {
+		for (const [index, item] of value.items.entries()) {
+			if (mcpOwnerKey(item.owner) !== mcpOwnerKey(value.owner)) {
+				context.addIssue({
+					code: "custom",
+					message: "MCP Server summary owner does not match the requested owner.",
+					path: ["items", index, "owner"],
+				});
+			}
+		}
+	});
+
+export const upsertMcpServerInputSchema = z
+	.object({
+		owner: mcpOwnerSchema,
+		commandId: z.string().uuid(),
+		stableResourceId: runtimeResourceIdSchema.optional(),
+		expectedConfigRevision: z.int().positive().safe().optional(),
+		displayName: z.string().trim().min(1).max(128),
+		enabled: z.boolean(),
+		transport: mcpTransportConfigSchema,
+		secret: mcpSecretInputSchema.optional(),
+		clearSecret: z.boolean().optional(),
+	})
+	.strict()
+	.refine(
+		(input) => input.secret === undefined || input.clearSecret !== true,
+		"Cannot set and clear an MCP secret in the same command.",
+	);
+
+export const setMcpServerEnabledInputSchema = z
+	.object({
+		owner: mcpOwnerSchema,
+		commandId: z.string().uuid(),
+		stableResourceId: runtimeResourceIdSchema,
+		expectedConfigRevision: z.int().positive().safe(),
+		enabled: z.boolean(),
+	})
+	.strict();
+
+export const deleteMcpServerInputSchema = z
+	.object({
+		owner: mcpOwnerSchema,
+		commandId: z.string().uuid(),
+		stableResourceId: runtimeResourceIdSchema,
+		expectedConfigRevision: z.int().positive().safe(),
+		deleteCredentials: z.boolean(),
+	})
+	.strict();
+
+export const mcpServerMutationResultSchema = z
+	.object({
+		owner: mcpOwnerSchema,
+		stableResourceId: runtimeResourceIdSchema,
+		configRevision: z.int().positive().safe(),
+		version: runtimeResourceVersionSchema,
+		contentHash: runtimeResourceContentHashSchema,
+		deleted: z.boolean(),
+		summary: mcpServerSummarySchema.optional(),
+	})
+	.strict();
+
+export const agentServerMcpResourceRefSchema = z
+	.object({
+		owner: agentServerMcpOwnerSchema,
+		stableResourceId: runtimeResourceIdSchema,
+		version: runtimeResourceVersionSchema,
+		contentHash: runtimeResourceContentHashSchema,
+	})
+	.strict();
+
+export const agentGlobalProfileSchema = z
+	.object({
+		agentId: runtimeProfileSchema.shape.agentId,
+		revision: z.int().positive().safe(),
+		serverMcpRefs: z.array(agentServerMcpResourceRefSchema).max(256),
+		createdAt: z.string().datetime({ offset: true }),
+		updatedAt: z.string().datetime({ offset: true }),
+	})
+	.strict()
+	.superRefine((profile, context) => {
+		const ids = new Set<string>();
+		for (const [index, ref] of profile.serverMcpRefs.entries()) {
+			if (ids.has(ref.stableResourceId)) {
+				context.addIssue({
+					code: "custom",
+					message: "Agent global MCP refs must be unique.",
+					path: ["serverMcpRefs", index],
+				});
+			}
+			ids.add(ref.stableResourceId);
+		}
+	});
+
+export const getAgentGlobalProfileInputSchema = z
+	.object({ agentId: runtimeProfileSchema.shape.agentId.default("moshu.default") })
+	.strict();
+export const getAgentGlobalProfileOutputSchema = z
+	.object({ profile: agentGlobalProfileSchema })
+	.strict();
+export const updateAgentGlobalProfileInputSchema = z
+	.object({
+		agentId: runtimeProfileSchema.shape.agentId.default("moshu.default"),
+		expectedRevision: z.int().positive().safe(),
+		serverMcpRefs: z.array(agentServerMcpResourceRefSchema).max(256),
+	})
+	.strict()
+	.superRefine((input, context) => {
+		const ids = new Set<string>();
+		for (const [index, ref] of input.serverMcpRefs.entries()) {
+			if (ids.has(ref.stableResourceId)) {
+				context.addIssue({
+					code: "custom",
+					message: "Agent global MCP refs must be unique.",
+					path: ["serverMcpRefs", index],
+				});
+			}
+			ids.add(ref.stableResourceId);
+		}
+	});
+export const updateAgentGlobalProfileOutputSchema = getAgentGlobalProfileOutputSchema;
+
+function mcpOwnerKey(owner: z.infer<typeof mcpOwnerSchema>): string {
+	return owner.kind === "agent-server" ? owner.kind : `${owner.kind}:${owner.runtimeBoxId}`;
+}
+
 export type RuntimeResourceKind = z.infer<typeof runtimeResourceKindSchema>;
 export type McpToolDescriptor = z.infer<typeof mcpToolDescriptorSchema>;
 export type McpTransportConfig = z.infer<typeof mcpTransportConfigSchema>;
@@ -723,3 +889,17 @@ export type GetRuntimeProfileInput = z.infer<typeof getRuntimeProfileInputSchema
 export type GetRuntimeProfileOutput = z.infer<typeof getRuntimeProfileOutputSchema>;
 export type UpdateRuntimeProfileInput = z.infer<typeof updateRuntimeProfileInputSchema>;
 export type ListRuntimeBoxInventoryOutput = z.infer<typeof listRuntimeBoxInventoryOutputSchema>;
+export type McpOwner = z.infer<typeof mcpOwnerSchema>;
+export type McpServerSummary = z.infer<typeof mcpServerSummarySchema>;
+export type ListMcpServersInput = z.infer<typeof listMcpServersInputSchema>;
+export type ListMcpServersOutput = z.infer<typeof listMcpServersOutputSchema>;
+export type UpsertMcpServerInput = z.infer<typeof upsertMcpServerInputSchema>;
+export type SetMcpServerEnabledInput = z.infer<typeof setMcpServerEnabledInputSchema>;
+export type DeleteMcpServerInput = z.infer<typeof deleteMcpServerInputSchema>;
+export type McpServerMutationResult = z.infer<typeof mcpServerMutationResultSchema>;
+export type AgentServerMcpResourceRef = z.infer<typeof agentServerMcpResourceRefSchema>;
+export type AgentGlobalProfile = z.infer<typeof agentGlobalProfileSchema>;
+export type GetAgentGlobalProfileInput = z.infer<typeof getAgentGlobalProfileInputSchema>;
+export type GetAgentGlobalProfileOutput = z.infer<typeof getAgentGlobalProfileOutputSchema>;
+export type UpdateAgentGlobalProfileInput = z.infer<typeof updateAgentGlobalProfileInputSchema>;
+export type UpdateAgentGlobalProfileOutput = z.infer<typeof updateAgentGlobalProfileOutputSchema>;

@@ -50,15 +50,15 @@ describe("RuntimeIngressAuth", () => {
 						deviceKeyId: "old-device",
 						instanceId: "old-runtime",
 						generation: 1,
-						protocolVersion: 2,
+						protocolVersion: 1,
 					}),
 				),
 			);
 			expect(response.status).toBe(426);
 			expect(await response.json()).toEqual({
 				error: "RUNTIME_BOX_UPGRADE_REQUIRED",
-				minProtocolVersion: 1,
-				maxProtocolVersion: 1,
+				minProtocolVersion: 2,
+				maxProtocolVersion: 2,
 			});
 			expect(upgrades).toEqual([]);
 		} finally {
@@ -142,7 +142,7 @@ describe("RuntimeIngressAuth", () => {
 				deviceKeyId: "device-key-1",
 				instanceId: "remote-instance-1",
 				generation: 1,
-				protocolVersion: 2,
+				protocolVersion: 1,
 				reportId: crypto.randomUUID(),
 				issuedAt: new Date().toISOString(),
 			};
@@ -166,8 +166,8 @@ describe("RuntimeIngressAuth", () => {
 				runtimeBoxCompatibilityReportOutputSchema.parse(await compatibilityResponse.json()),
 			).toEqual({
 				accepted: true,
-				requiredProtocolMinVersion: 1,
-				requiredProtocolMaxVersion: 1,
+				requiredProtocolMinVersion: 2,
+				requiredProtocolMaxVersion: 2,
 			});
 			expect(upgrades).toEqual([status.runtimeBoxId]);
 			expect(database.runtimeBoxes.listCompatibility()).toEqual([
@@ -175,7 +175,7 @@ describe("RuntimeIngressAuth", () => {
 					runtimeBoxId: status.runtimeBoxId,
 					state: "upgrade_required",
 					generation: 1,
-					protocolVersion: 2,
+					protocolVersion: 1,
 				},
 			]);
 			await expect(
@@ -204,7 +204,7 @@ describe("RuntimeIngressAuth", () => {
 				deviceKeyId: "device-key-1",
 				instanceId: "remote-instance-1",
 				generation: 1,
-				protocolVersion: 1 as const,
+				protocolVersion: 2 as const,
 			};
 			const serverIdentity = rpcIdentity;
 			server = createRpcServer({
@@ -400,7 +400,7 @@ function signedUpgradeRequest(
 		deviceKeyId: string;
 		instanceId: string;
 		generation: number;
-		protocolVersion: 1;
+		protocolVersion: 2;
 	},
 	challenge: {
 		challengeId: string;
@@ -409,7 +409,7 @@ function signedUpgradeRequest(
 		agentServerId: string;
 		rpcIdentity: ProcessPeerIdentity;
 		actionJournalEpoch: string;
-		negotiatedProtocolVersion: 1;
+		negotiatedProtocolVersion: 2;
 		transportSecurity: "relay-tls";
 		supportedTransportSecurity: Array<"relay-tls" | "noise-xx">;
 	},

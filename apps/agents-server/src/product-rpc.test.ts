@@ -11,6 +11,8 @@ import {
 	clientProductRequestMethods,
 	createChatSessionOutputSchema,
 	defaultLocalRuntimeBoxId,
+	getAgentGlobalProfileOutputSchema,
+	mcpServerMutationResultSchema,
 	productRpcInternalHandlerErrorCode,
 	productRpcMethods,
 	runtimeBoxProductRequestMethods,
@@ -123,8 +125,8 @@ describe("Runtime Box product RPC", () => {
 						generation: 1,
 					},
 					processRpcProtocol: { major: 1, minor: 0 },
-					runtimeProtocolMinVersion: 1,
-					runtimeProtocolMaxVersion: 1,
+					runtimeProtocolMinVersion: 2,
+					runtimeProtocolMaxVersion: 2,
 					transportSecurity: "relay-tls",
 					noiseUpgradeAvailable: false,
 				},
@@ -182,6 +184,7 @@ describe("Runtime Box product RPC", () => {
 				items: [
 					{
 						stableResourceId: "private-mcp",
+						configRevision: 1,
 						version: crypto.randomUUID(),
 						contentHash: "a".repeat(64),
 						displayName: "Private MCP",
@@ -231,6 +234,109 @@ describe("Runtime Box product RPC", () => {
 		});
 		expect(JSON.stringify(output)).not.toContain("must-not-project");
 		expect(JSON.stringify(output)).not.toContain("transport");
+	});
+
+	test("manages Agent Server-owned MCPs and global Agent refs independently of Runtime Box", async () => {
+		const database = openAppDatabase(":memory:");
+		try {
+			const handlers = createProductRpcHandlers({
+				authController,
+				chatService: {} as ChatApplicationService,
+				runtimeBoxRegistry: new RuntimeBoxRegistry(),
+				runtimeBoxes: database.runtimeBoxes,
+				agentServerMcps: database.agentServerMcps,
+				agentGlobalProfiles: database.agentGlobalProfiles,
+				runtimeIngressAuth,
+				getDevTunnelService: () => devTunnelService,
+				eventRouter: new ProductEventRouter(),
+				serverVersion: "test",
+			}).requests;
+			const upsert = handlers?.[productRpcMethods.mcpUpsert];
+			const list = handlers?.[productRpcMethods.mcpList];
+			const getProfile = handlers?.[productRpcMethods.agentGlobalProfileGet];
+			const updateProfile = handlers?.[productRpcMethods.agentGlobalProfileUpdate];
+			const remove = handlers?.[productRpcMethods.mcpDelete];
+			if (
+				upsert === undefined ||
+				list === undefined ||
+				getProfile === undefined ||
+				updateProfile === undefined ||
+				remove === undefined
+			) {
+				throw new Error("Agent Server MCP handlers are missing.");
+			}
+			const peer = createPeer({ emitEvent: () => "event", close() {} });
+			const created = await upsert(
+				{
+					owner: { kind: "agent-server" },
+					commandId: crypto.randomUUID(),
+					displayName: "Global MCP",
+					enabled: true,
+					transport: {
+						type: "streamable-http",
+						url: "https://mcp.example.test/rpc",
+						timeoutMs: 30_000,
+					},
+				},
+				createRequestContext(peer, productRpcMethods.mcpUpsert),
+			);
+			const parsedCreated = mcpServerMutationResultSchema.parse(created);
+			database.agentServerMcps.updateMcpRuntimeState(parsedCreated.stableResourceId, "ready", [
+				{
+					stableToolId: "tool-global",
+					name: "global",
+					schemaHash: "a".repeat(64),
+					inputSchema: { type: "object", properties: {} },
+				},
+			]);
+			const listed = await list(
+				{ owner: { kind: "agent-server" } },
+				createRequestContext(peer, productRpcMethods.mcpList),
+			);
+			expect(listed).toMatchObject({
+				owner: { kind: "agent-server" },
+				items: [{ displayName: "Global MCP", health: "ready", stale: false }],
+			});
+			expect(JSON.stringify(listed)).not.toContain("mcp.example.test");
+			const currentProfile = await getProfile(
+				{ agentId: "moshu.default" },
+				createRequestContext(peer, productRpcMethods.agentGlobalProfileGet),
+			);
+			const parsedProfile = getAgentGlobalProfileOutputSchema.parse(currentProfile);
+			const live = database.agentServerMcps.list().items[0];
+			if (live === undefined) {
+				throw new Error("Expected a live Agent Server MCP.");
+			}
+			await updateProfile(
+				{
+					agentId: "moshu.default",
+					expectedRevision: parsedProfile.profile.revision,
+					serverMcpRefs: [
+						{
+							owner: { kind: "agent-server" },
+							stableResourceId: live.stableResourceId,
+							version: live.version,
+							contentHash: live.contentHash,
+						},
+					],
+				},
+				createRequestContext(peer, productRpcMethods.agentGlobalProfileUpdate),
+			);
+			await expect(
+				remove(
+					{
+						owner: { kind: "agent-server" },
+						commandId: crypto.randomUUID(),
+						stableResourceId: live.stableResourceId,
+						expectedConfigRevision: live.configRevision,
+						deleteCredentials: true,
+					},
+					createRequestContext(peer, productRpcMethods.mcpDelete),
+				),
+			).rejects.toMatchObject({ code: "MCP_RESOURCE_IN_USE" });
+		} finally {
+			database.close();
+		}
 	});
 
 	test("creates Projects only after the owning Runtime Box validates their path", async () => {

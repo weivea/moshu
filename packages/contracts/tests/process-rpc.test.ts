@@ -58,7 +58,7 @@ describe("product process RPC contracts", () => {
 		const registration = {
 			schemaVersion: 1 as const,
 			status: "ready" as const,
-			protocolVersion: 1 as const,
+			protocolVersion: 2 as const,
 			transportSecurity: "relay-tls" as const,
 			runtimeBox: {
 				schemaVersion: 1 as const,

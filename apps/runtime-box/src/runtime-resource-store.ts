@@ -71,7 +71,7 @@ import { parseDocument } from "yaml";
 
 import { ExecutorSecretStore } from "./executor-secret-store";
 
-const runtimeResourceDatabaseVersion = 2;
+const runtimeResourceDatabaseVersion = 4;
 const maxInventoryChangeRecords = 2_048;
 const maxCommandResults = 1_024;
 const inventoryPageSize = 64;
@@ -79,6 +79,15 @@ const inventoryPageSize = 64;
 interface RuntimeResourceStoreOptions {
 	readonly onInventoryChanged?: (hint: RuntimeBoxInventoryChangedHint) => void;
 	readonly now?: () => number;
+	readonly secretStore?: RuntimeMcpSecretStore;
+}
+
+export interface RuntimeMcpSecretStore {
+	put(stableResourceId: string, secret: McpSecretInput): string;
+	read(stableResourceId: string, locator: string): McpSecretInput;
+	delete(locator: string): void;
+	cleanupOrphans(referencedLocators: ReadonlySet<string>): void;
+	fingerprint(secret: McpSecretInput): string;
 }
 
 export interface RuntimeMcpConnectionConfig {
@@ -94,6 +103,7 @@ interface InventoryStateRow {
 
 interface McpConfigRow {
 	id: string;
+	config_revision: number;
 	version: string;
 	content_hash: string;
 	display_name: string;
@@ -164,7 +174,7 @@ export class RuntimeResourceStore {
 	readonly #root: string;
 	readonly #skillsRoot: string;
 	readonly #database: Database;
-	readonly #secrets: ExecutorSecretStore;
+	readonly #secrets: RuntimeMcpSecretStore;
 	#onInventoryChanged: ((hint: RuntimeBoxInventoryChangedHint) => void) | undefined;
 	#onMcpConfigChanged:
 		| ((change: { stableResourceId: string; operation: "upsert" | "delete" }) => void)
@@ -198,8 +208,9 @@ export class RuntimeResourceStore {
 					chmodSync(artifact, 0o600);
 				}
 			}
-			this.#secrets = new ExecutorSecretStore(join(this.#root, "secrets"));
+			this.#secrets = options.secretStore ?? new ExecutorSecretStore(join(this.#root, "secrets"));
 			this.#secrets.cleanupOrphans(new Set(this.#listSecretLocators()));
+			this.#drainPendingSecretDeletions();
 			this.#cleanupOrphanSkillDirectories();
 		} catch (error) {
 			this.#database.close();
@@ -225,6 +236,13 @@ export class RuntimeResourceStore {
 		this.#onMcpConfigChanged = listener;
 	}
 
+	listMcpServerIds(): readonly string[] {
+		return this.#database
+			.query<{ id: string }, []>("SELECT id FROM mcp_configs ORDER BY id ASC")
+			.all()
+			.map((row) => row.id);
+	}
+
 	getMcpConnectionConfig(stableResourceId: string): RuntimeMcpConnectionConfig {
 		const row = this.#selectMcp(stableResourceId);
 		if (row === undefined) {
@@ -248,8 +266,10 @@ export class RuntimeResourceStore {
 		if (row === undefined) {
 			return undefined;
 		}
-		const tools = toolsValue.map((tool) => mcpToolDescriptorSchema.parse(tool));
-		const previousTools = JSON.stringify(JSON.parse(row.tools_json) as unknown);
+		const receivedTools = toolsValue.map((tool) => mcpToolDescriptorSchema.parse(tool));
+		const previousToolValues = mcpToolDescriptorSchema.array().parse(JSON.parse(row.tools_json));
+		const tools = health === "ready" ? receivedTools : previousToolValues;
+		const previousTools = JSON.stringify(previousToolValues);
 		const nextTools = JSON.stringify(tools);
 		if (row.health === health && previousTools === nextTools) {
 			return undefined;
@@ -257,13 +277,7 @@ export class RuntimeResourceStore {
 		const toolsChanged = previousTools !== nextTools;
 		const version = toolsChanged ? crypto.randomUUID() : row.version;
 		const contentHash = toolsChanged
-			? sha256Canonical({
-					displayName: row.display_name,
-					enabled: row.enabled === 1,
-					transport: JSON.parse(row.transport_json),
-					credentialConfigured: row.secret_locator !== null,
-					tools,
-				})
+			? sha256Canonical({ transport: JSON.parse(row.transport_json), tools })
 			: row.content_hash;
 		const descriptor = runtimeBoxInventoryResourceSchema.parse({
 			resourceKind: "mcp",
@@ -302,6 +316,7 @@ export class RuntimeResourceStore {
 			const state = this.#getInventoryState();
 			return runtimeBoxResourceMutationResultSchema.parse({
 				stableResourceId,
+				configRevision: row.config_revision,
 				version,
 				contentHash,
 				inventoryEpoch: state.epoch,
@@ -433,13 +448,22 @@ export class RuntimeResourceStore {
 
 	upsertMcpServer(inputValue: UpsertRuntimeBoxMcpServerInput): RuntimeBoxResourceMutationResult {
 		const input = upsertRuntimeBoxMcpServerInputSchema.parse(inputValue);
-		const replay = this.#getCommandResult(input.commandId, "mcp.upsert", commandDigest(input));
+		const digest = commandDigest(
+			input,
+			input.secret === undefined ? undefined : this.#secrets.fingerprint(input.secret),
+		);
+		const replay = this.#getCommandResult(input.commandId, "mcp.upsert", digest);
 		if (replay !== undefined) {
+			this.#drainPendingSecretDeletions();
+			this.#onMcpConfigChanged?.({
+				stableResourceId: replay.stableResourceId,
+				operation: "upsert",
+			});
 			return replay;
 		}
 		const stableResourceId = input.stableResourceId ?? `mcp-${crypto.randomUUID().toLowerCase()}`;
 		const existing = this.#selectMcp(stableResourceId);
-		assertExpectedVersion(existing?.version, input.expectedVersion, "MCP Server");
+		assertExpectedMcpConfig(existing, input.expectedConfigRevision, input.expectedVersion);
 		const retainedSecretLocator = this.#selectRetainedSecret(stableResourceId);
 		let nextSecretLocator = existing?.secret_locator ?? retainedSecretLocator ?? null;
 		let createdSecretLocator: string | undefined;
@@ -455,36 +479,50 @@ export class RuntimeResourceStore {
 				? undefined
 				: this.#secrets.read(stableResourceId, nextSecretLocator));
 		const transport = withSecretNames(input.transport, effectiveSecret);
+		const transportJson = JSON.stringify(transport);
+		const executionChanged =
+			existing === undefined ||
+			canonicalJson(JSON.parse(existing.transport_json)) !== canonicalJson(transport);
+		const tools = executionChanged
+			? []
+			: mcpToolDescriptorSchema.array().parse(JSON.parse(existing.tools_json));
 		const now = this.#now();
-		const version = crypto.randomUUID();
-		const contentHash = sha256Canonical({
-			displayName: input.displayName,
-			enabled: input.enabled,
-			transport,
-			credentialConfigured: nextSecretLocator !== null,
-		});
+		const configRevision = (existing?.config_revision ?? 0) + 1;
+		const version =
+			executionChanged || existing === undefined ? crypto.randomUUID() : existing.version;
+		const contentHash =
+			executionChanged || existing === undefined
+				? sha256Canonical({ transport, tools })
+				: existing.content_hash;
+		const previousSecretLocator = existing?.secret_locator ?? retainedSecretLocator;
+		const credentialChanged = previousSecretLocator !== nextSecretLocator;
+		const health: "ready" | "stopped" | "error" =
+			!input.enabled || executionChanged || credentialChanged || existing === undefined
+				? "stopped"
+				: existing.health;
 		const descriptor = runtimeBoxInventoryResourceSchema.parse({
 			resourceKind: "mcp",
 			stableResourceId,
 			version,
 			contentHash,
-			health: "stopped",
+			health,
 			credentialConfigured: nextSecretLocator !== null,
-			mcpTools: [],
+			mcpTools: tools,
 		});
 		try {
 			this.#assertInventoryCapacity(descriptor);
 			this.#assertMcpQueryCapacity(
 				runtimeBoxMcpServerSchema.parse({
 					stableResourceId,
+					configRevision,
 					version,
 					contentHash,
 					displayName: input.displayName,
 					enabled: input.enabled,
 					transport,
 					credentialConfigured: nextSecretLocator !== null,
-					health: "stopped",
-					tools: [],
+					health,
+					tools,
 					createdAt: new Date(existing?.created_at_ms ?? now).toISOString(),
 					updatedAt: new Date(now).toISOString(),
 				}),
@@ -501,32 +539,49 @@ export class RuntimeResourceStore {
 				this.#database
 					.query(
 						`INSERT INTO mcp_configs (
-							id, version, content_hash, display_name, enabled, transport_json,
+							id, config_revision, version, content_hash, display_name, enabled, transport_json,
 							secret_locator, health, tools_json, created_at_ms, updated_at_ms
-						) VALUES (?, ?, ?, ?, ?, ?, ?, 'stopped', '[]', ?, ?)
+						) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 						ON CONFLICT(id) DO UPDATE SET
+							config_revision = excluded.config_revision,
 							version = excluded.version,
 							content_hash = excluded.content_hash,
 							display_name = excluded.display_name,
 							enabled = excluded.enabled,
 							transport_json = excluded.transport_json,
 							secret_locator = excluded.secret_locator,
-							health = 'stopped',
-							tools_json = '[]',
+							health = excluded.health,
+							tools_json = excluded.tools_json,
 							updated_at_ms = excluded.updated_at_ms`,
 					)
 					.run(
 						stableResourceId,
+						configRevision,
 						version,
 						contentHash,
 						input.displayName,
 						input.enabled ? 1 : 0,
-						JSON.stringify(transport),
+						transportJson,
 						nextSecretLocator,
+						health,
+						JSON.stringify(tools),
 						existing?.created_at_ms ?? now,
 						now,
 					);
 				this.#database.query("DELETE FROM mcp_retained_secrets WHERE id = ?").run(stableResourceId);
+				if (
+					previousSecretLocator !== null &&
+					previousSecretLocator !== undefined &&
+					previousSecretLocator !== nextSecretLocator
+				) {
+					this.#database
+						.query(
+							`INSERT INTO mcp_pending_secret_deletions (secret_locator, created_at_ms)
+							 VALUES (?, ?)
+							 ON CONFLICT(secret_locator) DO NOTHING`,
+						)
+						.run(previousSecretLocator, now);
+				}
 				const revision = this.#appendChange({
 					category: "mcp",
 					operation: "upsert",
@@ -536,6 +591,7 @@ export class RuntimeResourceStore {
 				const state = this.#getInventoryState();
 				const mutation = runtimeBoxResourceMutationResultSchema.parse({
 					stableResourceId,
+					configRevision,
 					version,
 					contentHash,
 					inventoryEpoch: state.epoch,
@@ -543,7 +599,7 @@ export class RuntimeResourceStore {
 					descriptor,
 					deleted: false,
 				});
-				this.#saveCommandResult(input.commandId, "mcp.upsert", commandDigest(input), mutation);
+				this.#saveCommandResult(input.commandId, "mcp.upsert", digest, mutation);
 				return mutation;
 			})();
 		} catch (error) {
@@ -552,14 +608,7 @@ export class RuntimeResourceStore {
 			}
 			throw error;
 		}
-		const previousSecretLocator = existing?.secret_locator ?? retainedSecretLocator;
-		if (
-			previousSecretLocator !== null &&
-			previousSecretLocator !== undefined &&
-			previousSecretLocator !== nextSecretLocator
-		) {
-			this.#secrets.delete(previousSecretLocator);
-		}
+		this.#drainPendingSecretDeletions();
 		this.#publishChange(result, ["mcp", "mcp_tool_schema"]);
 		this.#onMcpConfigChanged?.({ stableResourceId, operation: "upsert" });
 		return result;
@@ -577,6 +626,9 @@ export class RuntimeResourceStore {
 			runtimeBoxId: input.runtimeBoxId,
 			commandId: input.commandId,
 			stableResourceId: input.stableResourceId,
+			...(input.expectedConfigRevision === undefined
+				? {}
+				: { expectedConfigRevision: input.expectedConfigRevision }),
 			expectedVersion: input.expectedVersion,
 			displayName: existing.display_name,
 			enabled: input.enabled,
@@ -589,13 +641,18 @@ export class RuntimeResourceStore {
 		const digest = commandDigest(input);
 		const replay = this.#getCommandResult(input.commandId, "mcp.delete", digest);
 		if (replay !== undefined) {
+			this.#drainPendingSecretDeletions();
+			this.#onMcpConfigChanged?.({
+				stableResourceId: replay.stableResourceId,
+				operation: "delete",
+			});
 			return replay;
 		}
 		const existing = this.#selectMcp(input.stableResourceId);
 		if (existing === undefined) {
 			throw new RuntimeResourceNotFoundError("MCP Server was not found.");
 		}
-		assertExpectedVersion(existing.version, input.expectedVersion, "MCP Server");
+		assertExpectedMcpConfig(existing, input.expectedConfigRevision, input.expectedVersion);
 		const retainedSecretLocator = this.#selectRetainedSecret(input.stableResourceId);
 		const result = this.#database.transaction(() => {
 			if (!input.deleteCredentials && existing.secret_locator !== null) {
@@ -610,6 +667,19 @@ export class RuntimeResourceStore {
 				this.#database
 					.query("DELETE FROM mcp_retained_secrets WHERE id = ?")
 					.run(input.stableResourceId);
+				for (const locator of new Set(
+					[existing.secret_locator, retainedSecretLocator].filter(
+						(value): value is string => typeof value === "string",
+					),
+				)) {
+					this.#database
+						.query(
+							`INSERT INTO mcp_pending_secret_deletions (secret_locator, created_at_ms)
+							 VALUES (?, ?)
+							 ON CONFLICT(secret_locator) DO NOTHING`,
+						)
+						.run(locator, this.#now());
+				}
 			}
 			this.#database.query("DELETE FROM mcp_configs WHERE id = ?").run(input.stableResourceId);
 			const revision = this.#appendChange({
@@ -625,6 +695,7 @@ export class RuntimeResourceStore {
 			const state = this.#getInventoryState();
 			const mutation = runtimeBoxResourceMutationResultSchema.parse({
 				stableResourceId: input.stableResourceId,
+				configRevision: existing.config_revision,
 				version: existing.version,
 				contentHash: existing.content_hash,
 				inventoryEpoch: state.epoch,
@@ -634,15 +705,7 @@ export class RuntimeResourceStore {
 			this.#saveCommandResult(input.commandId, "mcp.delete", digest, mutation);
 			return mutation;
 		})();
-		if (input.deleteCredentials) {
-			for (const locator of new Set(
-				[existing.secret_locator, retainedSecretLocator].filter(
-					(value): value is string => value !== null && value !== undefined,
-				),
-			)) {
-				this.#secrets.delete(locator);
-			}
-		}
+		this.#drainPendingSecretDeletions();
 		this.#publishChange(result, ["mcp", "mcp_tool_schema"]);
 		this.#onMcpConfigChanged?.({
 			stableResourceId: input.stableResourceId,
@@ -941,14 +1004,28 @@ export class RuntimeResourceStore {
 		if (version === runtimeResourceDatabaseVersion) {
 			return;
 		}
-		if (version === 1) {
+		if (version === 1 || version === 2 || version === 3) {
 			this.#database.exec("BEGIN IMMEDIATE");
 			try {
-				this.#database.exec(`
-					CREATE TABLE mcp_retained_secrets (
-						id TEXT PRIMARY KEY NOT NULL,
-						secret_locator TEXT NOT NULL
+				if (version === 1) {
+					this.#database.exec(`
+						CREATE TABLE mcp_retained_secrets (
+							id TEXT PRIMARY KEY NOT NULL,
+							secret_locator TEXT NOT NULL
+						);
+					`);
+				}
+				if (version <= 2) {
+					this.#database.exec(
+						"ALTER TABLE mcp_configs ADD COLUMN config_revision INTEGER NOT NULL DEFAULT 1;",
 					);
+				}
+				this.#database.exec(`
+					CREATE TABLE mcp_pending_secret_deletions (
+						secret_locator TEXT PRIMARY KEY NOT NULL,
+						created_at_ms INTEGER NOT NULL
+					);
+					DELETE FROM command_results WHERE operation = 'mcp.upsert';
 					PRAGMA user_version = ${runtimeResourceDatabaseVersion};
 				`);
 				this.#database.exec("COMMIT");
@@ -972,6 +1049,7 @@ export class RuntimeResourceStore {
 				);
 				CREATE TABLE mcp_configs (
 					id TEXT PRIMARY KEY NOT NULL,
+					config_revision INTEGER NOT NULL,
 					version TEXT NOT NULL,
 					content_hash TEXT NOT NULL,
 					display_name TEXT NOT NULL,
@@ -986,6 +1064,10 @@ export class RuntimeResourceStore {
 				CREATE TABLE mcp_retained_secrets (
 					id TEXT PRIMARY KEY NOT NULL,
 					secret_locator TEXT NOT NULL
+				);
+				CREATE TABLE mcp_pending_secret_deletions (
+					secret_locator TEXT PRIMARY KEY NOT NULL,
+					created_at_ms INTEGER NOT NULL
 				);
 				CREATE TABLE skill_installations (
 					id TEXT PRIMARY KEY NOT NULL,
@@ -1304,6 +1386,19 @@ export class RuntimeResourceStore {
 			.map((row) => row.secret_locator);
 	}
 
+	#drainPendingSecretDeletions(): void {
+		for (const row of this.#database
+			.query<{ secret_locator: string }, []>(
+				"SELECT secret_locator FROM mcp_pending_secret_deletions ORDER BY created_at_ms ASC",
+			)
+			.all()) {
+			this.#secrets.delete(row.secret_locator);
+			this.#database
+				.query("DELETE FROM mcp_pending_secret_deletions WHERE secret_locator = ?")
+				.run(row.secret_locator);
+		}
+	}
+
 	#encodeCursor(cursor: InventoryCursor): string {
 		const state = this.#getInventoryState();
 		const payload = Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url");
@@ -1471,6 +1566,7 @@ interface DecodedSkillFile {
 function buildMcpServer(row: McpConfigRow): RuntimeBoxMcpServer {
 	return runtimeBoxMcpServerSchema.parse({
 		stableResourceId: row.id,
+		configRevision: row.config_revision,
 		version: row.version,
 		contentHash: row.content_hash,
 		displayName: row.display_name,
@@ -1537,8 +1633,58 @@ function assertExpectedVersion(
 	}
 }
 
-function commandDigest(value: unknown): string {
-	return createHash("sha256").update(canonicalJson(value)).digest("hex");
+function assertExpectedMcpConfig(
+	row: McpConfigRow | undefined,
+	expectedConfigRevision: number | undefined,
+	expectedVersion: string | undefined,
+): void {
+	if (row === undefined) {
+		if (expectedConfigRevision !== undefined || expectedVersion !== undefined) {
+			throw new RuntimeResourceVersionConflictError("MCP Server does not exist.");
+		}
+		return;
+	}
+	if (expectedConfigRevision !== undefined) {
+		if (row.config_revision !== expectedConfigRevision) {
+			throw new RuntimeResourceVersionConflictError("MCP Server configuration changed.");
+		}
+		return;
+	}
+	assertExpectedVersion(row.version, expectedVersion, "MCP Server");
+}
+
+function commandDigest(value: unknown, secretFingerprint?: string): string {
+	return createHash("sha256")
+		.update(canonicalJson(redactCommandSecrets(value, secretFingerprint)))
+		.digest("hex");
+}
+
+function redactCommandSecrets(value: unknown, secretFingerprint?: string): unknown {
+	if (Array.isArray(value)) {
+		return value.map((item) => redactCommandSecrets(item, secretFingerprint));
+	}
+	if (value !== null && typeof value === "object") {
+		return Object.fromEntries(
+			Object.entries(value).map(([key, item]) => {
+				if (key !== "secret" || item === null || typeof item !== "object") {
+					return [key, redactCommandSecrets(item, secretFingerprint)];
+				}
+				const secret = item as {
+					environment?: Record<string, unknown>;
+					headers?: Record<string, unknown>;
+				};
+				return [
+					key,
+					{
+						environmentKeys: Object.keys(secret.environment ?? {}).sort(),
+						headerNames: Object.keys(secret.headers ?? {}).sort(),
+						fingerprint: secretFingerprint,
+					},
+				];
+			}),
+		);
+	}
+	return value;
 }
 
 function withSecretNames(

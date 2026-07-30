@@ -12,24 +12,27 @@ describe("McpLifecycleManager", () => {
 		const directory = mkdtempSync(join(tmpdir(), "moshu-mcp-lifecycle-"));
 		try {
 			const store = new RuntimeResourceStore(join(directory, "resources"));
-			store.upsertMcpServer({
+			const initialInput = {
 				commandId: crypto.randomUUID(),
 				stableResourceId: "database-tools",
 				displayName: "Database Tools",
 				enabled: true,
 				transport: {
-					type: "stdio",
+					type: "stdio" as const,
 					command: "/unused/mcp",
-					args: [],
+					args: [] as string[],
 					startupTimeoutMs: 10_000,
 				},
 				secret: { environment: { DATABASE_TOKEN: "runtime-box-only" } },
-			});
+			};
+			store.upsertMcpServer(initialInput);
 			let receivedSecret: unknown;
+			let connectCalls = 0;
 			let closeCalls = 0;
 			let toolCalls = 0;
 			const manager = new McpLifecycleManager(store, {
 				connect: async (input) => {
+					connectCalls += 1;
 					receivedSecret = input.secret;
 					return {
 						tools: [
@@ -96,6 +99,10 @@ describe("McpLifecycleManager", () => {
 				argumentsValue: { sql: "select 1" },
 			});
 			expect(toolCalls).toBe(1);
+			store.upsertMcpServer(initialInput);
+			await Bun.sleep(20);
+			expect(connectCalls).toBe(1);
+			expect(closeCalls).toBe(0);
 
 			store.upsertMcpServer({
 				commandId: crypto.randomUUID(),
@@ -424,6 +431,47 @@ describe("McpLifecycleManager", () => {
 					connectCount === 4 && store.listMcpServers("runtime-box").items[0]?.health === "ready",
 			);
 			await manager.shutdown();
+			store.close();
+		} finally {
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+
+	test("surfaces connection cleanup failure and allows shutdown retry", async () => {
+		const directory = mkdtempSync(join(tmpdir(), "moshu-mcp-lifecycle-shutdown-retry-"));
+		try {
+			const store = new RuntimeResourceStore(join(directory, "resources"));
+			store.upsertMcpServer({
+				commandId: crypto.randomUUID(),
+				stableResourceId: "shutdown-retry-server",
+				displayName: "Shutdown retry",
+				enabled: true,
+				transport: {
+					type: "stdio",
+					command: "/unused/mcp",
+					args: [],
+					startupTimeoutMs: 10_000,
+				},
+			});
+			let closeCount = 0;
+			const manager = new McpLifecycleManager(store, {
+				connect: async () => ({
+					tools: [],
+					async callTool() {
+						return null;
+					},
+					async close() {
+						closeCount += 1;
+						if (closeCount === 1) {
+							throw new Error("temporary close failure");
+						}
+					},
+				}),
+			});
+			await manager.start();
+			await expect(manager.shutdown()).rejects.toThrow("failed to close");
+			await expect(manager.shutdown()).resolves.toBeUndefined();
+			expect(closeCount).toBe(2);
 			store.close();
 		} finally {
 			rmSync(directory, { recursive: true, force: true });

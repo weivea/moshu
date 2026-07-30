@@ -1,6 +1,6 @@
 import type Database from "bun:sqlite";
 
-export const currentAppDatabaseVersion = 18;
+export const currentAppDatabaseVersion = 19;
 
 export class AppDatabaseResetRequiredError extends Error {
 	readonly currentVersion: number;
@@ -55,6 +55,11 @@ export function applyAppMigrations(client: Database): void {
 	try {
 		client.exec(`
 			DROP TABLE IF EXISTS agent_session_cleanup_outbox;
+			DROP TABLE IF EXISTS agent_global_profiles;
+			DROP TABLE IF EXISTS agent_server_mcp_command_results;
+			DROP TABLE IF EXISTS agent_server_mcp_pending_secret_deletions;
+			DROP TABLE IF EXISTS agent_server_mcp_retained_secrets;
+			DROP TABLE IF EXISTS agent_server_mcp_servers;
 			DROP TABLE IF EXISTS agent_runtime_profiles;
 			DROP TABLE IF EXISTS runtime_box_inventory_cache;
 			DROP TABLE IF EXISTS runtime_box_inventory_state;
@@ -130,6 +135,50 @@ export function applyAppMigrations(client: Database): void {
 				created_at_ms INTEGER NOT NULL,
 				updated_at_ms INTEGER NOT NULL,
 				PRIMARY KEY (agent_id, runtime_box_id)
+			);
+
+			CREATE TABLE agent_server_mcp_servers (
+				id TEXT PRIMARY KEY NOT NULL,
+				config_revision INTEGER NOT NULL,
+				version TEXT NOT NULL,
+				content_hash TEXT NOT NULL,
+				display_name TEXT NOT NULL,
+				enabled INTEGER NOT NULL,
+				transport_json TEXT NOT NULL,
+				secret_locator TEXT,
+				credential_configured INTEGER NOT NULL,
+				health TEXT NOT NULL,
+				tools_json TEXT NOT NULL,
+				created_at_ms INTEGER NOT NULL,
+				updated_at_ms INTEGER NOT NULL
+			);
+
+			CREATE TABLE agent_server_mcp_retained_secrets (
+				id TEXT PRIMARY KEY NOT NULL,
+				secret_locator TEXT NOT NULL
+			);
+
+			CREATE TABLE agent_server_mcp_pending_secret_deletions (
+				secret_locator TEXT PRIMARY KEY NOT NULL,
+				created_at_ms INTEGER NOT NULL
+			);
+
+			CREATE TABLE agent_server_mcp_command_results (
+				command_id TEXT PRIMARY KEY NOT NULL,
+				operation TEXT NOT NULL,
+				request_digest TEXT NOT NULL,
+				result_json TEXT NOT NULL,
+				created_at_ms INTEGER NOT NULL
+			);
+			CREATE INDEX agent_server_mcp_command_results_created_idx
+				ON agent_server_mcp_command_results(created_at_ms);
+
+			CREATE TABLE agent_global_profiles (
+				agent_id TEXT PRIMARY KEY NOT NULL,
+				revision INTEGER NOT NULL,
+				server_mcp_refs_json TEXT NOT NULL,
+				created_at_ms INTEGER NOT NULL,
+				updated_at_ms INTEGER NOT NULL
 			);
 
 			CREATE TABLE app_settings (
@@ -269,7 +318,8 @@ export function applyAppMigrations(client: Database): void {
 			CREATE TABLE action_intents (
 				id TEXT PRIMARY KEY NOT NULL,
 				invocation_id TEXT NOT NULL UNIQUE,
-				runtime_box_id TEXT NOT NULL REFERENCES runtime_boxes(id),
+				target_kind TEXT NOT NULL,
+				target_id TEXT NOT NULL,
 				run_id TEXT NOT NULL REFERENCES chat_runs(id) ON DELETE CASCADE,
 				tool_call_id TEXT NOT NULL,
 				tool TEXT NOT NULL,
@@ -293,8 +343,8 @@ export function applyAppMigrations(client: Database): void {
 				server_acked_at_ms INTEGER,
 				box_receipt_confirmed_at_ms INTEGER
 			);
-			CREATE INDEX action_intents_runtime_state_idx
-				ON action_intents(runtime_box_id, state);
+			CREATE INDEX action_intents_target_state_idx
+				ON action_intents(target_kind, target_id, state);
 			CREATE INDEX action_intents_run_idx
 				ON action_intents(run_id);
 

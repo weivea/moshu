@@ -3,7 +3,7 @@
 > 更新日期：2026-07-28
 > 当前产品阶段：Phase 0
 > 当前架构里程碑：RB-09 发布加固
-> 当前代码基线：Local/Remote Runtime Box、强认证 ingress、Dev Tunnel、durable Action recovery、Box-owned MCP/Skills
+> 当前代码基线：Local/Remote Runtime Box、强认证 ingress、Dev Tunnel、durable Action recovery、双 owner MCP、Box-owned Skills
 
 本文只记录代码或自动化测试已经证明的能力。批准的目标见[技术架构](./architecture.md)，后续顺序见[工程交付计划](./delivery-plan.md)。
 
@@ -26,6 +26,10 @@ Local Runtime Box
   -> Runtime Box descriptor registration + keyed registry/invocation gateway
   -> read/bash/edit/write/grep/find/ls
   -> MCP stdio/Streamable HTTP/SSE + immutable Skills
+
+Agent Server
+  -> Server-owned MCP stdio/Streamable HTTP/SSE
+  -> global Agent MCP refs + local Action dispatcher
 ```
 
 “三进程”表示三个应用角色；Electrobun framework 仍会创建 launcher、application worker 和 WebView 等额外进程。
@@ -35,7 +39,7 @@ Local Runtime Box
 - 两个 TypeScript + Bun compiled companion 由 desktop supervisor 启动、认证、监管和协作关闭。
 - 动态 loopback bootstrap、stable identity、instance/generation fencing、请求 allowlist、取消和 event replay 已有合同与测试。
 - packaged canary、standalone binary、three-process、parent-death 和 companion smoke 构成当前发布门槛。
-- Runtime protocol v1 已冻结到独立 min/max/current；不兼容 Remote Box 在 Upgrade 前收到 HTTP 426，
+- Runtime protocol v2 已冻结到独立 min/max/current；v2 增加 MCP config revision，旧 Remote Box 在 Upgrade 前收到 HTTP 426，
   再用设备 key 提交短时防重放兼容性报告；Server 验证 generation 后持久化，registry/UI 跨重启显示
   `upgrade_required`。报告受 lifecycle/5 秒 timeout 约束；Relay TLS 与未来 Noise negotiation 字段均进入签名。
 - Runtime RPC 收发字节按月持久估算，设置页显示 5 GiB 的 50/80/100% 告警及公开 Dev Tunnels 数量、
@@ -62,12 +66,16 @@ Local Runtime Box
   Action，再释放锁。数据库 reset 通过 `actionJournalEpoch` 隔离旧 journal。
 - Runtime Box 私有 SQLite/SecretStore/Skill store 保存 MCP config/credential、immutable Skill content、
   inventory epoch/revision/change log；Agent Server 仅保存严格脱敏 projection 和稳定 Runtime Profile ref。
+- Agent Server-owned MCP 使用 Product DB metadata、独立 MCP SecretStore 和全局 Agent profile；连接不随 active
+  Runtime Box 切换，stdio 运行在 Agent Server host。
 - MCP list 给 renderer 的 DTO 不含 command/args/cwd/URL 等 transport config；启停使用 Box 内部
   `setEnabled` mutation，不再把持久 transport round-trip 到 WebView。
 - 每次连接先 full inventory sync，连续 delta/hint 和 48–72 秒独立 poll 维持 cache；gap、压缩、epoch reset、
   无前进 cursor 或旧 peer 结果均 fail closed/full snapshot，offline 只标 stale。
 - MCP stdio、Streamable HTTP 与兼容 SSE lifecycle 已接入，进程树/session/stream 均可回收；每次 MCP Tool
   仍使用 durable intent、版本/hash/schema 绑定的单次 grant 与 invocation journal。
+- Server-owned MCP 与 Box-owned MCP 共用协议/lifecycle package、owner-aware ToolDefinition 和 Action
+  语义；Server 本地调用不伪装成 Runtime Box target，Box 调用继续使用 journal/evidence。
 - Skills 使用 YAML 规范校验、内容 hash、不可变版本、filesystem-safe 目录和 fsync commit；Run 启动时 live
   验证并只在内存加载 `SKILL.md`，不会写入 Product DB、事件或 Pi Session JSONL。
 - 产品数据库只有 agents server 写入，保存 SessionCatalog、RunJournal、durable events、retirement tombstone 和

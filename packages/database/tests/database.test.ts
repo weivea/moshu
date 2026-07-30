@@ -1,5 +1,6 @@
 import Database from "bun:sqlite";
 import { describe, expect, test } from "bun:test";
+import { createHmac } from "node:crypto";
 import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -7,6 +8,7 @@ import { join } from "node:path";
 import {
 	type AppError,
 	defaultLocalRuntimeBoxId,
+	type McpSecretInput,
 	retiredSessionTombstoneTtlMs,
 } from "@moshu/contracts";
 
@@ -452,7 +454,8 @@ describe("application database", () => {
 				grantId,
 				grantTokenHash: tokenHash,
 				invocationId,
-				runtimeBoxId: defaultLocalRuntimeBoxId,
+				targetKind: "runtime-box",
+				targetId: defaultLocalRuntimeBoxId,
 				runId: run.id,
 				toolCallId: "tool-call",
 				tool: "read",
@@ -522,6 +525,41 @@ describe("application database", () => {
 					result: { ...result, invocationId: crypto.randomUUID() },
 				}),
 			).toThrow("did not match");
+
+			const localActionId = crypto.randomUUID();
+			const localGrantId = crypto.randomUUID();
+			const localInvocationId = crypto.randomUUID();
+			const localTokenHash = "d".repeat(64);
+			database.actions.createGrant({
+				actionId: localActionId,
+				grantId: localGrantId,
+				grantTokenHash: localTokenHash,
+				invocationId: localInvocationId,
+				targetKind: "agent-server",
+				targetId: "agent-server-id",
+				runId: run.id,
+				toolCallId: "server-mcp-call",
+				tool: "mcp:global:send",
+				parameterDigest: "e".repeat(64),
+				riskClass: "high",
+				sideEffectClass: "remote",
+				idempotencyClass: "non_idempotent",
+				policyRule: "test",
+				originInstanceId: "agents-instance",
+				originGeneration: 2,
+				targetInstanceId: "agents-instance",
+				targetGeneration: 2,
+				executionScope: "agent-server-mcp",
+				expiresAtMs: Date.now() + 60_000,
+			});
+			database.actions.consumeGrant(localActionId, localGrantId, localTokenHash);
+			database.actions.markFailed(localInvocationId, "definitive MCP failure");
+			expect(database.actions.get(localInvocationId)).toMatchObject({
+				targetKind: "agent-server",
+				state: "failed",
+				serverAckedAtMs: expect.any(Number),
+			});
+			expect(database.actions.hasUnacknowledgedForSession(session.id)).toBe(false);
 		} finally {
 			database.close();
 		}
@@ -542,7 +580,8 @@ describe("application database", () => {
 					grantId,
 					grantTokenHash: tokenHash,
 					invocationId,
-					runtimeBoxId: defaultLocalRuntimeBoxId,
+					targetKind: "runtime-box",
+					targetId: defaultLocalRuntimeBoxId,
 					runId: run.id,
 					toolCallId: crypto.randomUUID(),
 					tool: "bash",
@@ -1505,6 +1544,156 @@ describe("application database", () => {
 					)
 					.get()?.count,
 			).toBe(maxAgentSessionCleanupJobs);
+		} finally {
+			database.close();
+		}
+	});
+
+	test("stores Agent Server MCPs separately and keeps global refs stable across credential rotation", () => {
+		const secretValues = new Map<string, { resourceId: string; value: McpSecretInput }>();
+		let failNextSecretDelete = false;
+		const secretStore = {
+			put(resourceId: string, value: McpSecretInput) {
+				const locator = crypto.randomUUID();
+				secretValues.set(locator, { resourceId, value });
+				return locator;
+			},
+			read(resourceId: string, locator: string) {
+				const stored = secretValues.get(locator);
+				if (stored?.resourceId !== resourceId) {
+					throw new Error("Secret does not match its MCP resource.");
+				}
+				return stored.value;
+			},
+			delete(locator: string) {
+				if (failNextSecretDelete) {
+					failNextSecretDelete = false;
+					throw new Error("simulated secret cleanup failure");
+				}
+				secretValues.delete(locator);
+			},
+			fingerprint(value: McpSecretInput) {
+				return createHmac("sha256", "test-only-mcp-idempotency-key")
+					.update(JSON.stringify(value))
+					.digest("hex");
+			},
+		};
+		const database = openAppDatabase(":memory:", {
+			agentServerMcpSecrets: secretStore,
+		});
+		try {
+			const owner = { kind: "agent-server" as const };
+			const transport = {
+				type: "stdio" as const,
+				command: "/usr/bin/example-mcp",
+				args: [],
+				startupTimeoutMs: 10_000,
+			};
+			const created = database.agentServerMcps.upsert({
+				owner,
+				commandId: crypto.randomUUID(),
+				displayName: "Global database",
+				enabled: true,
+				transport,
+				secret: { environment: { DATABASE_TOKEN: "server-secret-one" } },
+			});
+			const replayCommand = crypto.randomUUID();
+			const tool = {
+				stableToolId: "tool-query",
+				name: "query",
+				schemaHash: "a".repeat(64),
+				inputSchema: { type: "object", properties: {} },
+			};
+			database.agentServerMcps.updateMcpRuntimeState(created.stableResourceId, "ready", [tool]);
+			const ready = database.agentServerMcps.list().items[0];
+			if (ready === undefined) {
+				throw new Error("Expected an Agent Server MCP.");
+			}
+			expect(ready).toMatchObject({
+				owner,
+				health: "ready",
+				credentialConfigured: true,
+				tools: [tool],
+			});
+			const profile = database.agentGlobalProfiles.getOrCreate("moshu.default");
+			const updatedProfile = database.agentGlobalProfiles.update({
+				agentId: profile.agentId,
+				expectedRevision: profile.revision,
+				serverMcpRefs: [
+					{
+						owner,
+						stableResourceId: ready.stableResourceId,
+						version: ready.version,
+						contentHash: ready.contentHash,
+					},
+				],
+			});
+			expect(database.agentGlobalProfiles.isResourceReferenced(ready.stableResourceId)).toBe(true);
+			expect(database.agentServerMcps.resolveRefs(updatedProfile.serverMcpRefs)).toHaveLength(1);
+
+			const rotationInput = {
+				owner,
+				commandId: replayCommand,
+				stableResourceId: ready.stableResourceId,
+				expectedConfigRevision: ready.configRevision,
+				displayName: ready.displayName,
+				enabled: true,
+				transport,
+				secret: { environment: { DATABASE_TOKEN: "server-secret-two" } },
+			};
+			failNextSecretDelete = true;
+			expect(() => database.agentServerMcps.upsert(rotationInput)).toThrow(
+				"simulated secret cleanup failure",
+			);
+			const rotated = database.agentServerMcps.upsert(rotationInput);
+			expect(rotated.configRevision).toBe(ready.configRevision + 1);
+			expect(rotated.version).toBe(ready.version);
+			expect(rotated.contentHash).toBe(ready.contentHash);
+			expect(rotated.summary?.health).toBe("stopped");
+			expect(database.agentServerMcps.upsert(rotationInput)).toEqual(rotated);
+			expect(() =>
+				database.agentServerMcps.upsert({
+					...rotationInput,
+					secret: { environment: { DATABASE_TOKEN: "different-secret-same-command" } },
+				}),
+			).toThrow("different request");
+			expect(
+				database.agentServerMcps.getMcpConnectionConfig(ready.stableResourceId).secret,
+			).toEqual({
+				environment: { DATABASE_TOKEN: "server-secret-two" },
+			});
+			database.agentServerMcps.updateMcpRuntimeState(ready.stableResourceId, "ready", [tool]);
+			expect(database.agentServerMcps.resolveRefs(updatedProfile.serverMcpRefs)).toHaveLength(1);
+			const disableInput = {
+				owner,
+				commandId: crypto.randomUUID(),
+				stableResourceId: ready.stableResourceId,
+				expectedConfigRevision: rotated.configRevision,
+				enabled: false,
+			};
+			const disabled = database.agentServerMcps.setEnabled(disableInput);
+			expect(disabled).toMatchObject({
+				configRevision: rotated.configRevision + 1,
+				version: ready.version,
+				contentHash: ready.contentHash,
+			});
+			database.agentServerMcps.upsert({
+				owner,
+				commandId: crypto.randomUUID(),
+				stableResourceId: ready.stableResourceId,
+				expectedConfigRevision: disabled.configRevision,
+				displayName: "Renamed after disable",
+				enabled: false,
+				transport,
+			});
+			expect(database.agentServerMcps.setEnabled(disableInput)).toEqual(disabled);
+			expect(
+				JSON.stringify(
+					database.client
+						.query<Record<string, unknown>, []>("SELECT * FROM agent_server_mcp_servers")
+						.all(),
+				),
+			).not.toContain("server-secret");
 		} finally {
 			database.close();
 		}

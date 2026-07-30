@@ -25,10 +25,10 @@ Agent
 
 ### 1.1 三角色映射
 
-- agents server 保存 Provider/model 配置与 credential、Agent definitions/versions、Session/Run/event、Policy/approval/Action；MCP/Skill 只保存 Agent resource reference 和非权威、可丢弃 inventory cache。
-- 每个 Runtime Box 是自身 MCP config/credential/OAuth/lifecycle、Skill installation/immutable version/content/hash/resources 和相关 private local data 的唯一 source of truth。
+- agents server 保存 Provider/model、Agent/Run/Policy/Action，以及 Agent Server-owned MCP config/credential/lifecycle 和 Agent global refs；对 Box-owned MCP/Skill 只保存 stable ref 与非权威 inventory cache。
+- 每个 Runtime Box 是自身 Box-owned MCP config/credential/OAuth/lifecycle、Skill installation/immutable version/content/hash/resources 和相关 private local data 的唯一 source of truth。
 - 每次 Runtime Box 注册/重连时 server 先 full sync redacted inventory；运行期以 revision hint + 60 秒 ±20% jitter poll 拉取 delta，cache 可丢弃且不构成授权。
-- Agent 只可引用 assigned Runtime Box 的资源，reference 为 `runtimeBoxId + stable resourceId + version/hash`；server 按 ref 获取 Skill metadata 与 `SKILL.md` 构造 prompt，resources/scripts 仍由 Runtime Box 读取或执行。
+- Agent global profile 可引用 Server-owned MCP；Runtime Profile 只可引用 assigned Runtime Box 的资源。server 合并两类 MCP ref，并按 Box ref 获取 Skill metadata 与 `SKILL.md`。
 - server 决定并持久化 Policy/approval，随后签发一次性 execution grant；Runtime Box 验证后才执行。
 - 当前 desktop 由 client 监管一个 host-backed Local Runtime Box；Agent 全局共享，并为每个 Box 建立 Runtime Profile。
 
@@ -200,7 +200,9 @@ notification。`start` 立即返回，UI 单请求有界轮询；离开面板或
 
 测试连接不得自动调用有副作用 Tool。
 
-client 提供完整 MCP 配置 UI，但不直连 Runtime Box。query/command 先由 agents server 校验 client/Runtime Box identity、Agent binding 与产品授权，再路由到 selected Runtime Box；Runtime Box 是 connection config、credential/OAuth、lifecycle 和 Tool inventory 的唯一 source of truth。Agent resource selection 保存为 server 的 stable refs，Tool risk override 仍属于 server Policy。
+client 提供 owner-explicit MCP 配置 UI。Server-owned query/command 由 agents server 本地 authority 处理；Box-owned
+query/command 经身份与授权校验后路由到 selected Runtime Box。Agent global profile 保存 Server-owned refs，
+Runtime Profile 保存 Box-owned refs；Tool risk override 始终属于 server Policy。
 
 - Runtime Box 只有在原子持久化成功后才返回 redacted result 与新的 inventory epoch/revision；server 随即拉取到该 revision，再向后续 inventory read 展示新状态。
 - Runtime Box offline、版本冲突或存储失败时明确失败；server 不排队并伪装成功。
@@ -208,28 +210,33 @@ client 提供完整 MCP 配置 UI，但不直连 Runtime Box。query/command 先
 
 ### 4.3 认证
 
-- stdio credential 由 Runtime Box 自己的 `ExecutorSecretStore` 解析；启动 MCP process 时只注入目标 child 的最小环境，并可在 process 生命周期内驻留 Runtime Box 内存，不使用远程 OAuth 流程。
+- stdio credential 由 owner 的 MCP SecretStore 解析；启动 MCP process 时只注入目标 child 的最小环境，不使用远程 OAuth 流程。
 - 远程连接支持静态 Header、Bearer/API Key。
 - 支持符合 MCP 规范的 OAuth 2.1、PKCE、资源服务器发现和浏览器授权。
 - 动态客户端注册不可用时，允许用户填写 Client ID；Client Secret 安全存储。
-- Access/Refresh Token 和其他 MCP Secret 只写入 owning Runtime Box 的 `ExecutorSecretStore`，不进入 server
-  DB/Pi Session JSONL/backup/snapshot、MCP query result、日志或 WebView。
+- Access/Refresh Token 和其他 MCP Secret 只写入显式 owner 的 SecretStore，不进入 Product DB/Pi Session
+  JSONL/backup/snapshot、MCP query result、日志或 WebView。
 - local desktop 首个 `ExecutorSecretStore` 可使用 private files；future Runtime Box 可改用 Keychain、Docker Secret 或 cloud secret manager。
-- Runtime Box 可在 connection/process 生命周期内把 credential 加载到内存；不得进入模型/UI/prompt、query RPC、diagnostic/export、Runtime Box 全局环境或无关 child/Agent。
+- owner 可在 connection/process 生命周期内把 credential 加载到内存；不得进入模型/UI/prompt、query RPC、diagnostic/export、进程全局环境或无关 child/Agent。
 - revocation、expiry 或 MCP shutdown 会关闭对应连接/进程并释放 runtime reference；JavaScript 不承诺可靠清零 string memory。
 - HTTP transport 可在可行时按 request 注入 credential，但这只是优化。
 - 撤销连接时同时提供清理本地 Token 的选项。
 
 ### 4.4 作用域
 
-MCP Server 可设为：
+MCP Server 先选择 owner：
+
+- Agent Server：连接跨 Runtime Box 保持，stdio 在 Agent Server host 执行。
+- Runtime Box：只在 owning Box 生效。
+
+然后可设为：
 
 - 全局可用。
 - 仅指定 Project 可用。
 - 仅指定 Agent 可用。
 
-最终 Tool 集合取以上范围的交集，并叠加权限策略；解析结果只在 Runtime Profile 中保存 owning Runtime Box
-stable refs，不复制 MCP config。Agent 选择某 Tool 不代表该 Tool 已预授权执行。
+最终 Tool 集合取以上范围的交集，并叠加权限策略。Server-owned refs 保存在 Agent global profile，Box-owned
+refs 保存在 Runtime Profile，均不复制 owner config。Agent 选择某 Tool 不代表该 Tool 已预授权执行。
 
 ### 4.5 运行与错误
 
@@ -241,6 +248,7 @@ stable refs，不复制 MCP config。Agent 选择某 Tool 不代表该 Tool 已�
 
 ### 4.6 Inventory 同步
 
+- 以下 epoch/revision 同步只适用于 Box-owned MCP；Server-owned MCP 直接读取 Agent Server authority。
 - Runtime Box 持久化 `inventoryEpoch`、单调递增 `inventoryRevision` 和带 deletion tombstone 的有界 change log；普通 restart 不换 epoch，inventory reset 才换。
 - 每次 MCP/Skill/config/Tool-schema/capability change commit 后发送 `inventory.changed`；hint 只含 epoch/revision/category，不含 credential、config、Tool schema body 或 Skill content。
 - server 对 hint 去抖并调用 `inventory.getChanges(sinceRevision, cursor)`；另按每次 48–72 秒的随机间隔主动增量 reconciliation。
@@ -379,5 +387,5 @@ Box 管理。client 管理 UI 使用与 MCP 相同的 server-routed command；se
 | EXT-015 | Agent 绑定已注册 Runtime Box；Runtime Box syncing/offline 时不能启动新 Run | P0 |
 | EXT-016 | Runtime Box 独占 MCP config/credential/OAuth/lifecycle；client UI 经 server 校验路由，offline/持久化失败不返回成功，Tool 仍逐次走 grant | P0 |
 | EXT-017 | Runtime Box 独占 immutable Skill versions/content；Agent 只保存 assigned Runtime Box stable ref，server 按 version/hash 获取 `SKILL.md`，missing/mismatch fail closed | P0 |
-| EXT-018 | server 不保存 recoverable MCP/Skill config/content/credential；inventory cache 明确为 replaceable、non-authoritative、disposable | P0 |
+| EXT-018 | server 不保存 recoverable Box-owned MCP/Skill config/content/credential；Box inventory cache 明确为 replaceable、non-authoritative、disposable | P0 |
 | EXT-019 | Runtime Box inventory 使用 registration full sync、persisted epoch/revision、hint + jittered poll、delta/tombstone 与 snapshot fallback；Run 仍 live 验证 | P0 |

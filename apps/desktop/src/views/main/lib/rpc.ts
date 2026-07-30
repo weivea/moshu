@@ -60,6 +60,15 @@ import {
 	upsertRuntimeBoxMcpServerInputSchema,
 	deleteRuntimeBoxMcpServerInputSchema,
 	runtimeBoxResourceMutationResultSchema,
+	listMcpServersInputSchema,
+	listMcpServersOutputSchema,
+	upsertMcpServerInputSchema,
+	setMcpServerEnabledInputSchema,
+	deleteMcpServerInputSchema,
+	mcpServerMutationResultSchema,
+	getAgentGlobalProfileInputSchema,
+	getAgentGlobalProfileOutputSchema,
+	updateAgentGlobalProfileInputSchema,
 	listRuntimeBoxSkillsInputSchema,
 	listRuntimeBoxSkillsOutputSchema,
 	installRuntimeBoxSkillInputSchema,
@@ -333,6 +342,46 @@ export const desktopClient = {
 		const parsed = deleteRuntimeBoxMcpServerInputSchema.parse(input);
 		return runtimeBoxResourceMutationResultSchema.parse(
 			await requestDesktop(() => getRequest().deleteMcpServer(parsed)),
+		);
+	},
+	async listOwnedMcpServers(input: Parameters<typeof listMcpServersInputSchema.parse>[0]) {
+		const parsed = listMcpServersInputSchema.parse(input);
+		return listMcpServersOutputSchema.parse(
+			await requestDesktop(() => getRequest().listOwnedMcpServers(parsed)),
+		);
+	},
+	async upsertOwnedMcpServer(input: Parameters<typeof upsertMcpServerInputSchema.parse>[0]) {
+		const parsed = upsertMcpServerInputSchema.parse(input);
+		return mcpServerMutationResultSchema.parse(
+			await requestDesktop(() => getRequest().upsertOwnedMcpServer(parsed)),
+		);
+	},
+	async setOwnedMcpServerEnabled(
+		input: Parameters<typeof setMcpServerEnabledInputSchema.parse>[0],
+	) {
+		const parsed = setMcpServerEnabledInputSchema.parse(input);
+		return mcpServerMutationResultSchema.parse(
+			await requestDesktop(() => getRequest().setOwnedMcpServerEnabled(parsed)),
+		);
+	},
+	async deleteOwnedMcpServer(input: Parameters<typeof deleteMcpServerInputSchema.parse>[0]) {
+		const parsed = deleteMcpServerInputSchema.parse(input);
+		return mcpServerMutationResultSchema.parse(
+			await requestDesktop(() => getRequest().deleteOwnedMcpServer(parsed)),
+		);
+	},
+	async getAgentGlobalProfile(agentId = "moshu.default") {
+		const input = getAgentGlobalProfileInputSchema.parse({ agentId });
+		return getAgentGlobalProfileOutputSchema.parse(
+			await requestDesktop(() => getRequest().getAgentGlobalProfile(input)),
+		);
+	},
+	async updateAgentGlobalProfile(
+		input: Parameters<typeof updateAgentGlobalProfileInputSchema.parse>[0],
+	) {
+		const parsed = updateAgentGlobalProfileInputSchema.parse(input);
+		return getAgentGlobalProfileOutputSchema.parse(
+			await requestDesktop(() => getRequest().updateAgentGlobalProfile(parsed)),
 		);
 	},
 	async listSkills(runtimeBoxId?: string) {
