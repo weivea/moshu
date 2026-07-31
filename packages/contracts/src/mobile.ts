@@ -255,6 +255,126 @@ export const mobileAccessStatusOutputSchema = z
 	})
 	.strict();
 
+// ---------------------------------------------------------------------------
+// Durable Mobile attention / unread feed (Agent Server owned).
+//
+// The Agent Server durably records a minimal, desensitized "attention" event whenever an approval
+// enters the pending state or a Run reaches a terminal state. The phone never persists business
+// events: it reads the feed from the server, tracks unread via a server-side per-device ack cursor,
+// and recovers missed unread after a reconnect. An attention event carries NO prompt/message text,
+// tool raw arguments, provider secret, file path body, or shell command — only stable opaque ids and
+// localization keys the client renders into generic, local text.
+// ---------------------------------------------------------------------------
+
+export const mobileAttentionEventTypeSchema = z.enum([
+	"approval_required",
+	"run_completed",
+	"run_failed",
+	"run_cancelled",
+]);
+
+// A monotonic, server-assigned sequence number. It is the stable ordering key and the value a client
+// acknowledges. `0` is reserved to mean "no events" / "nothing acknowledged".
+export const mobileAttentionSeqSchema = z.int().nonnegative().safe();
+export const mobileAttentionPositiveSeqSchema = z.int().positive().safe();
+
+// Opaque reference ids (sessionId/runId/approvalId). They are treated as opaque handles by the phone;
+// the feed never carries any business content beyond these ids and the localization keys.
+const mobileAttentionRefIdSchema = z
+	.string()
+	.min(1)
+	.max(128)
+	.regex(/^[A-Za-z0-9][A-Za-z0-9._-]*$/);
+
+// A localization key such as `attention.approvalRequired.title`. It is a generic, static string that
+// never embeds business content, so it is safe to render on a lock screen.
+const mobileAttentionMessageKeySchema = z
+	.string()
+	.min(1)
+	.max(128)
+	.regex(/^[a-z][a-zA-Z0-9]*(\.[a-zA-Z0-9]+)+$/);
+
+export const mobileAttentionEventSchema = z
+	.object({
+		schemaVersion: z.literal(1),
+		eventId: z.string().uuid(),
+		seq: mobileAttentionPositiveSeqSchema,
+		type: mobileAttentionEventTypeSchema,
+		// Every event in this feed is visible only to authenticated mobile clients. The literal makes
+		// that explicit and lets the contract evolve if a future visibility scope is ever added.
+		visibility: z.literal("mobile-clients"),
+		sessionId: mobileAttentionRefIdSchema.optional(),
+		runId: mobileAttentionRefIdSchema.optional(),
+		approvalId: mobileAttentionRefIdSchema.optional(),
+		createdAt: z.string().datetime({ offset: true }),
+		titleKey: mobileAttentionMessageKeySchema,
+		bodyKey: mobileAttentionMessageKeySchema,
+	})
+	.strict();
+
+export const mobileAttentionListPageSize = 100 as const;
+export const mobileAttentionListCursorSchema = z.string().min(1).max(512);
+
+export const listMobileAttentionInputSchema = z
+	.object({
+		cursor: mobileAttentionListCursorSchema.optional(),
+		limit: z.int().min(1).max(mobileAttentionListPageSize).optional(),
+	})
+	.strict();
+
+export const listMobileAttentionOutputSchema = z
+	.object({
+		schemaVersion: z.literal(1),
+		items: z.array(mobileAttentionEventSchema).max(mobileAttentionListPageSize),
+		// Count of retained events with seq greater than the caller's acknowledgement cursor.
+		unreadCount: mobileAttentionSeqSchema,
+		// The caller's current server-side acknowledgement cursor (0 = nothing acknowledged yet).
+		ackSeq: mobileAttentionSeqSchema,
+		// The highest sequence the server has ever assigned (0 = the feed is empty). A client uses this
+		// to know the newest event without paging the whole feed.
+		latestSeq: mobileAttentionSeqSchema,
+		// True when retention pruned events the caller had not yet acknowledged (a "retention gap"), so
+		// the client must resnapshot rather than trust an incremental unread delta. The server never
+		// pretends there is no unread when a gap exists.
+		resyncRequired: z.boolean(),
+		nextCursor: mobileAttentionListCursorSchema.optional(),
+	})
+	.strict();
+
+export const ackMobileAttentionInputSchema = z
+	.object({
+		// Acknowledge every event up to and including this sequence. The server clamps to `latestSeq`
+		// and never regresses an existing cursor (monotonic CAS), so replays/out-of-order acks are safe.
+		seq: mobileAttentionSeqSchema,
+	})
+	.strict();
+
+export const ackMobileAttentionOutputSchema = z
+	.object({
+		schemaVersion: z.literal(1),
+		ackSeq: mobileAttentionSeqSchema,
+		unreadCount: mobileAttentionSeqSchema,
+		latestSeq: mobileAttentionSeqSchema,
+	})
+	.strict();
+
+// A no-payload live hint pushed ONLY to authenticated mobile-client peers when the attention feed
+// changes. It carries no business content; the client refreshes via the authorization-checked
+// `mobile.attention.list`. Desktop product clients never receive this event.
+export const mobileAttentionChangedEventSchema = z
+	.object({
+		schemaVersion: z.literal(1),
+	})
+	.strict();
+
+export type MobileAttentionEventType = z.infer<typeof mobileAttentionEventTypeSchema>;
+export type MobileAttentionEvent = z.infer<typeof mobileAttentionEventSchema>;
+export type ListMobileAttentionInput = z.infer<typeof listMobileAttentionInputSchema>;
+export type ListMobileAttentionOutput = z.infer<typeof listMobileAttentionOutputSchema>;
+export type AckMobileAttentionInput = z.infer<typeof ackMobileAttentionInputSchema>;
+export type AckMobileAttentionOutput = z.infer<typeof ackMobileAttentionOutputSchema>;
+export type MobileAttentionChangedEvent = z.infer<typeof mobileAttentionChangedEventSchema>;
+
 export type MobileProtocolVersion = z.infer<typeof mobileProtocolVersionSchema>;
 export type MobileTransportSecurity = z.infer<typeof mobileTransportSecuritySchema>;
 export type MobilePlatform = z.infer<typeof mobilePlatformSchema>;

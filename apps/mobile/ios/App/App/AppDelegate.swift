@@ -1,10 +1,39 @@
 import UIKit
 import Capacitor
+import MoshuMobileCore
+
+/// Bridges `UIApplication`'s background-task API to the pure-logic ``BackgroundActivityCoordinator``.
+/// This is a plain, finite background task — NOT a declared `UIBackgroundMode`, remote/silent push,
+/// or VoIP keep-alive. It only extends the App's runtime briefly after backgrounding so an already
+/// open socket can still receive a live attention event; when it ends (or the OS expires it) the web
+/// layer's lifecycle handling tears the socket down.
+final class UIApplicationBackgroundTaskHost: BackgroundTaskHost {
+	func beginTask(expirationHandler: @escaping () -> Void) -> Int {
+		let identifier = UIApplication.shared.beginBackgroundTask(
+			withName: "dev.moshu.mobile.attention-window",
+			expirationHandler: expirationHandler
+		)
+		return Int(identifier.rawValue)
+	}
+
+	func endTask(_ id: Int) {
+		UIApplication.shared.endBackgroundTask(UIBackgroundTaskIdentifier(rawValue: UInt(id)))
+	}
+}
 
 @UIApplicationMain
 class AppDelegate: UIResponder, UIApplicationDelegate {
 
     var window: UIWindow?
+
+    /// Owns the single bounded background task. Created lazily so the coordinator's cleanup callback
+    /// captures a stable instance.
+    private lazy var backgroundActivity = BackgroundActivityCoordinator(
+        host: UIApplicationBackgroundTaskHost(),
+        // On OS expiration there is nothing native to tear down here: the web layer closes the socket
+        // via `@capacitor/app` lifecycle. The coordinator itself guarantees the task is ended.
+        onExpire: {}
+    )
 
     func application(_ application: UIApplication, didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
         // Override point for customization after application launch.
@@ -17,8 +46,9 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
     }
 
     func applicationDidEnterBackground(_ application: UIApplication) {
-        // Use this method to release shared resources, save user data, invalidate timers, and store enough application state information to restore your application to its current state in case it is terminated later.
-        // If your application supports background execution, this method is called instead of applicationWillTerminate: when the user quits.
+        // Begin the single, bounded background task so an already-open socket can survive the OS's
+        // short background window and still receive a live attention event. Idempotent.
+        backgroundActivity.begin()
     }
 
     func applicationWillEnterForeground(_ application: UIApplication) {
@@ -26,11 +56,14 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
     }
 
     func applicationDidBecomeActive(_ application: UIApplication) {
-        // Restart any tasks that were paused (or not yet started) while the application was inactive. If the application was previously in the background, optionally refresh the user interface.
+        // Back in the foreground: end the background task promptly (idempotent). The web layer
+        // reconnects and re-snapshots the durable attention feed.
+        backgroundActivity.end()
     }
 
     func applicationWillTerminate(_ application: UIApplication) {
-        // Called when the application is about to terminate. Save data if appropriate. See also applicationDidEnterBackground:.
+        // Ensure the background task is released if the app is terminating.
+        backgroundActivity.end()
     }
 
     func application(_ app: UIApplication, open url: URL, options: [UIApplication.OpenURLOptionsKey: Any] = [:]) -> Bool {

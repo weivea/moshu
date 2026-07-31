@@ -60,7 +60,9 @@
       "name": "@moshu/mobile",
       "version": "0.0.1",
       "dependencies": {
+        "@capacitor/app": "8.1.1",
         "@capacitor/core": "8.4.2",
+        "@capacitor/local-notifications": "8.2.1",
         "@heroui/react": "3.2.2",
         "@heroui/styles": "3.2.2",
         "@moshu/contracts": "workspace:*",
@@ -315,11 +317,15 @@
 
     "@biomejs/cli-win32-x64": ["@biomejs/cli-win32-x64@2.5.4", "https://ms-feed-25.pkgs.visualstudio.com/1es-public/_packaging/npm-public/npm/registry/@biomejs/cli-win32-x64/-/cli-win32-x64-2.5.4.tgz", { "os": "win32", "cpu": "x64" }, "sha1-pSpUVOTgvnvQjXiKH73lKJhN8JU="],
 
+    "@capacitor/app": ["@capacitor/app@8.1.1", "https://ms-feed-2.pkgs.visualstudio.com/1es-public/_packaging/npm-public/npm/registry/@capacitor/app/-/app-8.1.1.tgz", { "peerDependencies": { "@capacitor/core": ">=8.0.0" } }, "sha1-rwBknQx3meyDRpscStqSH5kzp34="],
+
     "@capacitor/cli": ["@capacitor/cli@8.4.2", "https://ms-feed-25.pkgs.visualstudio.com/1es-public/_packaging/npm-public/npm/registry/@capacitor/cli/-/cli-8.4.2.tgz", { "dependencies": { "@ionic/cli-framework-output": "^2.2.8", "@ionic/utils-subprocess": "^3.0.1", "@ionic/utils-terminal": "^2.3.5", "commander": "^12.1.0", "debug": "^4.4.0", "env-paths": "^2.2.0", "fs-extra": "^11.2.0", "kleur": "^4.1.5", "native-run": "^2.0.3", "open": "^8.4.0", "plist": "^3.1.0", "prompts": "^2.4.2", "rimraf": "^6.0.1", "semver": "^7.6.3", "tar": "^7.5.3", "tslib": "^2.8.1", "xml2js": "^0.6.2" }, "bin": { "capacitor": "./bin/capacitor", "cap": "./bin/capacitor" } }, "sha1-P1/r5n49cmwHqLEvj82BcuOmwL8="],
 
     "@capacitor/core": ["@capacitor/core@8.4.2", "https://ms-feed-25.pkgs.visualstudio.com/1es-public/_packaging/npm-public/npm/registry/@capacitor/core/-/core-8.4.2.tgz", { "dependencies": { "tslib": "^2.1.0" } }, "sha1-0o4l5xmpJy0nNNGnNYEnyTlA0s0="],
 
     "@capacitor/ios": ["@capacitor/ios@8.4.2", "https://ms-feed-12.pkgs.visualstudio.com/1es-public/_packaging/npm-public/npm/registry/@capacitor/ios/-/ios-8.4.2.tgz", { "peerDependencies": { "@capacitor/core": "^8.4.0" } }, "sha1-PtbnIDpbFeYmsfvVAf88/R3a+LE="],
+
+    "@capacitor/local-notifications": ["@capacitor/local-notifications@8.2.1", "https://ms-feed-2.pkgs.visualstudio.com/1es-public/_packaging/npm-public/npm/registry/@capacitor/local-notifications/-/local-notifications-8.2.1.tgz", { "peerDependencies": { "@capacitor/core": ">=8.0.0" } }, "sha1-M5jo6LtvSlvWPWitW13K8PHx2cw="],
 
     "@csstools/color-helpers": ["@csstools/color-helpers@5.1.0", "https://ms-feed-25.pkgs.visualstudio.com/1es-public/_packaging/npm-public/npm/registry/@csstools/color-helpers/-/color-helpers-5.1.0.tgz", {}, "sha1-EGxUyAjKv9GrTGAthQXuWEwplu8="],
 

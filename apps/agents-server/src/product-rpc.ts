@@ -58,6 +58,7 @@ import {
 	ChatSessionNotFoundError,
 	McpResourceNotFoundError,
 	McpResourceVersionConflictError,
+	type MobileAttentionRepository,
 	type MobileDeviceRepository,
 	PairingFingerprintMismatchError,
 	PairingSessionNotFoundError,
@@ -96,6 +97,7 @@ import type { DevTunnelService } from "./dev-tunnel-service";
 import type { MobileIngressAuth } from "./mobile-ingress-auth";
 import {
 	broadcastApprovalActivityChanged,
+	broadcastMobileAttentionChanged,
 	ProductEventRouter,
 	publishChatEvent,
 	publishRetiredChatSessions,
@@ -128,6 +130,7 @@ export interface ProductRpcDependencies {
 	runtimeBoxPairings?: RuntimeBoxPairingRepository;
 	mobileIngressAuth?: MobileIngressAuth;
 	mobileDevices?: MobileDeviceRepository;
+	mobileAttention?: MobileAttentionRepository;
 	disconnectMobileDevice?: (mobileClientId: string, reason: string) => void;
 	projectService?: ProjectApplicationService;
 	runtimeBoxInventory?: RuntimeBoxInventoryRepository;
@@ -146,6 +149,7 @@ export interface ProductRpcDependencies {
 export type { ProductEventRouteLease } from "./product-event-hub";
 export {
 	broadcastApprovalActivityChanged,
+	broadcastMobileAttentionChanged,
 	ProductEventRouter,
 	publishChatEvent,
 	publishRetiredChatSessions,
@@ -183,6 +187,7 @@ export function createProductRpcHandlers(dependencies: ProductRpcDependencies): 
 		runtimeBoxPairings,
 		mobileIngressAuth,
 		mobileDevices,
+		mobileAttention,
 		disconnectMobileDevice,
 		projectService,
 		runtimeBoxInventory,
@@ -213,6 +218,12 @@ export function createProductRpcHandlers(dependencies: ProductRpcDependencies): 
 			throw new Error("Mobile device repository is not initialized.");
 		}
 		return mobileDevices;
+	};
+	const requireMobileAttention = (): MobileAttentionRepository => {
+		if (mobileAttention === undefined) {
+			throw new Error("Mobile attention repository is not initialized.");
+		}
+		return mobileAttention;
 	};
 	const getRuntimeBoxInventory = (): RuntimeBoxInventoryRepository => {
 		if (runtimeBoxInventory === undefined) {
@@ -402,8 +413,29 @@ export function createProductRpcHandlers(dependencies: ProductRpcDependencies): 
 				productRpcRequestSchemas[productRpcMethods.mobileDeviceRevoke],
 				(input) => {
 					const output = requireMobileIngressAuth().revokeDevice(input);
+					// Drop the device's server-side unread cursor so a revoked (and later re-paired)
+					// client id can never inherit stale read state, and no feed is retained for it.
+					mobileAttention?.deleteAckCursor(input.mobileClientId);
 					disconnectMobileDevice?.(input.mobileClientId, "Mobile device revoked.");
 					return output;
+				},
+			),
+			[productRpcMethods.mobileAttentionList]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.mobileAttentionList],
+				// Peer identity is server-derived from the authenticated Mobile ingress session, never
+				// from request input, so a caller can neither forge another device's clientId nor read a
+				// Desktop feed. Desktop product clients are rejected outright.
+				(input, peer) =>
+					requireMobileAttention().list(resolveMobileClientId(peer), {
+						cursor: input.cursor,
+						limit: input.limit,
+					}),
+			),
+			[productRpcMethods.mobileAttentionAck]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.mobileAttentionAck],
+				(input, peer) => {
+					const result = requireMobileAttention().ack(resolveMobileClientId(peer), input.seq);
+					return { schemaVersion: 1 as const, ...result };
 				},
 			),
 			[productRpcMethods.remoteAccessStatus]: createRequestHandler(
@@ -1227,6 +1259,19 @@ function resolveProductClientId(peer: RpcPeer): string {
 		throw new RpcHandlerError(
 			"CLIENT_IDENTITY_REQUIRED",
 			"Runtime Box selection is only available to authenticated product clients.",
+		);
+	}
+	return peer.remoteIdentity.peerId;
+}
+
+// The Mobile attention feed is per-device unread state, so its handlers must bind strictly to an
+// authenticated Mobile client. Desktop product clients are rejected — a Desktop peer must never be
+// able to read or advance a phone's unread cursor, and a Mobile caller can only address its own feed.
+function resolveMobileClientId(peer: RpcPeer): string {
+	if (peer.remoteIdentity.role !== "mobile-client") {
+		throw new RpcHandlerError(
+			"CLIENT_IDENTITY_REQUIRED",
+			"The Mobile attention feed is only available to authenticated Mobile clients.",
 		);
 	}
 	return peer.remoteIdentity.peerId;

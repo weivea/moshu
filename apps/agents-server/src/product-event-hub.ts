@@ -7,6 +7,7 @@ import {
 	chatEventDeliverySchema,
 	chatRunEventSchema,
 	chatSessionsRetiredEventSchema,
+	mobileAttentionChangedEventSchema,
 	productRpcEvents,
 	type SessionApprovalPolicyEvent,
 	sessionApprovalPolicyEventSchema,
@@ -339,6 +340,28 @@ export class ProductEventRouter {
 export function broadcastApprovalActivityChanged(peers: readonly RpcPeer[]): void {
 	const payload = encodeJsonValue(approvalActivityChangedEventSchema.parse({ schemaVersion: 1 }));
 	emitToClients(peers, productRpcEvents.approvalActivityChanged, payload, "Approval activity hint");
+}
+
+// A no-payload live hint delivered ONLY to authenticated Mobile clients when the durable attention
+// feed changes. It never reaches Desktop `client` peers (Desktop has no notion of a phone's unread),
+// and it carries no business content — the phone refreshes via the authorization-checked
+// `mobile.attention.list`. Suspended/terminated devices simply miss it and recover on reconnect.
+export function broadcastMobileAttentionChanged(peers: readonly RpcPeer[]): void {
+	const payload = encodeJsonValue(mobileAttentionChangedEventSchema.parse({ schemaVersion: 1 }));
+	for (const peer of peers) {
+		if (peer.remoteIdentity.role !== "mobile-client") {
+			continue;
+		}
+		try {
+			peer.emitEvent(productRpcEvents.mobileAttentionChanged, payload);
+		} catch (error) {
+			peer.close(1011, "Mobile attention hint publication failed.");
+			console.error(
+				`Failed to publish Mobile attention hint to client ${peer.remoteIdentity.peerId}.`,
+				error,
+			);
+		}
+	}
 }
 
 function emitToClients(

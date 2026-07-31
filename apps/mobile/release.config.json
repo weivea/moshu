@@ -1,0 +1,9 @@
+{
+	"$comment": "Single source of truth for the iOS App version + bundle identity. Run `bun run release:version` to fan these values out into the Xcode project (MARKETING_VERSION / CURRENT_PROJECT_VERSION) and this package's version. Signing team, certificates and provisioning profiles are intentionally NOT stored here — they are supplied at build time by whoever signs the App.",
+	"marketingVersion": "1.0.0",
+	"buildNumber": "1",
+	"bundleId": {
+		"development": "dev.moshu.mobile",
+		"$release": "Release builds override PRODUCT_BUNDLE_IDENTIFIER at build time (e.g. via an xcconfig or `xcodebuild PRODUCT_BUNDLE_IDENTIFIER=...`). The committed project keeps the development id so no App Store identity is baked into source. See docs/implementation/quality-release.md."
+	}
+}

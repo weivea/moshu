@@ -483,3 +483,73 @@ clean tagged commit
 
 - [ ] 当前开发期 reset 行为明确且已测试；没有迁移旧数据的错误承诺。
 - [ ] 当前 schema backup/restore、DB integrity 和 Pi Session contract 通过。
+
+## 21. Mobile stack Layer 5 发布加固（iOS App）
+
+Mobile stack Layer 5（final）交付 iOS 发布加固；**硬边界：无云 Push Relay、无 APNs remote/silent push、无
+VoIP/background-processing 伪保活、设备不落业务数据、Desktop 必须在线、suspended/terminated 不保证通知。**
+
+### 21.1 版本一致性（单一来源）
+
+- `apps/mobile/release.config.json` 是版本单一来源（`marketingVersion` / `buildNumber`）。
+- `bun run --cwd apps/mobile release:version` 把它 fan-out 到 Xcode `MARKETING_VERSION` /
+  `CURRENT_PROJECT_VERSION` 与 `apps/mobile/package.json`；`release:version -- --check` 只校验、drift 即非零退出。
+- **不提交** `DEVELOPMENT_TEAM` / 证书 / provisioning profile；签名身份构建期提供。
+
+### 21.2 Release gate（fail-closed 静态门）
+
+`bun run --cwd apps/mobile release:gate`（`scripts/release-gate.ts`）在构建前强制：
+
+- 无 remote UI：Capacitor 无 `server.url`（App 只加载本地 `dist`）。
+- 无 desktop/node 泄漏：mobile `src` 无 node builtins / `Buffer` / `ws` import。
+- 无 secret 样本：`src`/`ios` 无 PEM 私钥 / GitHub / Slack / AWS token。
+- 无宽泛 ATS：Info.plist 无 `NSAllowsArbitraryLoads*`。
+- 无违规 background mode：无 `remote-notification` / `voip` / `audio` / `fetch` / `processing`。
+- 无 APNs / Local Network：无 `aps-environment` entitlement、无 `NSLocalNetworkUsageDescription` / `NSBonjourServices`。
+- 无 baked 签名：pbxproj 无 `DEVELOPMENT_TEAM` / `PROVISIONING_PROFILE_SPECIFIER`。
+- version 一致（§21.1）、contracts↔canonical vectors 同步、`dist`↔iOS `public` 同步（需先 `build` + `cap:copy`/`cap:sync`）。
+
+### 21.3 Privacy manifest / required-reason API
+
+- `apps/mobile/ios/App/App/PrivacyInfo.xcprivacy`：`NSPrivacyTracking=false`、`NSPrivacyCollectedDataTypes` 空、
+  仅声明实际使用的 required-reason API `NSPrivacyAccessedAPICategoryUserDefaults`（reason `CA92.1`，Capacitor 运行时/
+  官方插件读写自身配置）。无其他类别（file timestamp / boot time / disk space / keyboard）。
+- Info.plist 仅 `NSCameraUsageDescription`（二维码），无宽泛 ATS、无 Local Network/Bonjour、无未使用的 background modes。
+
+### 21.4 Export compliance（发布方确认）
+
+- App 使用 CryptoKit **Ed25519**（设备认证签名）+ **TLS**（系统 WSS）。这属于标准加密用途。
+- App Store 加密问卷 / 可能的豁免需 **发布方确认**；工程 **不武断** 写 `ITSAppUsesNonExemptEncryption`。若填写，必须有
+  明确依据并允许构建期 override。不误报“无加密”。
+
+### 21.5 App Store reviewer 路径（Desktop 在线依赖）
+
+- App 需连接**用户自己在线的 Desktop**（无生产云账号/无假成功模式）。
+- 审核提交应附**临时 review 流程**：审核期由提交方运行一台在线 Desktop，开启 Remote Access，生成配对二维码给审核设备扫码，
+  或提供等价的安全 demo（录屏 + 明确说明 Desktop 在线是硬依赖）。**不引入生产云账号或伪造 connected 模式。**
+
+### 21.6 Dev vs Release bundle id
+
+- 开发 bundle id `dev.moshu.mobile`（committed）。发布 build 期 override `PRODUCT_BUNDLE_IDENTIFIER`
+  （xcconfig 或 `xcodebuild PRODUCT_BUNDLE_IDENTIFIER=...`），不把 App Store 身份写进源码。
+
+### 21.7 验证命令（本层）
+
+- `bun run --cwd apps/mobile test`（79 Vitest）、`typecheck`、`build`、`cap:copy`（或 `cap:sync`，best-effort）。
+- `swift test`（`apps/mobile/native/MoshuMobile`，67 XCTest）。
+- server 侧隔离测试：`bun test packages/contracts packages/database` 与
+  `apps/agents-server/src/mobile-attention-projection.test.ts` / `mobile-ingress-smoke.test.ts` /
+  `mobile-ingress-auth.test.ts` / `mobile-ingress-generation-fence.test.ts`。
+- `bun run --cwd apps/mobile release:gate`。
+- iOS simulator `xcodebuild test/build`（禁签名）与真实 Dev Tunnel probe（`scripts/probe-live-dev-tunnel.ts`）为
+  **opt-in**、记录命令、不要求 CI secret。
+
+### 21.8 发布检查表（Mobile Layer 5）
+
+- [ ] `release:version -- --check` 通过（版本一致）。
+- [ ] `release:gate` 全绿（remote UI / node-leak / secret / ATS / background mode / APNs / signing / vectors / bundle sync）。
+- [ ] `PrivacyInfo.xcprivacy` 与实际依赖一致；Info.plist 无多余权限/background mode。
+- [ ] Export compliance 问卷由发布方确认；未武断写 `ITSAppUsesNonExemptEncryption`。
+- [ ] reviewer 路径（在线 Desktop + 配对二维码或安全 demo）已备妥；无生产云账号/假成功。
+- [ ] 79 Vitest + 67 Swift XCTest + server attention smoke + database attention repository 通过。
+- [ ] 真机签名、真实 Dev Tunnel probe、App Store 提交为发布方人工步骤（记录在案）。

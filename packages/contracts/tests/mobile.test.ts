@@ -1,10 +1,13 @@
 import { describe, expect, test } from "bun:test";
 import {
+	ackMobileAttentionInputSchema,
 	createMobileAuthenticationPayload,
 	createMobileServerChallengePayload,
 	currentMobileProtocolVersion,
+	listMobileAttentionOutputSchema,
 	type MobileChallengeInput,
 	type MobileChallengeOutput,
+	mobileAttentionEventSchema,
 	mobileClientProductEventMethods,
 	mobileClientProductRequestMethods,
 	mobilePairingQrPayloadSchema,
@@ -140,6 +143,8 @@ describe("mobile allowlist", () => {
 				productRpcMethods.approvalsDecide,
 				productRpcMethods.sessionApprovalPolicyGet,
 				productRpcMethods.sessionApprovalPolicyUpdate,
+				productRpcMethods.mobileAttentionList,
+				productRpcMethods.mobileAttentionAck,
 			].sort(),
 		);
 	});
@@ -178,7 +183,79 @@ describe("mobile allowlist", () => {
 				productRpcEvents.approvalEvent,
 				productRpcEvents.sessionApprovalPolicyChanged,
 				productRpcEvents.approvalActivityChanged,
+				productRpcEvents.mobileAttentionChanged,
 			].sort(),
 		);
+	});
+});
+
+describe("mobile attention feed contracts", () => {
+	const validEvent = {
+		schemaVersion: 1 as const,
+		eventId: "55555555-5555-4555-8555-555555555555",
+		seq: 7,
+		type: "approval_required" as const,
+		visibility: "mobile-clients" as const,
+		sessionId: "01920000-0000-7000-8000-000000000001",
+		approvalId: "01920000-0000-7000-8000-000000000002",
+		createdAt: "2025-01-01T00:00:00.000Z",
+		titleKey: "attention.approvalRequired.title",
+		bodyKey: "attention.approvalRequired.body",
+	};
+
+	test("an attention event carries only opaque ids and localization keys", () => {
+		const event = mobileAttentionEventSchema.parse(validEvent);
+		const keys = Object.keys(event);
+		// No raw business content may ever ride the feed.
+		for (const forbidden of [
+			"prompt",
+			"message",
+			"content",
+			"toolArgs",
+			"arguments",
+			"command",
+			"path",
+			"secret",
+			"title",
+			"body",
+		]) {
+			expect(keys).not.toContain(forbidden);
+		}
+	});
+
+	test("rejects a free-text title so business content can never leak into the feed", () => {
+		expect(() =>
+			mobileAttentionEventSchema.parse({
+				...validEvent,
+				titleKey: "rm -rf / on production",
+			}),
+		).toThrow();
+	});
+
+	test("rejects an unexpected field to keep the event contract tight", () => {
+		expect(() =>
+			mobileAttentionEventSchema.parse({ ...validEvent, prompt: "do the thing" }),
+		).toThrow();
+	});
+
+	test("the list output surfaces unread, ack cursor and a retention-gap resync flag", () => {
+		const output = listMobileAttentionOutputSchema.parse({
+			schemaVersion: 1,
+			items: [validEvent],
+			unreadCount: 1,
+			ackSeq: 6,
+			latestSeq: 7,
+			resyncRequired: true,
+			nextCursor: "cursor-token",
+		});
+		expect(output.resyncRequired).toBe(true);
+		expect(output.unreadCount).toBe(1);
+		expect(output.ackSeq).toBe(6);
+	});
+
+	test("the ack input accepts a nonnegative sequence and nothing else", () => {
+		expect(ackMobileAttentionInputSchema.parse({ seq: 0 }).seq).toBe(0);
+		expect(() => ackMobileAttentionInputSchema.parse({ seq: -1 })).toThrow();
+		expect(() => ackMobileAttentionInputSchema.parse({ seq: 1, extra: true })).toThrow();
 	});
 });

@@ -50,13 +50,18 @@ import {
 	runtimeBoxToolProgressEventSchema,
 } from "./executor-tools";
 import {
+	ackMobileAttentionInputSchema,
+	ackMobileAttentionOutputSchema,
 	approveMobilePairingInputSchema,
 	approveMobilePairingOutputSchema,
 	createMobilePairingOutputSchema,
+	listMobileAttentionInputSchema,
+	listMobileAttentionOutputSchema,
 	listMobileDevicesInputSchema,
 	listMobileDevicesOutputSchema,
 	listMobilePairingClaimsOutputSchema,
 	mobileAccessStatusOutputSchema,
+	mobileAttentionChangedEventSchema,
 	rejectMobilePairingInputSchema,
 	rejectMobilePairingOutputSchema,
 	revokeMobileDeviceInputSchema,
@@ -202,6 +207,8 @@ export const productRpcMethods = {
 	mobilePairingReject: "moshu.v2.mobile.pairing.reject",
 	mobileDeviceList: "moshu.v2.mobile.device.list",
 	mobileDeviceRevoke: "moshu.v2.mobile.device.revoke",
+	mobileAttentionList: "moshu.v2.mobile.attention.list",
+	mobileAttentionAck: "moshu.v2.mobile.attention.ack",
 	remoteAccessStatus: "moshu.v1.remoteAccess.status",
 	remoteAccessAuthStart: "moshu.v1.remoteAccess.auth.start",
 	remoteAccessAuthGet: "moshu.v1.remoteAccess.auth.get",
@@ -314,6 +321,9 @@ export const productRpcEvents = {
 	approvalEvent: "moshu.v1.approvals.event",
 	sessionApprovalPolicyChanged: "moshu.v1.approvals.policy.changed",
 	approvalActivityChanged: "moshu.v1.approvals.activity.changed",
+	// Mobile-only live hint (never delivered to Desktop product clients): the durable attention feed
+	// changed, so a connected phone should refresh its unread snapshot.
+	mobileAttentionChanged: "moshu.v2.mobile.attention.changed",
 } as const;
 
 export const productRpcMaxFrameBytes = 4 * 1024 * 1024;
@@ -551,6 +561,14 @@ export const productRpcRequestSchemas = {
 	[productRpcMethods.mobileDeviceRevoke]: {
 		input: revokeMobileDeviceInputSchema,
 		output: revokeMobileDeviceOutputSchema,
+	},
+	[productRpcMethods.mobileAttentionList]: {
+		input: listMobileAttentionInputSchema,
+		output: listMobileAttentionOutputSchema,
+	},
+	[productRpcMethods.mobileAttentionAck]: {
+		input: ackMobileAttentionInputSchema,
+		output: ackMobileAttentionOutputSchema,
 	},
 	[productRpcMethods.remoteAccessStatus]: {
 		input: emptyParamsSchema,
@@ -938,6 +956,7 @@ export const productRpcEventSchemas = {
 	[productRpcEvents.approvalEvent]: approvalEventDeliverySchema,
 	[productRpcEvents.sessionApprovalPolicyChanged]: sessionApprovalPolicyEventSchema,
 	[productRpcEvents.approvalActivityChanged]: approvalActivityChangedEventSchema,
+	[productRpcEvents.mobileAttentionChanged]: mobileAttentionChangedEventSchema,
 } as const;
 
 export const clientProductRequestMethods = [
@@ -1098,6 +1117,8 @@ export const mobileClientProductRequestMethods = [
 	productRpcMethods.approvalsDecide,
 	productRpcMethods.sessionApprovalPolicyGet,
 	productRpcMethods.sessionApprovalPolicyUpdate,
+	productRpcMethods.mobileAttentionList,
+	productRpcMethods.mobileAttentionAck,
 ] as const;
 
 export const mobileClientProductEventMethods = [
@@ -1107,6 +1128,7 @@ export const mobileClientProductEventMethods = [
 	productRpcEvents.approvalEvent,
 	productRpcEvents.sessionApprovalPolicyChanged,
 	productRpcEvents.approvalActivityChanged,
+	productRpcEvents.mobileAttentionChanged,
 ] as const;
 
 export type SendAskChatMessageInput = z.infer<typeof sendAskChatMessageInputSchema>;

@@ -661,6 +661,41 @@ export const agentSessionCleanupOutboxTable = sqliteTable(
 	(table) => [index("agent_session_cleanup_outbox_next_attempt_idx").on(table.nextAttemptAtMs)],
 );
 
+export const mobileAttentionFeedMetaTable = sqliteTable("mobile_attention_feed_meta", {
+	id: integer("id").primaryKey(),
+	nextSeq: integer("next_seq").notNull(),
+	prunedThroughSeq: integer("pruned_through_seq").notNull(),
+});
+
+export const mobileAttentionEventsTable = sqliteTable(
+	"mobile_attention_events",
+	{
+		seq: integer("seq").primaryKey(),
+		eventId: text("event_id").notNull(),
+		dedupeKey: text("dedupe_key").notNull(),
+		type: text("type", {
+			enum: ["approval_required", "run_completed", "run_failed", "run_cancelled"],
+		}).notNull(),
+		sessionId: text("session_id"),
+		runId: text("run_id"),
+		approvalId: text("approval_id"),
+		titleKey: text("title_key").notNull(),
+		bodyKey: text("body_key").notNull(),
+		createdAtMs: integer("created_at_ms").notNull(),
+	},
+	(table) => [
+		uniqueIndex("mobile_attention_events_event_id_unique").on(table.eventId),
+		uniqueIndex("mobile_attention_events_dedupe_key_unique").on(table.dedupeKey),
+		index("mobile_attention_events_created_idx").on(table.createdAtMs),
+	],
+);
+
+export const mobileAttentionAckCursorsTable = sqliteTable("mobile_attention_ack_cursors", {
+	mobileClientId: text("mobile_client_id").primaryKey(),
+	ackedSeq: integer("acked_seq").notNull(),
+	updatedAtMs: integer("updated_at_ms").notNull(),
+});
+
 export const appSchema = {
 	agentGlobalProfilesTable,
 	agentRuntimeProfilesTable,
@@ -697,4 +732,7 @@ export const appSchema = {
 	mobileDeviceKeysTable,
 	mobileDeviceGenerationFencesTable,
 	mobilePairingSessionsTable,
+	mobileAttentionFeedMetaTable,
+	mobileAttentionEventsTable,
+	mobileAttentionAckCursorsTable,
 };

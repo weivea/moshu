@@ -8,7 +8,7 @@
 - **Agent Server**：独占 Provider、Agent runtime、Session、Project、Run/event、Policy/Action、产品数据库、Pi Session JSONL，以及 Server-owned MCP 和 prompt-only Skills。
 - **Runtime Box**：在本机或远程设备执行 `read`、`bash`、`edit`、`write`、`grep`、`find`、`ls`，并拥有自己的 MCP、完整 Skill packages、credential、journal 和 workspace。
 - **Remote Runtime Box**：通过 Agent Server 管理的 Anonymous Microsoft Dev Tunnel 主动连接，使用一次性配对码、Ed25519 双向身份、generation fence 和版本协商。
-- **iOS Mobile App**：同 monorepo 的 `apps/mobile`——Capacitor + React + Vite + HeroUI Web UI 随 App 打包，配原生 `MoshuMobileTransport` Swift plugin（CryptoKit 软件 Ed25519 + Keychain 单 Server binding、二维码配对、challenge 验签、authenticated WSS）。私钥永不进 JS，业务数据只存内存，扫码经二维码绑定单个在线 Agent Server；后台/suspended 通知属 Layer 5。
+- **iOS Mobile App**：同 monorepo 的 `apps/mobile`——Capacitor + React + Vite + HeroUI Web UI 随 App 打包，配原生 `MoshuMobileTransport` Swift plugin（CryptoKit 软件 Ed25519 + Keychain 单 Server binding、二维码配对、challenge 验签、authenticated WSS）。私钥永不进 JS，业务数据只存内存，扫码经二维码绑定单个在线 Agent Server。Layer 5（final）加 Agent Server 持有的 durable 未读/attention feed、iOS 生命周期/重连、best-effort 本地通知与发布加固；**无云 Push Relay/APNs/后台伪保活，suspended/terminated 不保证通知**，重连从 server feed 恢复 missed 未读。
 - **多 Box 路由**：切换 Runtime Box 后，界面切换 Box-owned Session、Project、MCP 和 Skills；Server-owned MCP/Skills 保持不变，既有 Session/Run 永远按持久归属路由。
 - **Projects 与 Project Chat**：支持 Local 目录选择和 Remote 路径、预览确认、路径健康/重新关联、归档/删除、Project Session 管理、根 `AGENTS.md` 上下文和 Project root 文件 Tool 边界。
 - **MCP 与 Skills**：支持 MCP 与 Skills 双归属、MCP stdio/Streamable HTTP/SSE、prompt-only Server Skills、Box immutable Skill packages、global/Runtime Profile 和 inventory reconciliation。

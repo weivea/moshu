@@ -3,6 +3,7 @@ import { createRoot } from "react-dom/client";
 import { HashRouter } from "react-router-dom";
 import { App } from "./app/app";
 import { AppearanceProvider } from "./app/appearance";
+import { AttentionProvider } from "./app/attention";
 import { ConnectionProvider } from "./app/connection";
 import { I18nProvider } from "./app/i18n";
 import "./styles.css";
@@ -18,7 +19,9 @@ createRoot(container).render(
 			<I18nProvider>
 				<HashRouter>
 					<ConnectionProvider>
-						<App />
+						<AttentionProvider>
+							<App />
+						</AttentionProvider>
 					</ConnectionProvider>
 				</HashRouter>
 			</I18nProvider>

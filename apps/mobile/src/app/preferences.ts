@@ -8,6 +8,7 @@
 
 const THEME_KEY = "moshu.appearance.theme";
 const LANGUAGE_KEY = "moshu.appearance.language";
+const NOTIFICATIONS_KEY = "moshu.notifications.enabled";
 
 export type StoredTheme = "light" | "dark";
 export type StoredLanguage = "en" | "zh";
@@ -45,4 +46,17 @@ export function readStoredLanguage(): StoredLanguage | null {
 
 export function writeStoredLanguage(language: StoredLanguage): void {
 	safeSet(LANGUAGE_KEY, language);
+}
+
+/**
+ * Whether the user has opted into best-effort local notifications. This is a UI preference only (no
+ * business data). It defaults to `false`: notifications are never enabled implicitly — the user must
+ * turn them on after pairing, which is also when the OS permission prompt is shown.
+ */
+export function readNotificationsEnabled(): boolean {
+	return safeGet(NOTIFICATIONS_KEY) === "true";
+}
+
+export function writeNotificationsEnabled(enabled: boolean): void {
+	safeSet(NOTIFICATIONS_KEY, enabled ? "true" : "false");
 }

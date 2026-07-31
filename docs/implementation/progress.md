@@ -70,7 +70,8 @@ Agent Server
   Mobile ingress 独立 frame/body/inflight/backpressure/handshake timeout、未认证连接与 HTTP 容量、per-source
   限流与流量计量；作为 DevTunnel 第二端口按 Layer 1 multi-port 模型逐端口 readiness/public URL 公开。
   Remote Access status v1 保持不变，新增 versioned `mobileAccess.status`（v2）向 Desktop 暴露 mobile ingress
-  状态/URL。**iOS App 本体已实现**（Layer 4：Capacitor Web UI + 原生 Swift 安全传输，见下条）；通知后台属 Layer 5。
+  状态/URL。**iOS App 本体已实现**（Layer 4：Capacitor Web UI + 原生 Swift 安全传输，见下条）；**Layer 5（final）
+  已实现** durable attention/未读 feed + 生命周期/重连 + best-effort 本地通知 + 发布加固（见 architecture §9.0.4）。
 - **iOS Mobile App（Layer 4）** 是同 monorepo 内可构建的 `apps/mobile` workspace：React + Vite + TypeScript strict +
   HeroUI + React Router HashRouter，Web assets 随 App 打包（`base:"./"`、`webDir:"dist"`、无 `server.url`），
   独立 mobile shell（底部 Chats/Projects/Activity/Settings tabs、`100dvh`/safe-area/VisualViewport 键盘避让、
@@ -101,7 +102,9 @@ Agent Server
   并将 teardown 关闭码安全映射到 `URLSessionWebSocketTask.CloseCode`（oversize→1009、binary→1003）而非一律 1001，
   close reason 按 UTF-8 边界截断到 123 字节。
   传输边界仍是 relay TLS +
-  应用设备签名（relay 可见），Noise 端到端与后台/suspended 可靠通知属 Layer 5。
+  应用设备签名（relay 可见），Noise 端到端后置。**Layer 5（final，已实现，见下方 M-L5 与 architecture §9.0.4）**：
+  Agent Server 持有 durable attention/未读 feed、iOS 生命周期/重连、best-effort 本地通知与发布加固；按硬边界
+  **无云 Push Relay/APNs/后台伪保活，suspended/terminated 不保证通知**，重连从 server feed 恢复 missed 未读。
 - Agent Server 管理 Dev Tunnel Microsoft device-code 登录、持久 cluster-qualified Tunnel ID、
   单一 Anonymous HTTP ingress port、Host watchdog、重建/修复、取消和重试；Product RPC 不暴露到 Tunnel。
 - Agent Server 在派发前持久化 Action intent，并签发参数、来源、目标 generation 与 execution scope
@@ -202,8 +205,10 @@ Agent Server
 - macOS Provider vault 当前是权限加固的 app-owned 文件；Keychain adapter 仍是外部分发前安全工作。
 - Mobile stack Layer 3 已实现独立 Mobile ingress、二维码配对与 Ed25519 设备认证（见 §2 与 architecture
   §9.0.2、data-contracts §9.3）。**iOS App 本体（Layer 4：Capacitor Web UI + 原生 Swift 安全传输）已实现**
-  （见 §2 iOS Mobile App 条目）；**移动通知后台/suspended 可靠投递与发布加固仍属 Layer 5 未实现**。
-  首版 Mobile client 只绑定一个 Agent Server（由 client 实现），Desktop 必须在线，relay TLS +
+  （见 §2 iOS Mobile App 条目）。**Mobile stack Layer 5（final）已实现**：Agent Server 持有 durable
+  attention/未读 feed、iOS 生命周期/重连、best-effort 本地通知与发布加固（见 architecture §9.0.4、
+  data-contracts §9.5、quality-release）。按硬边界 **无云 Push Relay/APNs/后台伪保活，suspended/terminated 不
+  保证通知**；重连从 server feed 恢复 missed 未读。首版 Mobile client 只绑定一个 Agent Server（由 client 实现），Desktop 必须在线，relay TLS +
   应用设备签名是当前传输边界（relay 可见），Noise 端到端握手后置且不会谎称已启用；设备 key 为软件
   CryptoKit key（非 Secure Enclave），App 不缓存任何业务数据。iOS 端配对 HTTP/WSS 端点路径为对 Layer 3
   ingress 的当前实现约定，真实 E2E 需在线 Desktop 验证。
@@ -235,6 +240,7 @@ Agent Server
 | M-L2 Durable approvals | 已完成 | server-authoritative 风险分级、durable approval + Session Allow-all、CAS/幂等决策、多 client 事件、Desktop UI |
 | M-L3 Mobile ingress/pairing/auth | 已完成 | 独立 `/mobile` ingress、二维码配对、Ed25519 设备认证、generation fence、独立 allowlist、Desktop 配对 UI |
 | M-L4 iOS Mobile App | 已完成（真机签名/后台通知后置） | 可构建 `apps/mobile` Capacitor Web UI + 原生 `MoshuMobileTransport` Swift plugin（Keychain 软件 Ed25519、单绑定/unpair、challenge 验签、WSS 帧序列/限额）、browser-safe RPC/Product allowlist client、离线清业务态、47 Vitest + 30 Swift XCTest、iOS simulator 构建通过；Layer 5 后台/suspended 通知与发布加固后置 |
+| M-L5 生命周期/通知/durable 未读/发布加固（final） | 已完成（真机签名/真实 Tunnel/App Store 提交为发布方人工步骤） | Agent Server 持有 durable attention/未读 feed（脱敏事件、幂等 append、per-client 单调 ack cursor、cursor 分页 + resyncRequired、bounded retention、revoke/unpair 清 cursor、mobile-only `attention.changed` hint）；iOS 生命周期/重连（`@capacitor/app`、有界退避+jitter、background 暂停、fatal 不重试、单一有界 background task 有保障 cleanup、无 UIBackgroundModes）；best-effort 本地通知（用户显式开启、仅短后台收到事件时 schedule、generic 文案、稳定 id、tap 先认证再导航、suspended/terminated 不保证、无 APNs）；发布加固（`release.config.json`+version sync、`PrivacyInfo.xcprivacy`、release-gate 脚本、dev/release bundle id、export compliance 待发布方确认）；79 Vitest + 67 Swift XCTest + server attention 端到端 smoke + database attention repository 全绿 |
 
 ## 7. 开发数据策略
 

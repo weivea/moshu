@@ -49,10 +49,15 @@ import { McpActionDispatcher } from "./mcp-action-dispatcher";
 import { MobileIngressAuth } from "./mobile-ingress-auth";
 import { MobileIngressGenerationFence } from "./mobile-ingress-generation-fence";
 import {
+	projectApprovalAttention,
+	projectRunTerminalAttention,
+} from "./mobile-attention-projection";
+import {
 	agentsServerClientMethodAllowlist,
 	agentsServerMobileMethodAllowlist,
 	agentsServerRuntimeMethodAllowlist,
 	broadcastApprovalActivityChanged,
+	broadcastMobileAttentionChanged,
 	createProductRpcHandlers,
 	createRuntimeBoxesSnapshot,
 	ProductEventRouter,
@@ -500,6 +505,7 @@ export async function createAgentsServer(
 			runtimeBoxPairings: database.runtimeBoxPairings,
 			mobileIngressAuth,
 			mobileDevices: database.mobileDevices,
+			mobileAttention: database.mobileAttention,
 			disconnectMobileDevice,
 			projectService,
 			runtimeBoxInventory: database.runtimeBoxInventory,
@@ -687,8 +693,32 @@ export async function createAgentsServer(
 			reportDiagnostic(error instanceof Error ? error.message : "Dev Tunnel startup failed.");
 		});
 		const service = chatService;
+		// Durably append a desensitized Mobile attention event and, only if a new row was actually
+		// written, push the mobile-only `attention.changed` live hint. Append is transactional and
+		// idempotent (dedupe key), so a duplicate business event neither double-appends nor re-notifies,
+		// and a server restart never loses or replays an event. Failures here never break the primary
+		// event fan-out — the phone still recovers missed unread from the durable feed on reconnect.
+		const appendMobileAttention = (
+			input: Parameters<typeof database.mobileAttention.append>[0],
+		): void => {
+			try {
+				const result = database.mobileAttention.append(input);
+				if (result.appended) {
+					broadcastMobileAttentionChanged(productEventPeers());
+				}
+			} catch (error) {
+				const message = error instanceof Error ? error.message.slice(0, 256) : "Unknown failure.";
+				reportDiagnostic(
+					`Mobile attention append failed; reconnect recovery still applies: ${message}`,
+				);
+			}
+		};
 		unsubscribe = service.subscribe((event) => {
 			eventRouter.publish(productEventPeers(), event, service.getClientRequestId(event.runId));
+			const attention = projectRunTerminalAttention(event);
+			if (attention !== undefined) {
+				appendMobileAttention(attention);
+			}
 		});
 		// Fan approval state changes out to the multi-client event hub: Session-scoped events reach
 		// that Session's subscribers, and a no-payload activity hint tells every client to refresh its
@@ -706,6 +736,10 @@ export async function createAgentsServer(
 					kind: event.type === "approval.created" ? "created" : "updated",
 					request: event.request,
 				});
+				const attention = projectApprovalAttention(event);
+				if (attention !== undefined) {
+					appendMobileAttention(attention);
+				}
 			}
 			broadcastApprovalActivityChanged(peers);
 		});

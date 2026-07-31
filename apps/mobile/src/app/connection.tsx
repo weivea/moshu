@@ -11,6 +11,7 @@ import type { MobileTransportBinding } from "../native";
 import type { MobileEventBus } from "../rpc/events";
 import type { MobileProductClient } from "../rpc/product-client";
 import { ConnectionController, type ConnectionState } from "../rpc/connection-controller";
+import { type AppLifecycle, CapacitorAppLifecycle } from "../native/lifecycle";
 
 interface ConnectionContextValue {
 	readonly state: ConnectionState;
@@ -21,15 +22,21 @@ const ConnectionContext = createContext<ConnectionContextValue | undefined>(unde
 
 export interface ConnectionProviderProps {
 	readonly controller?: ConnectionController;
+	readonly lifecycle?: AppLifecycle;
 	readonly children: ReactNode;
 }
 
-export function ConnectionProvider({ controller, children }: ConnectionProviderProps) {
+export function ConnectionProvider({ controller, lifecycle, children }: ConnectionProviderProps) {
 	const controllerRef = useRef<ConnectionController | null>(controller ?? null);
 	if (controllerRef.current === null) {
 		controllerRef.current = new ConnectionController();
 	}
 	const activeController = controllerRef.current;
+	const lifecycleRef = useRef<AppLifecycle | null>(lifecycle ?? null);
+	if (lifecycleRef.current === null) {
+		lifecycleRef.current = new CapacitorAppLifecycle();
+	}
+	const activeLifecycle = lifecycleRef.current;
 	const [state, setState] = useState<ConnectionState>(() => activeController.getState());
 
 	useEffect(() => {
@@ -38,22 +45,20 @@ export function ConnectionProvider({ controller, children }: ConnectionProviderP
 		return unsubscribe;
 	}, [activeController]);
 
-	// App foreground/active lifecycle: a WKWebView receives `visibilitychange` when the App returns
-	// to the foreground. Reconnect a paired-but-dropped session on activation (Layer 4 keeps only the
-	// basic active/foreground connect lifecycle; background reliability is Layer 5).
+	// App foreground/background lifecycle. On foreground we reconnect + resnapshot a paired-but-dropped
+	// session; on background we STOP scheduling new reconnects (no fake keep-alive) and let any live
+	// socket run out its short OS-granted window. The lifecycle source is native `@capacitor/app` on
+	// device and `document.visibilitychange` on web/dev.
 	useEffect(() => {
-		function handleVisibility(): void {
-			if (document.visibilityState === "visible") {
+		return activeLifecycle.subscribe({
+			onActive() {
 				void activeController.onAppActive();
-			}
-		}
-		document.addEventListener("visibilitychange", handleVisibility);
-		window.addEventListener("focus", handleVisibility);
-		return () => {
-			document.removeEventListener("visibilitychange", handleVisibility);
-			window.removeEventListener("focus", handleVisibility);
-		};
-	}, [activeController]);
+			},
+			onBackground() {
+				activeController.onAppBackground();
+			},
+		});
+	}, [activeController, activeLifecycle]);
 
 	const value = useMemo<ConnectionContextValue>(
 		() => ({ state, controller: activeController }),

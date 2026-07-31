@@ -1,6 +1,6 @@
 {
 	"name": "@moshu/mobile",
-	"version": "0.0.1",
+	"version": "1.0.0",
 	"private": true,
 	"type": "module",
 	"scripts": {
@@ -11,12 +11,16 @@
 		"test:watch": "vitest",
 		"typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.node.json",
 		"cap:sync": "cap sync ios",
-		"cap:open": "cap open ios",
 		"cap:copy": "cap copy ios",
+		"cap:open": "cap open ios",
+		"release:version": "bun run scripts/sync-version.ts",
+		"release:gate": "bun run scripts/release-gate.ts",
 		"gen:vectors": "bun run scripts/gen-canonical-vectors.ts"
 	},
 	"dependencies": {
+		"@capacitor/app": "8.1.1",
 		"@capacitor/core": "8.4.2",
+		"@capacitor/local-notifications": "8.2.1",
 		"@moshu/contracts": "workspace:*",
 		"@moshu/process-rpc-core": "workspace:*",
 		"@moshu/ui": "workspace:*",

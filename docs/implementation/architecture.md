@@ -466,7 +466,8 @@ agentDataDirectory/
   锁定并测试）、过期倒计时、pending claim 的设备名/平台/公钥指纹、approve/reject、已配对设备列表/revoke。
   **只有本地 Desktop Product RPC 能 create/approve/revoke，Mobile ingress 不能自批**；二维码 payload 不写
   localStorage/日志，组件 unmount/过期即清理显示。中英 i18n、a11y、loading/error/expired/revoked 状态齐备。
-- **仍未实现**：移动通知后台/suspended 可靠投递与发布加固（Layer 5）；iOS App 本体（Layer 4）已实现，见 §9.0.3。
+- **Layer 5（已实现，见 §9.0.4）**：durable attention/未读 feed、iOS 生命周期/重连、best-effort 本地通知与发布加固已落地；
+  按硬边界 **suspended/terminated 不保证通知**（无云 Push Relay/APNs/后台伪保活）。iOS App 本体（Layer 4）见 §9.0.3。
   首版 Mobile client 只绑定一个 Agent Server（由 client 实现），Desktop 必须在线；URL/server identity 变化需要重新配对。
 
 ### 9.0.3 Layer 4 iOS Mobile App（已实现）
@@ -525,6 +526,49 @@ agentDataDirectory/
   并由共享 canonical 测试向量固定，Vitest 与 Swift 同时断言防漂移；queued bytes 保守有界且 ≥ 单帧。teardown 将拟发
   数字关闭码安全映射到 `URLSessionWebSocketTask.CloseCode`（oversize→`messageTooBig`/1009、binary→`unsupportedData`/1003、
   其余标准码原值），保留/本地专用/未知码回退安全可发送码，close reason 按 UTF-8 标量边界截断到 123 字节——不再一律 `.goingAway`(1001)。
+
+### 9.0.4 Layer 5 生命周期 / 通知 / durable 未读 / 发布加固（已实现，final）
+
+> Mobile stack Layer 5 是移动栈**最终层**：在 Layer 4 之上加 **Agent Server 持有的 durable attention/未读 feed**、
+> iOS 生命周期/重连、best-effort 本地通知与发布加固。**硬边界：无云 Push Relay、无 APNs remote/silent push、
+> 无 VoIP/background-processing 伪保活、设备不落业务数据、Desktop 必须在线。** suspended/terminated **不保证通知**。
+
+- **Durable attention feed（server-owned）**：合同/表/repository/RPC 见 data-contracts §9.5。Agent Server 在 approval 进入
+  `pending`、Run 终态时投影出脱敏 `MobileAttentionEvent`（幂等/事务/重启不丢）durably append；每 `mobileClientId` 维护
+  server 侧单调 ack cursor。`mobile.attention.list`（cursor 分页 + unreadCount/nextCursor/latestSeq/resyncRequired）与
+  `mobile.attention.ack`（CAS/幂等/单调、不回退）加入 mobile-client strict allowlist；**peer identity 由 auth context 决定，
+  禁止伪造 clientId 或回退 cursor**。bounded retention（30 天 + per-feed 上限），cursor 过旧显式 `resyncRequired` 不伪装无未读；
+  设备 revoke 不可读、unpair 清 cursor 不泄漏旧 feed。live 只发最小 `attention.changed` hint（无业务正文），Desktop Product RPC
+  不暴露 mobile device 未读。
+- **iOS 生命周期/重连**：`src/native/lifecycle.ts` 用 `@capacitor/app` `appStateChange`（web `visibilitychange` 回退）。
+  foreground → 连接/恢复 + 立即一次重试；background → **暂停**重连（不新建 socket），仅让既有 socket 在系统短窗口存活；
+  系统 expiration 关闭 socket。重连用**有界指数退避 + jitter**（`reconnectMaxDelayMs`/`reconnectJitterRatio`），stable `connected`
+  与用户 `retry()` 后 reset；fatal（`AUTH_REVOKED`/`AUTH_FAILED`/`PROTOCOL_MISMATCH`/identity）不重试；background/offline 暂停
+  timer；旧 connection callbacks 不复活。断线仅显示 offline/reconnecting，不展示缓存业务；回连重新 snapshot + attention feed。
+- **原生 background task**：`BackgroundActivityCoordinator`（`MoshuMobileCore`，`AppDelegate` 装配）持有**单一、幂等、有界**的
+  `UIApplication.beginBackgroundTask`，end 或系统 expiration 都保证 cleanup。这是普通有限 task——**不声明任何 `UIBackgroundModes`**、
+  非 remote/silent push、非 VoIP/audio 保活。
+- **本地通知（best effort）**：官方 `@capacitor/local-notifications`（lazy import、iOS-only、web/test 降级 no-op）。首次成功配对后
+  由用户在 Settings **显式开启**（冷启动不突袭权限），Settings 显示 permission 状态与开关。仅当 App **非 active** 且短后台 socket
+  实际收到 `attention.changed` 时 schedule generic 本地通知；active 时只更新 Activity badge。通知文案本地化 generic（无 raw
+  prompt/command/path/secret），id 由 attention `seq` 稳定派生（`NotificationContentBuilder`/`notificationIdForSeq`）防重复。
+  tap/deeplink 只携 opaque id，App active 后先认证/重连/snapshot 再导航；未配对/fatal/offline 显示安全状态。**suspended/terminated
+  无通知保证**；重连从 server feed 恢复 missed 未读并显示 badge，但不为历史事件批量补发系统通知。**不注册 APNs token、不请求
+  remote notification entitlement、不加云服务。**
+- **发布加固**：`release.config.json`（单一版本源）+ `scripts/sync-version.ts`（fan-out MARKETING_VERSION/CURRENT_PROJECT_VERSION
+  + package.json，`--check` 校验）；`App/PrivacyInfo.xcprivacy`（无采集/无 tracking，仅 `NSPrivacyAccessedAPICategoryUserDefaults`
+  reason `CA92.1`）；`scripts/release-gate.ts`（fail-closed：无 server.url/remote UI、无 node builtins/Buffer/ws、无 secret 样本、
+  无宽泛 ATS、无 remote-notification/voip/audio/fetch/processing bg mode、无 aps-environment/Local Network/Bonjour、无 hardcoded
+  Team/provisioning、version 一致、contracts↔canonical vectors 同步、dist↔iOS public 一致）。开发 bundle id `dev.moshu.mobile`，
+  发布 build 期 override `PRODUCT_BUNDLE_IDENTIFIER`；export compliance（CryptoKit Ed25519 + TLS）问卷/豁免由发布方确认，工程不
+  武断写 `ITSAppUsesNonExemptEncryption`。详见 quality-release。
+- **验证**：79 Vitest（含 attention 恢复无 replay、badge、ack 单调、resyncRequired、notification 短后台 gating、permission、生命周期
+  退避/暂停）、67 Swift XCTest（含 background task 幂等/有界/expiration cleanup、稳定 notification id、generic 键、opaque route id）、
+  `tsc` strict、`vite build`、`cap copy ios`、release gate 全绿；server 侧 `mobile-attention-projection` + `mobile-ingress-smoke`
+  端到端（pair→approve→connect→create/send/subscribe→approval decide→attention append/list/ack→disconnect→missed→reconnect 恢复
+  未读→revoke fatal）与 `packages/database` attention repository（pagination/retention/ack 单调/幂等/revoke 清 cursor）通过。真机
+  签名、真实 Dev Tunnel probe（opt-in）、App Store review 提交为发布方人工步骤。
+
 
 ### 9.1 请求流程
 

@@ -1,6 +1,6 @@
 import type Database from "bun:sqlite";
 
-export const currentAppDatabaseVersion = 24;
+export const currentAppDatabaseVersion = 25;
 
 export class AppDatabaseResetRequiredError extends Error {
 	readonly currentVersion: number;
@@ -81,6 +81,9 @@ export function applyAppMigrations(client: Database): void {
 			DROP TABLE IF EXISTS runtime_box_generation_fences;
 			DROP TABLE IF EXISTS runtime_box_device_keys;
 			DROP TABLE IF EXISTS runtime_box_pairing_sessions;
+			DROP TABLE IF EXISTS mobile_attention_ack_cursors;
+			DROP TABLE IF EXISTS mobile_attention_events;
+			DROP TABLE IF EXISTS mobile_attention_feed_meta;
 			DROP TABLE IF EXISTS mobile_device_generation_fences;
 			DROP TABLE IF EXISTS mobile_device_keys;
 			DROP TABLE IF EXISTS mobile_pairing_sessions;
@@ -352,6 +355,44 @@ export function applyAppMigrations(client: Database): void {
 			);
 			CREATE INDEX mobile_pairing_sessions_state_expiry_idx
 				ON mobile_pairing_sessions(state, expires_at_ms);
+
+			-- Durable, Agent Server-owned Mobile attention / unread feed. Each event carries only the
+			-- minimal, desensitized signal a phone needs (stable monotonic seq + opaque ids +
+			-- localization keys) so a lock-screen notification can never leak business content. A
+			-- single-row meta table owns the monotonic sequence and the retention floor so the feed is
+			-- append-only, idempotent, and survives restart.
+			CREATE TABLE mobile_attention_feed_meta (
+				id INTEGER PRIMARY KEY NOT NULL CHECK (id = 1),
+				next_seq INTEGER NOT NULL,
+				pruned_through_seq INTEGER NOT NULL
+			);
+
+			CREATE TABLE mobile_attention_events (
+				seq INTEGER PRIMARY KEY NOT NULL,
+				event_id TEXT NOT NULL UNIQUE,
+				dedupe_key TEXT NOT NULL UNIQUE,
+				type TEXT NOT NULL,
+				session_id TEXT,
+				run_id TEXT,
+				approval_id TEXT,
+				title_key TEXT NOT NULL,
+				body_key TEXT NOT NULL,
+				created_at_ms INTEGER NOT NULL
+			);
+			CREATE INDEX mobile_attention_events_created_idx
+				ON mobile_attention_events(created_at_ms);
+
+			-- Per-device server-side acknowledgement cursor. Monotonic: it only ever advances, so a
+			-- replayed or out-of-order ack can never resurrect already-read unread. The phone stores no
+			-- business events; this cursor is the single source of truth for its unread state.
+			CREATE TABLE mobile_attention_ack_cursors (
+				mobile_client_id TEXT PRIMARY KEY NOT NULL,
+				acked_seq INTEGER NOT NULL,
+				updated_at_ms INTEGER NOT NULL
+			);
+
+			INSERT INTO mobile_attention_feed_meta (id, next_seq, pruned_through_seq)
+				VALUES (1, 1, 0);
 
 			CREATE TABLE projects (
 				id TEXT PRIMARY KEY NOT NULL,

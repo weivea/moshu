@@ -2,9 +2,10 @@ import { Button } from "@heroui/react";
 import { AppIcon } from "@moshu/ui";
 import { useState } from "react";
 import { useAppearance } from "../app/appearance";
+import { useAttention } from "../app/attention";
 import { useConnection, useConnectedSession } from "../app/connection";
 import { useI18n } from "../app/i18n";
-import type { Language } from "../app/i18n";
+import type { Language, MessageKey } from "../app/i18n";
 import { useWorkspace } from "../app/workspace";
 import { Screen, ScreenHeader, ScrollArea } from "../components/layout";
 
@@ -24,9 +25,21 @@ export function SettingsScreen() {
 	const { theme, setTheme } = useAppearance();
 	const { binding } = useConnectedSession();
 	const { controller } = useConnection();
+	const { permission, notificationsEnabled, enableNotifications, disableNotifications } =
+		useAttention();
 	const { runtimeBoxes, activeRuntimeBoxId, switchRuntimeBox } = useWorkspace();
 	const [confirmUnpair, setConfirmUnpair] = useState(false);
 	const [unpairing, setUnpairing] = useState(false);
+
+	const permissionStatusKey: MessageKey =
+		permission === "granted"
+			? "settings.notifications.status.granted"
+			: permission === "denied"
+				? "settings.notifications.status.denied"
+				: permission === "unavailable"
+					? "settings.notifications.status.unavailable"
+					: "settings.notifications.status.prompt";
+	const notificationsOn = notificationsEnabled && permission === "granted";
 
 	return (
 		<Screen>
@@ -52,6 +65,39 @@ export function SettingsScreen() {
 						<AppIcon name="globe" size={14} />
 						{t("settings.relayVisible")}
 					</p>
+				</div>
+
+				<p className="section-label">{t("settings.notifications")}</p>
+				<p className="px-4 pb-2 text-xs text-[var(--text-muted)]">
+					{t("settings.notifications.note")}
+				</p>
+				<div className="card mx-4 overflow-hidden">
+					<div className="flex items-center justify-between px-4 py-3">
+						<span className="min-w-0">
+							<span className="block text-sm font-medium text-[var(--text)]">
+								{t("settings.notifications.toggle")}
+							</span>
+							<span className="block text-xs text-[var(--text-muted)]">
+								{t(permissionStatusKey)}
+							</span>
+						</span>
+						{permission === "denied" || permission === "unavailable" ? (
+							<span className="text-xs text-[var(--text-faint)]">{t(permissionStatusKey)}</span>
+						) : notificationsOn ? (
+							<Button variant="ghost" size="sm" onPress={() => disableNotifications()}>
+								{t("common.cancel")}
+							</Button>
+						) : (
+							<Button variant="primary" size="sm" onPress={() => void enableNotifications()}>
+								{t("settings.notifications.enable")}
+							</Button>
+						)}
+					</div>
+					{permission === "denied" ? (
+						<p className="border-t border-[var(--line)] px-4 py-3 text-xs text-[var(--text-muted)]">
+							{t("settings.notifications.deniedHint")}
+						</p>
+					) : null}
 				</div>
 
 				<p className="section-label">{t("settings.runtimeBox")}</p>

@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  Apple Privacy Manifest for the Moshu iOS App.
+
+	  Moshu collects NO data: business content is never persisted on-device and is never sent to any
+	  Moshu-operated cloud service (there is no cloud service — the App talks only to the user's own
+	  Desktop over an authenticated WSS Dev Tunnel). Therefore NSPrivacyCollectedDataTypes is empty and
+	  tracking is false.
+
+	  The only required-reason API declared is UserDefaults, which the Capacitor runtime and the
+	  official @capacitor/local-notifications / @capacitor/app plugins read/write for their own
+	  operation. Reason code CA92.1: "Access info from same app, per documentation." No other
+	  required-reason API categories (file timestamp, system boot time, disk space, active keyboard)
+	  are used by the App or its declared dependencies.
+	-->
+	<key>NSPrivacyTracking</key>
+	<false/>
+	<key>NSPrivacyTrackingDomains</key>
+	<array/>
+	<key>NSPrivacyCollectedDataTypes</key>
+	<array/>
+	<key>NSPrivacyAccessedAPITypes</key>
+	<array>
+		<dict>
+			<key>NSPrivacyAccessedAPIType</key>
+			<string>NSPrivacyAccessedAPICategoryUserDefaults</string>
+			<key>NSPrivacyAccessedAPITypeReasons</key>
+			<array>
+				<string>CA92.1</string>
+			</array>
+		</dict>
+	</array>
+</dict>
+</plist>

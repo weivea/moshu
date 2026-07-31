@@ -6,6 +6,7 @@ export * from "./approval-repository";
 export * from "./database";
 export * from "./ids";
 export * from "./migrations";
+export * from "./mobile-attention-repository";
 export * from "./mobile-device-repository";
 export * from "./mobile-pairing-repository";
 export * from "./project-repository";

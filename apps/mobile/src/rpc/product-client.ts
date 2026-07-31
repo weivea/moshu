@@ -1,4 +1,6 @@
 import {
+	type AckMobileAttentionInput,
+	type AckMobileAttentionOutput,
 	type AgentsRuntimeInfo,
 	type CancelChatRunInput,
 	type CancelChatRunOutput,
@@ -19,6 +21,8 @@ import {
 	type ListAvailableModelsOutput,
 	type ListChatSessionsInput,
 	type ListChatSessionsOutput,
+	type ListMobileAttentionInput,
+	type ListMobileAttentionOutput,
 	type ListProjectsOutput,
 	type ListRuntimeBoxesOutput,
 	mobileClientProductEventMethods,
@@ -36,7 +40,7 @@ import {
 	type UpdateSessionApprovalPolicyOutput,
 } from "@moshu/contracts";
 import type { JsonValue, RpcHandlers, RpcMethodAllowlist, RpcPeer } from "@moshu/process-rpc-core";
-import { MobileEventBus } from "./events";
+import type { MobileEventBus } from "./events";
 
 const allowedRequestMethods = new Set<string>(mobileClientProductRequestMethods);
 
@@ -55,6 +59,7 @@ const eventNameByWire: Record<string, keyof MobileEventBusEventMapMarker> = {
 	[productRpcEvents.approvalEvent]: "approvalEvent",
 	[productRpcEvents.sessionApprovalPolicyChanged]: "sessionApprovalPolicyChanged",
 	[productRpcEvents.approvalActivityChanged]: "approvalActivityChanged",
+	[productRpcEvents.mobileAttentionChanged]: "mobileAttentionChanged",
 };
 
 // Purely a compile-time marker so the wire→name map stays exhaustive over the bus event names.
@@ -65,6 +70,7 @@ interface MobileEventBusEventMapMarker {
 	approvalEvent: unknown;
 	sessionApprovalPolicyChanged: unknown;
 	approvalActivityChanged: unknown;
+	mobileAttentionChanged: unknown;
 }
 
 /**
@@ -133,10 +139,15 @@ export class MobileProductClient {
 	}
 
 	switchRuntimeBox(input: SwitchRuntimeBoxInput): Promise<SwitchRuntimeBoxOutput> {
-		return this.#call(productRpcMethods.runtimeBoxesSwitch, input) as Promise<SwitchRuntimeBoxOutput>;
+		return this.#call(
+			productRpcMethods.runtimeBoxesSwitch,
+			input,
+		) as Promise<SwitchRuntimeBoxOutput>;
 	}
 
-	listProjects(input: { runtimeBoxId?: string; archived?: boolean; limit?: number } = {}): Promise<ListProjectsOutput> {
+	listProjects(
+		input: { runtimeBoxId?: string; archived?: boolean; limit?: number } = {},
+	): Promise<ListProjectsOutput> {
 		return this.#call(productRpcMethods.projectsList, input) as Promise<ListProjectsOutput>;
 	}
 
@@ -145,11 +156,17 @@ export class MobileProductClient {
 	}
 
 	getProjectSidebar(input: { runtimeBoxId?: string } = {}): Promise<GetProjectSidebarOutput> {
-		return this.#call(productRpcMethods.projectsGetSidebar, input) as Promise<GetProjectSidebarOutput>;
+		return this.#call(
+			productRpcMethods.projectsGetSidebar,
+			input,
+		) as Promise<GetProjectSidebarOutput>;
 	}
 
 	listAvailableModels(): Promise<ListAvailableModelsOutput> {
-		return this.#call(productRpcMethods.modelsListAvailable, {}) as Promise<ListAvailableModelsOutput>;
+		return this.#call(
+			productRpcMethods.modelsListAvailable,
+			{},
+		) as Promise<ListAvailableModelsOutput>;
 	}
 
 	createSession(input: CreateProcessChatSessionInput): Promise<CreateChatSessionOutput> {
@@ -216,5 +233,23 @@ export class MobileProductClient {
 			productRpcMethods.sessionApprovalPolicyUpdate,
 			input,
 		) as Promise<UpdateSessionApprovalPolicyOutput>;
+	}
+
+	// Durable attention feed. `list` returns the server-owned unread snapshot (cursor pagination,
+	// unread count, ack cursor, retention-gap resync flag); the phone never persists these events.
+	listAttention(input: ListMobileAttentionInput = {}): Promise<ListMobileAttentionOutput> {
+		return this.#call(
+			productRpcMethods.mobileAttentionList,
+			input,
+		) as Promise<ListMobileAttentionOutput>;
+	}
+
+	// `ack` advances the server-side monotonic read cursor to `seq`. It is idempotent and never
+	// regresses, so replays are safe; peer identity is server-derived, so no clientId can be forged.
+	ackAttention(input: AckMobileAttentionInput): Promise<AckMobileAttentionOutput> {
+		return this.#call(
+			productRpcMethods.mobileAttentionAck,
+			input,
+		) as Promise<AckMobileAttentionOutput>;
 	}
 }

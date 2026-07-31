@@ -25,6 +25,10 @@ import {
 	getDatabaseUserVersion,
 } from "./migrations";
 import {
+	type MobileAttentionRepository,
+	SqliteMobileAttentionRepository,
+} from "./mobile-attention-repository";
+import {
 	type MobileDeviceRepository,
 	SqliteMobileDeviceRepository,
 } from "./mobile-device-repository";
@@ -68,6 +72,7 @@ export interface AppDatabase {
 	runtimeBoxPairings: RuntimeBoxPairingRepository;
 	mobilePairings: MobilePairingRepository;
 	mobileDevices: MobileDeviceRepository;
+	mobileAttention: MobileAttentionRepository;
 	remoteAccess: RemoteAccessRepository;
 	runtimeBoxInventory: RuntimeBoxInventoryRepository;
 	runtimeProfiles: RuntimeProfileRepository;
@@ -190,6 +195,7 @@ export function openAppDatabase(
 		runtimeBoxPairings: new SqliteRuntimeBoxPairingRepository(orm),
 		mobilePairings: new SqliteMobilePairingRepository(orm),
 		mobileDevices: new SqliteMobileDeviceRepository(orm),
+		mobileAttention: new SqliteMobileAttentionRepository(orm),
 		remoteAccess: new SqliteRemoteAccessRepository(orm),
 		sessions: createSessionRepository({ orm, runtimeBoxes, projects }),
 		runs: createRunJournalRepository({ client, orm }),

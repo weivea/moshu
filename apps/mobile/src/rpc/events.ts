@@ -3,9 +3,10 @@ import type {
 	ApprovalEventDelivery,
 	ChatEventDelivery,
 	ListRuntimeBoxesOutput,
+	MobileAttentionChangedEvent,
 	SessionApprovalPolicyEvent,
 } from "@moshu/contracts";
-import { z } from "zod";
+import type { z } from "zod";
 
 export interface ChatSessionsRetiredEvent {
 	readonly schemaVersion: 1;
@@ -20,6 +21,9 @@ export interface MobileEventMap {
 	approvalEvent: ApprovalEventDelivery;
 	sessionApprovalPolicyChanged: SessionApprovalPolicyEvent;
 	approvalActivityChanged: ApprovalActivityChangedEvent;
+	// A no-payload live hint that the durable attention feed changed. The client refreshes the feed
+	// via the authorization-checked `mobile.attention.list`; the hint itself carries no business data.
+	mobileAttentionChanged: MobileAttentionChangedEvent;
 }
 
 export type MobileEventName = keyof MobileEventMap;

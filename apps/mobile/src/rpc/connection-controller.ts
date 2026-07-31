@@ -1,7 +1,4 @@
-import {
-	productRpcMaxBufferedOutboundBytes,
-	productRpcMaxFrameBytes,
-} from "@moshu/contracts";
+import { productRpcMaxBufferedOutboundBytes, productRpcMaxFrameBytes } from "@moshu/contracts";
 import { resolveRpcLimits, type RpcPeer } from "@moshu/process-rpc-core";
 import {
 	getMobileTransport,
@@ -12,7 +9,11 @@ import {
 import { MobileEventBus } from "./events";
 import { completeMobileHandshake } from "./handshake";
 import { NativeRpcConnection } from "./native-transport";
-import { buildMobileRpcHandlers, MobileProductClient, mobileInboundAllowlist } from "./product-client";
+import {
+	buildMobileRpcHandlers,
+	MobileProductClient,
+	mobileInboundAllowlist,
+} from "./product-client";
 
 export type FatalConnectionCode =
 	| "auth-revoked"
@@ -42,7 +43,11 @@ export type ConnectionState =
 			readonly client: MobileProductClient;
 			readonly bus: MobileEventBus;
 	  }
-	| { readonly kind: "error"; readonly code: FatalConnectionCode; readonly binding?: MobileTransportBinding };
+	| {
+			readonly kind: "error";
+			readonly code: FatalConnectionCode;
+			readonly binding?: MobileTransportBinding;
+	  };
 
 type Listener = (state: ConnectionState) => void;
 
@@ -87,8 +92,14 @@ const rpcLimits = resolveRpcLimits({
 export interface ConnectionControllerOptions {
 	readonly transport?: MobileTransportPlugin;
 	readonly deviceDisplayName?: string;
-	/** Reconnect backoff in ms; overridable for deterministic tests. */
+	/** Base reconnect backoff in ms (first attempt); overridable for deterministic tests. */
 	readonly reconnectDelayMs?: number;
+	/** Upper bound for the exponential backoff in ms. */
+	readonly reconnectMaxDelayMs?: number;
+	/** Fractional jitter (0..1) added on top of each backoff delay to de-synchronize reconnects. */
+	readonly reconnectJitterRatio?: number;
+	/** Randomness source for jitter; overridable for deterministic tests. */
+	readonly random?: () => number;
 	/** Pairing poll interval in ms. */
 	readonly pollIntervalMs?: number;
 	/**
@@ -109,6 +120,9 @@ export class ConnectionController {
 	readonly #transport: MobileTransportPlugin;
 	readonly #deviceDisplayName: string;
 	readonly #reconnectDelayMs: number;
+	readonly #reconnectMaxDelayMs: number;
+	readonly #reconnectJitterRatio: number;
+	readonly #random: () => number;
 	readonly #pollIntervalMs: number;
 	readonly #handshake: typeof completeMobileHandshake;
 	readonly #listeners = new Set<Listener>();
@@ -121,11 +135,22 @@ export class ConnectionController {
 	#reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 	#pollTimer: ReturnType<typeof setTimeout> | null = null;
 	#disposed = false;
+	// Consecutive failed reconnect attempts; drives the exponential backoff and is reset to 0 the
+	// moment a connection becomes stable (reaches `connected`).
+	#reconnectAttempt = 0;
+	// True while the App is backgrounded. In the background we never start a NEW reconnect (the OS
+	// gives us only a short, best-effort window and no way to keep flapping a socket alive); we just
+	// let any still-live socket run until the system expiration handler tears it down. Foreground
+	// resumes with an immediate, backoff-reset reconnect.
+	#backgrounded = false;
 
 	constructor(options: ConnectionControllerOptions = {}) {
 		this.#transport = options.transport ?? getMobileTransport();
 		this.#deviceDisplayName = options.deviceDisplayName ?? "iPhone";
 		this.#reconnectDelayMs = options.reconnectDelayMs ?? 2_000;
+		this.#reconnectMaxDelayMs = options.reconnectMaxDelayMs ?? 30_000;
+		this.#reconnectJitterRatio = options.reconnectJitterRatio ?? 0.2;
+		this.#random = options.random ?? Math.random;
 		this.#pollIntervalMs = options.pollIntervalMs ?? 2_000;
 		this.#handshake = options.handshake ?? completeMobileHandshake;
 	}
@@ -160,12 +185,44 @@ export class ConnectionController {
 
 	/** Called when the App enters the foreground/active. Reconnects a paired-but-dropped session. */
 	async onAppActive(): Promise<void> {
+		// Leaving the background: resume normal reconnect behavior and, because the user is now looking
+		// at the App, make one immediate attempt with a fresh backoff instead of waiting out a timer.
+		this.#backgrounded = false;
+		this.#reconnectAttempt = 0;
 		const kind = this.#state.kind;
 		if (kind === "offline" || kind === "reconnecting") {
-			await this.#connect(this.#state.binding as MobileTransportBinding);
+			await this.#connect(this.#state.binding as MobileTransportBinding, true);
 		} else if (kind === "unpaired" || kind === "initializing") {
 			await this.init();
 		}
+	}
+
+	/**
+	 * Called when the App leaves the foreground. We do NOT open or schedule any new connection: the OS
+	 * only grants a short, best-effort window, and faking keep-alive is out of scope. An already-live
+	 * socket is left running so events can still arrive during that window; a pending reconnect timer
+	 * is paused so we never burn the background budget flapping a socket.
+	 */
+	onAppBackground(): void {
+		this.#backgrounded = true;
+		this.#clearReconnectTimer();
+	}
+
+	/**
+	 * Called from the OS background-expiration handler. The short window is over: tear the socket down
+	 * cleanly and go offline WITHOUT scheduling a reconnect (we are still backgrounded). Foreground
+	 * re-entry ({@link onAppActive}) will re-snapshot and reconnect.
+	 */
+	async onAppBackgroundExpired(): Promise<void> {
+		this.#backgrounded = true;
+		this.#clearReconnectTimer();
+		this.#generationToken += 1;
+		const binding = "binding" in this.#state ? this.#state.binding : undefined;
+		await this.#teardownConnection();
+		if (this.#disposed) {
+			return;
+		}
+		this.#setState(binding ? { kind: "offline", binding } : { kind: "initializing" });
 	}
 
 	async #connect(binding: MobileTransportBinding, isRetry = false): Promise<void> {
@@ -207,6 +264,8 @@ export class ConnectionController {
 				this.#connection = connection;
 				this.#peer = peer;
 				this.#bus = bus;
+				// A stable connection resets the backoff so the next drop retries promptly.
+				this.#reconnectAttempt = 0;
 				this.#setState({ kind: "connected", binding, client: new MobileProductClient(peer), bus });
 			} catch (error) {
 				// Any failure/abort after the provisional connection exists must dispose it — removing
@@ -292,9 +351,24 @@ export class ConnectionController {
 
 	#scheduleReconnect(binding: MobileTransportBinding): void {
 		this.#clearReconnectTimer();
+		// In the background we intentionally do not arm a reconnect: no new connections off-foreground.
+		if (this.#backgrounded || this.#disposed) {
+			return;
+		}
+		const delay = this.#nextReconnectDelayMs();
+		this.#reconnectAttempt += 1;
 		this.#reconnectTimer = setTimeout(() => {
 			void this.#connect(binding, true);
-		}, this.#reconnectDelayMs);
+		}, delay);
+	}
+
+	// Bounded exponential backoff with additive jitter: base * 2^attempt capped at the max, plus up to
+	// `jitterRatio` extra. The attempt counter resets on a stable connection (see `#connect`).
+	#nextReconnectDelayMs(): number {
+		const exponential = this.#reconnectDelayMs * 2 ** this.#reconnectAttempt;
+		const capped = Math.min(exponential, this.#reconnectMaxDelayMs);
+		const jitter = capped * this.#reconnectJitterRatio * this.#random();
+		return Math.round(capped + jitter);
 	}
 
 	#clearReconnectTimer(): void {
@@ -306,6 +380,8 @@ export class ConnectionController {
 
 	/** Manual retry from an offline/error state. */
 	async retry(): Promise<void> {
+		// User-initiated: reset the backoff so an explicit tap connects promptly.
+		this.#reconnectAttempt = 0;
 		const state = this.#state;
 		if (state.kind === "offline" || state.kind === "reconnecting") {
 			await this.#connect(state.binding, true);

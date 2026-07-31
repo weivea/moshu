@@ -4,8 +4,10 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+	ackMobileAttentionOutputSchema,
 	claimMobilePairingOutputSchema,
 	createMobileAuthenticationPayload,
+	listMobileAttentionOutputSchema,
 	type MobileChallengeInput,
 	type MobileChallengeOutput,
 	mobileChallengeOutputSchema,
@@ -118,6 +120,25 @@ describe("Mobile ingress transport smoke", () => {
 						// A handler exists for a forbidden method, yet the allowlist must still deny it —
 						// proving isolation is enforced by policy, not by the absence of a handler.
 						[productRpcMethods.providersDelete]: () => ({ deleted: true }),
+						// The durable attention feed handlers mirror the Product RPC wiring: the peer's
+						// authenticated identity (never request input) selects the per-device unread state,
+						// so a Mobile client can only ever read/advance its own cursor.
+						[productRpcMethods.mobileAttentionList]: (payload, context) => {
+							const input = payload as { cursor?: string; limit?: number } | undefined;
+							return listMobileAttentionOutputSchema.parse(
+								database.mobileAttention.list(context.remoteIdentity.peerId, {
+									cursor: input?.cursor,
+									limit: input?.limit,
+								}),
+							);
+						},
+						[productRpcMethods.mobileAttentionAck]: (payload, context) => {
+							const input = payload as { seq: number };
+							return ackMobileAttentionOutputSchema.parse({
+								schemaVersion: 1,
+								...database.mobileAttention.ack(context.remoteIdentity.peerId, input.seq),
+							});
+						},
 					},
 				},
 				methodAllowlist: mobileAllowlist,
@@ -184,6 +205,63 @@ describe("Mobile ingress transport smoke", () => {
 			expect(runtimeGetCalls).toEqual([approved.mobileClientId]);
 			await expect(peer.request(productRpcMethods.providersDelete, {})).rejects.toThrow();
 
+			// 4b) Durable attention feed: the Agent Server appends desensitized events (as it would on a
+			// pending approval / Run terminal). The phone lists unread, acks, and — critically — recovers
+			// missed unread after a disconnect from the server-owned feed, never from device storage.
+			database.mobileAttention.append({
+				type: "approval_required",
+				dedupeKey: "approval:attn-1",
+				approvalId: "attn-1",
+				sessionId: "019fb74d-0000-7000-8000-000000000001",
+				titleKey: "attention.approvalRequired.title",
+				bodyKey: "attention.approvalRequired.body",
+			});
+			// Idempotency: the same business event must not append twice.
+			database.mobileAttention.append({
+				type: "approval_required",
+				dedupeKey: "approval:attn-1",
+				approvalId: "attn-1",
+				titleKey: "attention.approvalRequired.title",
+				bodyKey: "attention.approvalRequired.body",
+			});
+			database.mobileAttention.append({
+				type: "run_completed",
+				dedupeKey: "run:attn-run-1",
+				runId: "attn-run-1",
+				titleKey: "attention.runCompleted.title",
+				bodyKey: "attention.runCompleted.body",
+			});
+
+			const feed = listMobileAttentionOutputSchema.parse(
+				await peer.request(productRpcMethods.mobileAttentionList, {}),
+			);
+			expect(feed.unreadCount).toBe(2);
+			expect(feed.items).toHaveLength(2);
+			expect(feed.latestSeq).toBe(2);
+			expect(feed.resyncRequired).toBe(false);
+			// Desensitization: only opaque ids and localization keys ever cross the wire.
+			for (const item of feed.items) {
+				expect(item.visibility).toBe("mobile-clients");
+				expect(item.titleKey).toMatch(/^attention\./);
+				expect(Object.keys(item)).not.toContain("prompt");
+				expect(Object.keys(item)).not.toContain("command");
+			}
+
+			const ack = ackMobileAttentionOutputSchema.parse(
+				await peer.request(productRpcMethods.mobileAttentionAck, { seq: 1 }),
+			);
+			expect(ack.ackSeq).toBe(1);
+			expect(ack.unreadCount).toBe(1);
+
+			// A missed event arrives while the phone will be offline between reconnects.
+			database.mobileAttention.append({
+				type: "run_failed",
+				dedupeKey: "run:attn-run-2",
+				runId: "attn-run-2",
+				titleKey: "attention.runFailed.title",
+				bodyKey: "attention.runFailed.body",
+			});
+
 			// 5) A reconnect at a higher generation fences the previous live peer.
 			const reconnectInput: MobileChallengeInput = {
 				...challengeInput,
@@ -206,8 +284,22 @@ describe("Mobile ingress transport smoke", () => {
 			});
 			await peer.closed;
 
-			// 6) Revoking the device closes the live peer and blocks any new challenge/upgrade.
+			// 5b) After reconnect the phone re-snapshots the server-owned feed and recovers the unread
+			// that accrued while it was offline (ack cursor persisted at seq 1; two later events unread),
+			// without ever having stored a business event on-device.
+			const recovered = listMobileAttentionOutputSchema.parse(
+				await secondPeer.request(productRpcMethods.mobileAttentionList, {}),
+			);
+			expect(recovered.ackSeq).toBe(1);
+			expect(recovered.unreadCount).toBe(2);
+			expect(recovered.latestSeq).toBe(3);
+			expect(recovered.resyncRequired).toBe(false);
+
+			// 6) Revoking the device closes the live peer and blocks any new challenge/upgrade. The
+			// Product RPC revoke handler also drops the device's server-side unread cursor so a re-paired
+			// client id can never inherit stale read state; mirror that cleanup here.
 			auth.revokeDevice({ mobileClientId: approved.mobileClientId, deviceKeyId: "device-key-1" });
+			database.mobileAttention.deleteAckCursor(approved.mobileClientId);
 			for (const livePeer of server.peers) {
 				if (livePeer.remoteIdentity.peerId === approved.mobileClientId) {
 					livePeer.close(1008, "device revoked");

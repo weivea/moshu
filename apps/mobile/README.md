@@ -1,4 +1,4 @@
-# @moshu/mobile — iOS Mobile App (Mobile stack Layer 4)
+# @moshu/mobile — iOS Mobile App (Mobile stack Layer 4 + Layer 5)
 
 A real, buildable iPhone App: a Capacitor Web UI (React + Vite + TypeScript strict +
 HeroUI + React Router HashRouter) bundled with the app, plus a native Swift secure
@@ -7,7 +7,10 @@ transport plugin (`MoshuMobileTransport`). Web assets ship inside the app
 
 This layer depends on the Layer 3 Mobile ingress / pairing / device auth
 (`packages/contracts/src/mobile.ts`, `apps/agents-server`). It implements the iOS
-**client** side of those contracts and adds no new server contracts.
+**client** side of those contracts. **Layer 5** adds the durable Agent-Server-owned
+attention/unread feed contracts + client, iOS lifecycle/reconnect, best-effort local
+notifications, and release hardening. There is **no cloud push relay, no APNs/remote or
+silent push, and no background fake keep-alive** — see "No-cloud-push boundary" below.
 
 ## Scripts
 
@@ -17,8 +20,11 @@ This layer depends on the Layer 3 Mobile ingress / pairing / device auth
 | `bun run build` | Vite production build to `dist/` |
 | `bun run test` | Vitest (jsdom + Testing Library) |
 | `bun run typecheck` | `tsc --noEmit` (app + node config projects) |
-| `bun run cap:sync` | `cap sync ios` — copy `dist/` into the iOS project |
+| `bun run cap:sync` | `cap sync ios` — copy `dist/` into the iOS project + update native deps |
+| `bun run cap:copy` | `cap copy ios` — copy `dist/` + config into iOS (no pod install) |
 | `bun run cap:open` | Open the iOS project in Xcode |
+| `bun run release:version` | Fan `release.config.json` version into pbxproj + `package.json` (`-- --check` to verify) |
+| `bun run release:gate` | Static pre-release gate (see "Release hardening") |
 | `bun run gen:vectors` | Regenerate shared canonical test vectors from TS contracts |
 
 ## Layout
@@ -29,11 +35,19 @@ src/
   components/   layout, tab bar, approval card
   screens/      Chats, Projects, Activity, Settings, connection/onboarding
   rpc/          browser-safe process-rpc handshake, product client, reducers,
-                connection controller (fatalCodeMap), native transport adapter
-  native/       Capacitor plugin JS surface (transport-plugin.ts)
+                connection controller (fatalCodeMap), native transport adapter,
+                attention controller (durable feed recovery + badge + no replay)
+  native/       Capacitor plugin JS surface (transport-plugin.ts), injectable
+                lifecycle.ts (@capacitor/app) + notifications.ts (LocalNotifications)
 native/MoshuMobile/   pure-Swift `MoshuMobileCore` SPM package + XCTest + fixtures
-ios/App/              Capacitor 8 iOS project (SPM mode); App/plugins/*.swift
+  Sources/.../BackgroundActivityCoordinator.swift   single bounded bg task, guaranteed cleanup
+  Sources/.../NotificationContentBuilder.swift       stable id + generic keys + opaque route ids
+ios/App/              Capacitor 8 iOS project (SPM mode); App/plugins/*.swift,
+                      App/PrivacyInfo.xcprivacy, App/AppDelegate.swift (bg-task wiring)
 scripts/gen-canonical-vectors.ts   shared TS↔Swift byte-parity fixture generator
+scripts/sync-version.ts            single-source-of-truth version fan-out
+scripts/release-gate.ts            fail-closed pre-release static checks
+release.config.json                marketingVersion / buildNumber / bundle-id policy
 ```
 
 ## Native transport (`MoshuMobileTransport`)
@@ -124,9 +138,105 @@ A follow-up review pass tightened two transport edges (also fully tested):
   (1001). Reserved/local-only or unknown codes fall back to a safe sendable code, and the
   close reason is bounded to the 123-byte control-frame budget on UTF-8 scalar boundaries.
 
+## Durable attention feed (Layer 5)
+
+The unread/attention state is **owned by the Agent Server**, never by the phone. The
+server durably appends a desensitized `MobileAttentionEvent` when an approval enters
+`pending` or a Run reaches a terminal state (`run_completed` / `run_failed` /
+`run_cancelled`). Each event carries only opaque ids (`sessionId` / `runId` /
+`approvalId`), a stable `eventId` + monotonic `seq`, `createdAt`, and generic
+localization keys (`titleKey` / `bodyKey`) — **never** a prompt, tool args, path body,
+shell command, or provider secret. Append is idempotent per business event
+(`dedupeKey`), transactional, and survives server restart.
+
+- Per authenticated `mobileClientId`/device the server keeps a monotonic **ack cursor**
+  (read state). The phone stores **no** business events. RPC `mobile.attention.list`
+  does cursor pagination and returns `unreadCount` / `nextCursor` / `latestSeq` /
+  `resyncRequired`; `mobile.attention.ack` is CAS + idempotent and monotonic (an older
+  ack never regresses the cursor). Peer identity comes from the auth context — a caller
+  can never forge a `clientId` or roll the cursor backward.
+- Retention is bounded (age + per-feed cap). If a cursor is older than what is retained,
+  `list` returns `resyncRequired: true` (a resnapshot) instead of pretending "no unread".
+  A revoked device can no longer read the feed; unpair does not leak an old feed to a new
+  server binding.
+- Live updates send mobile clients only a minimal `attention.changed` **hint** (no
+  business body). The Desktop Product RPC never exposes mobile device unread.
+
+The client `AttentionController` (`src/rpc/attention-controller.ts`) attaches on connect,
+takes a **recovery snapshot** (badge only — it never replays historical events as system
+notifications), tracks a `#seenSeq` baseline, and drives the Activity tab badge from
+`max(pendingApprovals, unread)`.
+
+## Lifecycle & reconnect (Layer 5)
+
+- `src/native/lifecycle.ts` wraps `@capacitor/app` `appStateChange` (with a web
+  `visibilitychange` fallback). Foreground → connect/resume + one immediate retry;
+  background → **pause** reconnect (no new sockets), letting only an already-open socket
+  live inside the OS's short background window; OS expiration tears the socket down.
+- Reconnect uses **bounded exponential backoff + jitter** (`reconnectMaxDelayMs`,
+  `reconnectJitterRatio`), reset to zero on a stable `connected` and on user `retry()`.
+  Fatal `AUTH_REVOKED` / `AUTH_FAILED` / `PROTOCOL_MISMATCH` / identity mismatch never
+  retry; backoff timers pause while backgrounded/offline. Stale connection callbacks can
+  never revive a torn-down connection.
+- Native `BackgroundActivityCoordinator` (in `MoshuMobileCore`, wired from
+  `AppDelegate`) owns a **single, idempotent, bounded** `UIApplication` background task
+  with guaranteed cleanup on end **or** OS expiration. This is a plain finite task — it
+  declares **no** `UIBackgroundModes`, and is not remote/silent push or a VoIP/audio
+  keep-alive.
+
+## Local notifications (best effort, Layer 5)
+
+- Uses the official `@capacitor/local-notifications` plugin (lazy-imported, iOS-only,
+  degrades to a no-op on web/tests). The user must **explicitly enable** notifications
+  from Settings after the first successful pairing — the app never ambushes the
+  permission prompt on cold start. Settings shows the permission state + toggle.
+- A generic local notification is scheduled **only** when the app is not active *and* an
+  already-open short-background socket actually received an `attention.changed` hint.
+  When active, the app just updates the Activity badge. Notification content is a
+  localized generic string (no raw prompt/command/path/secret); the id is derived stably
+  from the attention `seq` (`NotificationContentBuilder` / `notificationIdForSeq`) so the
+  same event never double-fires.
+- Tap/deeplink carries only opaque ids (`sessionId` / `approvalId`); on activation the
+  app authenticates / reconnects / re-snapshots **before** navigating. Unpaired / fatal /
+  offline shows a safe status, never stale content.
+- **Suspended/terminated delivers no notification** — there is no APNs and no server that
+  can wake the app. On reconnect the phone recovers missed unread from the server feed and
+  shows a badge, but does **not** batch-replay historical events as system notifications.
+
+## Release hardening (Layer 5)
+
+- **`release.config.json`** is the single source of truth for `marketingVersion` /
+  `buildNumber`; `scripts/sync-version.ts` fans it into the Xcode
+  `MARKETING_VERSION` / `CURRENT_PROJECT_VERSION` and this `package.json`
+  (`release:version -- --check` verifies without writing). Signing team / certificate /
+  provisioning are **never** committed; they are supplied at build time by whoever signs.
+- **`App/PrivacyInfo.xcprivacy`** declares no data collection, no tracking, and the single
+  required-reason API actually used by the Capacitor runtime + plugins
+  (`NSPrivacyAccessedAPICategoryUserDefaults`, reason `CA92.1`).
+- **`scripts/release-gate.ts`** (`bun run release:gate`) is a fail-closed static gate:
+  no remote UI (`server.url`), no node builtins / `Buffer` / `ws` in the bundle, no
+  secret samples, no broad ATS, no forbidden background modes, no APNs entitlement /
+  Local Network / Bonjour, no baked signing identity, version consistency,
+  contracts↔canonical-vector sync, and web-bundle↔iOS `public` sync.
+- **Dev vs release bundle id**: the committed project keeps the development id
+  `dev.moshu.mobile`; release builds override `PRODUCT_BUNDLE_IDENTIFIER` at build time
+  (documented in `docs/implementation/quality-release.md`).
+- **Export compliance**: the App uses CryptoKit Ed25519 (auth signatures) + TLS. The App
+  Store encryption questionnaire / exemption must be confirmed by the publisher — the
+  project does not assert `ITSAppUsesNonExemptEncryption`; see quality-release doc.
+
+## No-cloud-push boundary
+
+Layer 5 deliberately does **not** add any of: a cloud Push Relay, an APNs device token /
+remote-notification entitlement, silent/background push, VoIP/audio/background-processing
+keep-alive, an account system, on-device business caching, or an offline queue. The App
+talks only to the user's own online Desktop; reliable delivery while suspended/terminated
+is out of scope by design.
 ## Status
 
-Layer 4 (this app) is implemented and builds. Background/suspended reliable
-notifications and release hardening are Layer 5. The pairing HTTP/WSS endpoint paths
-follow the current Layer 3 ingress convention; full end-to-end pairing requires an
-online Desktop.
+Layers 4 and 5 (this app) are implemented and build. The durable attention feed,
+lifecycle/reconnect, best-effort local notifications, and release hardening are in place;
+suspended/terminated reliable delivery is intentionally out of scope (no cloud push). The
+pairing HTTP/WSS endpoint paths follow the current Layer 3 ingress convention; full
+end-to-end pairing and live notifications require an **online Desktop**. Device signing,
+a real Dev Tunnel probe, and App Store review submission remain manual publisher steps.

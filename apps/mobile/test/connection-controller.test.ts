@@ -1,7 +1,7 @@
 import type { RpcPeer } from "@moshu/process-rpc-core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ConnectionController } from "../src/rpc/connection-controller";
-import { FakeTransport, makeBinding } from "./helpers";
+import { FakeTransport, makeBinding, makeConnectResult } from "./helpers";
 
 function codedError(code: string): Error {
 	const error = new Error(code);
@@ -39,6 +39,7 @@ function makeController(transport: FakeTransport, handshake: unknown): Connectio
 }
 
 afterEach(async () => {
+	vi.useRealTimers();
 	for (const controller of controllers.splice(0)) {
 		await controller.dispose();
 	}
@@ -250,5 +251,97 @@ describe("ConnectionController", () => {
 		}
 		expect(transport.activeFrameListenerCount).toBe(0);
 		expect(transport.activeStateListenerCount).toBe(0);
+	});
+
+	// --- Layer 5 lifecycle / reconnect -------------------------------------
+
+	it("does not open or schedule a reconnect while backgrounded (no fake keep-alive)", async () => {
+		const transport = new FakeTransport();
+		transport.status = { state: "paired", binding: makeBinding() };
+		const { handshake, captured } = fakeHandshake();
+		const controller = makeController(transport, handshake);
+		await controller.init();
+		expect(controller.getState().kind).toBe("connected");
+
+		const connectSpy = vi.spyOn(transport, "connect");
+		// Enter the background, then the live socket drops. We must NOT start a new connection.
+		controller.onAppBackground();
+		captured.onClose?.({ code: 1006, reason: "socket closed" });
+		await Promise.resolve();
+		await Promise.resolve();
+		await Promise.resolve();
+
+		expect(connectSpy).not.toHaveBeenCalled();
+		expect(controller.getState().kind).not.toBe("connected");
+	});
+
+	it("reconnects with bounded exponential backoff and resets after a stable connection", async () => {
+		vi.useFakeTimers();
+		const transport = new FakeTransport();
+		transport.status = { state: "paired", binding: makeBinding() };
+		transport.connectResult = new Error("down");
+		const { handshake } = fakeHandshake();
+		const controller = new ConnectionController({
+			transport,
+			handshake: handshake as never,
+			reconnectDelayMs: 100,
+			reconnectMaxDelayMs: 10_000,
+			reconnectJitterRatio: 0,
+			random: () => 0,
+			pollIntervalMs: 1_000_000,
+		});
+		controllers.push(controller);
+
+		await controller.init(); // fails → offline, schedules first retry at 100ms
+		const connectSpy = vi.spyOn(transport, "connect");
+
+		await vi.advanceTimersByTimeAsync(99);
+		expect(connectSpy).toHaveBeenCalledTimes(0);
+		await vi.advanceTimersByTimeAsync(1); // 100ms: first retry (fails) → next at 200ms
+		expect(connectSpy).toHaveBeenCalledTimes(1);
+
+		await vi.advanceTimersByTimeAsync(199);
+		expect(connectSpy).toHaveBeenCalledTimes(1);
+		await vi.advanceTimersByTimeAsync(1); // 200ms after: second retry (fails) → next at 400ms
+		expect(connectSpy).toHaveBeenCalledTimes(2);
+
+		// Let the next attempt succeed; the backoff must reset so a later drop retries promptly.
+		transport.connectResult = makeConnectResult();
+		await vi.advanceTimersByTimeAsync(400); // 400ms backoff: third retry succeeds
+		expect(connectSpy).toHaveBeenCalledTimes(3);
+		expect(controller.getState().kind).toBe("connected");
+	});
+
+	it("onAppActive retries immediately (fresh backoff) instead of waiting out the timer", async () => {
+		const transport = new FakeTransport();
+		transport.status = { state: "paired", binding: makeBinding() };
+		transport.connectResult = new Error("down");
+		const { handshake } = fakeHandshake();
+		const controller = makeController(transport, handshake); // reconnectDelayMs 1_000_000
+		await controller.init();
+		expect(controller.getState().kind).toBe("offline");
+
+		transport.connectResult = makeConnectResult();
+		const connectSpy = vi.spyOn(transport, "connect");
+		await controller.onAppActive();
+
+		expect(connectSpy).toHaveBeenCalledTimes(1);
+		expect(controller.getState().kind).toBe("connected");
+	});
+
+	it("onAppBackgroundExpired tears down the socket and goes offline without reconnecting", async () => {
+		const transport = new FakeTransport();
+		transport.status = { state: "paired", binding: makeBinding() };
+		const { handshake, peer } = fakeHandshake();
+		const controller = makeController(transport, handshake);
+		await controller.init();
+		expect(controller.getState().kind).toBe("connected");
+
+		const connectSpy = vi.spyOn(transport, "connect");
+		await controller.onAppBackgroundExpired();
+
+		expect(peer.close).toHaveBeenCalled();
+		expect(controller.getState().kind).toBe("offline");
+		expect(connectSpy).not.toHaveBeenCalled();
 	});
 });
