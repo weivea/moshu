@@ -6,6 +6,7 @@ import {
 	createMobileServerChallengePayload,
 	type MobileChallengeInput,
 	type MobileChallengeOutput,
+	productRpcMaxFrameBytes,
 } from "@moshu/contracts";
 import { describe, expect, it } from "vitest";
 
@@ -26,6 +27,10 @@ interface Vector {
 interface Fixture {
 	serverChallengeTag: string;
 	authenticationTag: string;
+	transportLimits: {
+		maxFrameBytes: number;
+		maxQueuedBytes: number;
+	};
 	deviceKey: {
 		seedUtf8: string;
 		seedHex: string;
@@ -56,6 +61,17 @@ describe("shared canonical vectors", () => {
 			expect(vector.serverChallengePayload.startsWith(`["${fixture.serverChallengeTag}"`)).toBe(true);
 			expect(vector.authenticationPayload.startsWith(`["${fixture.authenticationTag}"`)).toBe(true);
 		}
+	});
+
+	it("pins the shared transport frame limits to the Product-RPC cap so native/JS can't drift", () => {
+		// The native FrameLimits.productDefault, the inbound guard and the JS pre-bind buffer all
+		// derive from this single value; the Swift suite asserts the same fixture field.
+		expect(fixture.transportLimits.maxFrameBytes).toBe(productRpcMaxFrameBytes);
+		expect(fixture.transportLimits.maxFrameBytes).toBe(4 * 1024 * 1024);
+		// Queued bound stays conservative but never below one max frame.
+		expect(fixture.transportLimits.maxQueuedBytes).toBeGreaterThanOrEqual(
+			fixture.transportLimits.maxFrameBytes,
+		);
 	});
 
 	it("uses a canonical SPKI-DER Ed25519 public key encoding", () => {

@@ -508,10 +508,10 @@ agentDataDirectory/
   runId/seq dedupe→flush→ready。chat.send requestId 幂等；断线不自动重发未知 send、不离线 queue；
   cancel/approval 决策使用既有 CAS/idempotency。**业务数据仅存 React 内存**：Session/Project/message/approval
   绝不写 localStorage/Preferences/Keychain；仅 appearance/language 可持久化，binding 仅在 native Keychain。
-- **验证**：60 Vitest（native plugin mock、pairing 状态、单绑定、断线清业务态、无持久化、RPC schema/allowlist、
+- **验证**：63 Vitest（native plugin mock、pairing 状态、单绑定、断线清业务态、无持久化、RPC schema/allowlist、
   subscribe/replay 边界、stream/cancel、approval race/allow-all、Projects、RuntimeBox 独立选择、responsive/
   safe-area/键盘、i18n parity、hello 握手 accepted、fatal-auth 关闭无盲重连、pre-bind 溢出、历史分页、
-  ambiguous-send 幂等）、47 Swift XCTest、`tsc` strict typecheck、`vite build`、`cap sync ios` 与
+  ambiguous-send 幂等、4MiB 帧限额/大帧接受）、59 Swift XCTest、`tsc` strict typecheck、`vite build`、`cap sync ios` 与
   iOS simulator `xcodebuild`（禁签名）构建通过。生产 bundle 无 node builtins、无 secret、无 remote UI URL。
 - **PR #8 审查加固**：hello identity 必含 `deviceKeyId` 与 server canonical identity exact match；致命关闭按
   WS close code / HTTP upgrade 状态数值分类（`1008→AUTH_REVOKED`、`401/403→AUTH_FAILED`、`426→PROTOCOL_MISMATCH`）
@@ -520,6 +520,11 @@ agentDataDirectory/
   delete-then-add）、generation read→increment→persist 串行化并发 distinct/单调；入站 WS 帧 bridge 前按 UTF-8
   字节限帧、binary 一律 protocol-close；Chat 历史按 `getSessionPage` `nextCursor` 分页到含 active run 的最后一页；
   `chat.send` 由 controller 持有 `requestId` reservation，ambiguous 重试复用同 id、definitive 拒绝/编辑内容才换新 id。
+- **PR #8 复审加固（transport 帧限额/关闭码）**：native inbound guard / outbound queue / JS pre-bind 三处帧上限统一
+  为 Product-RPC `productRpcMaxFrameBytes`＝4 MiB（原 stale 1 MiB 会误拒合法 1–4 MiB 帧），值取自 `@moshu/contracts`
+  并由共享 canonical 测试向量固定，Vitest 与 Swift 同时断言防漂移；queued bytes 保守有界且 ≥ 单帧。teardown 将拟发
+  数字关闭码安全映射到 `URLSessionWebSocketTask.CloseCode`（oversize→`messageTooBig`/1009、binary→`unsupportedData`/1003、
+  其余标准码原值），保留/本地专用/未知码回退安全可发送码，close reason 按 UTF-8 标量边界截断到 123 字节——不再一律 `.goingAway`(1001)。
 
 ### 9.1 请求流程
 

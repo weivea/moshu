@@ -11,8 +11,11 @@ public struct FrameLimits {
 		self.maxQueuedBytes = maxQueuedBytes
 	}
 
-	/// Matches the Product RPC defaults used by the JS `ConnectionController`.
-	public static let productDefault = FrameLimits(maxFrameBytes: 1_048_576, maxQueuedBytes: 8_388_608)
+	/// Matches the Product RPC defaults used by the JS `ConnectionController`
+	/// (`productRpcMaxFrameBytes` = 4 MiB from `@moshu/contracts`). The queued-bytes bound stays
+	/// conservative but is kept >= one max frame. These values are asserted against the shared
+	/// `mobile-canonical-vectors.json` `transportLimits` in tests so they can't drift from JS.
+	public static let productDefault = FrameLimits(maxFrameBytes: 4_194_304, maxQueuedBytes: 8_388_608)
 }
 
 /// Assigns the monotonic per-connection sequence numbers that accompany each frame delivered to JS,

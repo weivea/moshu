@@ -110,6 +110,20 @@ covered by tests:
   a retry of the same draft reuses it (server dedupes to one run); a definitive rejection
   or a content edit mints a new id.
 
+A follow-up review pass tightened two transport edges (also fully tested):
+
+- **Frame limit alignment** — the native inbound guard, outbound queue and JS pre-bind
+  buffer all use the Product-RPC per-frame cap (`productRpcMaxFrameBytes` = 4 MiB, was a
+  stale 1 MiB) so a legal 1–4 MiB server frame is no longer wrongly rejected. The value is
+  sourced from `@moshu/contracts` and pinned by a shared field in the canonical test-vector
+  fixture that both Vitest and Swift assert against, so the limit can't silently drift.
+  Queued-byte bounds stay conservative but never below one max frame.
+- **WebSocket close-code mapping** — teardown maps the intended numeric code to a real
+  `URLSessionWebSocketTask.CloseCode` (oversize → `messageTooBig`/1009, binary →
+  `unsupportedData`/1003, and the standard codes), instead of always sending `.goingAway`
+  (1001). Reserved/local-only or unknown codes fall back to a safe sendable code, and the
+  close reason is bounded to the 123-byte control-frame budget on UTF-8 scalar boundaries.
+
 ## Status
 
 Layer 4 (this app) is implemented and builds. Background/suspended reliable

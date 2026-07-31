@@ -1,4 +1,5 @@
 import type { RpcPeer, RpcSocketTransport } from "@moshu/process-rpc-core";
+import { productRpcMaxFrameBytes } from "@moshu/contracts";
 import type {
 	MobileTransportListenerHandle,
 	MobileTransportPlugin,
@@ -12,10 +13,14 @@ type CloseSink = (code: number, reason: string) => void;
 /**
  * Hard bounds on the pre-bind frame buffer. Frames can legitimately arrive between `create()` and
  * `bind()` (a handful, at most), so a flood before bind is pathological and is failed closed rather
- * than buffered unboundedly.
+ * than buffered unboundedly. The per-frame cap is the same Product-RPC limit the native inbound
+ * guard and the RpcPeer enforce (`productRpcMaxFrameBytes`, sourced from `@moshu/contracts` so the
+ * three stay aligned); the total stays conservative but is kept >= one max frame so a single legal
+ * large frame arriving before bind is buffered rather than wrongly rejected.
  */
 const MAX_PREBIND_FRAMES = 64;
-const MAX_PREBIND_BYTES = 1_048_576;
+const MAX_PREBIND_FRAME_BYTES = productRpcMaxFrameBytes;
+const MAX_PREBIND_BYTES = 2 * productRpcMaxFrameBytes;
 
 /**
  * Bridges the native `MoshuMobileTransport` plugin to the browser-safe {@link RpcSocketTransport}
@@ -98,9 +103,11 @@ export class NativeRpcConnection implements RpcSocketTransport {
 
 	#onFrame(event: TransportFrameEvent): void {
 		if (this.#connectionId === null) {
-			// Bound pre-bind buffer: overflow fails closed rather than accumulating unboundedly.
+			// Bound pre-bind buffer: a single oversized frame or a flood past the count/byte caps
+			// fails closed rather than accumulating unboundedly.
 			const bytes = utf8ByteLength(event.text);
 			if (
+				bytes > MAX_PREBIND_FRAME_BYTES ||
 				this.#buffered.length >= MAX_PREBIND_FRAMES ||
 				this.#bufferedBytes + bytes > MAX_PREBIND_BYTES
 			) {

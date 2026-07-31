@@ -21,6 +21,7 @@ import {
 	createMobileServerChallengePayload,
 	type MobileChallengeInput,
 	type MobileChallengeOutput,
+	productRpcMaxFrameBytes,
 } from "@moshu/contracts";
 
 type ChallengeMinusSignature = Omit<MobileChallengeOutput, "signature">;
@@ -133,6 +134,15 @@ const fixture = {
 		"verifies (CryptoKit signatures are randomized, so only payloads are byte-compared).",
 	serverChallengeTag: "moshu-mobile-server-challenge-v1",
 	authenticationTag: "moshu-mobile-authentication-v1",
+	// Single source of truth for the transport frame limits shared by the native (Swift) and JS
+	// sides. `maxFrameBytes` is the Product-RPC per-frame cap from @moshu/contracts; the queued-bytes
+	// bound stays conservative but is kept >= one max frame so a single legal frame never overflows.
+	// Both `FrameLimits.productDefault` (Swift) and the JS pre-bind buffer assert against these so the
+	// limits can't silently drift apart.
+	transportLimits: {
+		maxFrameBytes: productRpcMaxFrameBytes,
+		maxQueuedBytes: 2 * productRpcMaxFrameBytes,
+	},
 	deviceKey: {
 		note: "TEST-ONLY Ed25519 key. The real device key is generated on-device and never leaves the Keychain.",
 		seedUtf8: SEED_TEXT,

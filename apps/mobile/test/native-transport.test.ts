@@ -75,6 +75,39 @@ describe("NativeRpcConnection frame discipline", () => {
 		expect(transport.closeArgs.some((c) => c.code === 1009)).toBe(true);
 	});
 
+	it("buffers a legal large frame (1 MiB < size <= 4 MiB) that the old 1 MiB bound wrongly dropped", async () => {
+		const transport = new FakeTransport();
+		const connection = await NativeRpcConnection.create(transport);
+		const frames: string[] = [];
+		connection.setFrameSink((text) => frames.push(text));
+
+		// 1.5 MiB frame: over the previous 1 MiB pre-bind cap but well within the 4 MiB Product-RPC
+		// limit, so it must be buffered (not fail-closed) until bind() flushes it.
+		const bigFrame = "x".repeat(1_572_864);
+		transport.pushFrame({ connectionId: "conn-1", seq: 1, text: bigFrame });
+		// Not fail-closed: no close was issued and nothing was dropped.
+		expect(transport.closeArgs).toEqual([]);
+		expect(frames).toEqual([]);
+
+		connection.bind("conn-1");
+		expect(connection.isOpen()).toBe(true);
+		expect(frames).toEqual([bigFrame]);
+	});
+
+	it("fails closed when a single pre-bind frame exceeds the 4 MiB per-frame cap", async () => {
+		const transport = new FakeTransport();
+		const connection = await NativeRpcConnection.create(transport);
+		connection.setFrameSink(() => {});
+
+		// One frame just over the 4 MiB Product-RPC per-frame limit → protocol-close, don't buffer.
+		transport.pushFrame({ connectionId: "conn-1", seq: 1, text: "x".repeat(4 * 1024 * 1024 + 1) });
+
+		expect(transport.closeArgs.some((c) => c.code === 1009)).toBe(true);
+		// Even once the id is bound the connection stays closed.
+		connection.bind("conn-1");
+		expect(connection.isOpen()).toBe(false);
+	});
+
 	it("captures a fatal close reason so the controller can stop retrying", async () => {
 		const transport = new FakeTransport();
 		const connection = await NativeRpcConnection.create(transport);

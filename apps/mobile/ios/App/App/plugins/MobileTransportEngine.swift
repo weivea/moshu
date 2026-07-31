@@ -292,14 +292,14 @@ final class MobileTransportEngine: NSObject {
 							self.receiveNext(connectionId: connectionId)
 						case .rejectOversize:
 							// Oversized frame: protocol-close with a stable code and stop the loop.
-							self.teardown(connectionId: connectionId, code: 1009, reason: "inbound-frame-too-large")
+							self.teardown(connectionId: connectionId, code: InboundFrameCloseCode.oversize, reason: "inbound-frame-too-large")
 						case .rejectBinary:
 							break
 						}
 					case .data:
 						// Binary frames are not part of the text-only RPC transport. Protocol-close
 						// instead of silently consuming, so a misbehaving peer can't smuggle data.
-						self.teardown(connectionId: connectionId, code: 1003, reason: "binary-frame-rejected")
+						self.teardown(connectionId: connectionId, code: InboundFrameCloseCode.binary, reason: "binary-frame-rejected")
 					@unknown default:
 						self.receiveNext(connectionId: connectionId)
 					}
@@ -336,7 +336,10 @@ final class MobileTransportEngine: NSObject {
 		delegate?.transportDidChangeState(
 			connectionId: connectionId, state: "closing", code: code, reason: reason, fatalReason: fatal
 		)
-		webSocketTask?.cancel(with: .goingAway, reason: reason?.data(using: .utf8))
+		webSocketTask?.cancel(
+			with: WebSocketClose.sendableCode(code),
+			reason: WebSocketClose.boundedReasonData(reason)
+		)
 		webSocketTask = nil
 		activeConnectionId = nil
 		inboundSequencer.deactivate(connectionId: connectionId)

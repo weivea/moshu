@@ -13,6 +13,11 @@ struct CanonicalVectorsFixture: Decodable {
 		let spkiDerBase64Url: String
 	}
 
+	struct TransportLimits: Decodable {
+		let maxFrameBytes: Int
+		let maxQueuedBytes: Int
+	}
+
 	struct Vector: Decodable {
 		let name: String
 		let input: MobileChallengeInput
@@ -25,6 +30,7 @@ struct CanonicalVectorsFixture: Decodable {
 
 	let serverChallengeTag: String
 	let authenticationTag: String
+	let transportLimits: TransportLimits
 	let deviceKey: DeviceKey
 	let vectors: [Vector]
 }

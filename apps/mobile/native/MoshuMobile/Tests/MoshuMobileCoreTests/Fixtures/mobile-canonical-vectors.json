@@ -2,6 +2,10 @@
 	"description": "Canonical Mobile signing test vectors. Generated from @moshu/contracts by apps/mobile/scripts/gen-canonical-vectors.ts. Payload strings are asserted byte-for-byte identical in both Vitest and Swift XCTest; signatures are node/OpenSSL Ed25519 that Swift verifies (CryptoKit signatures are randomized, so only payloads are byte-compared).",
 	"serverChallengeTag": "moshu-mobile-server-challenge-v1",
 	"authenticationTag": "moshu-mobile-authentication-v1",
+	"transportLimits": {
+		"maxFrameBytes": 4194304,
+		"maxQueuedBytes": 8388608
+	},
 	"deviceKey": {
 		"note": "TEST-ONLY Ed25519 key. The real device key is generated on-device and never leaves the Keychain.",
 		"seedUtf8": "Moshu mobile test vector seed 01",
