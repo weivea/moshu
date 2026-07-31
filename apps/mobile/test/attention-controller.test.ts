@@ -1,7 +1,7 @@
 import type { AckMobileAttentionOutput, ListMobileAttentionOutput } from "@moshu/contracts";
 import { beforeEach, describe, expect, it } from "vitest";
-import { AttentionController, type AttentionFeedClient } from "../src/rpc/attention-controller";
 import type { LocalNotificationScheduler, NotificationRoute } from "../src/native/notifications";
+import { AttentionController, type AttentionFeedClient } from "../src/rpc/attention-controller";
 import { MobileEventBus } from "../src/rpc/events";
 
 function listOutput(overrides: Partial<ListMobileAttentionOutput> = {}): ListMobileAttentionOutput {
@@ -214,6 +214,80 @@ describe("AttentionController", () => {
 		await controller.whenSettled();
 
 		expect(scheduled).toHaveLength(1);
+		expect(scheduled[0]?.route).toBeUndefined();
+	});
+
+	it("resolves the newest-event route by walking pages when the feed exceeds one page (>100 events)", async () => {
+		const feed = makeFeedClient();
+		const { scheduler, scheduled } = makeScheduler();
+		feed.enqueue(listOutput({ unreadCount: 0, latestSeq: 0 }));
+		const controller = new AttentionController({
+			scheduler,
+			isAppActive: () => false,
+			notificationText: () => TEXT,
+		});
+		controller.attach(feed.client, bus);
+		await controller.whenSettled();
+
+		// A busy feed: the live-hint snapshot is the FIRST page (oldest events, ascending), so the
+		// newest event (seq 150) is NOT on it — it is on a later page reached via the opaque cursor.
+		const firstPage = listOutput({
+			unreadCount: 100,
+			latestSeq: 150,
+			items: [makeEvent(1), makeEvent(2), makeEvent(50)],
+			nextCursor: "cursor-page-2",
+		});
+		const newest = makeEvent(150, { sessionId: "session-150", approvalId: "approval-150" });
+		const secondPage = listOutput({
+			unreadCount: 100,
+			latestSeq: 150,
+			items: [makeEvent(149), newest],
+		});
+		feed.enqueue(firstPage);
+		feed.enqueue(secondPage);
+		bus.emit("mobileAttentionChanged", { schemaVersion: 1 });
+		await controller.whenSettled();
+
+		expect(scheduled).toHaveLength(1);
+		expect(scheduled[0]?.id).toBe(150);
+		// The route was resolved from the LAST page's newest event, not lost because it was off page 1.
+		expect(scheduled[0]?.route).toEqual({
+			attentionEventId: newest.eventId,
+			sessionId: "session-150",
+			approvalId: "approval-150",
+		});
+		// The walk actually followed the server-issued opaque cursor.
+		expect(feed.listCalls).toContainEqual({ cursor: "cursor-page-2" });
+	});
+
+	it("omits the route (safe Activity) when a retention gap appears while walking pages", async () => {
+		const feed = makeFeedClient();
+		const { scheduler, scheduled } = makeScheduler();
+		feed.enqueue(listOutput({ unreadCount: 0, latestSeq: 0 }));
+		const controller = new AttentionController({
+			scheduler,
+			isAppActive: () => false,
+			notificationText: () => TEXT,
+		});
+		controller.attach(feed.client, bus);
+		await controller.whenSettled();
+
+		const firstPage = listOutput({
+			unreadCount: 100,
+			latestSeq: 150,
+			items: [makeEvent(1), makeEvent(2)],
+			nextCursor: "cursor-page-2",
+		});
+		// The next page reports a retention gap: our opaque ids may be stale, so we must NOT guess a
+		// route from them. The notification still fires (badge/awareness) but a tap lands on safe state.
+		const gapPage = listOutput({ unreadCount: 100, latestSeq: 150, resyncRequired: true });
+		feed.enqueue(firstPage);
+		feed.enqueue(gapPage);
+		bus.emit("mobileAttentionChanged", { schemaVersion: 1 });
+		await controller.whenSettled();
+
+		expect(scheduled).toHaveLength(1);
+		expect(scheduled[0]?.id).toBe(150);
 		expect(scheduled[0]?.route).toBeUndefined();
 	});
 

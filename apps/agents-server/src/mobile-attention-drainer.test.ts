@@ -158,8 +158,8 @@ describe("MobileAttentionOutboxDrainer", () => {
 	});
 
 	test("retention prune after a drain is throttled and forced explicitly", () => {
-		let nowMs = 1_000_000;
 		let pruneCalls = 0;
+		let nowMs = 1_000_000;
 		const attention: MobileAttentionRepository = {
 			append: (input) => db.mobileAttention.append(input),
 			list: (id, options) => db.mobileAttention.list(id, options),
@@ -195,5 +195,107 @@ describe("MobileAttentionOutboxDrainer", () => {
 		nowMs += mobileAttentionPruneMinIntervalMs * 2;
 		drainer.prune(false);
 		expect(pruneCalls).toBe(afterFirst + 2);
+	});
+
+	test("stop() clears the exact periodic timer handle and is idempotent", () => {
+		// A fake timer that records the concrete handle it hands out and the handle clearInterval is
+		// asked to clear. The production default previously wrapped the real handle in a fresh object,
+		// so clearInterval received the wrapper — not the timer — and the interval leaked. Here we prove
+		// the drainer clears *exactly* the handle its setInterval returned.
+		const handle = { token: "periodic-timer" } as unknown as { unref?: () => void };
+		let installed = 0;
+		const cleared: Array<{ unref?: () => void }> = [];
+		const drainer = new MobileAttentionOutboxDrainer({
+			attention: db.mobileAttention,
+			outbox: db.mobileAttentionOutbox,
+			setInterval: () => {
+				installed += 1;
+				return handle;
+			},
+			clearInterval: (h) => {
+				cleared.push(h);
+			},
+		});
+
+		const control = drainer.start();
+		expect(installed).toBe(1);
+
+		control.stop();
+		expect(cleared).toEqual([handle]);
+
+		// Idempotent: a second stop() does not clear again (and never throws).
+		control.stop();
+		drainer.stop();
+		expect(cleared).toEqual([handle]);
+	});
+
+	test("a periodic tick or live trigger after stop() never drains or prunes a closed feed", () => {
+		let tick: (() => void) | undefined;
+		let pruneCalls = 0;
+		const attention: MobileAttentionRepository = {
+			append: (input) => db.mobileAttention.append(input),
+			list: (id, options) => db.mobileAttention.list(id, options),
+			ack: (id, seq) => db.mobileAttention.ack(id, seq),
+			deleteAckCursor: (id) => db.mobileAttention.deleteAckCursor(id),
+			prune: (now) => {
+				pruneCalls += 1;
+				return db.mobileAttention.prune(now);
+			},
+			latestSeq: () => db.mobileAttention.latestSeq(),
+		};
+		const drainer = new MobileAttentionOutboxDrainer({
+			attention,
+			outbox: db.mobileAttentionOutbox,
+			setInterval: (handler) => {
+				tick = handler;
+				return {};
+			},
+			clearInterval: () => {},
+		});
+
+		const control = drainer.start();
+		const prunesAtStart = pruneCalls;
+		expect(tick).toBeDefined();
+
+		control.stop();
+
+		// A queued periodic tick that fires after stop() is a no-op: no drain, no prune.
+		enqueue(db, "after-stop");
+		tick?.();
+		expect(db.mobileAttention.latestSeq()).toBe(0);
+		expect(pruneCalls).toBe(prunesAtStart);
+
+		// A live trigger (e.g. a Run terminal racing shutdown) is likewise inert after stop().
+		expect(drainer.drain()).toEqual({ appended: 0, failed: 0, processed: 0 });
+		expect(db.mobileAttention.latestSeq()).toBe(0);
+		expect(db.mobileAttentionOutbox.pendingCount()).toBe(1);
+	});
+
+	test("stop() halts a real Bun periodic timer so no further work runs", async () => {
+		let drains = 0;
+		const outbox: MobileAttentionOutboxRepository = {
+			enqueue: (input) => db.mobileAttentionOutbox.enqueue(input),
+			claimPending: (limit) => {
+				drains += 1;
+				return db.mobileAttentionOutbox.claimPending(limit);
+			},
+			markProcessed: (id, at) => db.mobileAttentionOutbox.markProcessed(id, at),
+			markFailed: (id, error) => db.mobileAttentionOutbox.markFailed(id, error),
+			pendingCount: () => db.mobileAttentionOutbox.pendingCount(),
+			deleteProcessedBefore: (cutoff) => db.mobileAttentionOutbox.deleteProcessedBefore(cutoff),
+		};
+		// A real (short) Bun interval via the production default path; if stop() failed to clear the
+		// exact handle, claimPending would keep incrementing after we stopped.
+		const drainer = new MobileAttentionOutboxDrainer({
+			attention: db.mobileAttention,
+			outbox,
+			setInterval: (handler, _ms) => setInterval(handler, 5) as unknown as { unref?: () => void },
+		});
+		const control = drainer.start();
+		await new Promise((resolve) => setTimeout(resolve, 25));
+		control.stop();
+		const drainsAtStop = drains;
+		await new Promise((resolve) => setTimeout(resolve, 30));
+		expect(drains).toBe(drainsAtStop);
 	});
 });

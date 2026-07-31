@@ -23,8 +23,6 @@ import {
 	listSkillsOutputSchema,
 	mcpServerMutationResultSchema,
 	mobileAccessStatusOutputSchema,
-	mobileClientProductEventMethods,
-	mobileClientProductRequestMethods,
 	mobileProtocolMaxVersion,
 	mobileProtocolMinVersion,
 	productRpcEvents,
@@ -95,11 +93,8 @@ import { ApprovalRunUnavailableError, type ApprovalService } from "./approval-se
 import type { ChatApplicationService } from "./chat-application-service";
 import type { DevTunnelService } from "./dev-tunnel-service";
 import type { MobileIngressAuth } from "./mobile-ingress-auth";
-import {
-	ackMobileAttentionForPeer,
-	listMobileAttentionForPeer,
-	revokeMobileDevice,
-} from "./mobile-ingress-handlers";
+import { mobileAttentionRequestHandlers } from "./mobile-ingress-composition";
+import { revokeMobileDevice } from "./mobile-ingress-handlers";
 import {
 	broadcastApprovalActivityChanged,
 	broadcastMobileAttentionChanged,
@@ -172,16 +167,10 @@ export const agentsServerRuntimeMethodAllowlist: RpcMethodAllowlist = {
 };
 
 // The Mobile ingress reuses the shared Product handlers but is pinned to its own strict allowlist so
-// an authenticated Mobile client can only reach the MVP subset — never Provider auth, Remote Access
-// control, Runtime Box pairing/device revoke, MCP/Skills, Project mutations, diagnostics, or any
-// Desktop-only surface. Requests/events outside this set are rejected by the RPC layer before a
-// handler runs, even though the same handler map backs the Product ingress.
-export const agentsServerMobileMethodAllowlist: RpcMethodAllowlist = {
-	"mobile-client": {
-		requests: mobileClientProductRequestMethods,
-		events: mobileClientProductEventMethods,
-	},
-};
+// an authenticated Mobile client can only reach the MVP subset. The allowlist now lives with the
+// pi-free `createMobileIngressComposition` (the single source of truth shared by this Product wiring
+// and the ingress smoke); it is re-exported here for the existing agents-server import sites.
+export { agentsServerMobileMethodAllowlist } from "./mobile-ingress-composition";
 
 export function createProductRpcHandlers(dependencies: ProductRpcDependencies): RpcHandlers {
 	const {
@@ -430,17 +419,12 @@ export function createProductRpcHandlers(dependencies: ProductRpcDependencies): 
 						input,
 					),
 			),
-			[productRpcMethods.mobileAttentionList]: createRequestHandler(
-				productRpcRequestSchemas[productRpcMethods.mobileAttentionList],
-				// Peer identity is server-derived from the authenticated Mobile ingress session, never
-				// from request input, so a caller can neither forge another device's clientId nor read a
-				// Desktop feed. Desktop product clients are rejected outright.
-				(input, peer) => listMobileAttentionForPeer(requireMobileAttention(), peer, input),
-			),
-			[productRpcMethods.mobileAttentionAck]: createRequestHandler(
-				productRpcRequestSchemas[productRpcMethods.mobileAttentionAck],
-				(input, peer) => ackMobileAttentionForPeer(requireMobileAttention(), peer, input),
-			),
+			// Durable Mobile attention list/ack. The handlers are the single source of truth shared with
+			// `createMobileIngressComposition` (and thus the ingress smoke): peer identity is server-derived
+			// from the authenticated Mobile ingress session, never from request input, so a caller can
+			// neither forge another device's clientId nor read a Desktop feed. Desktop product clients are
+			// rejected outright.
+			...mobileAttentionRequestHandlers(requireMobileAttention),
 			[productRpcMethods.remoteAccessStatus]: createRequestHandler(
 				productRpcRequestSchemas[productRpcMethods.remoteAccessStatus],
 				async (_input, _peer, context) =>

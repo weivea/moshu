@@ -544,13 +544,18 @@ agentDataDirectory/
   与有界 periodic 路径执行（避免每 event O(n)），与 cursor gap/resync 语义一致；cursor 过旧显式 `resyncRequired` 不伪装无未读；
   设备 revoke 不可读、unpair 清 cursor 不泄漏旧 feed。live 只发最小 `attention.changed` hint（无业务正文），Desktop Product RPC
   不暴露 mobile device 未读。mobile ingress handler 逻辑抽到 pi-free `mobile-ingress-handlers.ts`（`resolveMobileClientId` /
-  `listMobileAttentionForPeer` / `ackMobileAttentionForPeer` / `revokeMobileDevice`），由 `product-rpc.ts` 与 smoke 复用**单一来源**。
+  `listMobileAttentionForPeer` / `ackMobileAttentionForPeer` / `revokeMobileDevice`），并进一步由 pi-free
+  `mobile-ingress-composition.ts` 的 `createMobileIngressComposition`（封装 strict allowlist、merged attention handler、
+  transactional-outbox drainer 与 revoke 装配）作为**单一生产装配来源**，`create-agents-server.ts` 与 `mobile-ingress-smoke.test.ts`
+  共同调用；smoke 不再自建 `createRpcServer` + 手工 handler map，wiring contract test 保证新增 ingress method 会被 smoke 覆盖。
 - **iOS 生命周期/重连**：`src/native/lifecycle.ts` 用 `@capacitor/app` `appStateChange`（web `visibilitychange` 回退）。
   foreground → 连接/恢复 + 立即一次重试；background → **暂停**重连（不新建 socket），仅让既有 socket 在系统短窗口存活；
   系统 expiration 关闭 socket。重连用**有界指数退避 + jitter**（`reconnectMaxDelayMs`/`reconnectJitterRatio`），stable `connected`
   与用户 `retry()` 后 reset；fatal（`AUTH_REVOKED`/`AUTH_FAILED`/`PROTOCOL_MISMATCH`/`UNSUPPORTED_PROTOCOL`/identity）不重试；
   background/offline 暂停 timer；旧 connection callbacks 不复活。background 期 socket close **直接转 offline 不排重连**。
-  断线仅显示 offline/reconnecting，不展示缓存业务；回连重新 snapshot + attention feed。
+  断线仅显示 offline/reconnecting，不展示缓存业务；回连重新 snapshot + attention feed。**background→foreground 若 socket 仍存活**
+  也触发一次 **non-notifying** attention refresh + 必要 session/runtime snapshot freshness（`onAppActive` 对存活 socket re-emit
+  `connected` 促使重新 snapshot），旧 transition token 不影响新连接，且不为历史事件补发系统通知。
 - **原生 background task**：`BackgroundActivityCoordinator`（`MoshuMobileCore`，纯逻辑、XCTest 覆盖）持有**单一、幂等、有界**的
   `UIApplication.beginBackgroundTask`。**由 `MoshuMobileTransportPlugin` 独占装配**（与 engine 同一 owner，避免 AppDelegate 跨对象
   连线）：plugin 在 `load()` 注册 `didEnterBackground`→`begin` / `didBecomeActive`/`willTerminate`→`end`，`deinit` 移除 observer；
@@ -562,9 +567,11 @@ agentDataDirectory/
   实际收到 `attention.changed` 时 schedule generic 本地通知；active 时只更新 Activity badge。通知文案本地化 generic（无 raw
   prompt/command/path/secret），id 由 attention `seq` 稳定派生（`NotificationContentBuilder`/`notificationIdForSeq`）防重复。
   schedule 只挂**校验过的 opaque route**（`sessionId`/`approvalId`/`attentionEventId`，`parseNotificationRoute` 白名单过滤）。
-  tap 由 `NotificationTapCoordinator` 处理（注册 `localNotificationActionPerformed`、start/dispose 单一 listener 无泄漏）：未配对/fatal
+  route 解析用**有界 server cursor 走查**（`MAX_ROUTE_LOOKUP_PAGES`）按 latestSeq 精确定位事件，覆盖 >100 事件与 retention gap
+  （gap/未解析→安全 Activity，不使用 stale opaque id）。tap 由 `NotificationTapCoordinator` 处理（注册 `localNotificationActionPerformed`、start/dispose 单一 listener 无泄漏）：未配对/fatal
   显示安全状态**不导航**；否则**等到 authenticated connection + attention snapshot 刷新成功后**才用 opaque id 导航，绝不直接展示 stale
-  payload。**suspended/terminated 无通知保证**；重连从 server feed 恢复 missed 未读并显示 badge，但不为历史事件批量补发系统通知。
+  payload。`AttentionProvider` 在 app root（`main.tsx` HashRouter 内）用真实 React Router（`useNavigate`）装配 navigate/safe-state
+  默认实现（**非 optional no-op**）：validated route → 导航 Chat/Activity approval，unpaired/fatal/invalid → 明确安全页面。**suspended/terminated 无通知保证**；重连从 server feed 恢复 missed 未读并显示 badge，但不为历史事件批量补发系统通知。
   **不注册 APNs token、不请求 remote notification entitlement、不加云服务。**
 - **发布加固**：`release.config.json`（单一版本源 + `bundleId.development`/`bundleId.release`）+ `scripts/sync-version.ts`（fan-out
   MARKETING_VERSION/CURRENT_PROJECT_VERSION + package.json，`--check` 校验）；`App/PrivacyInfo.xcprivacy`（无采集/无 tracking，仅
@@ -575,15 +582,17 @@ agentDataDirectory/
   或 `--release`）要求发布方设 `MOSHU_MOBILE_RELEASE_BUNDLE_ID`（或 `release.config.json` `bundleId.release`）为永久非 dev id，
   拒绝空值/`dev.moshu.mobile`，并用 `xcodebuild -showBuildSettings -configuration Release` 解析的 `PRODUCT_BUNDLE_IDENTIFIER`
   精确比对；export compliance（CryptoKit Ed25519 + TLS）问卷/豁免由发布方确认，工程不武断写 `ITSAppUsesNonExemptEncryption`。详见 quality-release。
-- **验证（实际运行）**：**102 Vitest**（含 attention 恢复无 replay、badge、ack 单调、resyncRequired、notification 短后台 gating、opaque
-  route 只带白名单 id、notification tap offline→connect→refresh→navigate / unpaired-fatal 安全态 / dispose、`UNSUPPORTED_PROTOCOL`
-  fatal 无重连、background close→offline）、**68 Swift XCTest**（含 background task 幂等/有界/expiration cleanup、**stale expiration
-  no-op**、稳定 notification id、generic 键、opaque route id）、`tsc` strict、`vite build`、`cap sync ios`、release gate 全绿（dev 10 checks；
-  real-release 正确 FAIL 于 dev bundle id）；server 侧 `mobile-attention-drainer`（crash/restart/幂等/retention）+ **真实 production 组合**的
-  `mobile-ingress-smoke`（`openAppDatabase` + Approval/Run 仓储 → 事务 outbox → 真实 drainer 投影 → 共享 list/ack → 真实 revoke）
-  与 `packages/database` attention repository/outbox（pagination/retention/ack 单调/幂等/revoke 清 cursor）通过（合计 contracts+database
-  125、隔离 agents-server mobile 14）。**iOS simulator `xcodebuild build`（iPhone 17 Pro / iOS 26.5，禁签名）BUILD SUCCEEDED**。真机
-  签名、真实发布 bundle id 覆盖、真实 Dev Tunnel probe（opt-in）、App Store review 提交为发布方人工步骤。
+- **验证（实际运行）**：**110 Vitest**（含 attention 恢复无 replay、badge、ack 单调、resyncRequired、notification 短后台 gating、opaque
+  route 只带白名单 id、notification tap offline→connect→refresh→navigate / unpaired-fatal 安全态 / dispose、production root
+  tap→navigate + surviving-socket foreground resnapshot、`UNSUPPORTED_PROTOCOL` fatal 无重连、background close→offline）、**70 Swift XCTest**
+  （含 background task 幂等/有界/expiration cleanup、**stale/late-A vs B/synchronous expiration no-op**、稳定 notification id、generic 键、
+  opaque route id）、`tsc` strict、`vite build`、`cap sync ios`、release gate 全绿（dev 10 checks；real-release 正确 FAIL 于 dev/缺失 bundle id）；
+  server 侧 `mobile-attention-drainer`（crash/restart/幂等/retention/timer stop）+ **真实 production 组合**的 `mobile-ingress-smoke`
+  （`createMobileIngressComposition` → `openAppDatabase` + Approval/Run 仓储 → 事务 outbox → 真实 drainer 投影 → 共享 list/ack → 真实 revoke）
+  与 `mobile-ingress-composition`（wiring contract：owned method 全在 allowlist + merged map + smoke 覆盖）、`packages/database` attention
+  repository/outbox（pagination/retention/ack 单调/幂等/revoke 清 cursor）通过（合计 contracts+database 125+87、隔离 agents-server mobile 22）。
+  **iOS simulator `xcodebuild build`（iPhone 17 Pro / iOS 26.5，禁签名）BUILD SUCCEEDED**。真机签名、真实发布 bundle id 覆盖、真实
+  Dev Tunnel probe（opt-in）、App Store review 提交为发布方人工步骤。
 
 
 ### 9.1 请求流程

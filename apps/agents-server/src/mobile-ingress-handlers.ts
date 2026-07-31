@@ -1,5 +1,7 @@
 import type {
+	AckMobileAttentionInput,
 	AckMobileAttentionOutput,
+	ListMobileAttentionInput,
 	ListMobileAttentionOutput,
 	RevokeMobileDeviceInput,
 	RevokeMobileDeviceOutput,
@@ -30,7 +32,7 @@ export function resolveMobileClientId(peer: RpcPeer): string {
 export function listMobileAttentionForPeer(
 	mobileAttention: MobileAttentionRepository,
 	peer: RpcPeer,
-	input: { cursor?: string; limit?: number },
+	input: ListMobileAttentionInput,
 ): ListMobileAttentionOutput {
 	return mobileAttention.list(resolveMobileClientId(peer), {
 		cursor: input.cursor,
@@ -41,7 +43,7 @@ export function listMobileAttentionForPeer(
 export function ackMobileAttentionForPeer(
 	mobileAttention: MobileAttentionRepository,
 	peer: RpcPeer,
-	input: { seq: number },
+	input: AckMobileAttentionInput,
 ): AckMobileAttentionOutput {
 	return {
 		schemaVersion: 1 as const,

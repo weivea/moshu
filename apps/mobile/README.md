@@ -164,8 +164,12 @@ unread, and a lost `attention.changed` hint never affects the reconnect `list`.
   `resyncRequired`; `mobile.attention.ack` is CAS + idempotent and monotonic (an older
   ack never regresses the cursor). Peer identity comes from the auth context — a caller
   can never forge a `clientId` or roll the cursor backward. The list/ack/revoke handler
-  logic lives in a pi-free `apps/agents-server/src/mobile-ingress-handlers.ts` reused as a
-  single source of truth by `product-rpc.ts` and the smoke test.
+  logic lives in a pi-free `apps/agents-server/src/mobile-ingress-handlers.ts`, and the whole
+  Mobile ingress (strict allowlist + merged attention handlers + transactional-outbox drainer
+  + revoke) is assembled by the pi-free `createMobileIngressComposition`
+  (`mobile-ingress-composition.ts`) — the single production wiring source that both
+  `create-agents-server.ts` and the ingress smoke call, so the smoke exercises the real
+  composition (a wiring contract test guarantees new ingress methods stay covered).
 - Retention is bounded and **enforced in production** (age 30 days + per-client 500),
   pruned at startup (forced), after each drain (throttled + jittered), and on a bounded
   periodic path. If a cursor is older than what is retained, `list` returns
@@ -177,7 +181,13 @@ unread, and a lost `attention.changed` hint never affects the reconnect `list`.
 The client `AttentionController` (`src/rpc/attention-controller.ts`) attaches on connect,
 takes a **recovery snapshot** (badge only — it never replays historical events as system
 notifications), tracks a `#seenSeq` baseline, and drives the Activity tab badge from
-`max(pendingApprovals, unread)`.
+`max(pendingApprovals, unread)`. Returning to the foreground while the socket is still alive
+re-runs a **non-notifying** refresh + snapshot-freshness check (`onAppActive` re-emits the
+surviving `connected` state) so unread updates without re-firing historical local
+notifications. Notification routes are resolved by walking the server cursor up to a bounded
+page count (`MAX_ROUTE_LOOKUP_PAGES`) so a tap on the newest event still resolves past the
+first page (150+ events); a retention gap falls back to the safe Activity screen rather than
+using a stale opaque id.
 
 ## Lifecycle & reconnect (Layer 5)
 
@@ -221,7 +231,11 @@ notifications), tracks a `#seenSeq` baseline, and drives the Activity tab badge 
   Performed` listener and disposes it cleanly (no leak): if the session is unpaired/fatal it
   shows a safe status and **does not navigate**; otherwise it waits for an authenticated
   connection **and** a fresh attention snapshot to succeed before navigating with the opaque
-  id — it never surfaces a stale payload.
+  id — it never surfaces a stale payload. The `AttentionProvider` is mounted at the app root
+  (inside the `main.tsx` HashRouter) and wires the real React Router `useNavigate` +
+  safe-state handlers as built-in defaults (not an optional no-op), so a validated route
+  navigates to the Chat / Activity approval in production while unpaired/fatal/invalid routes
+  land on an explicit safe screen.
 - **Suspended/terminated delivers no notification** — there is no APNs and no server that
   can wake the app. On reconnect the phone recovers missed unread from the server feed and
   shows a badge, but does **not** batch-replay historical events as system notifications.

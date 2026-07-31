@@ -289,6 +289,47 @@ describe("ConnectionController", () => {
 		expect(transport.activeStateListenerCount).toBe(0);
 	});
 
+	it("re-snapshots a surviving socket on foreground without tearing it down or reconnecting", async () => {
+		const transport = new FakeTransport();
+		transport.status = { state: "paired", binding: makeBinding() };
+		const { handshake, peer } = fakeHandshake();
+		const controller = makeController(transport, handshake);
+		await controller.init();
+		expect(controller.getState().kind).toBe("connected");
+
+		// Record every state the UI observes so we can prove a fresh `connected` is re-emitted (which
+		// drives the attention/session resnapshot) — not a teardown or reconnect.
+		const seen: string[] = [];
+		controller.subscribe((state) => seen.push(state.kind));
+		const connectSpy = vi.spyOn(transport, "connect");
+
+		// The whole background window elapses with the socket still alive, then we return to foreground.
+		controller.onAppBackground();
+		await controller.onAppActive();
+
+		// A brand-new `connected` state is emitted (subscribers re-snapshot), but the exact live socket
+		// is untouched and no reconnect is attempted.
+		expect(seen).toEqual(["connected"]);
+		expect(controller.getState().kind).toBe("connected");
+		expect(connectSpy).not.toHaveBeenCalled();
+		expect(peer.close).not.toHaveBeenCalled();
+	});
+
+	it("does not re-snapshot on a spurious foreground that was never preceded by a background", async () => {
+		const transport = new FakeTransport();
+		transport.status = { state: "paired", binding: makeBinding() };
+		const { handshake } = fakeHandshake();
+		const controller = makeController(transport, handshake);
+		await controller.init();
+		expect(controller.getState().kind).toBe("connected");
+
+		const seen: string[] = [];
+		controller.subscribe((state) => seen.push(state.kind));
+		// No preceding onAppBackground → nothing to resnapshot; avoid a redundant refresh storm.
+		await controller.onAppActive();
+		expect(seen).toEqual([]);
+	});
+
 	// --- Layer 5 lifecycle / reconnect -------------------------------------
 
 	it("does not open or schedule a reconnect while backgrounded (no fake keep-alive)", async () => {

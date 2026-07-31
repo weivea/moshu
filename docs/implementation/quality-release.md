@@ -540,19 +540,24 @@ VoIP/background-processing 伪保活、设备不落业务数据、Desktop 必须
 
 ### 21.7 验证命令（本层，实际运行结果）
 
-- `bun run --cwd apps/mobile test`（**102 Vitest**，含 notification-tap / attention route / release-gate）、
+- `bun run --cwd apps/mobile test`（**110 Vitest**，含 notification-tap / attention route (>100 events) /
+  production-root tap→navigate + surviving-socket foreground resnapshot / release-gate）、
   `typecheck`（clean）、`build`（vite production）、`cap:sync`（copy dist→`ios/App/App/public`，含
   `@capacitor/local-notifications`）。
-- `swift test`（`apps/mobile/native/MoshuMobile`，**68 XCTest**，含 `BackgroundActivityCoordinator` 陈旧
-  expiration no-op）。
-- server 侧隔离测试：`bun test packages/contracts packages/database`（**125 pass**，含 mobile attention
+- `swift test`（`apps/mobile/native/MoshuMobile`，**70 XCTest**，含 `BackgroundActivityCoordinator` 陈旧/
+  late-A-vs-B/同步 expiration no-op）。
+- server 侧隔离测试：`bun test packages/contracts packages/database`（**125 + 87 pass**，含 mobile attention
   contracts + `mobile-attention-repository` + `mobile-attention-outbox` DB 测试）与
   `apps/agents-server/src/mobile-attention-drainer.test.ts` / `mobile-ingress-smoke.test.ts` /
-  `mobile-ingress-auth.test.ts` / `mobile-ingress-generation-fence.test.ts`（**14 pass**）。
-  smoke 通过真实 `openAppDatabase` + Approval/Run 仓储 → 事务 outbox → 真实 drainer 投影 → 共享
-  list/ack handler → 真实 revoke，**不再自建 bespoke handler**（复用 `mobile-ingress-handlers.ts`）。
+  `mobile-ingress-composition.test.ts` / `mobile-ingress-auth.test.ts` /
+  `mobile-ingress-generation-fence.test.ts`（**22 pass**）。
+  smoke 通过真实 **`createMobileIngressComposition`**（生产装配单一来源）→ `openAppDatabase` + Approval/Run
+  仓储 → 事务 outbox → 真实 drainer 投影 → 共享 list/ack handler → 真实 revoke，**不再自建 `createRpcServer`/
+  bespoke handler map**；`mobile-ingress-composition.test.ts` 的 wiring contract 保证 composition 拥有的
+  ingress method 全部落在 strict allowlist + merged handler map，且被 smoke 覆盖。
   > 环境限制：`@earendil-works/pi-*` 未安装，故无法导入 `@moshu/agent-runtime`（即 `product-rpc.ts` /
-  > `create-agents-server.ts`）跑完整 agents-server 套件；以上隔离测试覆盖 mobile 增量。
+  > `create-agents-server.ts`）跑完整 agents-server 套件；以上隔离测试覆盖 mobile 增量（composition 为
+  > pi-free 模块，故可隔离运行）。
 - `bun run --cwd apps/mobile release:gate`（dev 模式 **10 checks 全绿**）。真实发布模式
   `MOSHU_MOBILE_RELEASE=1 MOSHU_MOBILE_RELEASE_BUNDLE_ID=... release:gate` 已验证会用
   `xcodebuild -showBuildSettings -configuration Release` 解析 `PRODUCT_BUNDLE_IDENTIFIER` 并精确比对：

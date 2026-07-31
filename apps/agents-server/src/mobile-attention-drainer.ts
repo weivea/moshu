@@ -50,6 +50,9 @@ export class MobileAttentionOutboxDrainer {
 	#rerunRequested = false;
 	#lastPruneMs = 0;
 	#timer: { unref?: () => void } | undefined;
+	// Set the moment stop() runs so a periodic tick that is already queued (or a live trigger racing
+	// shutdown) can never drain/prune against a closed database.
+	#stopped = false;
 
 	constructor(options: MobileAttentionOutboxDrainerOptions) {
 		this.#attention = options.attention;
@@ -57,12 +60,14 @@ export class MobileAttentionOutboxDrainer {
 		this.#onAppended = options.onAppended;
 		this.#reportDiagnostic = options.reportDiagnostic ?? (() => {});
 		this.#now = options.now ?? (() => Date.now());
+		// IMPORTANT: the default must return the REAL timer handle so clearInterval clears exactly this
+		// interval. Wrapping it in a fresh `{ unref }` object (as an earlier version did) meant stop()
+		// passed the wrapper — not the timer — to clearInterval, so the interval leaked and kept firing
+		// after shutdown. Node/Bun `Timeout` already exposes `unref()`, so the raw handle satisfies the
+		// injectable shape directly.
 		this.#setInterval =
 			options.setInterval ??
-			((handler, ms) => {
-				const handle = setInterval(handler, ms);
-				return { unref: () => handle.unref?.() };
-			});
+			((handler, ms) => setInterval(handler, ms) as unknown as { unref?: () => void });
 		this.#clearInterval =
 			options.clearInterval ??
 			((handle) => {
@@ -73,26 +78,40 @@ export class MobileAttentionOutboxDrainer {
 	// Startup: drain any rows left behind by a crash before wiring the live triggers, force an initial
 	// retention pass, and install the bounded periodic backstop. Returns a disposer.
 	start(): { stop: () => void } {
+		this.#stopped = false;
 		this.drain();
 		this.prune(true);
 		this.#timer = this.#setInterval(() => {
+			// A tick that fires after (or racing) stop() must not touch the database.
+			if (this.#stopped) {
+				return;
+			}
 			this.drain();
 			this.prune(true);
 		}, mobileAttentionPrunePeriodicMs);
 		this.#timer.unref?.();
 		return {
-			stop: () => {
-				if (this.#timer !== undefined) {
-					this.#clearInterval(this.#timer);
-					this.#timer = undefined;
-				}
-			},
+			stop: () => this.stop(),
 		};
+	}
+
+	// Idempotent shutdown: clear the exact periodic timer this drainer installed and latch `#stopped`
+	// so any already-queued tick or racing live trigger becomes a no-op instead of draining/pruning a
+	// closed database.
+	stop(): void {
+		this.#stopped = true;
+		if (this.#timer !== undefined) {
+			this.#clearInterval(this.#timer);
+			this.#timer = undefined;
+		}
 	}
 
 	// Project all currently-pending outbox rows. Reentrancy-guarded: a drain requested while one is in
 	// flight coalesces into a single follow-up pass so live triggers can call this freely.
 	drain(): MobileAttentionDrainResult {
+		if (this.#stopped) {
+			return { appended: 0, failed: 0, processed: 0 };
+		}
 		if (this.#draining) {
 			this.#rerunRequested = true;
 			return { appended: 0, failed: 0, processed: 0 };
@@ -155,6 +174,9 @@ export class MobileAttentionOutboxDrainer {
 	// Enforce retention (30 days / per-feed cap) plus bounded cleanup of processed outbox rows. Throttled
 	// to `mobileAttentionPruneMinIntervalMs` (with jitter) unless `force` is set, so it is never O(events).
 	prune(force: boolean): number {
+		if (this.#stopped) {
+			return 0;
+		}
 		const now = this.#now();
 		if (!force) {
 			const jitter = mobileAttentionPruneMinIntervalMs * 0.25 * Math.random();

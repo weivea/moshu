@@ -1,5 +1,5 @@
 import { productRpcMaxBufferedOutboundBytes, productRpcMaxFrameBytes } from "@moshu/contracts";
-import { resolveRpcLimits, type RpcPeer } from "@moshu/process-rpc-core";
+import { type RpcPeer, resolveRpcLimits } from "@moshu/process-rpc-core";
 import {
 	getMobileTransport,
 	type MobileTransportBinding,
@@ -192,13 +192,29 @@ export class ConnectionController {
 	async onAppActive(): Promise<void> {
 		// Leaving the background: resume normal reconnect behavior and, because the user is now looking
 		// at the App, make one immediate attempt with a fresh backoff instead of waiting out a timer.
+		const wasBackgrounded = this.#backgrounded;
 		this.#backgrounded = false;
 		this.#reconnectAttempt = 0;
-		const kind = this.#state.kind;
+		const state = this.#state;
+		const kind = state.kind;
 		if (kind === "offline" || kind === "reconnecting") {
-			await this.#connect(this.#state.binding as MobileTransportBinding, true);
+			await this.#connect(state.binding, true);
 		} else if (kind === "unpaired" || kind === "initializing") {
 			await this.init();
+		} else if (kind === "connected" && wasBackgrounded) {
+			// The short OS-granted window kept the socket alive across the whole background, so there is
+			// nothing to reconnect — but durable attention and session/runtime data may have advanced
+			// while we were away. Re-emit the (unchanged) live session so subscribers take a fresh,
+			// NON-notifying snapshot (the attention controller re-baselines the badge WITHOUT replaying
+			// the missed backlog as system notifications). Reading `this.#state` here means only the
+			// current connection is ever re-emitted: a connection replaced since we backgrounded is
+			// snapshotted, and a stale transition can never disturb a newer one.
+			this.#setState({
+				kind: "connected",
+				binding: state.binding,
+				client: state.client,
+				bus: state.bus,
+			});
 		}
 	}
 

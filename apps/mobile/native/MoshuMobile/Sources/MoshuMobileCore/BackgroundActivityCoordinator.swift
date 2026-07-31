@@ -29,6 +29,18 @@ public final class BackgroundActivityCoordinator {
 	private let onExpire: () -> Void
 	private let lock = NSLock()
 	private var taskId: Int?
+	// Monotonic generation stamped on every begin(). The expiration closure captures the generation it
+	// was created for; a callback whose generation is no longer the active one is a strict no-op. This
+	// is what stops a late/stale expiration from a previous task (already ended or superseded) from
+	// tearing down a NEWER task's socket.
+	private var generation: UInt64 = 0
+	// The generation of the window the app currently wants alive. `nil` means no active window (never
+	// begun, or ended/expired). Only the callback matching this generation may run `onExpire`/end.
+	private var activeGeneration: UInt64?
+	// Set when the OS fires expiration *synchronously inside* `host.beginTask`, before we have recorded
+	// the returned task id. begin() observes this after beginTask returns and completes the expiration
+	// (onExpire + endTask) with the now-known id, so a synchronous expiration is never dropped.
+	private var pendingExpired = false
 
 	public init(host: BackgroundTaskHost, onExpire: @escaping () -> Void) {
 		self.host = host
@@ -49,26 +61,47 @@ public final class BackgroundActivityCoordinator {
 			lock.unlock()
 			return
 		}
+		generation &+= 1
+		let token = generation
+		activeGeneration = token
+		pendingExpired = false
 		// Release the lock before calling the host: the host may invoke the expiration handler
 		// synchronously in tests, and re-entering the lock there would deadlock.
 		lock.unlock()
+
 		let id = host.beginTask { [weak self] in
-			self?.handleExpiration()
+			self?.handleExpiration(token)
 		}
+
 		lock.lock()
-		if taskId == nil {
-			taskId = id
-			lock.unlock()
-		} else {
-			// A concurrent begin already recorded a task; end this duplicate to keep exactly one.
+		// A newer begin() (or an end()) superseded this window while beginTask was running: this task id
+		// is stale, so end it immediately and record nothing.
+		if activeGeneration != token {
 			lock.unlock()
 			host.endTask(id)
+			return
 		}
+		// Expiration fired synchronously during beginTask, before we could record the id. Complete it
+		// now with the known id: clear the active window, run onExpire, and end exactly this task.
+		if pendingExpired {
+			pendingExpired = false
+			activeGeneration = nil
+			taskId = nil
+			lock.unlock()
+			onExpire()
+			host.endTask(id)
+			return
+		}
+		taskId = id
+		lock.unlock()
 	}
 
 	/// Ends the active background task if any. Idempotent.
 	public func end() {
 		lock.lock()
+		// Retire the current window so any in-flight/late expiration callback becomes a no-op.
+		activeGeneration = nil
+		pendingExpired = false
 		guard let id = taskId else {
 			lock.unlock()
 			return
@@ -79,15 +112,24 @@ public final class BackgroundActivityCoordinator {
 	}
 
 	/// OS expiration path: clean up exactly once — run `onExpire` (close the socket) then end the task.
-	/// If the task was already ended (e.g. the App returned to the foreground and called `end()`),
-	/// a late/stale expiration callback is a strict no-op: it must NOT run `onExpire`, so an expired
-	/// task can never tear down a *newer* connection opened by a subsequent foreground session.
-	private func handleExpiration() {
+	/// The callback carries the `token` of the window it was created for; if that window is no longer
+	/// active (the app called `end()` and returned to the foreground, or a newer `begin()` superseded
+	/// it) the callback is a strict no-op, so an expired/stale task can never tear down a newer
+	/// connection. If expiration races ahead of `begin()` recording the task id, we latch
+	/// `pendingExpired` and let `begin()` finish the teardown once it has the id.
+	private func handleExpiration(_ token: UInt64) {
 		lock.lock()
-		guard let id = taskId else {
+		guard activeGeneration == token else {
 			lock.unlock()
 			return
 		}
+		guard let id = taskId else {
+			// Synchronous expiration before begin() recorded the id: defer to begin().
+			pendingExpired = true
+			lock.unlock()
+			return
+		}
+		activeGeneration = nil
 		taskId = nil
 		lock.unlock()
 		onExpire()

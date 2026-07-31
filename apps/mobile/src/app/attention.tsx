@@ -8,6 +8,7 @@ import {
 	useRef,
 	useState,
 } from "react";
+import { useNavigate } from "react-router-dom";
 import {
 	CapacitorNotificationScheduler,
 	type LocalNotificationScheduler,
@@ -59,6 +60,29 @@ function mapReadiness(state: ConnectionState): NotificationTapReadiness {
 		default:
 			return "connecting";
 	}
+}
+
+// Neutral in-app hub a notification tap falls back to whenever it cannot safely deep-link (unpaired,
+// fatal, timed out, or a route carrying no navigable id). Activity re-snapshots the durable server
+// feed, so we never surface a stale/opaque business id — the connection-state root still shows
+// onboarding/offline/fatal as appropriate underneath.
+const NOTIFICATION_SAFE_PATH = "/activity";
+
+/**
+ * Map an opaque, validated {@link NotificationRoute} to the in-app path a tap navigates to AFTER the
+ * session is authenticated and freshly snapshotted. Approvals live on the Activity screen; a
+ * session-scoped event deep-links to that chat. A route carrying only an opaque `attentionEventId`
+ * (or nothing navigable) falls back to the safe Activity hub. Never derives a path from business
+ * content — only server-issued ids.
+ */
+export function notificationRouteToPath(route: NotificationRoute): string {
+	if (route.approvalId) {
+		return NOTIFICATION_SAFE_PATH;
+	}
+	if (route.sessionId) {
+		return `/chats/${route.sessionId}`;
+	}
+	return NOTIFICATION_SAFE_PATH;
 }
 
 /**
@@ -129,6 +153,7 @@ export function AttentionProvider({
 }: AttentionProviderProps) {
 	const { state, controller: connectionController } = useConnection();
 	const { t } = useI18n();
+	const navigate = useNavigate();
 
 	const [snapshot, setSnapshot] = useState<AttentionSnapshot>(EMPTY_SNAPSHOT);
 	const [permission, setPermission] = useState<NotificationPermissionState>("prompt");
@@ -144,16 +169,30 @@ export function AttentionProvider({
 	permissionRef.current = permission;
 	translateRef.current = t;
 
+	// Production default: a validated tap navigates through the REAL router (this provider is mounted
+	// inside the app's router), and a safe-state tap lands on the neutral Activity hub. Callers may
+	// override either handler (tests) — but wiring is never an optional no-op in production.
+	const defaultNavigate = useCallback(
+		(route: NotificationRoute) => {
+			navigate(notificationRouteToPath(route));
+		},
+		[navigate],
+	);
+	const defaultSafeState = useCallback(() => {
+		navigate(NOTIFICATION_SAFE_PATH);
+	}, [navigate]);
+
 	// Notification-tap callbacks are read through refs so the coordinator (created once) always calls
-	// the latest handler without being torn down and re-registered on every render.
-	const navigateRef = useRef<((route: NotificationRoute) => void) | undefined>(
-		onNotificationNavigate,
+	// the latest handler without being torn down and re-registered on every render. Props override the
+	// production defaults so a tap is always wired to real navigation.
+	const navigateRef = useRef<(route: NotificationRoute) => void>(
+		onNotificationNavigate ?? defaultNavigate,
 	);
-	const safeStateRef = useRef<((route: NotificationRoute) => void) | undefined>(
-		onNotificationSafeState,
+	const safeStateRef = useRef<(route: NotificationRoute) => void>(
+		onNotificationSafeState ?? defaultSafeState,
 	);
-	navigateRef.current = onNotificationNavigate;
-	safeStateRef.current = onNotificationSafeState;
+	navigateRef.current = onNotificationNavigate ?? defaultNavigate;
+	safeStateRef.current = onNotificationSafeState ?? defaultSafeState;
 
 	const schedulerRef = useRef<LocalNotificationScheduler | null>(scheduler ?? null);
 	if (schedulerRef.current === null) {
@@ -214,8 +253,8 @@ export function AttentionProvider({
 			scheduler: activeScheduler,
 			readiness: () => mapReadiness(connectionController.getState()),
 			waitUntilReady: () => waitUntilReady(connectionController, controller),
-			navigate: (route) => navigateRef.current?.(route),
-			showSafeState: (route) => safeStateRef.current?.(route),
+			navigate: (route) => navigateRef.current(route),
+			showSafeState: (route) => safeStateRef.current(route),
 		});
 		coordinator.start();
 		return () => {

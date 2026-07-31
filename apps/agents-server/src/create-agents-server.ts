@@ -47,11 +47,10 @@ import { resolveEffectiveSkills } from "./effective-skill-resolver";
 import { FileProviderRegistryStore } from "./file-provider-registry-store";
 import { McpActionDispatcher } from "./mcp-action-dispatcher";
 import { MobileIngressAuth } from "./mobile-ingress-auth";
+import { createMobileIngressComposition } from "./mobile-ingress-composition";
 import { MobileIngressGenerationFence } from "./mobile-ingress-generation-fence";
-import { MobileAttentionOutboxDrainer } from "./mobile-attention-drainer";
 import {
 	agentsServerClientMethodAllowlist,
-	agentsServerMobileMethodAllowlist,
 	agentsServerRuntimeMethodAllowlist,
 	broadcastApprovalActivityChanged,
 	broadcastMobileAttentionChanged,
@@ -633,36 +632,36 @@ export async function createAgentsServer(
 		// Physically separate Mobile ingress listener: its own loopback port and `/mobile` path, its own
 		// authenticator (device-signature only), generation fence, and strict allowlist. It shares the
 		// process handler map but never the Runtime/Product accepted-role set, so a Mobile peer can only
-		// ever reach the Mobile allowlist surface.
+		// ever reach the Mobile allowlist surface. The listener, its merged attention handlers, and the
+		// transactional-outbox drainer are all built by the pi-free `createMobileIngressComposition` — the
+		// single source of truth that the ingress smoke also drives, so the smoke exercises the real
+		// production wiring rather than a bespoke reimplementation.
+		const mobileComposition = createMobileIngressComposition({
+			serverIdentity: options.bootstrap.serverIdentity,
+			authenticate: mobileIngressAuth.authenticate,
+			handleHttpRequest: mobileIngressAuth.handleHttpRequest,
+			generationFence: mobileGenerationFence,
+			baseHandlers: handlers,
+			mobileAttention: database.mobileAttention,
+			mobileAttentionOutbox: database.mobileAttentionOutbox,
+			// Pushes the mobile-only `attention.changed` hint only when a NEW row was projected; losing
+			// that hint never affects durable recovery because the phone re-reads the feed on reconnect.
+			onAttentionAppended: () => broadcastMobileAttentionChanged(productEventPeers()),
+			reportDiagnostic,
+			onTraffic(direction, bytes, peer) {
+				if (peer.remoteIdentity.deviceKeyId !== undefined) {
+					devTunnelService?.recordTraffic(direction, bytes);
+				}
+			},
+			onClose(_info, peer) {
+				eventRouter.releasePeer(peer);
+			},
+			onError(error) {
+				console.error("agents-server Mobile ingress RPC error.", error);
+			},
+		});
 		const createMobileRpcServer = (port?: number): RpcServer =>
-			createRpcServer({
-				identity: options.bootstrap.serverIdentity,
-				hostname: "127.0.0.1",
-				...(port === undefined ? {} : { port }),
-				path: "/mobile",
-				maxRequestBodyBytes: 32 * 1024,
-				authenticate: mobileIngressAuth.authenticate,
-				handleHttpRequest: mobileIngressAuth.handleHttpRequest,
-				acceptedPeerRoles: ["mobile-client"],
-				generationFence: mobileGenerationFence,
-				handlers,
-				methodAllowlist: agentsServerMobileMethodAllowlist,
-				limits: {
-					maxFrameBytes: productRpcMaxFrameBytes,
-					maxBufferedOutboundBytes: productRpcMaxBufferedOutboundBytes,
-				},
-				onTraffic(direction, bytes, peer) {
-					if (peer.remoteIdentity.deviceKeyId !== undefined) {
-						devTunnelService?.recordTraffic(direction, bytes);
-					}
-				},
-				onClose(_info, peer) {
-					eventRouter.releasePeer(peer);
-				},
-				onError(error) {
-					console.error("agents-server Mobile ingress RPC error.", error);
-				},
-			});
+			mobileComposition.createServer(port);
 		const persistedMobilePort = database.remoteAccess.get().mobileIngressPort;
 		try {
 			mobileRpcServer = createMobileRpcServer(persistedMobilePort);
@@ -694,17 +693,10 @@ export async function createAgentsServer(
 		// The durable Mobile attention feed is fed by a transactional outbox: the approval and Run
 		// repositories write a desensitized outbox row in the SAME transaction as the business write, so
 		// a crash between the business commit and the feed projection can never permanently lose unread.
-		// This independent, idempotent drainer projects committed outbox rows into the feed and enforces
-		// retention. It drains once at startup (replaying anything a crash left behind), on each relevant
-		// live event, and on a bounded periodic backstop. `onAppended` pushes the mobile-only
-		// `attention.changed` hint only when a NEW row was projected; losing that hint never affects
-		// durable recovery because the phone re-reads the feed on reconnect.
-		const attentionDrainer = new MobileAttentionOutboxDrainer({
-			attention: database.mobileAttention,
-			outbox: database.mobileAttentionOutbox,
-			onAppended: () => broadcastMobileAttentionChanged(productEventPeers()),
-			reportDiagnostic,
-		});
+		// This independent, idempotent drainer (owned by the composition) projects committed outbox rows
+		// into the feed and enforces retention. It drains once at startup (replaying anything a crash
+		// left behind), on each relevant live event, and on a bounded periodic backstop.
+		const attentionDrainer = mobileComposition.drainer;
 		attentionDrainerHandle = attentionDrainer.start();
 		unsubscribe = service.subscribe((event) => {
 			eventRouter.publish(productEventPeers(), event, service.getClientRequestId(event.runId));

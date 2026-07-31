@@ -1,11 +1,11 @@
 import type { AckMobileAttentionOutput, ListMobileAttentionOutput } from "@moshu/contracts";
-import type { MobileEventBus } from "./events";
 import {
 	type LocalNotificationScheduler,
 	type NotificationRoute,
 	noopNotificationScheduler,
 	notificationIdForSeq,
 } from "../native/notifications";
+import type { MobileEventBus } from "./events";
 
 // ---------------------------------------------------------------------------
 // AttentionController
@@ -29,6 +29,12 @@ export interface AttentionFeedClient {
 	listAttention(input?: { cursor?: string; limit?: number }): Promise<ListMobileAttentionOutput>;
 	ackAttention(input: { seq: number }): Promise<AckMobileAttentionOutput>;
 }
+
+// Hard upper bound on how many extra pages the notification-route lookup will walk to locate the
+// newest event. The durable feed is capped at 500 events / 100 per page, so the newest event is at
+// most ~5 pages deep; this cap (with margin) keeps the walk strictly bounded even if the feed grows
+// between calls, so a busy feed never triggers an unbounded page crawl.
+const MAX_ROUTE_LOOKUP_PAGES = 12;
 
 /** Generic, already-localized notification copy. Must never contain business content. */
 export interface AttentionNotificationText {
@@ -168,7 +174,7 @@ export class AttentionController {
 		this.#resyncRequired = page.resyncRequired;
 
 		if (notify && page.latestSeq > this.#seenSeq) {
-			await this.#maybeNotify(page.latestSeq, page.items);
+			await this.#maybeNotify(page);
 		}
 		// Whether or not we notified, everything up to latestSeq is now "seen": a later reconnect
 		// snapshot must not resurface these as notifications.
@@ -178,33 +184,68 @@ export class AttentionController {
 		this.#emit();
 	}
 
-	async #maybeNotify(latestSeq: number, items: ListMobileAttentionOutput["items"]): Promise<void> {
+	async #maybeNotify(firstPage: ListMobileAttentionOutput): Promise<void> {
 		// Active app → Activity badge only, no lock-screen banner.
 		if (this.#isAppActive() || !this.#isNotificationsEnabled()) {
 			return;
 		}
 		const text = this.#notificationText();
 		await this.#scheduler.schedule({
-			id: notificationIdForSeq(latestSeq),
+			id: notificationIdForSeq(firstPage.latestSeq),
 			title: text.title,
 			body: text.body,
-			route: this.#routeForSeq(latestSeq, items),
+			// The route resolves the NEWEST event, which is on the LAST page (feed is ascending). When
+			// the newest event is beyond the first page we walk forward via the opaque cursor rather than
+			// giving up, so a busy feed (>1 page) still produces an actionable tap route.
+			route: await this.#resolveRoute(firstPage),
 		});
 	}
 
 	/**
-	 * Build the opaque tap route for the newest event. Only server-issued ids are carried
-	 * (sessionId/approvalId + the stable attention eventId); never any business content. Returns
-	 * `undefined` when the newest event isn't present in the page so we never fabricate a route.
+	 * Resolve the opaque tap route for the newest event (`firstPage.latestSeq`). The feed lists events
+	 * in ascending seq order starting at the retention floor, so on a feed with more than one page the
+	 * newest event is NOT on the first page. We follow the server-issued opaque `nextCursor` forward — a
+	 * strictly bounded walk (the feed is capped at {@link mobileAttentionRetentionMaxEvents}) — until we
+	 * reach the page containing the target seq.
+	 *
+	 * Retention-gap safety: if any page reports `resyncRequired`, events have aged out and the opaque
+	 * ids we hold may be stale, so we return `undefined` (no route). A tap then lands on a safe Activity
+	 * state that re-snapshots the server feed rather than navigating with a stale/guessed id.
 	 */
-	#routeForSeq(
-		latestSeq: number,
-		items: ListMobileAttentionOutput["items"],
-	): NotificationRoute | undefined {
-		const event = items.find((item) => item.seq === latestSeq);
-		if (!event) {
+	async #resolveRoute(
+		firstPage: ListMobileAttentionOutput,
+	): Promise<NotificationRoute | undefined> {
+		const client = this.#client;
+		if (!client || firstPage.resyncRequired) {
 			return undefined;
 		}
+		const targetSeq = firstPage.latestSeq;
+		const direct = firstPage.items.find((item) => item.seq === targetSeq);
+		if (direct) {
+			return this.#buildRoute(direct);
+		}
+		let cursor = firstPage.nextCursor;
+		for (let page = 0; page < MAX_ROUTE_LOOKUP_PAGES && cursor !== undefined; page += 1) {
+			const next: ListMobileAttentionOutput = await client.listAttention({ cursor });
+			// A gap opening up mid-walk means our opaque ids may be stale: fail safe, never guess.
+			if (next.resyncRequired) {
+				return undefined;
+			}
+			const found = next.items.find((item) => item.seq === targetSeq);
+			if (found) {
+				return this.#buildRoute(found);
+			}
+			cursor = next.nextCursor;
+		}
+		// Bounded walk exhausted without locating the target (e.g. it aged out between pages): no route.
+		return undefined;
+	}
+
+	/**
+	 * Build the opaque tap route for a specific event. Only server-issued ids are carried
+	 * (sessionId/approvalId + the stable attention eventId); never any business content.
+	 */
+	#buildRoute(event: ListMobileAttentionOutput["items"][number]): NotificationRoute {
 		const route: { -readonly [K in keyof NotificationRoute]: NotificationRoute[K] } = {
 			attentionEventId: event.eventId,
 		};

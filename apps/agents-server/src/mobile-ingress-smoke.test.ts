@@ -12,28 +12,16 @@ import {
 	type MobileChallengeInput,
 	type MobileChallengeOutput,
 	mobileChallengeOutputSchema,
-	mobileClientProductEventMethods,
-	mobileClientProductRequestMethods,
 	mobileDeviceSchema,
 	productRpcMethods,
 } from "@moshu/contracts";
 import { type AppDatabase, createUuidV7, openAppDatabase } from "@moshu/database";
-import {
-	connectRpcClient,
-	createRpcServer,
-	type RpcMethodAllowlist,
-	type RpcServer,
-} from "@moshu/process-rpc";
+import { connectRpcClient, type RpcHandlers, type RpcServer } from "@moshu/process-rpc";
 
 import { AgentServerIdentity } from "./agent-server-identity";
-import { MobileAttentionOutboxDrainer } from "./mobile-attention-drainer";
 import { MobileIngressAuth } from "./mobile-ingress-auth";
+import { createMobileIngressComposition } from "./mobile-ingress-composition";
 import { MobileIngressGenerationFence } from "./mobile-ingress-generation-fence";
-import {
-	ackMobileAttentionForPeer,
-	listMobileAttentionForPeer,
-	revokeMobileDevice,
-} from "./mobile-ingress-handlers";
 
 const rpcIdentity = {
 	role: "agents" as const,
@@ -42,16 +30,6 @@ const rpcIdentity = {
 	generation: 1,
 };
 const actionJournalEpoch = "550e8400-e29b-41d4-a716-446655440099";
-
-// The Mobile ingress shares the process handler map, but a Mobile peer must only ever reach the
-// strict MVP allowlist — never the full product surface. This mirror is reconstructed from the
-// contract allowlist arrays so the smoke test stays free of the agent-runtime handler wiring.
-const mobileAllowlist: RpcMethodAllowlist = {
-	"mobile-client": {
-		requests: [...mobileClientProductRequestMethods],
-		events: [...mobileClientProductEventMethods],
-	},
-};
 
 const mediumRisk: ActionRisk = { tier: "medium", overridable: true, reasons: ["edit"] };
 
@@ -192,59 +170,46 @@ describe("Mobile ingress transport smoke", () => {
 				isRemoteAccessEnabled: () => true,
 			});
 			const fence = new MobileIngressGenerationFence(database.mobileDevices);
-			// Real production drainer: it projects the transactional outbox into the durable feed exactly
-			// as the Agent Server does at runtime. `onAppended` is the mobile-only `attention.changed`
-			// live hint; losing it never affects durable recovery.
 			let attentionChangedHints = 0;
-			const drainer = new MobileAttentionOutboxDrainer({
-				attention: database.mobileAttention,
-				outbox: database.mobileAttentionOutbox,
-				onAppended: () => {
-					attentionChangedHints += 1;
-				},
-			});
+			// A minimal stub of the shared Product handler map: only the two methods this smoke needs to
+			// prove allowlist isolation. `runtimeGet` is allowlisted; `providersDelete` is NOT — a handler
+			// exists for it, yet the allowlist must still deny it, proving isolation is enforced by policy,
+			// not by the absence of a handler. In production these come from the full product handler map;
+			// the composition merges the durable attention handlers on top of whatever base is supplied.
 			const runtimeGetCalls: string[] = [];
-			server = createRpcServer({
-				identity: rpcIdentity,
-				hostname: "127.0.0.1",
-				path: "/mobile",
-				maxRequestBodyBytes: 32 * 1024,
+			const baseHandlers: RpcHandlers = {
+				requests: {
+					[productRpcMethods.runtimeGet]: (_payload, context) => {
+						runtimeGetCalls.push(context.remoteIdentity.peerId);
+						return { runtimeBoxId: "local", stub: true };
+					},
+					[productRpcMethods.providersDelete]: () => ({ deleted: true }),
+				},
+			};
+			// Drive the REAL production wiring: `createMobileIngressComposition` is the single source of
+			// truth that create-agents-server also uses. It builds the ingress server (identity, /mobile
+			// path, mobile-client role, strict allowlist, frame limits, auth + generation fence), merges
+			// the durable attention list/ack handlers onto the base map, owns the transactional-outbox
+			// drainer, and exposes the shared revoke closure. The smoke never re-declares the allowlist,
+			// re-implements the attention handlers, or hand-builds the drainer/revoke — so a new ingress
+			// method or event added to the composition is automatically exercised here.
+			const composition = createMobileIngressComposition({
+				serverIdentity: rpcIdentity,
 				authenticate: auth.authenticate,
 				handleHttpRequest: auth.handleHttpRequest,
-				acceptedPeerRoles: ["mobile-client"],
 				generationFence: fence,
-				handlers: {
-					requests: {
-						[productRpcMethods.runtimeGet]: (_payload, context) => {
-							runtimeGetCalls.push(context.remoteIdentity.peerId);
-							return { runtimeBoxId: "local", stub: true };
-						},
-						// A handler exists for a forbidden method, yet the allowlist must still deny it —
-						// proving isolation is enforced by policy, not by the absence of a handler.
-						[productRpcMethods.providersDelete]: () => ({ deleted: true }),
-						// The durable attention feed handlers reuse the shared production helpers: the peer's
-						// authenticated identity (never request input) selects the per-device unread state,
-						// so a Mobile client can only ever read/advance its own cursor.
-						[productRpcMethods.mobileAttentionList]: (payload, context) =>
-							listMobileAttentionOutputSchema.parse(
-								listMobileAttentionForPeer(
-									database.mobileAttention,
-									context.peer,
-									(payload ?? {}) as { cursor?: string; limit?: number },
-								),
-							),
-						[productRpcMethods.mobileAttentionAck]: (payload, context) =>
-							ackMobileAttentionOutputSchema.parse(
-								ackMobileAttentionForPeer(
-									database.mobileAttention,
-									context.peer,
-									payload as { seq: number },
-								),
-							),
-					},
+				baseHandlers,
+				mobileAttention: database.mobileAttention,
+				mobileAttentionOutbox: database.mobileAttentionOutbox,
+				// The mobile-only `attention.changed` live hint; losing it never affects durable recovery.
+				onAttentionAppended: () => {
+					attentionChangedHints += 1;
 				},
-				methodAllowlist: mobileAllowlist,
+				revokeDeviceKey: (input) => auth.revokeDevice(input),
+				disconnectMobileDevice,
 			});
+			const drainer = composition.drainer;
+			server = composition.createServer();
 
 			// 1) Desktop mints a pairing; the phone claims it over the pre-auth HTTP endpoint.
 			const device = createDeviceKey();
@@ -389,14 +354,10 @@ describe("Mobile ingress transport smoke", () => {
 			// 6) Revoking the device runs the REAL shared revoke composition: it revokes the durable key,
 			// drops the device's server-side unread cursor (so a re-paired client id can never inherit
 			// stale read state), and tears down the live peer.
-			revokeMobileDevice(
-				{
-					mobileAttention: database.mobileAttention,
-					revokeDeviceKey: (input) => auth.revokeDevice(input),
-					disconnectMobileDevice,
-				},
-				{ mobileClientId: approved.mobileClientId, deviceKeyId: "device-key-1" },
-			);
+			composition.revoke({
+				mobileClientId: approved.mobileClientId,
+				deviceKeyId: "device-key-1",
+			});
 			await secondPeer.closed;
 
 			const revokedInput: MobileChallengeInput = {
