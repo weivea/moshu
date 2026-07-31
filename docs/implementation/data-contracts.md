@@ -456,6 +456,16 @@ Layer 3 在独立的 Mobile 接入面上新增合同（见 `packages/contracts/s
 - **设备列表分页（lifetime capacity）**：吊销设备永久保留作审计，设备数量随生命周期无上限增长。`mobile.device.list` 采用 keyset/cursor 分页（`{ cursor?, limit≤128 }` → `{ items≤128, nextCursor? }`），稳定排序 `(active 优先, createdAtMs, id)`；单页 schema 恒有效，Desktop 通过 `nextCursor` 逐页加载（“加载更多”）遍历/管理全部 active 设备。绝不静默丢弃 active 设备。
 - **配对 fail-closed（Remote Access 未启用 / ingress 未就绪）**：`pairing.create` 仅在 **Remote Access `enabled===true`** 且 mobile ingress ready 且有 exact public URL 时创建；否则抛稳定 `MOBILE_INGRESS_NOT_READY` 且**不创建/消耗任何 pairing 记录**。注意 `disable()` 会先持久化 `enabled=false`、随后才异步 stop ingress，过渡期 readiness/URL 仍可见——server 因此同时对 enabled 与 URL 双重 gate（`getMobilePublicUrl` + `isRemoteAccessEnabled`），保证过渡期零副作用 fail closed。Desktop 创建按钮 `disabled` 直到 `mobileAccess.status.remoteAccessEnabled && ingressReady && publicUrl`，并对 legacy 无 URL 的 pending 显式 expire/重建，避免产生无 QR 的失效配对。
 
+### 9.4 iOS Mobile App 客户端合同消费（Layer 4，已实现）
+
+Layer 4 是 §9.3 server 合同的 **iOS client 侧实现**（见 `apps/mobile/`：`src/native/transport-plugin.ts`、`src/rpc/*`、`native/MoshuMobile/Sources/MoshuMobileCore/*`、`ios/App/App/plugins/*`）。所有 wire 合同均沿用 `packages/contracts/src/mobile.ts`，client 不新增 server 合同。
+
+- **canonical payload byte-parity**：`createMobileServerChallengePayload` / `createMobileAuthenticationPayload`（`JSON.stringify` 固定字段数组）是签名/验签的唯一字节来源。`apps/mobile/scripts/gen-canonical-vectors.ts` 从 TS 合同生成共享 fixture `native/MoshuMobile/Tests/.../Fixtures/mobile-canonical-vectors.json`，Swift `MoshuMobileCore` XCTest 与 Web `test/canonical-vectors.test.ts` 同时消费，证明 Swift/TS **canonical payload 逐字节一致**。注意 CryptoKit Ed25519 签名**随机化**（非 RFC 8032 确定性），故 vectors 只断言**跨实现验签**通过，不断言签名字节相等。
+- **设备公钥 canonical SPKI DER**：Ed25519 公钥以 12 字节 SPKI 前缀 `302a300506032b6570032100` + 32 字节 raw = 44 字节 DER，base64url（去 padding）承载于 claim 与设备身份，供 server 校验指纹（`SHA256:base64url`）。
+- **WSS upgrade headers**：device 用 Keychain 私钥签 canonical authentication payload，经 `URLSessionWebSocketTask` 以 `x-moshu-mobile-client-id` / `x-moshu-device-key-id` / `x-moshu-instance-id` / `x-moshu-generation` / `x-moshu-protocol-version` / `x-moshu-challenge-id` / `x-moshu-signature`（base64url device 签名）连接 `/mobile`。长期凭据只走 header/签名，**绝不放 query string**。
+- **client 侧 allowlist**：Product client 严格只调用 `mobileClientProductRequestMethods` / 订阅 `mobileClientProductEventMethods`，不尝试任何 Desktop-only 方法；连接恢复 subscribe→buffer→replay（durable cursor）→runId/seq dedupe→flush→ready。所有 response/event 严格 Zod。
+- **client-side 状态与持久化边界**：`fatalCodeMap`（`connection-controller.ts`）区分致命（`AUTH_REVOKED` / `PROTOCOL_MISMATCH` / `IDENTITY_MISMATCH` / `URL_INVALID` / `PAIRING_REJECTED`，不可盲重试）与网络失败（offline/reconnecting）；Swift `MobileTransportError` rawValue 与之逐一对应。仅 `connected` 态暴露业务数据，断线即清空；业务数据只存 React 内存，binding/private key 只在 native Keychain，仅 appearance/language 可持久化。
+
 
 ## 10. Policy、Approval 与 Execution Grant
 

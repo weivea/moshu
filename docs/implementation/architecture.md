@@ -419,14 +419,15 @@ agentDataDirectory/
 - **Desktop UX**：Chat 流内的等待审批卡片（Tool、目标、脱敏 command/path/operation、风险原因、时间/状态；
   Approve once / Reject / Allow all for this Session，处理 loading、已被另一端决定、冲突、离线、过期、取消）；
   侧栏全局 Activity 入口列出跨 Session 待办并可导航到 Session。
-- **仍未实现**：Mobile client 的 iOS App 本体（apps/mobile、native plugin、通知）不在本层；Mobile ingress、
-  配对与设备认证已由 Layer 3 落地（见 §9.0.2）。
+- **本层（Layer 2）不含**：Mobile client 的 iOS App 本体（apps/mobile、native plugin）不在本层，已由 Layer 4
+  落地（见 §9.0.3）；Mobile ingress、配对与设备认证由 Layer 3 落地（见 §9.0.2）；移动通知后台属 Layer 5。
 
 ### 9.0.2 Layer 3 Mobile ingress、二维码配对与设备认证（已实现）
 
 > Mobile stack Layer 3 在 Layer 1 的 browser-safe RPC/multi-client/multi-port 底座与 Layer 2 的 durable
 > approvals 之上，落地了**独立的 Mobile 接入面**：专属 ingress、二维码配对、Ed25519 设备认证与严格 allowlist。
-> **iOS App 本体（Layer 4：Capacitor/Swift plugin）与移动通知后台（Layer 5）尚未实现**；本层交付的是移动端可
+> **iOS App 本体（Layer 4：Capacitor Web UI + 原生 Swift 安全传输）已实现（见 §9.0.3）；移动通知后台/suspended
+> 可靠投递（Layer 5）尚未实现**；本层交付的是移动端可
 > 安全接入所需的 server + Desktop 侧全部合同与实现。
 
 - **独立 Mobile ingress**：Agent Server 启动一个固定 loopback listener，路径 `/mobile`，作为独立 `RpcServer`
@@ -465,8 +466,52 @@ agentDataDirectory/
   锁定并测试）、过期倒计时、pending claim 的设备名/平台/公钥指纹、approve/reject、已配对设备列表/revoke。
   **只有本地 Desktop Product RPC 能 create/approve/revoke，Mobile ingress 不能自批**；二维码 payload 不写
   localStorage/日志，组件 unmount/过期即清理显示。中英 i18n、a11y、loading/error/expired/revoked 状态齐备。
-- **仍未实现**：apps/mobile 的 Capacitor/Swift plugin（Layer 4）与移动通知后台（Layer 5）；首版 Mobile client
-  只绑定一个 Agent Server（由 client 实现），Desktop 必须在线；URL/server identity 变化需要重新配对。
+- **仍未实现**：移动通知后台/suspended 可靠投递与发布加固（Layer 5）；iOS App 本体（Layer 4）已实现，见 §9.0.3。
+  首版 Mobile client 只绑定一个 Agent Server（由 client 实现），Desktop 必须在线；URL/server identity 变化需要重新配对。
+
+### 9.0.3 Layer 4 iOS Mobile App（已实现）
+
+> Mobile stack Layer 4 在 Layer 3 的 Mobile ingress/配对/设备认证之上，落地了**真正可构建的 iPhone App**：
+> Capacitor Web UI + 原生 Swift 安全传输。交付物是同 monorepo 的 `apps/mobile` workspace 加原生
+> `MoshuMobileTransport` plugin。**移动通知后台/suspended 可靠投递与发布加固仍属 Layer 5**；App active/foreground
+> 的基本连接生命周期可用。
+
+- **Web 应用（`apps/mobile`）**：React + Vite + TypeScript strict + HeroUI + React Router HashRouter，
+  独立 mobile shell（底部 Chats/Projects/Activity/Settings tabs），不复制 Desktop 三栏/760px shell。
+  `base:"./"`、Capacitor `webDir:"dist"`、无 `server.url`——Web assets 随 App 本地打包，Agent Server 只传数据。
+  `viewport-fit=cover`、`100dvh`、safe-area、自管内部 scroll、VisualViewport/键盘 composer 避让、touch target、
+  VoiceOver labels、light/dark、中英 i18n。复用 `@moshu/contracts` 与 `@moshu/ui` tokens，不引入 Electrobun 依赖。
+- **Capacitor iOS 工程**：Capacitor 8、SPM 模式、deployment target iOS 15+、开发 bundle id `dev.moshu.mobile`；
+  iOS `contentInset:"never"`、外层 scroll disabled。Info.plist **仅**申请相机（二维码）使用说明，
+  **无宽泛 ATS 例外、无 Local Network/Bonjour**；保留自定义 URL scheme deeplink hook 但首版不依赖。
+  二维码扫描用 AVFoundation 原生 scanner，结果只在内存，绝不写日志/localStorage。不写死个人签名凭据/Team ID。
+- **原生安全身份 + authenticated WebSocket plugin（`MoshuMobileTransport`）**：JS 不可接触 private key。
+  CryptoKit `Curve25519.Signing`（Ed25519）生成**软件**设备 key（非 Secure Enclave），private key 存 Keychain
+  `kSecAttrAccessibleWhenUnlockedThisDeviceOnly` + 不同步 iCloud；公开 key 用 server contract 要求的 canonical
+  SPKI DER。**单 Server binding**：保存 exact mobile URL、agentServerId、server 公钥/指纹、mobileClientId/
+  deviceKeyId/协议；已绑定拒绝覆盖，显式 unpair 才清 Keychain binding/private key 并关闭 socket。**配对**：
+  解析/验证 versioned 二维码（URL/expiry/协议/server identity）→ URLSession POST claim、签名轮询 status →
+  approved 后核对 Agent Server 公钥与二维码指纹并原子持久化；reject/expire 清临时 key/state，绝不输出
+  code/claimToken/key 到日志/error。**重连**：Keychain 持久单调 generation、每次连接新 instanceId；URLSession
+  请求 challenge、验证 Agent Server 应用层 Ed25519 签名与 pinned server 公钥，再用设备 key 签 canonical upgrade
+  payload，经 `URLSessionWebSocketTask` 带 `x-moshu-*` headers 连 WSS。TLS 只信系统信任链（relay TLS 可见，
+  不错误 pin relay cert）。receive loop 按 connectionId + 单调 frame sequence 上送 JS，限制帧/队列大小、
+  backpressure、拒绝 binary、丢弃旧连接；App 进入 active 可连接，显式 close 可重复。
+- **共享 canonical test vectors**：从 TS contracts 固定 fixture，Swift `MoshuMobileCore` 纯包（`swift test`）消费，
+  证明 Swift/TS canonical payload 逐字节一致。注意 CryptoKit Ed25519 签名为**随机化**（非 RFC 8032 确定性），
+  故 vectors 断言**跨实现验签**通过而非签名字节相等；SPKI DER、base64url、challenge 验签、generation 递增、
+  单绑定/unpair、帧序列/限额均有 XCTest。
+- **Browser-safe RPC/Product client**：复用 Layer 1 `@moshu/process-rpc-core` 的 RpcPeer/RpcSocketTransport，
+  写 Capacitor 原生 transport adapter（不引入 `node:crypto/net/tls`、Buffer、ws、Bun）。JS 完成 process-rpc
+  hello/ack 与 expected Agent Server identity；identity mismatch 立即 close/清 volatile state，不自动改 pin。
+  Product client 严格调用 Layer 3 allowlist，不尝试 Desktop-only 方法；连接恢复 subscribe→buffer→replay→
+  runId/seq dedupe→flush→ready。chat.send requestId 幂等；断线不自动重发未知 send、不离线 queue；
+  cancel/approval 决策使用既有 CAS/idempotency。**业务数据仅存 React 内存**：Session/Project/message/approval
+  绝不写 localStorage/Preferences/Keychain；仅 appearance/language 可持久化，binding 仅在 native Keychain。
+- **验证**：47 Vitest（native plugin mock、pairing 状态、单绑定、断线清业务态、无持久化、RPC schema/allowlist、
+  subscribe/replay 边界、stream/cancel、approval race/allow-all、Projects、RuntimeBox 独立选择、responsive/
+  safe-area/键盘、i18n parity）、30 Swift XCTest、`tsc` strict typecheck、`vite build`、`cap sync ios` 与
+  iOS simulator `xcodebuild`（禁签名）构建通过。生产 bundle 无 node builtins、无 secret、无 remote UI URL。
 
 ### 9.1 请求流程
 
