@@ -36,7 +36,6 @@ export interface ActionClassification {
 	summary: RedactedActionSummary;
 }
 
-const maxCommandSummaryLength = 2_048;
 const maxPathSummaryLength = 1_024;
 
 // Patterns that additionally raise a shell command from high to *critical*:
@@ -72,112 +71,22 @@ const criticalBashPatterns: { pattern: RegExp; reason: string }[] = [
 	},
 ];
 
-// --- Fail-closed shell command preview ------------------------------------
+// --- Fixed shell command preview ------------------------------------------
 //
-// A shell command's public preview must never expose a credential. The argument
-// surface of a shell is unbounded — attached credential flags (`-uuser:secret`,
-// `-pSECRET`), arbitrary/unknown flags, URL userinfo, query secrets, env
-// assignments, and operator right-hand sides — so no denylist can be trusted.
-// The preview is therefore fully fail-closed: it discloses ONLY the safely
-// parsed executable basename (or "shell" when that cannot be proven), followed
-// by "[arguments hidden]". No argv, flag value, URL, env assignment, or operator
-// right-hand side is ever shown. The raw validated command stays exclusively on
-// the server-only execution path (the Action intent); it never reaches the
-// Approval contract, events, UI, or logs.
+// A shell command's argument surface is unbounded, and every attempt to derive
+// something "safe" to display (executable name, basename, first token) is
+// exploitable: operator/assignment gluing (`SAFE=1;curl -pSECRET`), leading
+// flags, newlines, semicolons, quoting, escapes, and Unicode all let a secret
+// masquerade as the program word. So the public preview for ANY bash/shell
+// Action is a FIXED CONSTANT — the command is never parsed. The Approval Tool
+// field already identifies "bash"; the raw validated command lives only on the
+// server-only Action-intent execution path and never reaches the Approval
+// contract, events, UI, or logs.
 
-const hiddenArgumentsLabel = "[arguments hidden]";
-const shellFallbackLabel = "shell";
+export const shellApprovalPreview = "shell [arguments hidden]";
 
-export function buildSafeCommandPreview(command: string): string {
-	return truncate(
-		`${shellExecutableLabel(command)} ${hiddenArgumentsLabel}`,
-		maxCommandSummaryLength,
-	);
-}
-
-// Discloses only the executable basename we can *prove* safe to show. Unbalanced
-// quotes, command/process substitution, a quoted or metacharacter-bearing
-// program word, or an empty command all collapse to "shell".
-function shellExecutableLabel(command: string): string {
-	const tokens = tokenizeCommand(command);
-	if (tokens === null) {
-		return shellFallbackLabel;
-	}
-	let index = 0;
-	// Skip leading `NAME=VALUE` environment assignments; their value may be secret.
-	while (index < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[index] ?? "")) {
-		index += 1;
-	}
-	const executable = tokens[index];
-	if (executable === undefined || executable.length === 0) {
-		return shellFallbackLabel;
-	}
-	const basename = executable.slice(executable.lastIndexOf("/") + 1);
-	// Only a clean, metacharacter-free program name is ever disclosed.
-	if (!/^[A-Za-z0-9._+-]{1,64}$/.test(basename)) {
-		return shellFallbackLabel;
-	}
-	return basename;
-}
-
-// Conservative POSIX-ish tokenizer. Returns null on unbalanced quotes so the
-// caller fails closed instead of guessing. Only used to locate the executable;
-// argument contents are never surfaced.
-function tokenizeCommand(command: string): string[] | null {
-	const tokens: string[] = [];
-	let current = "";
-	let has = false;
-	let quote: '"' | "'" | null = null;
-	for (let i = 0; i < command.length; i += 1) {
-		const ch = command[i] ?? "";
-		if (quote === "'") {
-			if (ch === "'") {
-				quote = null;
-			} else {
-				current += ch;
-			}
-			continue;
-		}
-		if (quote === '"') {
-			if (ch === "\\" && i + 1 < command.length) {
-				i += 1;
-				current += command[i] ?? "";
-			} else if (ch === '"') {
-				quote = null;
-			} else {
-				current += ch;
-			}
-			continue;
-		}
-		if (ch === "'" || ch === '"') {
-			quote = ch;
-			has = true;
-			continue;
-		}
-		if (ch === "\\" && i + 1 < command.length) {
-			i += 1;
-			current += command[i] ?? "";
-			has = true;
-			continue;
-		}
-		if (/\s/.test(ch)) {
-			if (has) {
-				tokens.push(current);
-				current = "";
-				has = false;
-			}
-			continue;
-		}
-		current += ch;
-		has = true;
-	}
-	if (quote !== null) {
-		return null;
-	}
-	if (has) {
-		tokens.push(current);
-	}
-	return tokens;
+export function buildSafeCommandPreview(_command: string): string {
+	return shellApprovalPreview;
 }
 
 function truncate(value: string, max: number): string {

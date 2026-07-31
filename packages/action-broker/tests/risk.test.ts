@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { buildSafeCommandPreview, classifyExecutorAction, classifyMcpAction } from "../src";
+import {
+	buildSafeCommandPreview,
+	classifyExecutorAction,
+	classifyMcpAction,
+	shellApprovalPreview,
+} from "../src";
 
 describe("server-authoritative risk classification", () => {
 	test("read/search/list actions are low risk and never require approval", () => {
@@ -119,43 +124,80 @@ describe("server-authoritative risk classification", () => {
 		}
 	});
 
-	test("shell command preview discloses only the executable basename", () => {
-		const cases: { command: string; label: string }[] = [
-			{ command: "curl -u alice:supersecret https://x", label: "curl" },
-			{ command: "/bin/bash -c 'echo hi'", label: "bash" },
-			{ command: "/usr/bin/env python3 deploy.py", label: "env" },
-			{ command: "TOKEN=abc bash script.sh", label: "bash" },
-			{ command: "./run.sh --secret v", label: "run.sh" },
-			{ command: "   git   push --force  ", label: "git" },
-			// A substitution / metacharacter program word cannot be proven safe.
-			{ command: "$(cat evil) arg", label: "shell" },
-			{ command: "`evil` arg", label: "shell" },
-			{ command: "'quoted prog' arg", label: "shell" },
-			{ command: "", label: "shell" },
+	test("shell command preview is always the fixed constant, never derived from input", () => {
+		// No parsing of any kind: executable/basename/first-token derivation is
+		// unbounded and exploitable (operator gluing, assignment gluing, leading
+		// flags, newlines, semicolons, quotes, escapes, Unicode). The public
+		// preview is a fixed constant for EVERY input.
+		expect(shellApprovalPreview).toBe("shell [arguments hidden]");
+		const hostileInputs: string[] = [
+			"",
+			" ",
+			"\n",
+			"\t\r\n",
+			"echo hi",
+			"curl -u alice:supersecret https://x",
+			// Assignment gluing: the classic basename bypass.
+			"SAFE=1;curl -pRawSecret123",
+			"SAFE=1;curl -uuser:RawSecret123 https://x",
+			"A=1 B=2 C=3;wget --header=Authorization:tok https://x",
+			// Operator gluing.
+			"x;curl -pRawSecret123",
+			"true&&curl -pRawSecret123",
+			"false||sshpass -pUnmaskedValueDEF ssh h",
+			"a|curl -pRawSecret123",
+			// Leading flags masquerading as the program word.
+			"-pLeadingFlagSecret",
+			"--oauth2-bearer UnmaskedValueABC",
+			"-uuser:RawSecret123",
+			// Attached/separate credential flags.
+			"curl -uuser:RawSecret123 https://x",
+			"sshpass -pUnmaskedValueDEF ssh host",
+			"curl --oauth2-bearer UnmaskedValueABC https://x",
+			"deploy --totally-unknown-flag zzUnknownFlagSecret",
+			"deploy --totally-unknown-flag=zzAttachedUnknown",
+			// URL userinfo / query secrets.
+			"curl https://user:urlUserSecret@example.com",
+			'curl "https://x/api?token=urlQuerySecret&q=1"',
+			// Env assignments.
+			"API_TOKEN=envSecretValue run",
+			"MYAPP_WHATEVER=unknownEnvSecret run",
+			// Quotes / pipes / substitution.
+			'echo "quotedSecretVal" | curl -d @- https://x',
+			"curl $(printf subShellSecret) https://x",
+			"curl `printf backtickSecret` https://x",
+			"bash <(echo procSubSecret)",
+			"run --password 'unbalQuoteSecret",
+			// Newline / semicolon embedded secrets.
+			"echo one\nSECRET_TOKEN=leakme curl https://x",
+			"foo; SECRET_TOKEN=leakme; bar",
+			// Unicode / escape obfuscation.
+			"café=1;cûrl -pUnicodeSecretÿ",
+			"printf '\\x41\\x42' ; run --token escapeSecret",
+			// Backslash-glued.
+			"SAFE=1\\;curl -pRawSecret123",
 		];
-		for (const { command, label } of cases) {
-			expect(buildSafeCommandPreview(command)).toBe(`${label} [arguments hidden]`);
+		for (const command of hostileInputs) {
+			expect(buildSafeCommandPreview(command)).toBe(shellApprovalPreview);
 		}
 	});
 
-	test("no secret sentinel leaks into the shell preview or serialized Approval summary", () => {
-		// Attached/separate credential flags, arbitrary/unknown flags, URL
-		// userinfo/query, env assignments, quotes, pipes, and substitution must all
-		// keep their secret out of every public projection. A denylist is not
-		// trusted: only the executable basename is ever shown.
+	test("no input substring or secret sentinel ever reaches the public preview or summary", () => {
 		const cases: { command: string; secret: string }[] = [
+			{ command: "SAFE=1;curl -pRawSecret123", secret: "RawSecret123" },
+			{ command: "x;curl -pRawSecret123", secret: "RawSecret123" },
+			{ command: "-pLeadingFlagSecret", secret: "LeadingFlagSecret" },
 			{ command: "curl -uuser:RawSecret123 https://x", secret: "RawSecret123" },
 			{ command: "curl --oauth2-bearer UnmaskedValueABC https://x", secret: "UnmaskedValueABC" },
 			{ command: "sshpass -pUnmaskedValueDEF ssh host", secret: "UnmaskedValueDEF" },
 			{ command: "curl -u alice:supersecret https://x", secret: "supersecret" },
 			{ command: "deploy --password hunter2", secret: "hunter2" },
-			{ command: "deploy --password=hunter2", secret: "hunter2" },
 			{
 				command: "deploy --totally-unknown-flag zzUnknownFlagSecret",
 				secret: "zzUnknownFlagSecret",
 			},
 			{ command: "deploy --totally-unknown-flag=zzAttachedUnknown", secret: "zzAttachedUnknown" },
-			{ command: "curl https://alice:urlUserSecret@example.com", secret: "urlUserSecret" },
+			{ command: "curl https://user:urlUserSecret@example.com", secret: "urlUserSecret" },
 			{ command: 'curl "https://x/api?token=urlQuerySecret&q=1"', secret: "urlQuerySecret" },
 			{ command: "API_TOKEN=envSecretValue run", secret: "envSecretValue" },
 			{ command: "MYAPP_WHATEVER=unknownEnvSecret run", secret: "unknownEnvSecret" },
@@ -164,29 +206,18 @@ describe("server-authoritative risk classification", () => {
 			{ command: "curl `printf backtickSecret` https://x", secret: "backtickSecret" },
 			{ command: "bash <(echo procSubSecret)", secret: "procSubSecret" },
 			{ command: "run --password 'unbalQuoteSecret", secret: "unbalQuoteSecret" },
+			{ command: "SECRET_TOKEN=leakme $(do)", secret: "leakme" },
 		];
 		for (const { command, secret } of cases) {
 			const preview = buildSafeCommandPreview(command);
+			expect(preview).toBe(shellApprovalPreview);
 			expect(preview).not.toContain(secret);
-			expect(preview.endsWith("[arguments hidden]")).toBe(true);
 			// The full server-authoritative summary/risk that is persisted and
-			// broadcast must likewise never carry the secret.
+			// broadcast must likewise never carry the secret or any raw argument.
 			const classification = classifyExecutorAction({ tool: "bash", arguments: { command } });
+			expect(classification.summary.command).toBe(shellApprovalPreview);
 			expect(JSON.stringify(classification.summary)).not.toContain(secret);
 			expect(JSON.stringify(classification.risk)).not.toContain(secret);
 		}
-	});
-
-	test("command preview reduces unparseable commands to a safe label", () => {
-		expect(buildSafeCommandPreview("curl $(cat /run/secrets/token) https://x")).toBe(
-			"curl [arguments hidden]",
-		);
-		expect(buildSafeCommandPreview("deploy `cat secret`")).toBe("deploy [arguments hidden]");
-		// Unbalanced quotes → fail closed to "shell", never leak the trailing literal.
-		expect(buildSafeCommandPreview('run --password "unterminated hunter2')).toBe(
-			"shell [arguments hidden]",
-		);
-		// A leading secret env assignment must not leak through the fallback label.
-		expect(buildSafeCommandPreview("SECRET_TOKEN=leakme $(do)")).toBe("shell [arguments hidden]");
 	});
 });

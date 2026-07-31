@@ -39,7 +39,7 @@ function buildRequest(overrides: Partial<ApprovalRequest> = {}): ApprovalRequest
 			tool: "bash",
 			operation: "bash",
 			target: { kind: "runtime-box", id: "local" },
-			command: "rm [arguments hidden]",
+			command: "shell [arguments hidden]",
 			redactedParams: {},
 		},
 		risk: {
@@ -99,7 +99,7 @@ describe("ApprovalCard", () => {
 	test("renders tool, command, risk reason, and actions", () => {
 		renderCard(buildRequest(), buildPolicy());
 		expect(screen.getByRole("heading", { name: "bash" })).toBeInTheDocument();
-		expect(screen.getByText("rm [arguments hidden]")).toBeInTheDocument();
+		expect(screen.getByText("shell [arguments hidden]")).toBeInTheDocument();
 		expect(
 			screen.getByText("Runs a shell command whose full effect is hidden for security"),
 		).toBeInTheDocument();

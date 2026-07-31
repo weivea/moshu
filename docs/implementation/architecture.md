@@ -394,10 +394,11 @@ agentDataDirectory/
   bash/shell → **一律不可覆盖**（fail-closed：shell 的真实效果无法被 denylist 静态证明为安全，故解释器路径、
   env 包装、引号/命令替换、混淆都不能降级），命中危险模式（sudo、`rm -rf`、mkfs、`dd of=`、fork bomb、
   `curl|sh` 等）仅将 tier 由 high 抬升到 critical 并附原因；MCP → high 可覆盖。shell summary 的 command 是
-  **完全 fail-closed 预览**：只公开可安全解析出的**可执行文件 basename**（无法证明时显示 `shell`）+
-  `[arguments hidden]`，绝不公开任何 argv、flag value（含 `-uuser:secret`、`-pSECRET` 等贴合式）、URL、
-  env 赋值或 operator 右侧——不依赖任何 secret denylist。原始 validated 命令只留在 server 侧执行路径
-  （Action intent），绝不进入 Approval 合同/事件/UI/日志。
+  **完全 fail-closed 的固定常量** `shell [arguments hidden]`：对 bash/shell Action **完全不解析命令**——不推导
+  可执行文件/basename/首 token（因为运算符粘连 `SAFE=1;curl -pSECRET`、前导 flag、换行、分号、引号、转义、
+  Unicode 都能让 secret 伪装成程序词），因此无论输入如何，公开预览恒为该常量，绝不公开任何 argv、flag value、
+  URL、env 赋值或 operator 右侧——不依赖任何 secret denylist。Approval 的 Tool 字段已单独标识 `bash`；原始
+  validated 命令只留在 server 侧执行路径（Action intent），绝不进入 Approval 合同/事件/UI/日志。
 - **持久化与并发**：approval request 与 session allow-all policy 持久到 SQLite，带 monotonic revision/CAS 与
   唯一 decision idempotency key。Action intent 与 Approval 状态转换在事务边界内，不会“决定成功但 action 未持久”。
 - **决策语义**：approve → CAS decision → grant → resume；reject/expire/cancel → 持久终态并让 Tool/Run 得到
