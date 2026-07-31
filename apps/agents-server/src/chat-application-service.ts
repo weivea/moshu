@@ -164,6 +164,7 @@ export interface ChatApplicationServiceOptions {
 	logger?: ChatServiceLogger;
 	isRuntimeReady?: (runtimeBoxId: string) => boolean;
 	getActiveRuntimeBoxId?: () => string;
+	getActiveRuntimeBoxIdForClient?: (clientId: string) => string;
 	withProjectSessionCreation?: <T>(
 		projectId: string,
 		createSession: () => T,
@@ -195,6 +196,13 @@ export interface ChatApplicationServiceOptions {
 	agentSessionCleanupStartupTimeoutMs?: number;
 	agentSessionCleanupStartupMaxAttempts?: number;
 	shutdownTimeoutMs?: number;
+	/**
+	 * Invoked with the retired session ids whenever a Session's runs are retired through this service
+	 * (both direct `deleteSession` and any future retire path). Centralizing the notification here —
+	 * rather than only wiring it into the Project retirement callback — guarantees that every delete/
+	 * retire path (including direct product-rpc `session.delete`) tears down live event subscriptions.
+	 */
+	onSessionsRetired?: (sessionIds: readonly string[]) => void;
 }
 
 export interface SendChatMessageInput {
@@ -233,6 +241,8 @@ export class ChatApplicationService {
 	readonly #logger: ChatServiceLogger;
 	readonly #isRuntimeReady: (runtimeBoxId: string) => boolean;
 	readonly #getActiveRuntimeBoxId: () => string;
+	readonly #getActiveRuntimeBoxIdForClient: (clientId: string) => string;
+	readonly #onSessionsRetired: (sessionIds: readonly string[]) => void;
 	readonly #withProjectSessionCreation:
 		| (<T>(projectId: string, createSession: () => T, signal?: AbortSignal) => Promise<T>)
 		| undefined;
@@ -291,6 +301,9 @@ export class ChatApplicationService {
 		this.#logger = options.logger ?? console;
 		this.#isRuntimeReady = options.isRuntimeReady ?? (() => true);
 		this.#getActiveRuntimeBoxId = options.getActiveRuntimeBoxId ?? (() => defaultLocalRuntimeBoxId);
+		this.#getActiveRuntimeBoxIdForClient =
+			options.getActiveRuntimeBoxIdForClient ?? (() => defaultLocalRuntimeBoxId);
+		this.#onSessionsRetired = options.onSessionsRetired ?? (() => undefined);
 		this.#withProjectSessionCreation = options.withProjectSessionCreation;
 		this.#withProjectRunPreflight = options.withProjectRunPreflight;
 		this.#actions = options.actions;
@@ -558,13 +571,29 @@ export class ChatApplicationService {
 				signal,
 			);
 		}
-		this.#assertRuntimeReady(request.runtimeBoxId ?? this.#getActiveRuntimeBoxId());
-		return this.#sessions.createIdempotently({ request, origin });
+		const runtimeBoxId =
+			request.runtimeBoxId ?? this.#getActiveRuntimeBoxIdForClient(origin.peerId);
+		this.#assertRuntimeReady(runtimeBoxId);
+		return this.#sessions.createIdempotently({
+			request: { ...request, runtimeBoxId },
+			origin,
+		});
 	}
 
 	listSessions(input: ListChatSessionsInput = {}): ListChatSessionsOutput {
 		this.#assertDataPlaneAvailable();
 		return this.#sessions.list(listChatSessionsInputSchema.parse(input));
+	}
+
+	// Validates that a Session exists and is currently visible, so callers (e.g. the event-hub
+	// subscribe handler) never register interest in a missing, deleting, or retired Session. Throws
+	// ChatSessionNotFoundError (mapped to a stable SESSION_NOT_FOUND handler error) when it is not.
+	assertSessionVisible(sessionId: string): void {
+		this.#assertDataPlaneAvailable();
+		if (this.#deletingSessions.has(sessionId) || this.#runs.isSessionRetired(sessionId)) {
+			throw new ChatSessionNotFoundError(sessionId);
+		}
+		this.#sessions.get({ sessionId });
 	}
 
 	listRetiredSessions(input: ListRetiredChatSessionsInput): ListRetiredChatSessionsOutput {
@@ -622,6 +651,10 @@ export class ChatApplicationService {
 			this.#deletingSessions.delete(parsedInput.sessionId);
 			throw error;
 		}
+		// Notify retirement here so a direct session delete tears down live event subscriptions exactly
+		// like a Project retirement does. The early-return paths above (already-deleting, already-retired)
+		// intentionally do not re-notify.
+		this.#onSessionsRetired([deleted.sessionId]);
 		const result = Promise.resolve({ sessionId: deleted.sessionId });
 		this.#sessionDeletions.set(parsedInput.sessionId, result);
 		const cleanup = this.#attemptAgentSessionCleanup(parsedInput.sessionId, 0);

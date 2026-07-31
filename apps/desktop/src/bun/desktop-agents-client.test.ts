@@ -7,6 +7,7 @@ import {
 	cancelChatRunInputSchema,
 	cancelChatRunOutputSchema,
 	chatSendAcceptedOutputSchema,
+	chatSubscribeInputSchema,
 	confirmCreateProjectInputSchema,
 	confirmCreateProjectOutputSchema,
 	createChatSessionOutputSchema,
@@ -816,6 +817,150 @@ describe("DesktopAgentsClient", () => {
 		expect(createCalls).toBe(2);
 		await expect(client.createSession(crypto.randomUUID())).resolves.toBeDefined();
 		client.close();
+	});
+
+	test("returns a successful sessionDelete even when its own retirement notification races the response", async () => {
+		const targetSessionId = createRetirementSessionId(1);
+		let connectionOptions: ConnectRpcClientOptions | undefined;
+		let deleteCalls = 0;
+		const peer = new FakePeer(async (method, payload) => {
+			if (method === productRpcMethods.sessionDelete) {
+				deleteCalls += 1;
+				const sessionId = deleteChatSessionInputSchema.parse(payload).sessionId;
+				// Reproduce the server broadcasting the resulting retirement to THIS initiating peer before
+				// its successful delete response settles: the retirement lands mid-request, marking the
+				// Session retired by the time the response resolves.
+				const retire = connectionOptions?.handlers?.events?.[productRpcEvents.chatSessionsRetired];
+				if (retire === undefined) {
+					throw new Error("Session retirement event handler was not installed.");
+				}
+				await retire({ schemaVersion: 1, sessionIds: [sessionId] }, {} as RpcEventContext);
+				return { sessionId };
+			}
+			return { events: [] };
+		});
+		const client = new DesktopAgentsClient(async (options) => {
+			connectionOptions = options;
+			return peer;
+		});
+		const invalidations: string[] = [];
+		client.subscribeChatSessionInvalidations((invalidation) => {
+			invalidations.push(`${invalidation.reason}:${invalidation.sessionId}`);
+			client.acknowledgeChatSessionInvalidation({
+				schemaVersion: 1,
+				invalidationId: invalidation.invalidationId,
+				sessionId: invalidation.sessionId,
+				accepted: true,
+			});
+		});
+		await client.connect(createConnectOptions());
+
+		// The delete owns its Session's retirement: its successful response must not be rejected by the
+		// concurrent self-retirement notification.
+		const output = await client.request(
+			productRpcMethods.sessionDelete,
+			{ sessionId: targetSessionId },
+			deleteChatSessionInputSchema,
+			deleteChatSessionOutputSchema,
+		);
+		expect(output).toEqual({ sessionId: targetSessionId });
+		expect(deleteCalls).toBe(1);
+		// The retirement was still observed — the Session is genuinely gone.
+		expect(invalidations).toContain(`session_retired:${targetSessionId}`);
+
+		// Every other operation on the now-retired Session still fails closed, and never reaches the wire.
+		await expect(
+			client.request(
+				productRpcMethods.sessionDelete,
+				{ sessionId: targetSessionId },
+				deleteChatSessionInputSchema,
+				deleteChatSessionOutputSchema,
+			),
+		).rejects.toBeInstanceOf(ChatSessionNotFoundError);
+		expect(deleteCalls).toBe(1);
+		client.close();
+	});
+
+	test("resolves a direct delete for the initiating peer while a second peer still observes the retirement", async () => {
+		const targetSessionId = createRetirementSessionId(2);
+
+		// Observer peer B: a second authenticated Desktop client that only watches the shared Session.
+		let observerOptions: ConnectRpcClientOptions | undefined;
+		const observerInvalidations: string[] = [];
+		const observer = new DesktopAgentsClient(async (options) => {
+			observerOptions = options;
+			return new FakePeer(() => ({ events: [] }));
+		});
+		observer.subscribeChatSessionInvalidations((invalidation) => {
+			observerInvalidations.push(`${invalidation.reason}:${invalidation.sessionId}`);
+			observer.acknowledgeChatSessionInvalidation({
+				schemaVersion: 1,
+				invalidationId: invalidation.invalidationId,
+				sessionId: invalidation.sessionId,
+				accepted: true,
+			});
+		});
+
+		// Initiator peer A: issues session.delete. The delete handler models the server fanning the
+		// resulting retirement out to EVERY connected peer (A and B) BEFORE A's success response settles.
+		let initiatorOptions: ConnectRpcClientOptions | undefined;
+		let deleteCalls = 0;
+		const initiator = new DesktopAgentsClient(async (options) => {
+			initiatorOptions = options;
+			return new FakePeer(async (method, payload) => {
+				if (method === productRpcMethods.sessionDelete) {
+					deleteCalls += 1;
+					const sessionId = deleteChatSessionInputSchema.parse(payload).sessionId;
+					const observerRetire =
+						observerOptions?.handlers?.events?.[productRpcEvents.chatSessionsRetired];
+					const initiatorRetire =
+						initiatorOptions?.handlers?.events?.[productRpcEvents.chatSessionsRetired];
+					if (observerRetire === undefined || initiatorRetire === undefined) {
+						throw new Error("Session retirement event handler was not installed.");
+					}
+					await observerRetire(
+						{ schemaVersion: 1, sessionIds: [sessionId] },
+						{} as RpcEventContext,
+					);
+					await initiatorRetire(
+						{ schemaVersion: 1, sessionIds: [sessionId] },
+						{} as RpcEventContext,
+					);
+					return { sessionId };
+				}
+				return { events: [] };
+			});
+		});
+		const initiatorInvalidations: string[] = [];
+		initiator.subscribeChatSessionInvalidations((invalidation) => {
+			initiatorInvalidations.push(`${invalidation.reason}:${invalidation.sessionId}`);
+			initiator.acknowledgeChatSessionInvalidation({
+				schemaVersion: 1,
+				invalidationId: invalidation.invalidationId,
+				sessionId: invalidation.sessionId,
+				accepted: true,
+			});
+		});
+
+		await observer.connect(createConnectOptions());
+		await initiator.connect(createConnectOptions());
+
+		// The initiating peer's delete succeeds despite its own concurrent self-retirement...
+		const output = await initiator.request(
+			productRpcMethods.sessionDelete,
+			{ sessionId: targetSessionId },
+			deleteChatSessionInputSchema,
+			deleteChatSessionOutputSchema,
+		);
+		expect(output).toEqual({ sessionId: targetSessionId });
+		expect(deleteCalls).toBe(1);
+
+		// ...and the second peer still observes the retirement for the same Session.
+		expect(observerInvalidations).toContain(`session_retired:${targetSessionId}`);
+		expect(initiatorInvalidations).toContain(`session_retired:${targetSessionId}`);
+
+		observer.close();
+		initiator.close();
 	});
 
 	test("rejects a pending create that binds to a retired Session without releasing newer state", async () => {
@@ -2531,6 +2676,284 @@ describe("DesktopAgentsClient", () => {
 		client.close();
 	});
 
+	test("delivers a live event correlated by Run id without the origin request id echo", async () => {
+		const peer = new FakePeer((method) =>
+			method === productRpcMethods.chatSend ? createAcceptedPayload() : { events: [] },
+		);
+		let activeOptions: ConnectRpcClientOptions | undefined;
+		const client = new DesktopAgentsClient(async (options) => {
+			activeOptions = options;
+			return peer;
+		});
+		const receivedSeqs: number[] = [];
+		client.subscribeChatEvents((event) => {
+			receivedSeqs.push(event.seq);
+		});
+		await client.connect(createConnectOptions());
+		await client.request(
+			productRpcMethods.chatSend,
+			{ requestId: clientRequestId, sessionId, content: "hello" },
+			sendAskChatMessageInputSchema,
+			chatSendAcceptedOutputSchema,
+		);
+		const handler = activeOptions?.handlers?.events?.[agentsProductEventMethods[0]];
+		if (handler === undefined) {
+			throw new Error("Active chat event handler was not installed.");
+		}
+		await handler(
+			rpcJsonValueSchema.parse({ event: createDeltaEventPayload(1, "echo-less live") }),
+			{} as RpcEventContext,
+		);
+		expect(receivedSeqs).toEqual([1]);
+		client.close();
+	});
+
+	test("subscribes before replay and merges an event committed in between exactly once, in order", async () => {
+		const firstPeer = new FakePeer((method) =>
+			method === productRpcMethods.chatSend ? createAcceptedPayload() : { events: [] },
+		);
+		let resolveReplay: ((payload: JsonValue) => void) | undefined;
+		let replayStarted: (() => void) | undefined;
+		const replayStartedPromise = new Promise<void>((resolve) => {
+			replayStarted = resolve;
+		});
+		const callOrder: string[] = [];
+		const recoveredPeer = new FakePeer((method) => {
+			if (method === productRpcMethods.chatReplay) {
+				callOrder.push("replay");
+				replayStarted?.();
+				return new Promise<JsonValue>((resolve) => {
+					resolveReplay = resolve;
+				});
+			}
+			return { events: [] };
+		});
+		recoveredPeer.chatSubscribeHandler = (payload) => {
+			callOrder.push("subscribe");
+			const parsed = chatSubscribeInputSchema.parse(payload);
+			return { schemaVersion: 1, sessionId: parsed.sessionId, subscribed: true };
+		};
+		const peers = [firstPeer, recoveredPeer];
+		let index = 0;
+		let recoveredOptions: ConnectRpcClientOptions | undefined;
+		const client = new DesktopAgentsClient(async (options) => {
+			recoveredOptions = options;
+			const peer = peers[index];
+			index += 1;
+			return peer ?? Promise.reject(new Error("No fake peer available."));
+		});
+		const receivedSeqs: number[] = [];
+		client.subscribeChatEvents((event) => {
+			receivedSeqs.push(event.seq);
+		});
+		const firstConnection = await client.connect(createConnectOptions());
+		await client.request(
+			productRpcMethods.chatSend,
+			{ requestId: clientRequestId, sessionId, content: "hello" },
+			sendAskChatMessageInputSchema,
+			chatSendAcceptedOutputSchema,
+		);
+		firstConnection.close();
+
+		const reconnect = client.connect(createConnectOptions());
+		await replayStartedPromise;
+		// The live subscription is installed BEFORE replay so the server can route live events into the
+		// provisional buffer while replay is still in flight.
+		expect(callOrder).toEqual(["subscribe", "replay"]);
+
+		const handler = recoveredOptions?.handlers?.events?.[agentsProductEventMethods[0]];
+		if (handler === undefined) {
+			throw new Error("Provisional chat event handler was not installed.");
+		}
+		// seq 2 is committed AFTER subscribe but BEFORE the replay response — it only reaches the client
+		// live, via the buffer. seq 1 is delivered BOTH live (overlap) and in the replay snapshot.
+		await handler(createDeliveryPayload(2, "live after subscribe"), {} as RpcEventContext);
+		await handler(createDeliveryPayload(1, "live overlap"), {} as RpcEventContext);
+
+		// The replay snapshot only carries seq 1 (seq 2 committed after the snapshot was taken).
+		resolveReplay?.({ events: [createDeltaEventPayload(1, "replayed")] });
+
+		await reconnect;
+		// No gap and no duplicate: seq 1 (from replay) then seq 2 (merged from the live buffer), each once.
+		expect(receivedSeqs).toEqual([1, 2]);
+		client.close();
+	});
+
+	test("flushes a live event injected during the final retirement retry before readiness", async () => {
+		// Regression guard for the recovery drain race. A live event that arrives while the connection is
+		// still provisional — during the LAST recovery await (the pending-retirement retry) — must be
+		// flushed before connectionActive flips, not enqueued-then-stranded. The fix makes the final
+		// #flushProvisionalEvents the last await before activation; this test injects a live event at the
+		// tail of the retry and asserts it is delivered exactly once, before readiness.
+		const firstPeer = new FakePeer((method) =>
+			method === productRpcMethods.chatSend ? createAcceptedPayload() : { events: [] },
+		);
+		const recoveredPeer = new FakePeer(() => ({ events: [] }));
+		const peers = [firstPeer, recoveredPeer];
+		let index = 0;
+		let recoveredOptions: ConnectRpcClientOptions | undefined;
+		const client = new DesktopAgentsClient(async (options) => {
+			recoveredOptions = options;
+			const peer = peers[index];
+			index += 1;
+			return peer ?? Promise.reject(new Error("No fake peer available."));
+		});
+		const receivedSeqs: number[] = [];
+		client.subscribeChatEvents((event) => {
+			receivedSeqs.push(event.seq);
+		});
+
+		// Establish a live Run cursor on the first connection so recovery installs a live subscription
+		// and keeps the Run's provisional buffer available across the reconnect.
+		const firstConnection = await client.connect(createConnectOptions());
+		await client.request(
+			productRpcMethods.chatSend,
+			{ requestId: clientRequestId, sessionId, content: "hello" },
+			sendAskChatMessageInputSchema,
+			chatSendAcceptedOutputSchema,
+		);
+		firstConnection.close();
+
+		// Stage an unrelated Session retirement during recovery, AFTER the early retry, by piggy-backing
+		// on the live subscription install. It is therefore only processed by the FINAL retry — the last
+		// await before activation — which is exactly the window the drain-race fix protects.
+		recoveredPeer.chatSubscribeHandler = async (payload) => {
+			const parsed = chatSubscribeInputSchema.parse(payload);
+			const retirementHandler =
+				recoveredOptions?.handlers?.events?.[productRpcEvents.chatSessionsRetired];
+			if (retirementHandler === undefined) {
+				throw new Error("Provisional retirement handler was not installed.");
+			}
+			await retirementHandler(
+				{ schemaVersion: 1, sessionIds: [otherSessionId] },
+				{} as RpcEventContext,
+			);
+			return { schemaVersion: 1, sessionId: parsed.sessionId, subscribed: true };
+		};
+
+		let injected = false;
+		client.subscribeChatSessionInvalidations((invalidation) => {
+			if (invalidation.sessionId === otherSessionId && !injected) {
+				injected = true;
+				const eventHandler = recoveredOptions?.handlers?.events?.[agentsProductEventMethods[0]];
+				if (eventHandler === undefined) {
+					throw new Error("Provisional chat event handler was not installed.");
+				}
+				// This live event arrives while connectionActive is still false, during the final retry —
+				// after the old code's last flush. It must be enqueued now and drained before readiness.
+				void eventHandler(
+					createDeliveryPayload(1, "injected during final retry"),
+					{} as RpcEventContext,
+				);
+			}
+			client.acknowledgeChatSessionInvalidation({
+				schemaVersion: 1,
+				invalidationId: invalidation.invalidationId,
+				sessionId: invalidation.sessionId,
+				accepted: true,
+			});
+		});
+
+		await client.connect(createConnectOptions());
+
+		// The event injected mid-recovery is flushed before readiness — delivered exactly once.
+		expect(injected).toBe(true);
+		expect(receivedSeqs).toEqual([1]);
+		client.close();
+	});
+
+	test("invalidates a retirement staged during the final chat-event flush before readiness", async () => {
+		// Regression guard for the unified drain fence. A retirement notification can be staged while the
+		// final provisional chat-event flush is awaiting a renderer chat listener. Draining events and
+		// retirements as two separate single passes would leave that late-staged retirement un-invalidated
+		// before the connection is marked ready. The drain-until-quiescent loop must finalize it first.
+		const secondRetiringSessionId = createRetirementSessionId(3);
+		const firstPeer = new FakePeer((method) =>
+			method === productRpcMethods.chatSend ? createAcceptedPayload() : { events: [] },
+		);
+		const recoveredPeer = new FakePeer(() => ({ events: [] }));
+		const peers = [firstPeer, recoveredPeer];
+		let index = 0;
+		let recoveredOptions: ConnectRpcClientOptions | undefined;
+		const client = new DesktopAgentsClient(async (options) => {
+			recoveredOptions = options;
+			const peer = peers[index];
+			index += 1;
+			return peer ?? Promise.reject(new Error("No fake peer available."));
+		});
+
+		const order: string[] = [];
+
+		// Delivering the injected chat event stages a SECOND retirement mid-flush — the exact tail window
+		// the fence must cover.
+		client.subscribeChatEvents((event) => {
+			order.push(`event:${event.seq}`);
+			const retire = recoveredOptions?.handlers?.events?.[productRpcEvents.chatSessionsRetired];
+			if (retire === undefined) {
+				throw new Error("Session retirement event handler was not installed.");
+			}
+			return retire(
+				{ schemaVersion: 1, sessionIds: [secondRetiringSessionId] },
+				{} as RpcEventContext,
+			);
+		});
+
+		let chatEventInjected = false;
+		client.subscribeChatSessionInvalidations((invalidation) => {
+			order.push(`invalidated:${invalidation.sessionId}`);
+			// While finalizing the FIRST staged retirement, enqueue a live chat event so it is flushed by
+			// a later drain round — the flush during which the second retirement is staged.
+			if (invalidation.sessionId === otherSessionId && !chatEventInjected) {
+				chatEventInjected = true;
+				const eventHandler = recoveredOptions?.handlers?.events?.[agentsProductEventMethods[0]];
+				if (eventHandler === undefined) {
+					throw new Error("Provisional chat event handler was not installed.");
+				}
+				void eventHandler(createDeliveryPayload(1, "flushed during drain"), {} as RpcEventContext);
+			}
+			client.acknowledgeChatSessionInvalidation({
+				schemaVersion: 1,
+				invalidationId: invalidation.invalidationId,
+				sessionId: invalidation.sessionId,
+				accepted: true,
+			});
+		});
+
+		// Stage the FIRST retirement during the live subscription install (after the early retry) so it is
+		// only processed by the final unified drain.
+		recoveredPeer.chatSubscribeHandler = async (payload) => {
+			const parsed = chatSubscribeInputSchema.parse(payload);
+			const retire = recoveredOptions?.handlers?.events?.[productRpcEvents.chatSessionsRetired];
+			if (retire === undefined) {
+				throw new Error("Provisional retirement handler was not installed.");
+			}
+			await retire({ schemaVersion: 1, sessionIds: [otherSessionId] }, {} as RpcEventContext);
+			return { schemaVersion: 1, sessionId: parsed.sessionId, subscribed: true };
+		};
+
+		const firstConnection = await client.connect(createConnectOptions());
+		await client.request(
+			productRpcMethods.chatSend,
+			{ requestId: clientRequestId, sessionId, content: "hello" },
+			sendAskChatMessageInputSchema,
+			chatSendAcceptedOutputSchema,
+		);
+		firstConnection.close();
+
+		// Track readiness only for the recovery connection under test (the first connection also fires it).
+		client.subscribeReady(() => order.push("ready"));
+		await client.connect(createConnectOptions());
+
+		// The retirement staged mid chat-event flush is invalidated BEFORE readiness.
+		expect(order).toContain("event:1");
+		const secondInvalidationIndex = order.indexOf(`invalidated:${secondRetiringSessionId}`);
+		const readyIndex = order.indexOf("ready");
+		expect(secondInvalidationIndex).toBeGreaterThanOrEqual(0);
+		expect(readyIndex).toBeGreaterThanOrEqual(0);
+		expect(secondInvalidationIndex).toBeLessThan(readyIndex);
+		client.close();
+	});
+
 	test.each([
 		["event count", { maxProvisionalEvents: 1, maxProvisionalBytes: 1_000_000 }],
 		["encoded bytes", { maxProvisionalEvents: 10, maxProvisionalBytes: 10 }],
@@ -3304,6 +3727,9 @@ class FakePeer implements DesktopAgentsRpcPeer {
 	retiredSessionPageHandler:
 		| ((payload: JsonValue, options?: RpcRequestOptions) => JsonValue | Promise<JsonValue>)
 		| undefined;
+	chatSubscribeHandler:
+		| ((payload: JsonValue, options?: RpcRequestOptions) => JsonValue | Promise<JsonValue>)
+		| undefined;
 
 	constructor(
 		private readonly onRequest: (
@@ -3329,6 +3755,22 @@ class FakePeer implements DesktopAgentsRpcPeer {
 			return this.retiredSessionPageHandler === undefined
 				? { schemaVersion: 1, sessionIds: [] }
 				: this.retiredSessionPageHandler(payload, options);
+		}
+		if (method === productRpcMethods.chatSubscribe) {
+			if (this.chatSubscribeHandler !== undefined) {
+				return this.chatSubscribeHandler(payload, options);
+			}
+			const sessionId =
+				typeof payload === "object" &&
+				payload !== null &&
+				!Array.isArray(payload) &&
+				typeof payload.sessionId === "string"
+					? payload.sessionId
+					: undefined;
+			if (sessionId === undefined) {
+				throw new Error("chat.subscribe requires a sessionId payload.");
+			}
+			return { schemaVersion: 1, sessionId, subscribed: true };
 		}
 		if (
 			method === productRpcMethods.chatReplay &&

@@ -114,8 +114,16 @@ interface AppError {
 | `sessions` | id, runtime_box_id, project_id, agent_version_id, mode, title, status, revision | 永久归属一个 Box 的产品会话 |
 | `runs` | id, session_id, runtime_box_id, mode, status, config_snapshot_json | 一次 Agent 执行；snapshot 只含 resource refs/hashes，不含 Skill 正文 |
 | `run_events` | id, run_id, seq, type, payload_json, created_at | durable append-only 轨迹 |
-| `approval_requests` | id, run_id, tool_call_id, state, action_snapshot_json | server 的不可变审批请求 |
-| `approval_decisions` | id, approval_request_id, decision, decided_at | server 持久化决定 |
+| `action_approval_requests` | id, session_id, run_id, action_id, tool_call_id, tool, operation, action_summary_json, risk_tier, risk_overridable, risk_json, state, revision, decision_idempotency_key, decision_json, policy_evidence_json, created_at_ms, expires_at_ms, decided_at_ms | Layer 2 已落地的 durable 审批请求；action_id 与 decision idempotency key 唯一，revision 支持 CAS |
+| `session_approval_policies` | session_id, allow_all, revision, updated_by_json, last_idempotency_key, updated_at_ms | session-scoped、revisioned、server-owned 的 Session Allow-all 策略；随 session 级联删除 |
+| `mobile_devices` | id (mobileClientId), display_name, model, platform, app_version, created_at_ms, updated_at_ms, approved_at_ms, last_seen_at_ms, revoked_at_ms | Layer 3 已配对的移动设备身份（`id` = stable mobileClientId）；`revoked_at_ms` 非空表示吊销 |
+| `mobile_device_keys` | (mobile_client_id, key_id) PK, public_key, public_key_fingerprint, created_at_ms, revoked_at_ms | 设备的 Ed25519 SPKI 公钥/指纹；随设备级联删除，吊销即置 `revoked_at_ms` |
+| `mobile_device_generation_fences` | mobile_client_id PK, accepted_generation, accepted_instance_id, updated_at_ms | 每设备持久 generation high-water fence；旧 generation/instance/late connection 不可复活 |
+| `mobile_pairing_sessions` | id (pairingId), code_hash UNIQUE, claim_token_hash, state, device_key_id, public_key, public_key_fingerprint, display_name, model, platform, app_version, mobile_client_id, created_at_ms, expires_at_ms, claimed_at_ms, decided_at_ms | 配对会话；**只存 code/claim token 的 hash**（≥128-bit 熵、5 分钟、single-use），state ∈ pending/approved/rejected/expired |
+| `mobile_attention_outbox` | seq PK, dedupe_key UNIQUE, type, payload_json（脱敏）, processed_at_ms?, attempts, last_error?, created_at_ms | Layer 5 **transactional outbox**：approval-pending / run-terminal 在**同一业务事务**内 append（`dedupe_key` 幂等），drainer 幂等投影到 `mobile_attention_events` 后 `markProcessed`；失败保留重试并记录 `last_error`，业务 commit 与 outbox 原子，crash/append 失败不丢未读 |
+| `mobile_attention_events` | seq PK（每 feed 单调）, event_id UNIQUE, dedupe_key UNIQUE, type, session_id?, run_id?, approval_id?, title_key, body_key, created_at_ms | Layer 5 durable attention feed；**仅脱敏 opaque id + generic 本地化键**，`dedupe_key` 保证同业务事件幂等 append（由 outbox drainer 投影） |
+| `mobile_attention_ack_cursors` | mobile_client_id PK, acked_seq, updated_at_ms | 每设备 server 侧单调 ack cursor（read state）；设备 revoke/unpair 时删除，旧 feed 不泄漏给新 binding |
+| `mobile_attention_feed_meta` | id PK, next_seq, pruned_through_seq | seq high-water + retention 水位；cursor ≤ `pruned_through_seq` 触发 `resyncRequired`（bounded prune by age 30d + per-client 500，在 startup/drain 后 throttle/periodic 执行） |
 | `action_executions` | id, run_id, tool_call_id, target_kind, target_id, state, intent_json, result_json | server 的 Action 事实；target 为 agent-server 或 runtime-box |
 | `execution_grants` | id, action_id, invocation_id, target_kind, target_id, instance_id, generation, digest, state, expires_at | 只存 grant 元数据/使用状态 |
 | `invocation_results` | invocation_id, action_id, state, result_json, received_at | Runtime Box typed result 的 server 投影 |
@@ -416,6 +424,67 @@ interface AppRunEvent<T extends RunEventType = RunEventType> {
 
 server 分配 durable `seq` 并先落库。Runtime Box notification 只有在 server 验证当前 instance/generation、关联 invocation 和 Schema 后，才转换为 `AppRunEvent`。
 
+### 9.1 多 Client 事件订阅（Mobile 协议基础）
+
+Live delivery 从「单 request-owner」模型演进为 Session/Run/seq scoped 的事件 hub（`ProductEventRouter`，见 `apps/agents-server/src/product-event-hub.ts`），为未来多 Client（Desktop 与 Mobile）观察同一 Session 铺路：
+
+- `chat.event` delivery 的 `clientRequestId` 现为**可选 origin echo**（`chatEventDeliverySchema.clientRequestId` optional）。接收 Client 不再需要持有原始 `clientRequestId` 即可观察其订阅的 Session；发起 Client 仍会收到自身 request id 回显用于本地关联。
+- 新增 `moshu.v1.chat.subscribe` / `moshu.v1.chat.unsubscribe`（input `{ sessionId }`）。二者是 **authorization-aware** 合同：handler 从 authenticated peer 解析 client identity（`role === "client"`），不信任调用方传入任意身份；非 client 角色被拒绝。
+- 发起 Client 通过 `chat.send` 的 request-owner 绑定接收自身 Run 的 live event（保持幂等/恢复与 generation fencing 语义不变）；其他已认证 Client 通过显式 `chat.subscribe` 观察同一 Session。实际投递是「request-owner ∪ 显式 subscriber」的并集，按连接去重。
+- 订阅是**连接作用域**的，按稳定 `peerId` 记录并携带 authenticated peer 的精确身份（`instanceId`/generation/deviceKeyId）。**无 gap 的恢复顺序**为 `subscribe → buffer live → replay(durable per-run cursor) → dedupe/merge by (runId, seq) → flush buffer → ready`：Client 在连接建立后**先**按已知 `sessionId` 安装 `chat.subscribe`（先于 replay），使 server 在 replay 仍在进行时即把 live event 路由进 provisional buffer；随后 replay 从持久 per-Run cursor 拉取快照，任何在 subscribe 与 replay 响应之间提交的事件都已进入 buffer，与 replay 的重叠按 `(runId, seq)` cursor 去重合并；在 replay→live 衔接（flush）完成前不标记 ready。因此不会丢失或重复投递两次请求之间提交的事件。恢复末尾用**原子 drain-and-activate fence**：由于投递一个 buffered event 会 await renderer listener（其间可能被 staged 一个新的 session retirement），而 retirement 的 invalidation 又会 await renderer ack（其间可能有新的 live event 入队），两个队列会相互喂给对方，故 fence 是对 **provisional event buffer 与 pending retirement invalidations 两个队列的 drain-until-quiescent 循环**：反复 flush events + retry retirements，直到两队列同时排空，再**同步**切换 `connectionActive=true`；drain 返回后到切换之间没有任何 await，故没有 live event handler 或 retirement 能在「两队列排空」与「切换 `connectionActive=true`」之间穿插，因而在 `connectionActive` 仍为 false 期间（含最后的 retirement retry 或最后一次 event flush）到达的 live event / retirement 只会被本轮 drain 排空或在切换后按 live 投递，绝不会入队后被遗留。旧连接（gen N）迟到的断开清理用精确身份逐 Session 比对，只回收 gen N 自己且未被 gen N+1 重新订阅的条目，不会误删新连接已接管的订阅（transport fence 保证 per-`peerId` 单一 live 连接与单调 generation）。不保留陈旧 socket 订阅。
+- 订阅在 handler 层做**存在性/可见性校验**：`chat.subscribe` 先经 Chat Session repository 确认 `sessionId` 存在且未在删除/退休中，否则以稳定 `RpcHandlerError`（`SESSION_NOT_FOUND`）拒绝。容量有 **per-peer（256）与 global（8192）上限**，越界返回稳定 `RpcHandlerError`（`SESSION_SUBSCRIPTION_PEER_LIMIT` / `SESSION_SUBSCRIPTION_LIMIT`）。Session **retirement** 时 hub 主动清理相关订阅（`retireSessions`）。退休通知在 agents-server 内**集中化**（`notifySessionsRetired`）：Project 退休与 product-rpc 直接 `session.delete`（经 `ChatApplicationService.deleteSession` 的 `onSessionsRetired`）都会走同一路径拆除订阅，避免只在单一 handler 打补丁导致其他删除路径遗漏。**发起删除的 Client 拥有该删除自身产生的退休通知**：成功的 `session.delete` 响应是权威的，不会因这次删除同步广播回发起端的退休通知而被误判为 `SESSION_NOT_FOUND`；其余 in-flight 操作仍对并发退休 fail closed。
+- 单用户 MVP 下授权边界按 Session **结构化**，不做全局裸 broadcast 调试事件。Desktop 现在在**连接恢复期间先安装 `chat.subscribe`（先于 replay）**以闭合 replay/live 衔接；稳定态下每个事件按连接（request-owner ∪ subscriber 并集）去重投递，逐事件投递内容与既有实现完全一致。
+- 本层（Layer 1）不实现 Mobile ingress/pairing 与 approvals。approvals 已由 Layer 2 落地（见 §9.2）；Mobile ingress/pairing/设备认证已由 Layer 3 落地（见 §9.3）。
+
+### 9.2 审批事件与 Product RPC（Layer 2，已实现）
+
+Layer 2 在同一 authorization-aware 事件 hub 上新增了 client-neutral 的审批合同（见 `packages/contracts/src/approval.ts`、`apps/agents-server/src/approval-service.ts`、`product-rpc.ts`、`product-event-hub.ts`）：
+
+- **Product RPC**：`approvals.list` / `approvals.get` / `approvals.decide`、`sessionApprovalPolicy.get` / `sessionApprovalPolicy.update`。`decide` 与 `policy.update` 均带 `expectedRevision` + `idempotencyKey`；`decide` 返回 `outcome ∈ {applied, idempotent, superseded}` 与 authoritative final request。稳定错误码：`APPROVAL_NOT_FOUND`、`APPROVAL_REVISION_CONFLICT`、`APPROVAL_ALREADY_DECIDED`、`SESSION_APPROVAL_POLICY_REVISION_CONFLICT`。
+- **事件**：`approval.created` / `approval.updated` 与 `sessionApprovalPolicy.changed` 只投递给该 **Session** 的已认证订阅 client（复用 chat 订阅的可见性/退休语义）；`approvalActivityChanged` 为**无 payload** 的提示，广播给所有已认证 client，供跨 Session 待办面板按 `approvals.list` 拉快照刷新——它不携带任何 session-scoped 或 secret 内容。
+- **恢复**：client 重连后依赖 durable `approvals.list`/snapshot 恢复，不依赖纯 live；快照 + 事件按 revision 合并去重。
+- **决策来源权威**：`decision.source` 由 server 从 authenticated peer 身份（`{kind:"client", clientId, clientRole}`）派生，绝不信任请求体传入的身份。
+
+### 9.3 Mobile ingress、二维码配对与设备认证（Layer 3，已实现）
+
+Layer 3 在独立的 Mobile 接入面上新增合同（见 `packages/contracts/src/mobile.ts`、`apps/agents-server/src/mobile-ingress-auth.ts`、`mobile-ingress-generation-fence.ts`、`product-rpc.ts`、`packages/database/src/mobile-pairing-repository.ts`、`mobile-device-repository.ts`）：
+
+- **独立 ingress**：固定 loopback listener + `/mobile` 路径，独立 `RpcServer`，与 Product RPC/Runtime ingress 物理隔离，不 fallback。独立 frame/body/inflight/backpressure/handshake timeout、未认证连接与 HTTP 容量、per-source 限流与流量计量。作为 DevTunnel 第二端口按 multi-port 模型逐端口 readiness/public URL 公开。
+- **状态方法（版本化）**：Remote Access status **v1 不变**；新增 `moshu.v2.mobileAccess.status`（v2 schema：schemaVersion、remoteAccessEnabled/state、ingressPort、ingressReady、publicUrl?、协议区间、transportSecurity、supportedTransportSecurity）。
+- **QR payload（v1）**：`{ v, kind:"moshu-mobile-pairing", mobileUrl, pairingId, code, agentServerId, agentServerPublicKey, agentServerPublicKeyFingerprint, expiresAt, protocolMinVersion, protocolMaxVersion }`，strict。**绝不含 server secret 或长期 token**，也不写日志/持久化 client 存储。
+- **Desktop 本地 Product RPC**：`moshu.v2.mobile.pairing.create` / `pairing.listClaims` / `pairing.approve` / `pairing.reject`、`mobile.device.list` / `device.revoke`。`approve` 带 `expectedPublicKeyFingerprint` 做 CAS，防审批错 claim。**仅本地 Desktop 可调用；Mobile ingress 不能自批。**
+- **Mobile pre-auth HTTP endpoints**：claim / status / challenge / compatibility，统一小响应，不泄漏 device/key/code 是否存在。配对 code ≥128-bit 熵、5 分钟、server 只存 hash、single-use；claim token 只存 hash；状态 pending/approved/rejected/expired。
+- **认证 canonical payload**：challenge 由 `AgentServerIdentity` 用 domain-tag `moshu-mobile-server-challenge-v1` 签名；设备签名的 authentication payload domain-tag `moshu-mobile-authentication-v1`，绑定 agentServerId、mobileClientId、deviceKeyId、instanceId、persisted generation、challengeId/nonce、mobile 协议版本与 transportSecurity。WebSocket upgrade 前验证签名/激活 key/吊销/challenge 单次与过期/server identity/协议，返回 canonical role=`mobile-client` identity，RPC hello 必须 exact match。
+- **generation fence**：独立持久 high-water（`mobile_device_generation_fences`）；`acceptGeneration` 幂等接受同 instance、拒绝 `STALE_GENERATION`/`GENERATION_CONFLICT`；吊销即关闭匹配 peer 并阻止新 challenge/upgrade。transportSecurity 预留 negotiation（含 `relay-tls`），Noise 不谎称启用。
+- **严格 allowlist**：mobile-client 独立请求/事件 allowlist（见 `mobileClientProductRequestMethods` / `mobileClientProductEventMethods`）。请求仅 MVP：runtime get/runtimeBoxes list/switch、projects list/get/getSidebar、models listAvailable、session list/get/create/setModel、chat send/cancel/replay/subscribe/unsubscribe/retiredSessions.list、approvals list/get/decide + sessionApprovalPolicy get/update；事件仅 chat.event、chat.sessions.retired、approvals.event、approvals.policy.changed、approvals.activity.changed、runtimeBoxes.changed。其余（Provider、Remote Access 控制、Runtime 配对/revoke、MCP/Skills、Project mutation、diagnostics、defaultModel set、agentGlobalProfile 等）**全部 deny**。client preference/decision source 均由 authenticated peer identity 派生，不接受伪造 clientId。
+- **设备列表分页（lifetime capacity）**：吊销设备永久保留作审计，设备数量随生命周期无上限增长。`mobile.device.list` 采用 keyset/cursor 分页（`{ cursor?, limit≤128 }` → `{ items≤128, nextCursor? }`），稳定排序 `(active 优先, createdAtMs, id)`；单页 schema 恒有效，Desktop 通过 `nextCursor` 逐页加载（“加载更多”）遍历/管理全部 active 设备。绝不静默丢弃 active 设备。
+- **配对 fail-closed（Remote Access 未启用 / ingress 未就绪）**：`pairing.create` 仅在 **Remote Access `enabled===true`** 且 mobile ingress ready 且有 exact public URL 时创建；否则抛稳定 `MOBILE_INGRESS_NOT_READY` 且**不创建/消耗任何 pairing 记录**。注意 `disable()` 会先持久化 `enabled=false`、随后才异步 stop ingress，过渡期 readiness/URL 仍可见——server 因此同时对 enabled 与 URL 双重 gate（`getMobilePublicUrl` + `isRemoteAccessEnabled`），保证过渡期零副作用 fail closed。Desktop 创建按钮 `disabled` 直到 `mobileAccess.status.remoteAccessEnabled && ingressReady && publicUrl`，并对 legacy 无 URL 的 pending 显式 expire/重建，避免产生无 QR 的失效配对。
+
+### 9.4 iOS Mobile App 客户端合同消费（Layer 4，已实现）
+
+Layer 4 是 §9.3 server 合同的 **iOS client 侧实现**（见 `apps/mobile/`：`src/native/transport-plugin.ts`、`src/rpc/*`、`native/MoshuMobile/Sources/MoshuMobileCore/*`、`ios/App/App/plugins/*`）。所有 wire 合同均沿用 `packages/contracts/src/mobile.ts`，client 不新增 server 合同。
+
+- **canonical payload byte-parity**：`createMobileServerChallengePayload` / `createMobileAuthenticationPayload`（`JSON.stringify` 固定字段数组）是签名/验签的唯一字节来源。`apps/mobile/scripts/gen-canonical-vectors.ts` 从 TS 合同生成共享 fixture `native/MoshuMobile/Tests/.../Fixtures/mobile-canonical-vectors.json`，Swift `MoshuMobileCore` XCTest 与 Web `test/canonical-vectors.test.ts` 同时消费，证明 Swift/TS **canonical payload 逐字节一致**。注意 CryptoKit Ed25519 签名**随机化**（非 RFC 8032 确定性），故 vectors 只断言**跨实现验签**通过，不断言签名字节相等。
+- **设备公钥 canonical SPKI DER**：Ed25519 公钥以 12 字节 SPKI 前缀 `302a300506032b6570032100` + 32 字节 raw = 44 字节 DER，base64url（去 padding）承载于 claim 与设备身份，供 server 校验指纹（`SHA256:base64url`）。
+- **WSS upgrade headers**：device 用 Keychain 私钥签 canonical authentication payload，经 `URLSessionWebSocketTask` 以 `x-moshu-mobile-client-id` / `x-moshu-device-key-id` / `x-moshu-instance-id` / `x-moshu-generation` / `x-moshu-protocol-version` / `x-moshu-challenge-id` / `x-moshu-signature`（base64url device 签名）连接 `/mobile`。长期凭据只走 header/签名，**绝不放 query string**。
+- **client 侧 allowlist**：Product client 严格只调用 `mobileClientProductRequestMethods` / 订阅 `mobileClientProductEventMethods`，不尝试任何 Desktop-only 方法；连接恢复 subscribe→buffer→replay（durable cursor）→runId/seq dedupe→flush→ready。所有 response/event 严格 Zod。
+- **client-side 状态与持久化边界**：`fatalCodeMap`（`connection-controller.ts`）区分致命（`AUTH_REVOKED` / `AUTH_FAILED` / `PROTOCOL_MISMATCH` / `IDENTITY_MISMATCH` / `URL_INVALID` / `PAIRING_REJECTED`，不可盲重试）与网络失败（offline/reconnecting）；Swift `MobileTransportError` rawValue 与之逐一对应。仅 `connected` 态暴露业务数据，断线即清空；业务数据只存 React 内存，binding/private key 只在 native Keychain，仅 appearance/language 可持久化。
+- **PR #8 审查加固（合同消费层）**：process-rpc hello 的 `peer` 必带 `deviceKeyId`（native `connect()` 结果与 JS hello 一致），与 server authenticated canonical identity `isSameRpcPeerIdentity`（含 `deviceKeyId`）exact match，否则握手被拒。致命关闭按 WS close code / HTTP upgrade 状态**数值**分类（`1008→AUTH_REVOKED`、`401/403→AUTH_FAILED`、`426→PROTOCOL_MISMATCH`，`fatalReason` 透传 native→JS），**不匹配本地化 error 串**；致命即停盲重连、清业务态。Chat 历史消费 `getSessionPage` 的 `nextCursor` 分页到含 active run 的最后一页（server 按 oldest-first 排序、`maxSessionRunsPerPage=2`），受 page/bytes 上界约束、cursor 不前进即 fail-closed。`chat.send` 的 `requestId` 由 `ChatSessionController` reservation 持有：ambiguous（连接断/超时/响应丢失）保留 reservation，重试复用同 id（server 幂等去重成一个 run）；definitive 拒绝（`INVALID_ARGUMENT` / `RUNTIME_BOX_NOT_READY` / `SESSION_NOT_FOUND`）或编辑草稿内容才换新 id。
+- **PR #8 复审加固（帧限额/关闭码）**：native inbound guard / outbound queue / JS pre-bind 帧上限统一为 `@moshu/contracts` 的 `productRpcMaxFrameBytes`＝4 MiB（原 stale 1 MiB 会误拒合法 1–4 MiB 帧），该值写入共享 canonical 测试向量 fixture，Vitest 与 Swift 同时断言防漂移；queued bytes 保守有界且 ≥ 单帧。teardown 将拟发数字关闭码安全映射到 `URLSessionWebSocketTask.CloseCode`（oversize→`messageTooBig`/1009、binary→`unsupportedData`/1003、其余标准协议码原值发送，保留/本地专用/未知码回退安全可发送码），close reason 按 UTF-8 标量边界截断到 123 字节控制帧预算——不再一律 `.goingAway`(1001)。
+
+### 9.5 Durable mobile attention/unread feed 与 iOS 生命周期/通知（Layer 5，已实现）
+
+Layer 5 在 §9.3/§9.4 之上新增 **Agent Server 持有** 的移动端未读/attention feed 合同与消费（见 `packages/contracts/src/mobile.ts`、`apps/agents-server/src/mobile-attention-drainer.ts` + `mobile-ingress-handlers.ts` + `product-rpc.ts`、`packages/database/src/{mobile-attention-repository.ts,mobile-attention-outbox-repository.ts}`、`apps/mobile/src/rpc/{attention-controller.ts,notification-tap.ts}`）。**无云 Push Relay、无 APNs remote/silent push、无后台伪保活、设备不落业务数据。**
+
+- **`MobileAttentionEvent`（versioned，脱敏）**：`{ schemaVersion:1, eventId(uuid), seq(正整数、每 feed 单调), type ∈ approval_required|run_completed|run_failed|run_cancelled, visibility:"mobile-clients", sessionId?/runId?/approvalId?（opaque）, createdAt, titleKey/bodyKey（generic 本地化键，如 `attention.approvalRequired.title`）}`，strict。**绝不含** prompt/message/tool raw args/provider secret/path 正文/shell command。
+- **transactional outbox（幂等、事务、重启不丢）**：approval 进入 `pending`、Run 达终态时，在**同一 SQLite 事务**内向 `mobile_attention_outbox` append 脱敏 payload（`dedupeKey` 如 `approval:<id>` / `run:<id>` UNIQUE），业务 commit 与 outbox 原子。独立 `MobileAttentionOutboxDrainer` 幂等投影到 `mobile_attention_events` 并 `markProcessed`，startup 与运行期 drain；投影失败**保留重试并记录诊断，绝不吞成成功**。因此 crash/append 失败不会永久丢未读，`attention.changed` hint 丢失也不影响 reconnect list。`mobile-attention-drainer.test.ts` 断言 crash-at-each-boundary / restart / 幂等；DB 层 `mobile-attention-outbox` 用例断言事务原子与去重。
+- **每设备 ack cursor（read state，server 侧）**：`mobile.attention.list`（`{ cursor?, limit }` → `{ items, unreadCount, ackSeq, latestSeq, resyncRequired, nextCursor? }`，cursor 分页）与 `mobile.attention.ack`（`{ seq }`，CAS + 幂等 + 单调，旧 ack 不回退 cursor）。**peer identity 由 auth context 决定**，禁止伪造 clientId 或回退。handler 逻辑抽到 pi-free `mobile-ingress-handlers.ts`（`resolveMobileClientId`/`listMobileAttentionForPeer`/`ackMobileAttentionForPeer`/`revokeMobileDevice`），并由 pi-free `mobile-ingress-composition.ts` 的 `createMobileIngressComposition`（strict allowlist + merged attention handler + outbox drainer + revoke 装配）作为**单一生产装配来源**，`create-agents-server.ts` 与 `mobile-ingress-smoke.test.ts` 共同调用（smoke 不自建 RpcServer/handler map，wiring contract test 保证覆盖）。均加入 mobile-client strict allowlist（`mobileClientProductRequestMethods`）。
+- **bounded retention + resync（production 执行）**：`MobileAttentionRepository.prune` 严格 age 30 天 + per-client 500，在 **startup（强制）、每次 drain 后（throttle + jitter）与有界 periodic** 路径触发（避免每 event O(n)）；cursor 过旧则 `list` 返回 `resyncRequired:true`（resnapshot），**不伪装无未读**。设备 revoke 后不可读；unpair 后 `deleteAckCursor` 清 read state，旧 feed 不泄漏给新 binding。DB 层用例见 `packages/database` `mobile-attention-repository`（monotonic/idempotent、pagination、retention prune by age/count、malformed cursor 拒绝、revoke 清 cursor）。
+- **live hint**：mobile-client 只收最小 `attention.changed`（`mobileClientProductEventMethods`，**不含业务正文**）；Desktop Product RPC 不暴露 mobile device unread。
+- **notification 路由（opaque、gated）**：schedule 时只挂 `parseNotificationRoute` 白名单校验过的 `{sessionId?, approvalId?, attentionEventId}` opaque route。`NotificationTapCoordinator` 注册 `localNotificationActionPerformed`（单一 listener、start/dispose 无泄漏）：未配对/fatal 显示安全状态**不导航**；否则等 authenticated connection + attention snapshot 刷新成功后才用 opaque id 导航，绝不直接展示 stale payload。
+- **client 消费（无 replay、badge、恢复）**：`AttentionController` 连接后取 recovery snapshot（仅刷 badge，`#seenSeq` baseline **不把历史事件补发为系统通知**）；Activity badge = `max(pendingApprovals, unread)`；重连从 server feed 恢复 missed unread。lifecycle/通知见 §架构 9.0.4。
+
+
 ## 10. Policy、Approval 与 Execution Grant
 
 ### 10.1 ActionRequest
@@ -441,23 +510,51 @@ interface ActionRequest<TAction extends ActionType = ActionType> {
 
 server 不信任模型、Tool wrapper 或 Runtime Box 提供的 risk/approval 结论；Policy Engine 根据持久配置重新计算并持久化。
 
-### 10.2 ApprovalRequest
+### 10.2 ApprovalRequest（Layer 2 已实现，见 `packages/contracts/src/approval.ts`）
+
+真实实现的 versioned、client-neutral wire 合同（server 权威）：
 
 ```ts
 interface ApprovalRequest {
+  schemaVersion: 1;
   id: string;
+  sessionId: string;
   runId: string;
+  actionId: string;
   toolCallId: string;
-  runtimeBoxId: string;
-  action: RedactedActionSnapshot;
-  risk: "low" | "medium" | "high";
-  allowedDecisions: Array<"approve" | "edit" | "reject" | "respond">;
-  policyVersion: string;
+  action: {
+    tool: string;
+    operation: "read" | "search" | "list" | "edit" | "write" | "bash" | "mcp" | "other";
+    target: { kind: "runtime-box" | "agent-server"; id: string };
+    command?: string; // 脱敏
+    path?: string;
+    mcpServerId?: string;
+    mcpToolId?: string;
+    redactedParams: Record<string, Json>; // 仅键名/脱敏值，绝不含内容或 secret
+  };
+  risk: {
+    tier: "low" | "medium" | "high" | "critical";
+    overridable: boolean; // false = 不可被 Allow-all 绕过
+    reasons: string[];
+  };
+  state: "pending" | "approved" | "rejected" | "expired" | "cancelled";
+  revision: number; // 每次状态转换 +1，作为 CAS token
   createdAt: string;
+  expiresAt: string;
+  decidedAt?: string;
+  decision?: { kind: "approve_once" | "reject"; source: DecisionSource; decidedAt: string };
+  policyEvidence?: { allowAllRevision: number }; // Allow-all 自动通过时记录
 }
 ```
 
-编辑后的 Action 重新经过 Schema、Policy 和 intent 持久化，不能复用旧 grant。
+- **风险由 server 权威计算**（`@moshu/action-broker`），从 Tool identity + 校验后 normalized 参数得出，不信任模型/Tool wrapper/Runtime Box 自报：read/search → low（不审批）；edit/write → medium 可覆盖；bash → high 可覆盖，危险模式 → critical **不可覆盖**；MCP → high 可覆盖。
+- **状态机**：`pending → approved | rejected | expired | cancelled`（终态不可逆）。approve/reject 由 client CAS decision 驱动；expire 由过期扫描或惰性检查驱动；cancel 由 waiter abort（Run/连接结束）驱动。
+- **并发**：`approvals.decide(expectedRevision, idempotencyKey)`。两 client 竞争只有一个 `applied`，另一个得到 `superseded` 的 authoritative final state；相同 idempotency key 重试得到 `idempotent`。
+- **Session Allow all**：`SessionApprovalPolicy{ sessionId, allowAll, revision, updatedBy?, updatedAt }` session-scoped、revisioned、server-owned。对 `overridable` 的普通 action 自动 `approve_once` 并写入 `policyEvidence`；**`overridable=false` 的 critical action 永不被绕过**。策略在 session retire 时 reset，不跨 Session 泄漏。
+- **执行门**：request 处于 `pending` 期间**不签发/消费 execution grant，不调用 Runtime Box**。agents-server 重启对 pending request 保守 expire（无法恢复进程内 waiter），已决定 action 不重复 grant/执行。
+- **决策来源**：`decision.source` 由 server 从 authenticated peer 身份派生，不信任请求体。
+- **仍未实现**：`edit` 决策与 Mobile client。当前只支持 `approve_once` / `reject` 两种 per-request 决策 + Session Allow-all 策略切换。
+
 
 ### 10.3 ExecutionGrant
 

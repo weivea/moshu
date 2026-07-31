@@ -33,20 +33,27 @@ import {
 	CURRENT_PROCESS_RPC_PROTOCOL,
 	createRpcBearerAuthenticator,
 	createRpcServer,
+	type RpcPeer,
 	type RpcServer,
 	rpcJsonValueSchema,
 } from "@moshu/process-rpc";
 import { FileSkillContentStore } from "@moshu/skill-runtime";
 import { DurableActionAuthorizationService } from "./action-authorization-service";
 import { AgentServerIdentity } from "./agent-server-identity";
+import { ApprovalService } from "./approval-service";
 import { ChatApplicationService } from "./chat-application-service";
 import { DevTunnelService } from "./dev-tunnel-service";
 import { resolveEffectiveSkills } from "./effective-skill-resolver";
 import { FileProviderRegistryStore } from "./file-provider-registry-store";
 import { McpActionDispatcher } from "./mcp-action-dispatcher";
+import { MobileIngressAuth } from "./mobile-ingress-auth";
+import { createMobileIngressComposition } from "./mobile-ingress-composition";
+import { MobileIngressGenerationFence } from "./mobile-ingress-generation-fence";
 import {
 	agentsServerClientMethodAllowlist,
 	agentsServerRuntimeMethodAllowlist,
+	broadcastApprovalActivityChanged,
+	broadcastMobileAttentionChanged,
 	createProductRpcHandlers,
 	createRuntimeBoxesSnapshot,
 	ProductEventRouter,
@@ -61,6 +68,7 @@ import { RuntimeIngressAuth } from "./runtime-ingress-auth";
 export interface AgentsServerInstance {
 	readonly productRpcServer: RpcServer;
 	readonly runtimeRpcServer: RpcServer;
+	readonly mobileRpcServer: RpcServer;
 	readonly devTunnelService: DevTunnelService;
 	readonly runtimeBoxRegistry: RuntimeBoxRegistry;
 	readonly actionJournalEpoch: string;
@@ -161,8 +169,12 @@ export async function createAgentsServer(
 	let projectService: ProjectApplicationService | undefined;
 	let productRpcServer: RpcServer | undefined;
 	let runtimeRpcServer: RpcServer | undefined;
+	let mobileRpcServer: RpcServer | undefined;
 	let devTunnelService: DevTunnelService | undefined;
 	let unsubscribe: (() => void) | undefined;
+	let unsubscribeApprovals: (() => void) | undefined;
+	let approvalSweepTimer: ReturnType<typeof setInterval> | undefined;
+	let attentionDrainerHandle: { stop: () => void } | undefined;
 	let authController: HeadlessAuthController | undefined;
 	let agentServerMcpLifecycle: McpLifecycleManager | undefined;
 	try {
@@ -188,10 +200,26 @@ export async function createAgentsServer(
 		await serverMcpLifecycle.start();
 		const activeRuntimeBox = database.runtimeBoxes.getActive();
 		let publishRuntimeBoxesChanged = () => undefined;
+		// The approval service is the durable execution gate + event hub for real Tool/Action
+		// approvals. Injecting it into the authorizer makes side-effecting Actions wait for a client
+		// decision (or a Session Allow-all policy) before any grant is issued or Runtime Box invoked.
+		const approvalService = new ApprovalService(database.approvals, database.runs);
+		const approvalRecovery = approvalService.recoverOnStartup();
+		if (approvalRecovery.expired > 0) {
+			reportDiagnostic(
+				`Expired ${approvalRecovery.expired} pending Tool approvals that could not resume after restart.`,
+			);
+		}
+		if (approvalRecovery.policiesReset > 0) {
+			reportDiagnostic(
+				`Reset ${approvalRecovery.policiesReset} Session Allow-all policies to off after restart (SEC-003).`,
+			);
+		}
 		const actionAuthorizer = new DurableActionAuthorizationService(
 			database.actions,
 			database.runs,
 			options.bootstrap.serverIdentity,
+			{ allowSideEffects: true, approvalGate: approvalService },
 		);
 		const runtimeBoxRegistry = new RuntimeBoxRegistry({
 			descriptors: database.runtimeBoxes.list(),
@@ -219,17 +247,19 @@ export async function createAgentsServer(
 			if (server === undefined) {
 				return;
 			}
-			const payload = rpcJsonValueSchema.parse(
-				createRuntimeBoxesSnapshot(
-					database.runtimeBoxes,
-					runtimeBoxRegistry,
-					database.runtimeBoxPairings,
-				),
-			);
 			for (const peer of server.peers) {
 				if (peer.remoteIdentity.role !== "client") {
 					continue;
 				}
+				// The snapshot's `active` selection is per-client, so build it for each client peer.
+				const payload = rpcJsonValueSchema.parse(
+					createRuntimeBoxesSnapshot(
+						database.runtimeBoxes,
+						runtimeBoxRegistry,
+						database.runtimeBoxPairings,
+						peer.remoteIdentity.peerId,
+					),
+				);
 				try {
 					peer.emitEvent(productRpcEvents.runtimeBoxesChanged, payload);
 				} catch (error) {
@@ -266,6 +296,39 @@ export async function createAgentsServer(
 			},
 		});
 		const eventRouter = new ProductEventRouter();
+		// Centralized retirement notification: every Session delete/retire path (Project retirement AND
+		// direct product-rpc session.delete) funnels through here so live event subscriptions are always
+		// torn down and retired-session invalidations are always published. Patching only one handler
+		// would leave the other path leaking subscriptions.
+		// Product events fan out to every product-client peer regardless of ingress: Desktop clients on
+		// the Product RPC server and authenticated Mobile clients on the dedicated Mobile ingress. The
+		// event hub still applies per-Session subscription authorization, so combining the peer sets only
+		// widens the candidate set, never the visibility rules.
+		const productEventPeers = (): readonly RpcPeer[] => [
+			...(productRpcServer?.peers ?? []),
+			...(mobileRpcServer?.peers ?? []),
+		];
+		const notifySessionsRetired = (sessionIds: readonly string[]): void => {
+			eventRouter.retireSessions(sessionIds);
+			// Session "Allow all" is session-scoped and server-owned: when a Session is retired its
+			// policy and any pending approvals are reset so the grant can never leak into a new Session.
+			for (const sessionId of sessionIds) {
+				try {
+					approvalService.resetForSession(sessionId);
+				} catch (error) {
+					const message = error instanceof Error ? error.message.slice(0, 256) : "Unknown failure.";
+					reportDiagnostic(`Approval reset for retired Session failed: ${message}`);
+				}
+			}
+			try {
+				publishRetiredChatSessions(productEventPeers(), sessionIds, reportDiagnostic);
+			} catch (error) {
+				const message = error instanceof Error ? error.message.slice(0, 256) : "Unknown failure.";
+				reportDiagnostic(
+					`Session retirement publication failed; replay will recover it: ${message}`,
+				);
+			}
+		};
 		const runtimeIngressAuth = new RuntimeIngressAuth({
 			pairings: database.runtimeBoxPairings,
 			runtimeBoxes: database.runtimeBoxes,
@@ -277,6 +340,40 @@ export async function createAgentsServer(
 			),
 			onUpgradeRequired: (runtimeBoxId) => runtimeBoxRegistry.markUpgradeRequired(runtimeBoxId),
 		});
+		// Dedicated Mobile ingress auth — its own pairing repository, device identity path, and pre-auth
+		// HTTP endpoints. It never shares the Runtime ingress bearer/local path: a Mobile client always
+		// authenticates with a signed Ed25519 device challenge, so there is no fallback to Product or
+		// Runtime credentials.
+		const mobileIngressAuth = new MobileIngressAuth({
+			pairings: database.mobilePairings,
+			identity: agentServerIdentity,
+			rpcIdentity: options.bootstrap.serverIdentity,
+			actionJournalEpoch: database.runtimeBoxes.getActionJournalEpoch(),
+			// A pairing QR is only publishable once the Mobile ingress port is live with a public URL AND
+			// Remote Access is still enabled. disable() persists enabled=false before the async stop
+			// clears readiness/URL, so the enabled flag is folded directly into the URL provider (and
+			// re-checked via isRemoteAccessEnabled) to fail closed during that transition window.
+			getMobilePublicUrl: () => {
+				if (devTunnelService?.getStatus().enabled !== true) {
+					return undefined;
+				}
+				const ingress = devTunnelService
+					?.getIngressReadiness()
+					.find((entry) => entry.kind === "mobile");
+				return ingress?.ready ? ingress.publicUrl : undefined;
+			},
+			isRemoteAccessEnabled: () => devTunnelService?.getStatus().enabled === true,
+		});
+		const mobileGenerationFence = new MobileIngressGenerationFence(database.mobileDevices);
+		// Revoking a Mobile device immediately tears down any live peer for that client id; the durable
+		// revoke flag then blocks any future challenge/upgrade so a stale connection cannot be revived.
+		const disconnectMobileDevice = (mobileClientId: string, reason: string): void => {
+			for (const peer of mobileRpcServer?.peers ?? []) {
+				if (peer.remoteIdentity.peerId === mobileClientId && !peer.isClosed) {
+					peer.close(1008, reason);
+				}
+			}
+		};
 		const initializedProjectService = new ProjectApplicationService({
 			projects: database.projects,
 			runs: database.runs,
@@ -284,18 +381,7 @@ export async function createAgentsServer(
 			runtimeBoxes: database.runtimeBoxes,
 			pathInspector: runtimeBoxRegistry,
 			onSessionsRetired: (sessionIds) => {
-				const server = productRpcServer;
-				if (server !== undefined) {
-					try {
-						publishRetiredChatSessions(server.peers, sessionIds, reportDiagnostic);
-					} catch (error) {
-						const message =
-							error instanceof Error ? error.message.slice(0, 256) : "Unknown failure.";
-						reportDiagnostic(
-							`Session retirement publication failed; replay will recover it: ${message}`,
-						);
-					}
-				}
+				notifySessionsRetired(sessionIds);
 				void chatService?.drainPendingAgentSessionCleanups({ batchSize: 64 });
 			},
 			reportDiagnostic,
@@ -312,6 +398,9 @@ export async function createAgentsServer(
 				: { fetchProviderModels: options.fetchProviderModels }),
 			isRuntimeReady: (runtimeBoxId) => runtimeBoxRegistry.isReady(runtimeBoxId),
 			getActiveRuntimeBoxId: () => database.runtimeBoxes.getActive().runtimeBoxId,
+			getActiveRuntimeBoxIdForClient: (clientId) =>
+				database.runtimeBoxes.getActiveForClient(clientId).runtimeBoxId,
+			onSessionsRetired: notifySessionsRetired,
 			withProjectSessionCreation: (projectId, createSession, signal) =>
 				initializedProjectService.withSessionCreation(projectId, createSession, signal),
 			withProjectRunPreflight: (projectId, createRun, signal) =>
@@ -407,9 +496,14 @@ export async function createAgentsServer(
 
 		const handlers = createProductRpcHandlers({
 			chatService,
+			approvalService,
 			runtimeBoxRegistry,
 			runtimeBoxes: database.runtimeBoxes,
 			runtimeBoxPairings: database.runtimeBoxPairings,
+			mobileIngressAuth,
+			mobileDevices: database.mobileDevices,
+			mobileAttention: database.mobileAttention,
+			disconnectMobileDevice,
 			projectService,
 			runtimeBoxInventory: database.runtimeBoxInventory,
 			runtimeProfiles: database.runtimeProfiles,
@@ -535,9 +629,60 @@ export async function createAgentsServer(
 		if (persistedRuntimePort === undefined) {
 			database.remoteAccess.setRuntimeIngressPort(runtimeRpcServer.port);
 		}
+		// Physically separate Mobile ingress listener: its own loopback port and `/mobile` path, its own
+		// authenticator (device-signature only), generation fence, and strict allowlist. It shares the
+		// process handler map but never the Runtime/Product accepted-role set, so a Mobile peer can only
+		// ever reach the Mobile allowlist surface. The listener, its merged attention handlers, and the
+		// transactional-outbox drainer are all built by the pi-free `createMobileIngressComposition` — the
+		// single source of truth that the ingress smoke also drives, so the smoke exercises the real
+		// production wiring rather than a bespoke reimplementation.
+		const mobileComposition = createMobileIngressComposition({
+			serverIdentity: options.bootstrap.serverIdentity,
+			authenticate: mobileIngressAuth.authenticate,
+			handleHttpRequest: mobileIngressAuth.handleHttpRequest,
+			generationFence: mobileGenerationFence,
+			baseHandlers: handlers,
+			mobileAttention: database.mobileAttention,
+			mobileAttentionOutbox: database.mobileAttentionOutbox,
+			// Pushes the mobile-only `attention.changed` hint only when a NEW row was projected; losing
+			// that hint never affects durable recovery because the phone re-reads the feed on reconnect.
+			onAttentionAppended: () => broadcastMobileAttentionChanged(productEventPeers()),
+			reportDiagnostic,
+			onTraffic(direction, bytes, peer) {
+				if (peer.remoteIdentity.deviceKeyId !== undefined) {
+					devTunnelService?.recordTraffic(direction, bytes);
+				}
+			},
+			onClose(_info, peer) {
+				eventRouter.releasePeer(peer);
+			},
+			onError(error) {
+				console.error("agents-server Mobile ingress RPC error.", error);
+			},
+		});
+		const createMobileRpcServer = (port?: number): RpcServer =>
+			mobileComposition.createServer(port);
+		const persistedMobilePort = database.remoteAccess.get().mobileIngressPort;
+		try {
+			mobileRpcServer = createMobileRpcServer(persistedMobilePort);
+		} catch (error) {
+			if (persistedMobilePort === undefined || !isAddressInUseError(error)) {
+				throw error;
+			}
+			mobileRpcServer = createMobileRpcServer();
+			reportDiagnostic(
+				`Mobile ingress port ${persistedMobilePort} is unavailable; rebound to ${mobileRpcServer.port}.`,
+			);
+		}
+		if (persistedMobilePort === undefined) {
+			database.remoteAccess.setMobileIngressPort(mobileRpcServer.port);
+		} else if (persistedMobilePort !== mobileRpcServer.port) {
+			database.remoteAccess.replaceMobileIngressPort(mobileRpcServer.port);
+		}
 		devTunnelService = new DevTunnelService({
 			repository: database.remoteAccess,
 			runtimeIngressPort: runtimeRpcServer.port,
+			mobileIngressPort: mobileRpcServer.port,
 			reportDiagnostic,
 			...(portConflict === undefined ? {} : { portConflict }),
 		});
@@ -545,17 +690,62 @@ export async function createAgentsServer(
 			reportDiagnostic(error instanceof Error ? error.message : "Dev Tunnel startup failed.");
 		});
 		const service = chatService;
+		// The durable Mobile attention feed is fed by a transactional outbox: the approval and Run
+		// repositories write a desensitized outbox row in the SAME transaction as the business write, so
+		// a crash between the business commit and the feed projection can never permanently lose unread.
+		// This independent, idempotent drainer (owned by the composition) projects committed outbox rows
+		// into the feed and enforces retention. It drains once at startup (replaying anything a crash
+		// left behind), on each relevant live event, and on a bounded periodic backstop.
+		const attentionDrainer = mobileComposition.drainer;
+		attentionDrainerHandle = attentionDrainer.start();
 		unsubscribe = service.subscribe((event) => {
-			const server = productRpcServer;
-			if (server !== undefined) {
-				eventRouter.publish(server.peers, event, service.getClientRequestId(event.runId));
+			eventRouter.publish(productEventPeers(), event, service.getClientRequestId(event.runId));
+			// A Run terminal transition committed its attention outbox row atomically; project it now.
+			if (event.type === "run.status") {
+				attentionDrainer.drain();
 			}
 		});
+		// Fan approval state changes out to the multi-client event hub: Session-scoped events reach
+		// that Session's subscribers, and a no-payload activity hint tells every client to refresh its
+		// cross-session pending-approvals snapshot.
+		unsubscribeApprovals = approvalService.subscribe((event) => {
+			const peers = productEventPeers();
+			if (event.type === "sessionApprovalPolicy.changed") {
+				eventRouter.publishSessionApprovalPolicy(peers, {
+					schemaVersion: 1,
+					policy: event.policy,
+				});
+			} else {
+				eventRouter.publishApproval(peers, {
+					schemaVersion: 1,
+					kind: event.type === "approval.created" ? "created" : "updated",
+					request: event.request,
+				});
+				// A newly-created approval that entered "pending" committed its attention outbox row
+				// atomically with the approval insert; project it now.
+				if (event.type === "approval.created") {
+					attentionDrainer.drain();
+				}
+			}
+			broadcastApprovalActivityChanged(peers);
+		});
+		// Lazily-expired approvals are settled on read, but a periodic sweep bounds the worst-case time
+		// a waiting Action lingers past its deadline when no client is actively polling.
+		approvalSweepTimer = setInterval(() => {
+			try {
+				approvalService.sweepExpired();
+			} catch (error) {
+				const message = error instanceof Error ? error.message.slice(0, 256) : "Unknown failure.";
+				reportDiagnostic(`Approval expiry sweep failed: ${message}`);
+			}
+		}, 30_000);
+		approvalSweepTimer.unref?.();
 
 		let shutdownPromise: Promise<void> | undefined;
 		return {
 			productRpcServer,
 			runtimeRpcServer,
+			mobileRpcServer,
 			devTunnelService,
 			runtimeBoxRegistry,
 			actionJournalEpoch: database.runtimeBoxes.getActionJournalEpoch(),
@@ -566,8 +756,14 @@ export async function createAgentsServer(
 				}
 				const execution = (async () => {
 					unsubscribe?.();
+					unsubscribeApprovals?.();
+					attentionDrainerHandle?.stop();
+					if (approvalSweepTimer !== undefined) {
+						clearInterval(approvalSweepTimer);
+					}
 					productRpcServer?.stop();
 					runtimeRpcServer?.stop();
+					mobileRpcServer?.stop();
 					await devTunnelService?.shutdown();
 					await authController?.dispose();
 					await projectService?.shutdown();
@@ -587,9 +783,12 @@ export async function createAgentsServer(
 		};
 	} catch (error) {
 		unsubscribe?.();
+		unsubscribeApprovals?.();
+		attentionDrainerHandle?.stop();
 		await devTunnelService?.shutdown();
 		productRpcServer?.stop();
 		runtimeRpcServer?.stop();
+		mobileRpcServer?.stop();
 		await authController?.dispose();
 		await projectService?.shutdown();
 		await chatService?.shutdown();

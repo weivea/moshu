@@ -1,4 +1,7 @@
 import {
+	type ApprovalEventDelivery,
+	type ApproveMobilePairingInput,
+	type ApproveMobilePairingOutput,
 	type ApproveRuntimeBoxPairingInput,
 	type ApproveRuntimeBoxPairingOutput,
 	type CancelChatRunInput,
@@ -10,8 +13,11 @@ import {
 	type ConfirmCreateProjectInput,
 	type ConfirmCreateProjectOutput,
 	type CreateChatSessionOutput,
+	type CreateMobilePairingOutput,
 	type CreateProviderInput,
 	type CreateRuntimeBoxPairingOutput,
+	type DecideApprovalInput,
+	type DecideApprovalOutput,
 	type DeleteChatSessionInput,
 	type DeleteChatSessionOutput,
 	type DeleteMcpServerInput,
@@ -25,6 +31,8 @@ import {
 	type FetchProviderModelsOutput,
 	type GetAgentGlobalProfileInput,
 	type GetAgentGlobalProfileOutput,
+	type GetApprovalInput,
+	type GetApprovalOutput,
 	type GetChatSessionInput,
 	type GetChatSessionSnapshotOutput,
 	type GetDefaultModelOutput,
@@ -36,12 +44,19 @@ import {
 	type GetProjectSidebarOutput,
 	type GetRuntimeProfileInput,
 	type GetRuntimeProfileOutput,
+	type GetSessionApprovalPolicyInput,
+	type GetSessionApprovalPolicyOutput,
 	type InstallRuntimeBoxSkillInput,
+	type ListApprovalsInput,
+	type ListApprovalsOutput,
 	type ListAvailableModelsOutput,
 	type ListChatSessionsInput,
 	type ListChatSessionsOutput,
 	type ListMcpServersInput,
 	type ListMcpServersOutput,
+	type ListMobileDevicesInput,
+	type ListMobileDevicesOutput,
+	type ListMobilePairingClaimsOutput,
 	type ListProjectsInput,
 	type ListProjectsOutput,
 	type ListProvidersOutput,
@@ -55,12 +70,15 @@ import {
 	type ListSkillsInput,
 	type ListSkillsOutput,
 	type McpServerMutationResult,
+	type MobileAccessStatusOutput,
 	type PreviewProjectPathInput,
 	type PreviewProjectPathOutput,
 	type PreviewProjectRelinkInput,
 	type PreviewProjectRelinkOutput,
 	type ProviderAuthAttemptOutput,
 	type ProviderMutationOutput,
+	type RejectMobilePairingInput,
+	type RejectMobilePairingOutput,
 	type RejectRuntimeBoxPairingInput,
 	type RejectRuntimeBoxPairingOutput,
 	type RelinkProjectInput,
@@ -71,11 +89,14 @@ import {
 	type RequestProjectDeletionInput,
 	type RequestProjectDeletionOutput,
 	type RespondProviderAuthInput,
+	type RevokeMobileDeviceInput,
+	type RevokeMobileDeviceOutput,
 	type RevokeRuntimeBoxDeviceInput,
 	type RevokeRuntimeBoxDeviceOutput,
 	type RuntimeBoxResourceMutationResult,
 	type RuntimeDiagnosticsOutput,
 	type RuntimeInfo,
+	type SessionApprovalPolicyEvent,
 	type SessionModelSelection,
 	type SetChatSessionArchivedInput,
 	type SetChatSessionArchivedOutput,
@@ -103,6 +124,8 @@ import {
 	type UpdateProjectOutput,
 	type UpdateProviderInput,
 	type UpdateRuntimeProfileInput,
+	type UpdateSessionApprovalPolicyInput,
+	type UpdateSessionApprovalPolicyOutput,
 	type UpsertMcpServerInput,
 	type UpsertRuntimeBoxMcpServerInput,
 	type UpsertSkillInput,
@@ -192,6 +215,34 @@ export type DesktopRpc = {
 			revokeRuntimeBoxDevice: {
 				params: RevokeRuntimeBoxDeviceInput;
 				response: RevokeRuntimeBoxDeviceOutput;
+			};
+			getMobileAccessStatus: {
+				params: EmptyParams;
+				response: MobileAccessStatusOutput;
+			};
+			createMobilePairing: {
+				params: EmptyParams;
+				response: CreateMobilePairingOutput;
+			};
+			listMobilePairingClaims: {
+				params: EmptyParams;
+				response: ListMobilePairingClaimsOutput;
+			};
+			approveMobilePairing: {
+				params: ApproveMobilePairingInput;
+				response: ApproveMobilePairingOutput;
+			};
+			rejectMobilePairing: {
+				params: RejectMobilePairingInput;
+				response: RejectMobilePairingOutput;
+			};
+			listMobileDevices: {
+				params: ListMobileDevicesInput;
+				response: ListMobileDevicesOutput;
+			};
+			revokeMobileDevice: {
+				params: RevokeMobileDeviceInput;
+				response: RevokeMobileDeviceOutput;
 			};
 			getRemoteAccessStatus: {
 				params: EmptyParams;
@@ -457,6 +508,26 @@ export type DesktopRpc = {
 				params: AcknowledgeChatSessionInvalidationInput;
 				response: EmptyParams;
 			};
+			listApprovals: {
+				params: ListApprovalsInput;
+				response: ListApprovalsOutput;
+			};
+			getApproval: {
+				params: GetApprovalInput;
+				response: GetApprovalOutput;
+			};
+			decideApproval: {
+				params: DecideApprovalInput;
+				response: DecideApprovalOutput;
+			};
+			getSessionApprovalPolicy: {
+				params: GetSessionApprovalPolicyInput;
+				response: GetSessionApprovalPolicyOutput;
+			};
+			updateSessionApprovalPolicy: {
+				params: UpdateSessionApprovalPolicyInput;
+				response: UpdateSessionApprovalPolicyOutput;
+			};
 		};
 		messages: EmptyRpcMap;
 	}>;
@@ -467,6 +538,9 @@ export type DesktopRpc = {
 			chatEvent: ChatRunEvent;
 			chatSessionInvalidated: ChatSessionInvalidation;
 			runtimeBoxesChanged: ListRuntimeBoxesOutput;
+			approvalEvent: ApprovalEventDelivery;
+			sessionApprovalPolicyChanged: SessionApprovalPolicyEvent;
+			approvalActivityChanged: EmptyParams;
 		};
 	}>;
 };

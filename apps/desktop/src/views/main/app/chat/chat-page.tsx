@@ -6,6 +6,7 @@ import { Link } from "react-router-dom";
 import { useI18n } from "../i18n";
 import { useRuntimeBoxes } from "../runtime-boxes";
 import { useAppShellContext } from "../shell-context";
+import { SessionApprovalCards } from "./approval-card";
 import { ChatComposer } from "./chat-composer";
 import { MessageList } from "./message-list";
 import { SessionSidebar } from "./session-sidebar";
@@ -287,6 +288,10 @@ export function ChatPage({
 							isLoading={controller.isSessionLoading && controller.session === null}
 							messages={controller.session?.messages ?? []}
 							sessionId={activeSessionId}
+						/>
+						<SessionApprovalCards
+							sessionId={activeSessionId}
+							disabled={disabledReason !== undefined}
 						/>
 						{controller.hasConfiguredProvider ? (
 							<ChatComposer

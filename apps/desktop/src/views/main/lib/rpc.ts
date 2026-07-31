@@ -1,5 +1,10 @@
 import {
+	type ApprovalEventDelivery,
+	type ApproveMobilePairingInput,
 	type ApproveRuntimeBoxPairingInput,
+	approvalEventDeliverySchema,
+	approveMobilePairingInputSchema,
+	approveMobilePairingOutputSchema,
 	approveRuntimeBoxPairingInputSchema,
 	approveRuntimeBoxPairingOutputSchema,
 	type ChatRunEvent,
@@ -13,10 +18,14 @@ import {
 	confirmCreateProjectInputSchema,
 	confirmCreateProjectOutputSchema,
 	createChatSessionOutputSchema,
+	createMobilePairingOutputSchema,
 	createProviderInputSchema,
 	createRuntimeBoxPairingOutputSchema,
+	type DecideApprovalInput,
 	type DeleteRuntimeBoxMcpServerInput,
 	type DeleteRuntimeBoxSkillInput,
+	decideApprovalInputSchema,
+	decideApprovalOutputSchema,
 	deleteChatSessionInputSchema,
 	deleteChatSessionOutputSchema,
 	deleteMcpServerInputSchema,
@@ -28,8 +37,12 @@ import {
 	emptyParamsSchema,
 	fetchProviderModelsInputSchema,
 	fetchProviderModelsOutputSchema,
+	type GetApprovalInput,
+	type GetSessionApprovalPolicyInput,
 	getAgentGlobalProfileInputSchema,
 	getAgentGlobalProfileOutputSchema,
+	getApprovalInputSchema,
+	getApprovalOutputSchema,
 	getChatSessionInputSchema,
 	getChatSessionSnapshotOutputSchema,
 	getDefaultModelOutputSchema,
@@ -41,14 +54,23 @@ import {
 	getProjectSidebarOutputSchema,
 	getRuntimeProfileInputSchema,
 	getRuntimeProfileOutputSchema,
+	getSessionApprovalPolicyInputSchema,
+	getSessionApprovalPolicyOutputSchema,
 	type InstallRuntimeBoxSkillInput,
 	installRuntimeBoxSkillInputSchema,
+	type ListApprovalsInput,
+	type ListMobileDevicesInput,
 	type ListProjectsInput,
+	listApprovalsInputSchema,
+	listApprovalsOutputSchema,
 	listAvailableModelsOutputSchema,
 	listChatSessionsInputSchema,
 	listChatSessionsOutputSchema,
 	listMcpServersInputSchema,
 	listMcpServersOutputSchema,
+	listMobileDevicesInputSchema,
+	listMobileDevicesOutputSchema,
+	listMobilePairingClaimsOutputSchema,
 	listProjectsInputSchema,
 	listProjectsOutputSchema,
 	listProvidersOutputSchema,
@@ -65,6 +87,7 @@ import {
 	logoutProviderInputSchema,
 	logoutProviderOutputSchema,
 	mcpServerMutationResultSchema,
+	mobileAccessStatusOutputSchema,
 	previewProjectPathInputSchema,
 	previewProjectPathOutputSchema,
 	previewProjectRelinkInputSchema,
@@ -72,9 +95,13 @@ import {
 	providerAuthAttemptInputSchema,
 	providerAuthAttemptOutputSchema,
 	providerMutationOutputSchema,
+	type RejectMobilePairingInput,
 	type RejectRuntimeBoxPairingInput,
 	type RespondProviderAuthInput,
+	type RevokeMobileDeviceInput,
 	type RevokeRuntimeBoxDeviceInput,
+	rejectMobilePairingInputSchema,
+	rejectMobilePairingOutputSchema,
 	rejectRuntimeBoxPairingInputSchema,
 	rejectRuntimeBoxPairingOutputSchema,
 	relinkProjectInputSchema,
@@ -86,6 +113,8 @@ import {
 	requestProjectDeletionInputSchema,
 	requestProjectDeletionOutputSchema,
 	respondProviderAuthInputSchema,
+	revokeMobileDeviceInputSchema,
+	revokeMobileDeviceOutputSchema,
 	revokeRuntimeBoxDeviceInputSchema,
 	revokeRuntimeBoxDeviceOutputSchema,
 	runtimeBoxResourceMutationResultSchema,
@@ -100,6 +129,7 @@ import {
 	type SetRuntimeBoxMcpServerEnabledInput,
 	type StartProviderAuthInput,
 	type SwitchRuntimeBoxInput,
+	sessionApprovalPolicyEventSchema,
 	setChatSessionArchivedInputSchema,
 	setChatSessionArchivedOutputSchema,
 	setChatSessionModelInputSchema,
@@ -123,6 +153,7 @@ import {
 	type UpdateProjectInput,
 	type UpdateProviderInput,
 	type UpdateRuntimeProfileInput,
+	type UpdateSessionApprovalPolicyInput,
 	type UpsertRuntimeBoxMcpServerInput,
 	updateAgentGlobalProfileInputSchema,
 	updateChatSessionInputSchema,
@@ -131,6 +162,8 @@ import {
 	updateProjectOutputSchema,
 	updateProviderInputSchema,
 	updateRuntimeProfileInputSchema,
+	updateSessionApprovalPolicyInputSchema,
+	updateSessionApprovalPolicyOutputSchema,
 	upsertMcpServerInputSchema,
 	upsertRuntimeBoxMcpServerInputSchema,
 	upsertSkillInputSchema,
@@ -156,6 +189,11 @@ const agentsReadyListeners = new Set<() => void>();
 const runtimeBoxesChangedListeners = new Set<
 	(snapshot: ReturnType<typeof listRuntimeBoxesOutputSchema.parse>) => void
 >();
+const approvalEventListeners = new Set<(delivery: ApprovalEventDelivery) => void>();
+const sessionApprovalPolicyChangedListeners = new Set<
+	(event: ReturnType<typeof sessionApprovalPolicyEventSchema.parse>) => void
+>();
+const approvalActivityChangedListeners = new Set<() => void>();
 const chatSessionInvalidationBridge = new ChatSessionInvalidationBridge({
 	timeoutMs: invalidationListenerTimeoutMs,
 	maxPending: maxPendingChatSessionInvalidations,
@@ -186,6 +224,24 @@ const rpc = Electroview.defineRPC<DesktopRpc>({
 				const snapshot = listRuntimeBoxesOutputSchema.parse(payload);
 				for (const listener of runtimeBoxesChangedListeners) {
 					listener(snapshot);
+				}
+			},
+			approvalEvent: (payload) => {
+				const delivery = approvalEventDeliverySchema.parse(payload);
+				for (const listener of approvalEventListeners) {
+					listener(delivery);
+				}
+			},
+			sessionApprovalPolicyChanged: (payload) => {
+				const event = sessionApprovalPolicyEventSchema.parse(payload);
+				for (const listener of sessionApprovalPolicyChangedListeners) {
+					listener(event);
+				}
+			},
+			approvalActivityChanged: (payload) => {
+				emptyParamsSchema.parse(payload);
+				for (const listener of approvalActivityChangedListeners) {
+					listener();
 				}
 			},
 		},
@@ -226,6 +282,50 @@ export const desktopClient = {
 			await requestDesktop(() => getRequest().listRuntimeBoxes({})),
 		);
 	},
+	subscribeApprovalEvents(listener: (delivery: ApprovalEventDelivery) => void) {
+		approvalEventListeners.add(listener);
+		return () => approvalEventListeners.delete(listener);
+	},
+	subscribeSessionApprovalPolicyChanged(
+		listener: (event: ReturnType<typeof sessionApprovalPolicyEventSchema.parse>) => void,
+	) {
+		sessionApprovalPolicyChangedListeners.add(listener);
+		return () => sessionApprovalPolicyChangedListeners.delete(listener);
+	},
+	subscribeApprovalActivityChanged(listener: () => void) {
+		approvalActivityChangedListeners.add(listener);
+		return () => approvalActivityChangedListeners.delete(listener);
+	},
+	async listApprovals(input: ListApprovalsInput) {
+		const parsedInput = listApprovalsInputSchema.parse(input);
+		return listApprovalsOutputSchema.parse(
+			await requestDesktop(() => getRequest().listApprovals(parsedInput)),
+		);
+	},
+	async getApproval(input: GetApprovalInput) {
+		const parsedInput = getApprovalInputSchema.parse(input);
+		return getApprovalOutputSchema.parse(
+			await requestDesktop(() => getRequest().getApproval(parsedInput)),
+		);
+	},
+	async decideApproval(input: DecideApprovalInput) {
+		const parsedInput = decideApprovalInputSchema.parse(input);
+		return decideApprovalOutputSchema.parse(
+			await requestDesktop(() => getRequest().decideApproval(parsedInput)),
+		);
+	},
+	async getSessionApprovalPolicy(input: GetSessionApprovalPolicyInput) {
+		const parsedInput = getSessionApprovalPolicyInputSchema.parse(input);
+		return getSessionApprovalPolicyOutputSchema.parse(
+			await requestDesktop(() => getRequest().getSessionApprovalPolicy(parsedInput)),
+		);
+	},
+	async updateSessionApprovalPolicy(input: UpdateSessionApprovalPolicyInput) {
+		const parsedInput = updateSessionApprovalPolicyInputSchema.parse(input);
+		return updateSessionApprovalPolicyOutputSchema.parse(
+			await requestDesktop(() => getRequest().updateSessionApprovalPolicy(parsedInput)),
+		);
+	},
 	async switchRuntimeBox(input: SwitchRuntimeBoxInput) {
 		const parsedInput = switchRuntimeBoxInputSchema.parse(input);
 		return switchRuntimeBoxOutputSchema.parse(
@@ -258,6 +358,45 @@ export const desktopClient = {
 		const parsedInput = revokeRuntimeBoxDeviceInputSchema.parse(input);
 		return revokeRuntimeBoxDeviceOutputSchema.parse(
 			await requestDesktop(() => getRequest().revokeRuntimeBoxDevice(parsedInput)),
+		);
+	},
+	async getMobileAccessStatus() {
+		return mobileAccessStatusOutputSchema.parse(
+			await requestDesktop(() => getRequest().getMobileAccessStatus({})),
+		);
+	},
+	async createMobilePairing() {
+		return createMobilePairingOutputSchema.parse(
+			await requestDesktop(() => getRequest().createMobilePairing({})),
+		);
+	},
+	async listMobilePairingClaims() {
+		return listMobilePairingClaimsOutputSchema.parse(
+			await requestDesktop(() => getRequest().listMobilePairingClaims({})),
+		);
+	},
+	async approveMobilePairing(input: ApproveMobilePairingInput) {
+		const parsedInput = approveMobilePairingInputSchema.parse(input);
+		return approveMobilePairingOutputSchema.parse(
+			await requestDesktop(() => getRequest().approveMobilePairing(parsedInput)),
+		);
+	},
+	async rejectMobilePairing(input: RejectMobilePairingInput) {
+		const parsedInput = rejectMobilePairingInputSchema.parse(input);
+		return rejectMobilePairingOutputSchema.parse(
+			await requestDesktop(() => getRequest().rejectMobilePairing(parsedInput)),
+		);
+	},
+	async listMobileDevices(input: ListMobileDevicesInput = {}) {
+		const parsedInput = listMobileDevicesInputSchema.parse(input);
+		return listMobileDevicesOutputSchema.parse(
+			await requestDesktop(() => getRequest().listMobileDevices(parsedInput)),
+		);
+	},
+	async revokeMobileDevice(input: RevokeMobileDeviceInput) {
+		const parsedInput = revokeMobileDeviceInputSchema.parse(input);
+		return revokeMobileDeviceOutputSchema.parse(
+			await requestDesktop(() => getRequest().revokeMobileDevice(parsedInput)),
 		);
 	},
 	async getRemoteAccessStatus() {

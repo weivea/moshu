@@ -1,6 +1,10 @@
 import { describe, expect, test } from "bun:test";
 
-import { type RuntimeDiagnosticsOutput, runtimeDiagnosticsOutputSchema } from "./runtime-box";
+import {
+	type RuntimeDiagnosticsOutput,
+	remoteAccessStatusOutputSchema,
+	runtimeDiagnosticsOutputSchema,
+} from "./runtime-box";
 
 const diagnostics: RuntimeDiagnosticsOutput = {
 	generatedAt: new Date().toISOString(),
@@ -61,5 +65,44 @@ describe("Runtime diagnostics contract", () => {
 				}),
 			).toThrow();
 		}
+	});
+});
+
+describe("Remote Access status contract (v1 wire compatibility)", () => {
+	const v1Status = {
+		enabled: false,
+		authenticated: false,
+		state: "disabled" as const,
+		runtimeIngressPort: 41_000,
+		trafficEstimate: {
+			month: "2026-07",
+			receivedBytes: 0,
+			sentBytes: 0,
+			totalBytes: 0,
+			monthlyLimitBytes: 5 * 1024 * 1024 * 1024,
+			warningLevel: "none" as const,
+			source: "runtime-rpc-application-payload-estimate" as const,
+		},
+		serviceLimits: {
+			maxTunnelsPerUser: 10 as const,
+			maxPortsPerTunnel: 10 as const,
+			maxBytesPerSecond: 20 * 1024 * 1024,
+		},
+	};
+
+	test("accepts the existing v1 status shape without an ingress set", () => {
+		expect(remoteAccessStatusOutputSchema.parse(v1Status)).toEqual(v1Status);
+	});
+
+	test("rejects a multi-ingress field on the strict v1 status schema", () => {
+		// Layer 1 keeps ingress descriptors internal (DevTunnelService.getIngressReadiness). A future
+		// Mobile ingress (Layer 3) must add multi-ingress readiness through an explicit versioned method,
+		// never by widening this strict v1 schema, so old clients keep parsing status payloads.
+		expect(() =>
+			remoteAccessStatusOutputSchema.parse({
+				...v1Status,
+				ingresses: [{ kind: "runtime", port: 41_000, ready: false }],
+			}),
+		).toThrow();
 	});
 });

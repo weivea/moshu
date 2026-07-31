@@ -1,0 +1,10 @@
+{
+	"$comment": "Single source of truth for the iOS App version + bundle identity. Run `bun run release:version` to fan these values out into the Xcode project (MARKETING_VERSION / CURRENT_PROJECT_VERSION) and this package's version. Signing team, certificates and provisioning profiles are intentionally NOT stored here — they are supplied at build time by whoever signs the App.",
+	"marketingVersion": "1.0.0",
+	"buildNumber": "1",
+	"bundleId": {
+		"development": "dev.moshu.mobile",
+		"release": null,
+		"$release": "Publishers MUST supply a permanent non-dev reverse-DNS bundle id via MOSHU_MOBILE_RELEASE_BUNDLE_ID for real release gates, or set bundleId.release here to that permanent id. The committed project keeps the development id so no App Store identity is baked into source; dev.moshu.mobile is forbidden for release builds."
+	}
+}

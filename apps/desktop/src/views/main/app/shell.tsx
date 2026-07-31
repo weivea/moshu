@@ -1,6 +1,7 @@
 import { AppIcon, type AppIconName } from "@moshu/ui";
 import { type CSSProperties, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, Outlet, useLocation, useNavigate, useNavigationType } from "react-router-dom";
+import { useApprovals } from "./approvals";
 import { CanvasPanel, type CanvasTab } from "./canvas-panel";
 import { chatTransport } from "./chat/rpc-chat-transport";
 import { ChatSessionRecoveryRoot } from "./chat/session-recovery-coordinator";
@@ -41,6 +42,7 @@ export function AppShell() {
 	const navigate = useNavigate();
 	const navigationType = useNavigationType();
 	const runtimeBoxes = useRuntimeBoxes();
+	const approvals = useApprovals();
 	const { pathname } = location;
 	const activeSessionId = readActiveChatSessionId(pathname);
 	const isOrdinaryChatWorkspace =
@@ -255,6 +257,22 @@ export function AppShell() {
 												<span>{t(item.label)}</span>
 											</button>
 										))}
+										<Link
+											to="/activity"
+											className={
+												pathname.startsWith("/activity")
+													? "sidebar-nav-item is-active"
+													: "sidebar-nav-item"
+											}
+										>
+											<AppIcon name="notifications" size={18} />
+											<span>{t("nav.activity")}</span>
+											{approvals.pending.length > 0 ? (
+												<span className="sidebar-nav-item__badge" aria-hidden="true">
+													{approvals.pending.length}
+												</span>
+											) : null}
+										</Link>
 									</nav>
 
 									<SessionSidebar
@@ -506,6 +524,9 @@ function getWorkspaceTitle(pathname: string, t: ReturnType<typeof useI18n>["t"])
 	}
 	if (pathname.startsWith("/tasks")) {
 		return t("page.tasks.title");
+	}
+	if (pathname.startsWith("/activity")) {
+		return t("page.activity.title");
 	}
 	if (pathname.startsWith("/agents")) {
 		return t("page.agents.title");

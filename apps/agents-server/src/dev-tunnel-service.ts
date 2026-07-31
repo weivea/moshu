@@ -13,7 +13,12 @@ const devTunnelTrafficFlushMs = 1_000;
 const devTunnelAuthenticationRefreshMs = 5_000;
 
 export interface DevTunnelHostProcess {
-	readonly ready: Promise<{ publicUrl: string }>;
+	/**
+	 * Resolves with the public URL for a single expected ingress `port` once the host publishes it.
+	 * A host forwards every expected port from one process, so the service awaits `waitForPort` for
+	 * each ingress and only comes online after they all resolve.
+	 */
+	waitForPort(port: number): Promise<{ publicUrl: string }>;
 	readonly exited: Promise<number>;
 	stop(force?: boolean): void;
 }
@@ -24,17 +29,60 @@ export interface DevTunnelAuthenticationProcess {
 	stop(): void;
 }
 
+/**
+ * A single Moshu-owned tunnel ingress. Today only the Runtime ingress exists; a future Mobile
+ * ingress (Layer 3) adds a second descriptor with its own port. Modelling the ingresses as a set of
+ * typed descriptors — rather than a single scalar port — is what lets the tunnel reconcile against
+ * an expected port set instead of destroying every other forwarded port.
+ */
+export type DevTunnelIngressKind = "runtime" | "mobile";
+
+export interface DevTunnelIngress {
+	readonly kind: DevTunnelIngressKind;
+	readonly port: number;
+}
+
+/**
+ * Live per-ingress readiness for the currently online host. This is an INTERNAL descriptor: Layer 1
+ * does not expose the ingress set over the wire (see remoteAccessStatusOutputSchema, which stays at
+ * v1). It lets callers inside the server observe per-port readiness/URL — a future Mobile ingress
+ * (Layer 3) will surface this through an explicit versioned status method. `publicUrl` is present
+ * only while the port is live and has published a URL; it is never a stale/persisted value.
+ */
+export interface DevTunnelIngressStatus {
+	readonly kind: DevTunnelIngressKind;
+	readonly port: number;
+	readonly ready: boolean;
+	readonly publicUrl?: string;
+}
+
 export interface DevTunnelAdapter {
 	isAuthenticated(signal: AbortSignal): Promise<boolean>;
 	startAuthentication(): DevTunnelAuthenticationProcess;
-	ensureTunnel(tunnelId: string, port: number, signal: AbortSignal): Promise<string>;
+	/**
+	 * Reconciles the tunnel so that exactly the expected `ports` are forwarded with anonymous HTTP
+	 * access. Ports already present that are not in the expected set are removed; expected ports that
+	 * are missing or misconfigured are repaired. Ports belonging to other Moshu ingresses in the same
+	 * expected set are preserved — they must never be cross-deleted.
+	 */
+	ensureTunnel(tunnelId: string, ports: readonly number[], signal: AbortSignal): Promise<string>;
 	deleteTunnel(tunnelId: string, signal: AbortSignal): Promise<void>;
-	startHost(tunnelId: string, port: number): DevTunnelHostProcess;
+	/**
+	 * Starts a single host process that forwards every expected ingress `port`. The returned process
+	 * exposes per-port readiness via {@link DevTunnelHostProcess.waitForPort}.
+	 */
+	startHost(tunnelId: string, ports: readonly number[]): DevTunnelHostProcess;
 }
 
 export interface DevTunnelServiceOptions {
 	repository: RemoteAccessRepository;
 	runtimeIngressPort: number;
+	/**
+	 * Forward-looking second ingress port (a future Mobile ingress, Layer 3). When set, the tunnel
+	 * forwards and waits for this port in addition to the Runtime port. No Mobile listener/pairing is
+	 * created here; it only exercises the multi-ingress reconcile/readiness path.
+	 */
+	mobileIngressPort?: number;
 	adapter?: DevTunnelAdapter;
 	reportDiagnostic?: (message: string) => void;
 	portConflict?: { expectedPort: number; boundPort: number };
@@ -64,6 +112,7 @@ class DevTunnelAuthenticationRequiredError extends Error {
 export class DevTunnelService {
 	readonly #repository: RemoteAccessRepository;
 	readonly #runtimeIngressPort: number;
+	readonly #ingresses: readonly DevTunnelIngress[];
 	readonly #adapter: DevTunnelAdapter;
 	readonly #reportDiagnostic: (message: string) => void;
 	readonly #now: () => number;
@@ -89,10 +138,28 @@ export class DevTunnelService {
 	#recreateOperation: SharedMutationOperation | undefined;
 	readonly #pendingTraffic = new Map<string, { receivedBytes: number; sentBytes: number }>();
 	#trafficFlushTimer: ReturnType<typeof setTimeout> | undefined;
+	// Live per-port readiness/URL for the currently online host, keyed by ingress port. Populated as the
+	// host publishes each expected ingress URL and cleared whenever the owning host stops, exits, or its
+	// startup fails/cancels/is superseded — always guarded by host identity so a replacement host's
+	// readiness is never wiped.
+	#ingressReadiness = new Map<number, { publicUrl: string }>();
+	// Hosts we have asked to stop but whose process exit is not yet confirmed — e.g. terminateHost()
+	// threw synchronously or its forced-shutdown timeout rejected. Tracked separately from #host so a
+	// rejected/timed-out termination never drops the only handle to a possibly-still-live public host:
+	// disable/shutdown re-terminate every tracked orphan until its `exited` resolves. Kept disjoint from
+	// the live #host, so a replacement host's ownership and readiness are never affected by an orphan's
+	// lingering cleanup, and a failed termination never blocks a replacement's start guard.
+	readonly #terminatingHosts = new Set<DevTunnelHostProcess>();
 
 	constructor(options: DevTunnelServiceOptions) {
 		this.#repository = options.repository;
 		this.#runtimeIngressPort = options.runtimeIngressPort;
+		this.#ingresses = [
+			{ kind: "runtime", port: options.runtimeIngressPort },
+			...(options.mobileIngressPort === undefined
+				? []
+				: [{ kind: "mobile" as const, port: options.mobileIngressPort }]),
+		];
 		this.#adapter =
 			options.adapter ??
 			new DevTunnelCliAdapter(process.env.MOSHU_DEVTUNNEL_PATH?.trim() || "devtunnel");
@@ -159,6 +226,25 @@ export class DevTunnelService {
 				maxPortsPerTunnel: 10,
 				maxBytesPerSecond: 20 * 1024 * 1024,
 			},
+		});
+	}
+
+	/**
+	 * Internal (non-wire) per-ingress readiness snapshot. Each expected ingress reports whether it is
+	 * currently live and, if so, its published public URL. Pending ports report `ready: false` with no
+	 * `publicUrl` — never a stale/persisted URL. Overall Remote Access only reaches "online" once every
+	 * required ingress is ready (see getStatus().state), but this getter reflects incremental per-port
+	 * progress while some ports are still pending.
+	 */
+	getIngressReadiness(): readonly DevTunnelIngressStatus[] {
+		return this.#ingresses.map((ingress) => {
+			const readiness = this.#ingressReadiness.get(ingress.port);
+			return {
+				kind: ingress.kind,
+				port: ingress.port,
+				ready: readiness !== undefined,
+				...(readiness?.publicUrl === undefined ? {} : { publicUrl: readiness.publicUrl }),
+			};
 		});
 	}
 
@@ -578,6 +664,7 @@ export class DevTunnelService {
 		}
 		this.#state = "starting";
 		this.#lastError = undefined;
+		this.#ingressReadiness = new Map();
 		const startAbortController = new AbortController();
 		let callerCancelled = false;
 		const cancelFromCaller = () => {
@@ -618,7 +705,11 @@ export class DevTunnelService {
 				this.#repository.setTunnel(tunnelId);
 			}
 			const qualifiedTunnelId = await withAbortTimeout(
-				this.#adapter.ensureTunnel(tunnelId, this.#runtimeIngressPort, startAbortController.signal),
+				this.#adapter.ensureTunnel(
+					tunnelId,
+					this.#ingresses.map((ingress) => ingress.port),
+					startAbortController.signal,
+				),
 				30_000,
 				"Dev Tunnel setup",
 				startAbortController,
@@ -630,10 +721,33 @@ export class DevTunnelService {
 			if (qualifiedTunnelId !== tunnelId) {
 				this.#repository.setTunnel(qualifiedTunnelId);
 			}
-			ownedHost = this.#adapter.startHost(qualifiedTunnelId, this.#runtimeIngressPort);
+			ownedHost = this.#adapter.startHost(
+				qualifiedTunnelId,
+				this.#ingresses.map((ingress) => ingress.port),
+			);
 			this.#host = ownedHost;
-			const ready = await withAbortTimeout(
-				withAbortSignal(ownedHost.ready, startAbortController.signal),
+			const host = ownedHost;
+			const ingresses = this.#ingresses;
+			// Every required ingress must publish its public URL before Remote Access is online. A single
+			// laggard or never-ready port keeps the whole service out of the "online" state.
+			const portPromises = ingresses.map((ingress) => host.waitForPort(ingress.port));
+			// Publish each ingress URL incrementally the moment its port resolves, so getIngressReadiness
+			// reflects partial progress (one ready, one still pending) rather than flipping every port at
+			// once. Guarded by host identity + generation so a superseded start never mutates live state.
+			// This runs off separate promise chains and does not feed the awaited path below, preserving
+			// the readiness/cancellation microtask ordering.
+			ingresses.forEach((ingress, index) => {
+				void portPromises[index]?.then(
+					(result) => {
+						if (this.#host === ownedHost && this.#isCurrent(generation)) {
+							this.#ingressReadiness.set(ingress.port, { publicUrl: result.publicUrl });
+						}
+					},
+					() => undefined,
+				);
+			});
+			const ingressUrls = await withAbortTimeout(
+				withAbortSignal(Promise.all(portPromises), startAbortController.signal),
 				15_000,
 				"Dev Tunnel host readiness",
 				startAbortController,
@@ -641,14 +755,37 @@ export class DevTunnelService {
 			throwIfAborted(startAbortController.signal);
 			if (this.#host !== ownedHost || !this.#isCurrent(generation)) {
 				if (this.#host === ownedHost) {
-					await terminateHost(ownedHost);
-					if (this.#host === ownedHost) {
-						this.#host = undefined;
-					}
+					// Clear readiness and release the live handle SYNCHRONOUSLY, before awaiting terminate:
+					// a rejected or timed-out stop must not leave a dead ingress reporting ready, nor block a
+					// replacement's start guard. The handle is retained in #terminatingHosts so a later
+					// disable/shutdown can re-terminate this exact orphan if its stop rejects. Guarded by host
+					// identity (this.#host === ownedHost) so a replacement host — which resets readiness on
+					// its own start — is never wiped.
+					this.#host = undefined;
+					this.#ingressReadiness = new Map();
+					await this.#terminateTrackedHost(ownedHost);
 				}
 				return;
 			}
-			this.#repository.setPublicUrl(ready.publicUrl);
+			const readiness = ingresses.map((ingress, index) => ({
+				ingress,
+				publicUrl: ingressUrls[index]?.publicUrl,
+			}));
+			const runtimeReadiness = readiness.find((entry) => entry.ingress.kind === "runtime");
+			if (runtimeReadiness?.publicUrl === undefined) {
+				throw new Error("Dev Tunnel runtime ingress did not report a public URL.");
+			}
+			this.#ingressReadiness = new Map(
+				readiness.flatMap((entry) =>
+					entry.publicUrl === undefined
+						? []
+						: [[entry.ingress.port, { publicUrl: entry.publicUrl }] as const],
+				),
+			);
+			// Persist the Runtime public URL for backward compatibility (top-level status.publicUrl and
+			// the persisted Remote Runtime Box URL). Additional ingress URLs are surfaced per-port via
+			// the internal getIngressReadiness() getter, not over the v1 status wire contract.
+			this.#repository.setPublicUrl(runtimeReadiness.publicUrl);
 			this.#state = "online";
 			this.#stableTimer = setTimeout(() => {
 				if (this.#host === ownedHost && this.#isCurrent(generation)) {
@@ -662,11 +799,15 @@ export class DevTunnelService {
 		} catch (error) {
 			let failure = error;
 			if (ownedHost !== undefined && this.#host === ownedHost) {
+				// Clear readiness and release the live handle SYNCHRONOUSLY, before awaiting terminate: a
+				// partial-startup failure or cancellation whose stop then rejects/times out must not leave an
+				// already-resolved ingress reporting ready, nor block a replacement's start guard. The handle
+				// is retained in #terminatingHosts so a later disable/shutdown can re-terminate this exact
+				// orphan. Guarded by host identity so a replacement's freshly-reset readiness is untouched.
+				this.#host = undefined;
+				this.#ingressReadiness = new Map();
 				try {
-					await terminateHost(ownedHost);
-					if (this.#host === ownedHost) {
-						this.#host = undefined;
-					}
+					await this.#terminateTrackedHost(ownedHost);
 				} catch (stopError) {
 					failure = stopError;
 				}
@@ -701,6 +842,7 @@ export class DevTunnelService {
 			return;
 		}
 		this.#host = undefined;
+		this.#ingressReadiness = new Map();
 		if (!this.#isCurrent(generation) || !this.#repository.get().enabled) {
 			return;
 		}
@@ -747,13 +889,55 @@ export class DevTunnelService {
 
 	async #stopHost(): Promise<void> {
 		this.#clearRestartTimers(true);
-		const host = this.#host;
-		if (host !== undefined) {
-			await terminateHost(host);
-			if (this.#host === host) {
-				this.#host = undefined;
-			}
+		this.#ingressReadiness = new Map();
+		const current = this.#host;
+		// Release the live handle up front so a rejected termination never blocks a replacement's start
+		// guard; the handle is retained in #terminatingHosts (via #terminateTrackedHost) until its exit
+		// is confirmed.
+		this.#host = undefined;
+		const targets = new Set<DevTunnelHostProcess>(this.#terminatingHosts);
+		if (current !== undefined) {
+			targets.add(current);
 		}
+		if (targets.size === 0) {
+			return;
+		}
+		// Re-terminate the live host plus any orphan whose earlier termination rejected or timed out, so a
+		// failed stop never strands a still-live public host beyond the reach of disable/shutdown.
+		const outcomes = await Promise.allSettled(
+			[...targets].map((host) => this.#terminateTrackedHost(host)),
+		);
+		const rejected = outcomes.find(
+			(outcome): outcome is PromiseRejectedResult => outcome.status === "rejected",
+		);
+		if (rejected !== undefined) {
+			throw rejected.reason;
+		}
+	}
+
+	/**
+	 * Terminates a host and tracks it in #terminatingHosts until its process exit is confirmed.
+	 *
+	 * The host is added to the orphan set before the (potentially rejecting) terminate is awaited and is
+	 * removed the moment its `exited` promise settles — however terminateHost() itself settles. So if the
+	 * stop throws or its forced-shutdown times out, the exact handle stays tracked and a later
+	 * disable/shutdown can drive it to a real exit, rather than the only reference being dropped while the
+	 * public host is still live. Callers must have already released ownership (cleared #host/readiness
+	 * under a host-identity guard) so this never touches a replacement host.
+	 */
+	async #terminateTrackedHost(host: DevTunnelHostProcess): Promise<void> {
+		this.#terminatingHosts.add(host);
+		void host.exited.then(
+			() => {
+				this.#terminatingHosts.delete(host);
+			},
+			() => {
+				this.#terminatingHosts.delete(host);
+			},
+		);
+		await terminateHost(host);
+		// terminateHost only resolves after `exited` resolves, so the process is confirmed gone.
+		this.#terminatingHosts.delete(host);
 	}
 
 	#assertRunning(): void {
@@ -841,7 +1025,15 @@ export class DevTunnelCliAdapter implements DevTunnelAdapter {
 		return createStreamingAuthenticationProcess(child);
 	}
 
-	async ensureTunnel(tunnelId: string, port: number, signal: AbortSignal): Promise<string> {
+	async ensureTunnel(
+		tunnelId: string,
+		ports: readonly number[],
+		signal: AbortSignal,
+	): Promise<string> {
+		const expectedPorts = [...new Set(ports)];
+		if (expectedPorts.length === 0) {
+			throw new Error("Dev Tunnel setup requires at least one expected ingress port.");
+		}
 		const tunnelList = await this.commandRunner(this.executable, ["list", "--json"], false, signal);
 		let qualifiedTunnelId = findListedTunnelId(tunnelList.stdout, tunnelId);
 		if (qualifiedTunnelId === undefined) {
@@ -853,7 +1045,8 @@ export class DevTunnelCliAdapter implements DevTunnelAdapter {
 			);
 			qualifiedTunnelId = parseQualifiedTunnelId(tunnelResult.stdout, tunnelId);
 		}
-		const ports = parseTunnelPorts(
+		const expected = new Set(expectedPorts);
+		const existingPorts = parseTunnelPorts(
 			(
 				await this.commandRunner(
 					this.executable,
@@ -863,8 +1056,10 @@ export class DevTunnelCliAdapter implements DevTunnelAdapter {
 				)
 			).stdout,
 		);
-		for (const existingPort of ports) {
-			if (existingPort !== port) {
+		// Reconcile against the expected set: drop only ports that no Moshu ingress claims. Ports for a
+		// second Moshu ingress (e.g. a future Mobile listener) stay in `expected` and are never deleted.
+		for (const existingPort of existingPorts) {
+			if (!expected.has(existingPort)) {
 				await this.commandRunner(
 					this.executable,
 					["port", "delete", qualifiedTunnelId, "-p", String(existingPort)],
@@ -873,29 +1068,31 @@ export class DevTunnelCliAdapter implements DevTunnelAdapter {
 				);
 			}
 		}
-		const targetPort = await this.commandRunner(
-			this.executable,
-			["port", "show", qualifiedTunnelId, "-p", String(port), "--json"],
-			true,
-			signal,
-		);
-		const targetProtocol =
-			targetPort.exitCode === 0 ? parseTunnelPortProtocol(targetPort.stdout) : undefined;
-		if (targetProtocol !== undefined && targetProtocol !== "http") {
-			await this.commandRunner(
+		for (const expectedPort of expectedPorts) {
+			const targetPort = await this.commandRunner(
 				this.executable,
-				["port", "delete", qualifiedTunnelId, "-p", String(port)],
-				false,
+				["port", "show", qualifiedTunnelId, "-p", String(expectedPort), "--json"],
+				true,
 				signal,
 			);
-		}
-		if (targetPort.exitCode !== 0 || targetProtocol !== "http") {
-			await this.commandRunner(
-				this.executable,
-				["port", "create", qualifiedTunnelId, "-p", String(port), "--protocol", "http"],
-				false,
-				signal,
-			);
+			const targetProtocol =
+				targetPort.exitCode === 0 ? parseTunnelPortProtocol(targetPort.stdout) : undefined;
+			if (targetProtocol !== undefined && targetProtocol !== "http") {
+				await this.commandRunner(
+					this.executable,
+					["port", "delete", qualifiedTunnelId, "-p", String(expectedPort)],
+					false,
+					signal,
+				);
+			}
+			if (targetPort.exitCode !== 0 || targetProtocol !== "http") {
+				await this.commandRunner(
+					this.executable,
+					["port", "create", qualifiedTunnelId, "-p", String(expectedPort), "--protocol", "http"],
+					false,
+					signal,
+				);
+			}
 		}
 		await this.commandRunner(
 			this.executable,
@@ -903,18 +1100,27 @@ export class DevTunnelCliAdapter implements DevTunnelAdapter {
 			false,
 			signal,
 		);
-		await this.commandRunner(
-			this.executable,
-			["access", "reset", qualifiedTunnelId, "--port-number", String(port)],
-			false,
-			signal,
-		);
-		await this.commandRunner(
-			this.executable,
-			["access", "create", qualifiedTunnelId, "--port-number", String(port), "--anonymous"],
-			false,
-			signal,
-		);
+		for (const expectedPort of expectedPorts) {
+			await this.commandRunner(
+				this.executable,
+				["access", "reset", qualifiedTunnelId, "--port-number", String(expectedPort)],
+				false,
+				signal,
+			);
+			await this.commandRunner(
+				this.executable,
+				[
+					"access",
+					"create",
+					qualifiedTunnelId,
+					"--port-number",
+					String(expectedPort),
+					"--anonymous",
+				],
+				false,
+				signal,
+			);
+		}
 		return qualifiedTunnelId;
 	}
 
@@ -922,12 +1128,13 @@ export class DevTunnelCliAdapter implements DevTunnelAdapter {
 		await this.commandRunner(this.executable, ["delete", tunnelId, "--force"], false, signal);
 	}
 
-	startHost(tunnelId: string, port: number): DevTunnelHostProcess {
+	startHost(tunnelId: string, ports: readonly number[]): DevTunnelHostProcess {
 		const child = spawnWatchdogCommand(this.executable, ["host", tunnelId]);
 		let stopRequested = false;
 		void drainStream(child.stderr);
+		const monitor = monitorHostPorts(child.stdout, ports);
 		return {
-			ready: monitorHostOutput(child.stdout, port),
+			waitForPort: (port) => monitor.waitForPort(port),
 			exited: child.exited,
 			stop(force = false) {
 				if (!stopRequested) {
@@ -1086,46 +1293,78 @@ function createStreamingAuthenticationProcess(child: CommandChild): DevTunnelAut
 	};
 }
 
-function monitorHostOutput(
+/**
+ * Watches a single host stdout stream that forwards one or more expected ingress ports and resolves a
+ * per-port public URL. A devtunnel URL embeds its forwarded port as a `-${port}.` segment, so each
+ * expected port is matched to its own URL; when exactly one port is expected we fall back to the first
+ * URL seen (older CLI output does not always tag single-port hosts). Pending ports are rejected if the
+ * stream ends or errors before their URL is published.
+ */
+export function monitorHostPorts(
 	stream: ReadableStream<Uint8Array>,
-	port: number,
-): Promise<{ publicUrl: string }> {
-	const completion = Promise.withResolvers<{ publicUrl: string }>();
+	ports: readonly number[],
+): { waitForPort(port: number): Promise<{ publicUrl: string }> } {
+	const resolvers = new Map<
+		number,
+		ReturnType<typeof Promise.withResolvers<{ publicUrl: string }>>
+	>();
+	for (const port of ports) {
+		resolvers.set(port, Promise.withResolvers<{ publicUrl: string }>());
+	}
+	const singlePort = ports.length === 1 ? ports[0] : undefined;
 	void (async () => {
 		const reader = stream.getReader();
 		const decoder = new TextDecoder();
 		let buffered = "";
-		let resolved = false;
+		const pending = new Set(ports);
 		try {
 			while (true) {
 				const next = await reader.read();
 				if (next.done) {
-					if (!resolved) {
-						completion.reject(
-							new Error("Dev Tunnel host exited before publishing its public URL."),
-						);
+					if (pending.size > 0) {
+						const error = new Error("Dev Tunnel host exited before publishing its public URL.");
+						for (const port of pending) {
+							resolvers.get(port)?.reject(error);
+						}
 					}
 					return;
 				}
 				buffered = `${buffered}${decoder.decode(next.value, { stream: true })}`.slice(-16_384);
-				if (!resolved) {
-					const urls = buffered.match(/https:\/\/[A-Za-z0-9.-]+\.devtunnels\.ms(?::\d+)?\/?/g);
-					const preferred = urls?.find((url) => url.includes(`-${port}.`)) ?? urls?.[0];
-					if (preferred !== undefined) {
-						resolved = true;
-						completion.resolve({ publicUrl: preferred.replace(/\/$/, "") });
+				if (pending.size === 0) {
+					continue;
+				}
+				const urls = buffered.match(/https:\/\/[A-Za-z0-9.-]+\.devtunnels\.ms(?::\d+)?\/?/g);
+				if (urls === null) {
+					continue;
+				}
+				for (const port of [...pending]) {
+					let match = urls.find((url) => url.includes(`-${port}.`));
+					if (match === undefined && singlePort === port) {
+						match = urls[0];
+					}
+					if (match !== undefined) {
+						pending.delete(port);
+						resolvers.get(port)?.resolve({ publicUrl: match.replace(/\/$/, "") });
 					}
 				}
 			}
 		} catch (error) {
-			if (!resolved) {
-				completion.reject(error);
+			for (const port of pending) {
+				resolvers.get(port)?.reject(error);
 			}
 		} finally {
 			reader.releaseLock();
 		}
 	})();
-	return completion.promise;
+	return {
+		waitForPort(port) {
+			const entry = resolvers.get(port);
+			if (entry === undefined) {
+				return Promise.reject(new Error(`Dev Tunnel host is not forwarding port ${port}.`));
+			}
+			return entry.promise;
+		},
+	};
 }
 
 async function drainStream(stream: ReadableStream<Uint8Array>): Promise<void> {

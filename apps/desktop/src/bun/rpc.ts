@@ -1,5 +1,7 @@
 import {
 	agentsRuntimeInfoSchema,
+	approveMobilePairingInputSchema,
+	approveMobilePairingOutputSchema,
 	approveRuntimeBoxPairingInputSchema,
 	approveRuntimeBoxPairingOutputSchema,
 	cancelChatRunInputSchema,
@@ -9,8 +11,11 @@ import {
 	checkProjectPathOutputSchema,
 	confirmCreateProjectInputSchema,
 	confirmCreateProjectOutputSchema,
+	createMobilePairingOutputSchema,
 	createProviderInputSchema,
 	createRuntimeBoxPairingOutputSchema,
+	decideApprovalInputSchema,
+	decideApprovalOutputSchema,
 	deleteChatSessionInputSchema,
 	deleteChatSessionOutputSchema,
 	deleteMcpServerInputSchema,
@@ -25,6 +30,8 @@ import {
 	type GetChatSessionPageOutput,
 	getAgentGlobalProfileInputSchema,
 	getAgentGlobalProfileOutputSchema,
+	getApprovalInputSchema,
+	getApprovalOutputSchema,
 	getChatSessionInputSchema,
 	getChatSessionPageInputSchema,
 	getChatSessionPageOutputSchema,
@@ -38,12 +45,19 @@ import {
 	getProjectSidebarOutputSchema,
 	getRuntimeProfileInputSchema,
 	getRuntimeProfileOutputSchema,
+	getSessionApprovalPolicyInputSchema,
+	getSessionApprovalPolicyOutputSchema,
 	installRuntimeBoxSkillInputSchema,
+	listApprovalsInputSchema,
+	listApprovalsOutputSchema,
 	listAvailableModelsOutputSchema,
 	listChatSessionsInputSchema,
 	listChatSessionsOutputSchema,
 	listMcpServersInputSchema,
 	listMcpServersOutputSchema,
+	listMobileDevicesInputSchema,
+	listMobileDevicesOutputSchema,
+	listMobilePairingClaimsOutputSchema,
 	listProjectsInputSchema,
 	listProjectsOutputSchema,
 	listProvidersOutputSchema,
@@ -60,6 +74,7 @@ import {
 	logoutProviderInputSchema,
 	logoutProviderOutputSchema,
 	mcpServerMutationResultSchema,
+	mobileAccessStatusOutputSchema,
 	previewProjectPathInputSchema,
 	previewProjectPathOutputSchema,
 	previewProjectRelinkInputSchema,
@@ -68,6 +83,8 @@ import {
 	providerAuthAttemptInputSchema,
 	providerAuthAttemptOutputSchema,
 	providerMutationOutputSchema,
+	rejectMobilePairingInputSchema,
+	rejectMobilePairingOutputSchema,
 	rejectRuntimeBoxPairingInputSchema,
 	rejectRuntimeBoxPairingOutputSchema,
 	relinkProjectInputSchema,
@@ -79,6 +96,8 @@ import {
 	requestProjectDeletionInputSchema,
 	requestProjectDeletionOutputSchema,
 	respondProviderAuthInputSchema,
+	revokeMobileDeviceInputSchema,
+	revokeMobileDeviceOutputSchema,
 	revokeRuntimeBoxDeviceInputSchema,
 	revokeRuntimeBoxDeviceOutputSchema,
 	runtimeBoxResourceMutationResultSchema,
@@ -111,6 +130,8 @@ import {
 	updateProjectOutputSchema,
 	updateProviderInputSchema,
 	updateRuntimeProfileInputSchema,
+	updateSessionApprovalPolicyInputSchema,
+	updateSessionApprovalPolicyOutputSchema,
 	upsertMcpServerInputSchema,
 	upsertRuntimeBoxMcpServerInputSchema,
 	upsertSkillInputSchema,
@@ -217,6 +238,55 @@ export function createDesktopRpc({ agentsClient }: DesktopRpcDependencies) {
 						params,
 						revokeRuntimeBoxDeviceInputSchema,
 						revokeRuntimeBoxDeviceOutputSchema,
+					),
+				getMobileAccessStatus: (params) =>
+					agentsClient.request(
+						productRpcMethods.mobileAccessStatus,
+						params,
+						emptyParamsSchema,
+						mobileAccessStatusOutputSchema,
+					),
+				createMobilePairing: (params) =>
+					agentsClient.request(
+						productRpcMethods.mobilePairingCreate,
+						params,
+						emptyParamsSchema,
+						createMobilePairingOutputSchema,
+					),
+				listMobilePairingClaims: (params) =>
+					agentsClient.request(
+						productRpcMethods.mobilePairingListClaims,
+						params,
+						emptyParamsSchema,
+						listMobilePairingClaimsOutputSchema,
+					),
+				approveMobilePairing: (params) =>
+					agentsClient.request(
+						productRpcMethods.mobilePairingApprove,
+						params,
+						approveMobilePairingInputSchema,
+						approveMobilePairingOutputSchema,
+					),
+				rejectMobilePairing: (params) =>
+					agentsClient.request(
+						productRpcMethods.mobilePairingReject,
+						params,
+						rejectMobilePairingInputSchema,
+						rejectMobilePairingOutputSchema,
+					),
+				listMobileDevices: (params) =>
+					agentsClient.request(
+						productRpcMethods.mobileDeviceList,
+						params,
+						listMobileDevicesInputSchema,
+						listMobileDevicesOutputSchema,
+					),
+				revokeMobileDevice: (params) =>
+					agentsClient.request(
+						productRpcMethods.mobileDeviceRevoke,
+						params,
+						revokeMobileDeviceInputSchema,
+						revokeMobileDeviceOutputSchema,
 					),
 				getRemoteAccessStatus: (params) =>
 					agentsClient.request(
@@ -684,6 +754,41 @@ export function createDesktopRpc({ agentsClient }: DesktopRpcDependencies) {
 					);
 					return {};
 				},
+				listApprovals: (params) =>
+					agentsClient.request(
+						productRpcMethods.approvalsList,
+						params,
+						listApprovalsInputSchema,
+						listApprovalsOutputSchema,
+					),
+				getApproval: (params) =>
+					agentsClient.request(
+						productRpcMethods.approvalsGet,
+						params,
+						getApprovalInputSchema,
+						getApprovalOutputSchema,
+					),
+				decideApproval: (params) =>
+					agentsClient.request(
+						productRpcMethods.approvalsDecide,
+						params,
+						decideApprovalInputSchema,
+						decideApprovalOutputSchema,
+					),
+				getSessionApprovalPolicy: (params) =>
+					agentsClient.request(
+						productRpcMethods.sessionApprovalPolicyGet,
+						params,
+						getSessionApprovalPolicyInputSchema,
+						getSessionApprovalPolicyOutputSchema,
+					),
+				updateSessionApprovalPolicy: (params) =>
+					agentsClient.request(
+						productRpcMethods.sessionApprovalPolicyUpdate,
+						params,
+						updateSessionApprovalPolicyInputSchema,
+						updateSessionApprovalPolicyOutputSchema,
+					),
 			},
 			messages: {},
 		},

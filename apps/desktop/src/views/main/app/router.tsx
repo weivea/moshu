@@ -1,4 +1,5 @@
 import { createHashRouter, Navigate } from "react-router-dom";
+import { ActivityPage } from "./activity-page";
 import {
 	ChatHomePage,
 	ChatSessionPage,
@@ -6,6 +7,7 @@ import {
 	DefaultModelSettingsRoutePage,
 	GeneralSettingsRoutePage,
 	McpServersSettingsRoutePage,
+	MobileAccessSettingsRoutePage,
 	NewChatPage,
 	PlaceholderPage,
 	ProjectChatSessionPage,
@@ -61,6 +63,10 @@ export const router = createHashRouter([
 				element: <PlaceholderPage titleKey="page.tasks.title" icon="tasks" />,
 			},
 			{
+				path: "activity",
+				element: <ActivityPage />,
+			},
+			{
 				path: "agents",
 				element: <PlaceholderPage titleKey="page.agents.title" icon="agents" />,
 			},
@@ -89,6 +95,7 @@ export const router = createHashRouter([
 					{ path: "default-model", element: <DefaultModelSettingsRoutePage /> },
 					{ path: "general", element: <GeneralSettingsRoutePage /> },
 					{ path: "runtime-boxes", element: <RuntimeBoxesSettingsRoutePage /> },
+					{ path: "mobile-access", element: <MobileAccessSettingsRoutePage /> },
 					{ path: "mcp", element: <McpServersSettingsRoutePage /> },
 					{ path: "skills", element: <SkillsSettingsRoutePage /> },
 					{ path: ":section", element: <SettingsPlaceholderPage /> },

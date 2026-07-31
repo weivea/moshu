@@ -114,11 +114,13 @@ export interface RuntimeBoxActionAuthorizer {
 		input: ExecutorToolInvokeInput,
 		targetIdentity: RpcPeerIdentity,
 		executionContext: ExecutorExecutionContext,
+		options?: { signal?: AbortSignal },
 	): ExecutorToolInvokeInput | Promise<ExecutorToolInvokeInput>;
 	authorizeMcp?(
 		runtimeBoxId: string,
 		input: RuntimeBoxMcpToolInvokeInput,
 		targetIdentity: RpcPeerIdentity,
+		options?: { signal?: AbortSignal },
 	): RuntimeBoxMcpToolInvokeInput | Promise<RuntimeBoxMcpToolInvokeInput>;
 	complete(
 		runtimeBoxId: string,
@@ -842,6 +844,7 @@ export class RuntimeBoxRegistry {
 							(this.#entries.get(runtimeBoxId)?.descriptor.kind === "remote"
 								? { executionScope: "runtime-box-workspace" }
 								: { executionScope: "request-cwd" }),
+						options.signal === undefined ? {} : { signal: options.signal },
 					);
 		if (options.signal?.aborted) {
 			this.#actionAuthorizer?.cancelUndispatched(
@@ -997,6 +1000,7 @@ export class RuntimeBoxRegistry {
 			runtimeBoxId,
 			input,
 			peer.remoteIdentity,
+			options.signal === undefined ? {} : { signal: options.signal },
 		);
 		if (options.signal?.aborted) {
 			this.#actionAuthorizer.cancelUndispatched(

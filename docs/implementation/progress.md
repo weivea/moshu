@@ -1,9 +1,9 @@
 # 实施进度
 
-> 更新日期：2026-07-30
+> 更新日期：2026-07-31
 > 当前产品阶段：Phase 0
 > 当前架构里程碑：RB-09 发布加固
-> 当前代码基线：Local/Remote Runtime Box、强认证 ingress、Dev Tunnel、durable Action recovery、双 owner MCP/Skills
+> 当前代码基线：Local/Remote Runtime Box、强认证 ingress、Dev Tunnel、durable Action recovery、双 owner MCP/Skills、独立 Mobile ingress + 二维码配对 + Ed25519 设备认证、可构建的 iOS Mobile App（Capacitor Web UI + 原生 Ed25519 安全传输）
 
 本文只记录代码或自动化测试已经证明的能力。批准的目标见[技术架构](./architecture.md)，后续顺序见[工程交付计划](./delivery-plan.md)。
 
@@ -55,6 +55,56 @@ Agent Server
   rg、fd 和 Photon WASM 资源，并使用私有配置、generation 和 workspace。
 - Agent Server 暴露独立 Runtime-only ingress，使用一次性 pairing code、Ed25519 challenge、
   device-key revocation、持久 generation fence、入口限流和 canonical RPC identity。
+- Agent Server 另暴露**独立 Mobile ingress**（固定 loopback listener、`/mobile` 路径，与 Product RPC、
+  Runtime ingress 物理/逻辑隔离，不复用其入口）。Mobile 配对使用 Desktop 展示的二维码（含 mobile public URL、
+  pairingId、一次性 code、agentServerId、server 公钥/指纹、有效期、协议区间；绝不含 server secret 或长期 token），
+  iOS 端生成 Ed25519 设备 key 并提交 claim；Desktop CAS 校验设备指纹后授权，之后自动重连。校验链为
+  canonical SPKI 公钥/指纹 + `AgentServerIdentity` 签名 challenge（绑定 agentServerId、mobileClientId、
+  deviceKeyId、instanceId、persisted generation、challengeId/nonce、协议版本与 `relay-tls` transportSecurity），
+  WebSocket upgrade 前验证签名/激活 key/吊销/challenge 单次与过期/server identity，返回 role=`mobile-client`；
+  独立持久 generation high-water fence 阻止旧 generation/instance/late connection 复活，设备吊销立即关闭匹配 peer。
+  Mobile 方法走**独立 allowlist**（runtime info/list/client-scoped switch；projects list/get/sidebar；models
+  listAvailable；session list/get/create/setModel；chat send/cancel/replay/subscribe/unsubscribe/retired；
+  approvals list/get/decide + session policy get/update），Provider/Remote Access 控制/Runtime 配对/MCP/Skills/
+  Project mutation/diagnostics 等一律 deny；事件按已订阅可见 Session 严格 Zod + redaction 下发。
+  Mobile ingress 独立 frame/body/inflight/backpressure/handshake timeout、未认证连接与 HTTP 容量、per-source
+  限流与流量计量；作为 DevTunnel 第二端口按 Layer 1 multi-port 模型逐端口 readiness/public URL 公开。
+  Remote Access status v1 保持不变，新增 versioned `mobileAccess.status`（v2）向 Desktop 暴露 mobile ingress
+  状态/URL。**iOS App 本体已实现**（Layer 4：Capacitor Web UI + 原生 Swift 安全传输，见下条）；**Layer 5（final）
+  已实现** durable attention/未读 feed + 生命周期/重连 + best-effort 本地通知 + 发布加固（见 architecture §9.0.4）。
+- **iOS Mobile App（Layer 4）** 是同 monorepo 内可构建的 `apps/mobile` workspace：React + Vite + TypeScript strict +
+  HeroUI + React Router HashRouter，Web assets 随 App 打包（`base:"./"`、`webDir:"dist"`、无 `server.url`），
+  独立 mobile shell（底部 Chats/Projects/Activity/Settings tabs、`100dvh`/safe-area/VisualViewport 键盘避让、
+  中英 i18n、light/dark、VoiceOver labels），复用 `@moshu/contracts` 与 `@moshu/ui` tokens。RPC 走 Layer 1
+  browser-safe `@moshu/process-rpc-core`，经原生 authenticated socket adapter 做 hello/ack 与 expected server
+  identity 校验，Product client 严格遵循 Layer 3 mobile allowlist；连接恢复按 subscribe→buffer→replay→dedupe→
+  flush→ready，业务数据仅存 React 内存（断线即清空、只显示 offline/reconnect，不缓存、不离线排队）。
+  Capacitor 8（SPM 模式、iOS 15+、bundle id `dev.moshu.mobile`），Info.plist 仅申请相机（二维码）说明、
+  无宽泛 ATS/无 Bonjour；保留自定义 URL scheme deeplink hook 但首版不依赖。原生 `MoshuMobileTransport`
+  Swift plugin 使用 CryptoKit Curve25519 (Ed25519) 生成**软件**设备 key，private key 存 Keychain
+  （`WhenUnlockedThisDeviceOnly` + 不同步 iCloud），JS 永不接触私钥；单 Server binding（exact URL/agentServerId/
+  server 公钥指纹/协议），已绑定拒绝覆盖、显式 unpair 才清 Keychain 与 socket；配对解析 versioned 二维码 →
+  URLSession claim/轮询 status → 核对 server 公钥指纹后原子持久化；重连持久单调 generation、每连接新 instanceId，
+  验证 Agent Server challenge 签名后用设备 key 签 canonical upgrade payload，经 `URLSessionWebSocketTask` 带
+  `x-moshu-*` headers 连 WSS，帧按 connectionId + 单调 sequence 上送、限制帧/队列大小、拒绝 binary、丢弃旧连接。
+  canonical payload 有从 TS contracts 固定的共享 test vectors，Swift `MoshuMobileCore` 纯包（47 XCTest）验证
+  Swift/TS 逐字节一致、SPKI DER、base64url、challenge 签名、generation 递增/并发原子、单绑定/unpair、
+  hello identity（含 deviceKeyId）、close code 分类与入站帧限额（59 XCTest）；
+  Web 侧 63 Vitest（native plugin mock、pairing 状态、断线清业务态、无持久化、RPC schema/allowlist、
+  subscribe/replay 边界、stream/cancel、approval race/allow-all、Projects、RuntimeBox 独立选择、
+  responsive/键盘、i18n parity、hello 握手 accepted、fatal-auth 关闭无盲重连、pre-bind 溢出、历史分页、
+  ambiguous-send 幂等、4MiB 帧限额）。iOS simulator `xcodebuild`（禁签名）构建通过。**PR #8 审查加固**：hello 必含
+  `deviceKeyId`；致命关闭按 close code/HTTP 状态数值分类（1008→AUTH_REVOKED、401/403→AUTH_FAILED、
+  426→PROTOCOL_MISMATCH）并停止盲重连清业务态；失败路径必 dispose provisional connection、pre-bind buffer
+  有界 fail-closed；Keychain `set` update-not-delete-then-add、generation 并发 distinct/单调；入站按 UTF-8
+  字节限帧、binary protocol-close；chat 历史按 nextCursor 分页含 active run；send 复用 requestId 幂等重试。
+  复审再对齐 transport 帧上限＝Product-RPC `productRpcMaxFrameBytes`＝4 MiB（共享向量固定防漂移、合法 1–4 MiB 帧接受），
+  并将 teardown 关闭码安全映射到 `URLSessionWebSocketTask.CloseCode`（oversize→1009、binary→1003）而非一律 1001，
+  close reason 按 UTF-8 边界截断到 123 字节。
+  传输边界仍是 relay TLS +
+  应用设备签名（relay 可见），Noise 端到端后置。**Layer 5（final，已实现，见下方 M-L5 与 architecture §9.0.4）**：
+  Agent Server 持有 durable attention/未读 feed、iOS 生命周期/重连、best-effort 本地通知与发布加固；按硬边界
+  **无云 Push Relay/APNs/后台伪保活，suspended/terminated 不保证通知**，重连从 server feed 恢复 missed 未读。
 - Agent Server 管理 Dev Tunnel Microsoft device-code 登录、持久 cluster-qualified Tunnel ID、
   单一 Anonymous HTTP ingress port、Host watchdog、重建/修复、取消和重试；Product RPC 不暴露到 Tunnel。
 - Agent Server 在派发前持久化 Action intent，并签发参数、来源、目标 generation 与 execution scope
@@ -142,18 +192,30 @@ Agent Server
 
 ## 5. 当前明确未实现
 
-- 当前 POC 的 Policy 默认信任已认证且绑定的 Agent Server，包括 Remote `bash`；用户级命令审批与 shell
-  sandbox 明确后置。现有 grant 用于 durable dispatch、单次消费、generation fencing 和恢复，不是交互审批。
+- 当前 POC 的 Policy 默认信任已认证且绑定的 Agent Server 用于 durable dispatch、单次消费、generation
+  fencing 和恢复。**用户级 Tool/Action 交互审批已由 Mobile stack Layer 2 实现**（server-authoritative 风险分级、
+  durable approval request + Session Allow-all、CAS/idempotent 决策、多 client 事件同步、Desktop 卡片/待办面板；
+  见 architecture §9.0.1 与 data-contracts §9.2/§10.2）。仍后置的是：把该审批门与最终 execution grant / Action
+  intent / outcome recovery 完整串起来，以及 shell sandbox 与 Mobile client。
 - Remote 普通 Chat 的 path tools 受 Box workspace canonical containment；Project Chat 文件 Tool 受
   Project root containment。`bash` 按当前完全信任决策不受文件 containment 限制。
 - 尚无独立 Git Tool；Agent 可经 `bash` 调用环境中可用的 Git，但没有 Git 专用合同、Diff journal 或 revert。
 - Plan、自定义 Agent、subagent、任务中心、Diff/撤销和桌面通知仍是后续产品范围。
 - MCP OAuth 2.1 浏览器授权/DCR、Git URL Skill 更新和完整目录/压缩包导入 UI 仍是后续产品增强。
 - macOS Provider vault 当前是权限加固的 app-owned 文件；Keychain adapter 仍是外部分发前安全工作。
+- Mobile stack Layer 3 已实现独立 Mobile ingress、二维码配对与 Ed25519 设备认证（见 §2 与 architecture
+  §9.0.2、data-contracts §9.3）。**iOS App 本体（Layer 4：Capacitor Web UI + 原生 Swift 安全传输）已实现**
+  （见 §2 iOS Mobile App 条目）。**Mobile stack Layer 5（final）已实现**：Agent Server 持有 durable
+  attention/未读 feed、iOS 生命周期/重连、best-effort 本地通知与发布加固（见 architecture §9.0.4、
+  data-contracts §9.5、quality-release）。按硬边界 **无云 Push Relay/APNs/后台伪保活，suspended/terminated 不
+  保证通知**；重连从 server feed 恢复 missed 未读。首版 Mobile client 只绑定一个 Agent Server（由 client 实现），Desktop 必须在线，relay TLS +
+  应用设备签名是当前传输边界（relay 可见），Noise 端到端握手后置且不会谎称已启用；设备 key 为软件
+  CryptoKit key（非 Secure Enclave），App 不缓存任何业务数据。iOS 端配对 HTTP/WSS 端点路径为对 Layer 3
+  ingress 的当前实现约定，真实 E2E 需在线 Desktop 验证。
 - Remote Runtime Box 的 ingress、设备配对认证、三平台 daemon、Dev Tunnel、durable grant、断线
   outcome reconciliation、MCP/Skill ownership 和发布故障矩阵已实现。真实 Microsoft Tunnel 探针、
   macOS 正式公证和 Windows 正式签名仍是需要外部账号、证书和对应 runner 的 release 执行门。
-  Mobile Client、团队共享、Docker/cloud 和多租户仍不在当前范围。
+  团队共享、Docker/cloud 和多租户仍不在当前范围。
 
 ## 6. 架构迁移状态
 
@@ -174,6 +236,11 @@ Agent Server
 | RB-07 Grants/recovery | 已完成 | durable Action/grant、Box journal、deadline lease、三阶段结果确认和 reset epoch |
 | RB-08 MCP/Skills | 已完成 | Box private store、SecretStore、inventory sync、Runtime Profile、live validation 与 MCP grant bridge |
 | RB-09 Hardening/release | 已完成（外部 release gate 待执行） | protocol/quota/diagnostics/fault matrix/signed package gates；真实 Tunnel 与正式平台签名由 release runner 验证 |
+| M-L1 Browser-safe RPC core | 已完成 | `@moshu/process-rpc-core`、client-scoped Runtime Box、authorization-aware Chat 订阅、DevTunnel multi-port |
+| M-L2 Durable approvals | 已完成 | server-authoritative 风险分级、durable approval + Session Allow-all、CAS/幂等决策、多 client 事件、Desktop UI |
+| M-L3 Mobile ingress/pairing/auth | 已完成 | 独立 `/mobile` ingress、二维码配对、Ed25519 设备认证、generation fence、独立 allowlist、Desktop 配对 UI |
+| M-L4 iOS Mobile App | 已完成（真机签名/后台通知后置） | 可构建 `apps/mobile` Capacitor Web UI + 原生 `MoshuMobileTransport` Swift plugin（Keychain 软件 Ed25519、单绑定/unpair、challenge 验签、WSS 帧序列/限额）、browser-safe RPC/Product allowlist client、离线清业务态、47 Vitest + 30 Swift XCTest、iOS simulator 构建通过；Layer 5 后台/suspended 通知与发布加固后置 |
+| M-L5 生命周期/通知/durable 未读/发布加固（final） | 已完成（真机签名/真实 Tunnel/App Store 提交为发布方人工步骤） | Agent Server 持有 durable attention/未读 feed（脱敏事件、**transactional outbox + 幂等 drainer 投影**、per-client 单调 ack cursor、cursor 分页 + resyncRequired、**production 执行的 bounded retention 30d/500**、revoke/unpair 清 cursor、mobile-only `attention.changed` hint；handler 抽到 pi-free `mobile-ingress-handlers.ts`，并由 pi-free `mobile-ingress-composition.ts` 的 `createMobileIngressComposition`（strict allowlist + merged attention handler + outbox drainer + revoke 装配）作为生产装配单一来源供 `create-agents-server` + smoke 共同调用）；iOS 生命周期/重连（`@capacitor/app`、有界退避+jitter、background 暂停、fatal 含 `UNSUPPORTED_PROTOCOL` 不重试、background close→offline、**plugin 独占的单一有界 background task**，系统 expiration 由 `engine.closeActiveConnection` 关精确 socket + stale/late-A-vs-B/同步 expiration guard no-op、background→foreground 存活 socket non-notifying resnapshot、无 UIBackgroundModes）；best-effort 本地通知（用户显式开启、仅短后台收到事件时 schedule、generic 文案、稳定 id、**opaque route（>100 事件按 latestSeq 有界 cursor 走查、gap/走查耗尽→显式 `safeActivity` 安全路由使 tap 仍可点、异步走查后 re-validate app-active/权限/generation）+ `AttentionProvider` app-root 真实 React Router 装配 + `NotificationTapCoordinator` 先认证/刷新再导航、未配对/fatal 安全态**、suspended/terminated 不保证、无 APNs）；发布加固（`release.config.json`+version sync、`PrivacyInfo.xcprivacy`、release-gate 脚本含**真实发布 bundle id 强制**（`MOSHU_MOBILE_RELEASE_BUNDLE_ID` + `xcodebuild -showBuildSettings` 精确比对）与 **dist↔public 递归 SHA-256 manifest**、export compliance 待发布方确认）；**117 Vitest + 70 Swift XCTest + 125+87 contracts/database + 22 隔离 agents-server mobile（真实 production 组合 smoke + composition wiring contract）全绿，iOS simulator `xcodebuild build`（禁签名）BUILD SUCCEEDED** |
 
 ## 7. 开发数据策略
 

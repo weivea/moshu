@@ -3536,3 +3536,244 @@ a {
 	font-size: 12px;
 	line-height: 1.5;
 }
+
+.sidebar-nav-item {
+	position: relative;
+}
+
+.sidebar-nav-item__badge {
+	margin-left: auto;
+	min-width: 20px;
+	height: 20px;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	padding: 0 6px;
+	border-radius: 999px;
+	background: var(--accent);
+	color: white;
+	font-size: 11px;
+	font-weight: 700;
+}
+
+.approval-card-list {
+	display: grid;
+	gap: 14px;
+}
+
+.approval-card {
+	gap: 14px;
+	border-left: 3px solid var(--line);
+}
+
+.approval-card[data-risk="high"] {
+	border-left-color: #d97706;
+}
+
+.approval-card[data-risk="critical"] {
+	border-left-color: #c2415d;
+}
+
+.approval-card[data-state="rejected"],
+.approval-card[data-state="expired"],
+.approval-card[data-state="cancelled"] {
+	opacity: 0.7;
+}
+
+.approval-card__header {
+	display: flex;
+	align-items: flex-start;
+	justify-content: space-between;
+	gap: 16px;
+}
+
+.approval-card__header h2 {
+	margin: 6px 0 4px;
+	font-size: 18px;
+	letter-spacing: -0.02em;
+}
+
+.approval-card__header p {
+	margin: 0;
+	color: var(--text-muted);
+	line-height: 1.5;
+}
+
+.approval-card__badges {
+	display: flex;
+	flex-direction: column;
+	align-items: flex-end;
+	gap: 6px;
+}
+
+.approval-card__risk {
+	display: inline-flex;
+	align-items: center;
+	border-radius: 999px;
+	padding: 3px 10px;
+	background: var(--surface-muted);
+	color: var(--text);
+	font-size: 12px;
+	font-weight: 600;
+	white-space: nowrap;
+}
+
+.approval-card__risk[data-risk="medium"] {
+	background: color-mix(in srgb, #d97706 18%, transparent);
+	color: #92400e;
+}
+
+.approval-card__risk[data-risk="high"] {
+	background: color-mix(in srgb, #d97706 26%, transparent);
+	color: #92400e;
+}
+
+.approval-card__risk[data-risk="critical"],
+.approval-card__risk--locked {
+	background: rgba(194, 65, 93, 0.16);
+	color: #9f1239;
+}
+
+.approval-card__meta {
+	display: grid;
+	grid-template-columns: repeat(2, minmax(0, 1fr));
+	gap: 12px;
+	margin: 0;
+}
+
+.approval-card__meta-wide {
+	grid-column: 1 / -1;
+}
+
+.approval-card__meta dt {
+	margin: 0 0 4px;
+	color: var(--text-muted);
+	font-size: 12px;
+	text-transform: uppercase;
+	letter-spacing: 0.04em;
+}
+
+.approval-card__meta dd {
+	margin: 0;
+	color: var(--text);
+	word-break: break-word;
+}
+
+.approval-card__code {
+	display: block;
+	border-radius: 10px;
+	background: var(--surface-muted);
+	padding: 8px 10px;
+	font-family: var(--font-mono, ui-monospace, monospace);
+	font-size: 13px;
+	white-space: pre-wrap;
+	word-break: break-word;
+}
+
+.approval-card__reasons ul {
+	margin: 6px 0 0;
+	padding-left: 18px;
+	color: var(--text-muted);
+	line-height: 1.5;
+}
+
+.approval-card__timing {
+	display: flex;
+	gap: 8px;
+	margin: 0;
+	color: var(--text-muted);
+	font-size: 12px;
+}
+
+.approval-card__actions {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 10px;
+}
+
+.activity-page {
+	display: grid;
+	gap: 18px;
+	max-width: 860px;
+	margin: 0 auto;
+	padding: 28px 24px;
+	width: 100%;
+}
+
+.activity-page__header {
+	display: grid;
+	gap: 4px;
+}
+
+.activity-page__header h1 {
+	margin: 2px 0 0;
+	font-size: 24px;
+	letter-spacing: -0.03em;
+}
+
+.activity-page__header p {
+	margin: 0;
+	color: var(--text-muted);
+}
+
+.activity-page__count {
+	color: var(--text-muted);
+	font-size: 13px;
+}
+
+.activity-page__list {
+	list-style: none;
+	margin: 0;
+	padding: 0;
+	display: grid;
+	gap: 12px;
+}
+
+.activity-row {
+	display: flex;
+	align-items: flex-start;
+	justify-content: space-between;
+	gap: 16px;
+	border: 1px solid var(--line);
+	border-left: 3px solid var(--line);
+	border-radius: 16px;
+	background: var(--surface);
+	padding: 16px 18px;
+}
+
+.activity-row[data-risk="high"] {
+	border-left-color: #d97706;
+}
+
+.activity-row[data-risk="critical"] {
+	border-left-color: #c2415d;
+}
+
+.activity-row__main {
+	display: grid;
+	gap: 6px;
+	min-width: 0;
+}
+
+.activity-row__tool {
+	font-weight: 600;
+	color: var(--text);
+}
+
+.activity-row__meta {
+	color: var(--text-muted);
+	font-size: 13px;
+}
+
+.activity-row__aside {
+	display: flex;
+	flex-direction: column;
+	align-items: flex-end;
+	gap: 8px;
+	white-space: nowrap;
+}
+
+.activity-row__time {
+	color: var(--text-muted);
+	font-size: 12px;
+}

@@ -8,6 +8,7 @@
 - **Agent Server**：独占 Provider、Agent runtime、Session、Project、Run/event、Policy/Action、产品数据库、Pi Session JSONL，以及 Server-owned MCP 和 prompt-only Skills。
 - **Runtime Box**：在本机或远程设备执行 `read`、`bash`、`edit`、`write`、`grep`、`find`、`ls`，并拥有自己的 MCP、完整 Skill packages、credential、journal 和 workspace。
 - **Remote Runtime Box**：通过 Agent Server 管理的 Anonymous Microsoft Dev Tunnel 主动连接，使用一次性配对码、Ed25519 双向身份、generation fence 和版本协商。
+- **iOS Mobile App**：同 monorepo 的 `apps/mobile`——Capacitor + React + Vite + HeroUI Web UI 随 App 打包，配原生 `MoshuMobileTransport` Swift plugin（CryptoKit 软件 Ed25519 + Keychain 单 Server binding、二维码配对、challenge 验签、authenticated WSS）。私钥永不进 JS，业务数据只存内存，扫码经二维码绑定单个在线 Agent Server。Layer 5（final）加 Agent Server 持有的 durable 未读/attention feed、iOS 生命周期/重连、best-effort 本地通知与发布加固；**无云 Push Relay/APNs/后台伪保活，suspended/terminated 不保证通知**，重连从 server feed 恢复 missed 未读。
 - **多 Box 路由**：切换 Runtime Box 后，界面切换 Box-owned Session、Project、MCP 和 Skills；Server-owned MCP/Skills 保持不变，既有 Session/Run 永远按持久归属路由。
 - **Projects 与 Project Chat**：支持 Local 目录选择和 Remote 路径、预览确认、路径健康/重新关联、归档/删除、Project Session 管理、根 `AGENTS.md` 上下文和 Project root 文件 Tool 边界。
 - **MCP 与 Skills**：支持 MCP 与 Skills 双归属、MCP stdio/Streamable HTTP/SSE、prompt-only Server Skills、Box immutable Skill packages、global/Runtime Profile 和 inventory reconciliation。
@@ -123,6 +124,7 @@ apps/
   desktop/          Electrobun Client 与 React WebView
   agents-server/    Agent Server、Product RPC、Runtime ingress、Dev Tunnel
   runtime-box/      Local/Remote Runtime Box、Tools、MCP、Skills、用户服务
+  mobile/           iOS Mobile App：Capacitor Web UI + 原生 MoshuMobileTransport Swift plugin
 
 packages/
   contracts/        跨角色 Zod contract 与 RPC allowlist
@@ -210,7 +212,8 @@ MOSHU_LIVE_RUNTIME_BASE_URL='https://example.devtunnels.ms' \
 - 独立 Git Tool、Diff journal 和 revert；
 - Plan、自定义 Agent、subagent、任务中心和桌面通知；
 - MCP OAuth 2.1 浏览器授权/DCR、Git URL Skill 更新和完整包导入；
-- Mobile Client、团队共享、Docker/cloud、多租户和云端 Agent Server；
+- 移动通知后台/suspended 可靠投递与发布加固（Layer 5）；iOS App 本体（Layer 4：Capacitor Web UI + 原生 Swift 安全传输）已实现（见 `apps/mobile` 与 docs），Mobile 接入面（独立 Mobile ingress、二维码配对、Ed25519 设备认证）由 Layer 3 实现；
+- 团队共享、Docker/cloud、多租户和云端 Agent Server；
 - 正式外部分发所需的真实 Tunnel、三平台签名 runner 和 macOS Keychain release gate。
 
 当前仍处于首次外部分发前，不兼容的旧开发数据可以明确 reset；首次发布冻结 schema 后必须使用正式 migration/rollback gate。

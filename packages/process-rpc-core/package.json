@@ -1,0 +1,17 @@
+{
+	"name": "@moshu/process-rpc-core",
+	"version": "0.0.1",
+	"private": true,
+	"type": "module",
+	"exports": {
+		".": "./src/index.ts",
+		"./internal": "./src/internal.ts"
+	},
+	"scripts": {
+		"typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.test.json",
+		"test": "bun test"
+	},
+	"dependencies": {
+		"zod": "4.4.3"
+	}
+}

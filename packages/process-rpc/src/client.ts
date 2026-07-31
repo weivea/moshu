@@ -1,26 +1,32 @@
-import type { RpcHandshakeHeadersProvider } from "./authentication";
-import { RpcHandshakeError } from "./errors";
-import { hasSafeRpcJsonStructure } from "./json-structure";
-import { type ResolvedRpcLimits, resolveRpcLimits } from "./limits";
-import { type RpcEndpointOptions, RpcPeer, type RpcSocketTransport } from "./peer";
 import {
 	CURRENT_PROCESS_RPC_PROTOCOL,
-	hasUnsupportedRpcSchemaVersion,
 	isSameRpcPeerIdentity,
 	PROCESS_RPC_SCHEMA_VERSION,
+	type ResolvedRpcLimits,
+	type RpcEndpointOptions,
 	type RpcEnvelope,
+	RpcHandshakeError,
 	type RpcHelloAckEnvelope,
 	type RpcHelloEnvelope,
+	RpcPeer,
 	type RpcPeerIdentity,
 	type RpcPeerRole,
 	type RpcProtocolErrorCode,
 	type RpcProtocolVersion,
+	type RpcSocketTransport,
+	resolveRpcLimits,
 	rpcEnvelopeSchema,
 	rpcHelloAckEnvelopeSchema,
 	rpcPeerIdentitySchema,
 	rpcProtocolErrorEnvelopeSchema,
 	rpcProtocolVersionSchema,
-} from "./protocol";
+} from "@moshu/process-rpc-core";
+import {
+	hasSafeRpcJsonStructure,
+	hasUnsupportedRpcSchemaVersion,
+} from "@moshu/process-rpc-core/internal";
+
+import type { RpcHandshakeHeadersProvider } from "./authentication";
 import {
 	RpcWebSocketClient,
 	type RpcWebSocketClient as RpcWebSocketClientInstance,

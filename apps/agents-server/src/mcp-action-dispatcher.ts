@@ -1,10 +1,10 @@
 import type { McpToolGateway } from "@moshu/agent-runtime";
 import {
-	runtimeBoxMcpToolInvokeInputSchema,
-	runtimeBoxMcpToolInvokeOutputSchema,
 	type McpOwner,
 	type RuntimeBoxMcpToolInvokeInput,
 	type RuntimeBoxMcpToolInvokeOutput,
+	runtimeBoxMcpToolInvokeInputSchema,
+	runtimeBoxMcpToolInvokeOutputSchema,
 } from "@moshu/contracts";
 import {
 	McpDefinitiveResponseError,
@@ -76,7 +76,11 @@ export class McpActionDispatcher implements McpToolGateway {
 		if (this.#activeAgentServerInvocations.has(input.invocationId)) {
 			throw new Error(`Agent Server MCP invocation ${input.invocationId} is already active.`);
 		}
-		await this.authorizer.authorizeAgentServerMcp(this.agentServerId, input);
+		await this.authorizer.authorizeAgentServerMcp(
+			this.agentServerId,
+			input,
+			signal === undefined ? {} : { signal },
+		);
 		if (signal?.aborted) {
 			this.authorizer.cancel(input, safeError(signal.reason));
 			signal.throwIfAborted();

@@ -1,37 +1,41 @@
 import {
-	type RpcHandshakeAuthenticator,
-	RpcHandshakeHttpError,
-	type RpcHttpRequestContext,
-} from "./authentication";
-import { invokeRpcCallback } from "./callback-errors";
-import { RpcHandshakeError } from "./errors";
-import {
-	InMemoryRpcGenerationFence,
-	type RpcGenerationFence,
-	type RpcGenerationLease,
-} from "./generation-fence";
-import { hasSafeRpcJsonStructure } from "./json-structure";
-import { type ResolvedRpcLimits, resolveRpcLimits } from "./limits";
-import { type RpcEndpointOptions, RpcPeer, type RpcSocketTransport } from "./peer";
-import {
 	CURRENT_PROCESS_RPC_PROTOCOL,
-	hasUnsupportedRpcSchemaVersion,
+	InMemoryRpcGenerationFence,
 	isSameRpcPeerIdentity,
 	negotiateRpcProtocol,
 	PROCESS_RPC_SCHEMA_VERSION,
+	type ResolvedRpcLimits,
+	type RpcEndpointOptions,
 	type RpcEnvelope,
+	type RpcGenerationFence,
+	type RpcGenerationLease,
+	RpcHandshakeError,
 	type RpcHelloAckEnvelope,
+	RpcPeer,
 	type RpcPeerIdentity,
 	type RpcPeerRole,
 	type RpcProtocolErrorCode,
 	type RpcProtocolErrorEnvelope,
 	type RpcProtocolVersion,
+	type RpcSocketTransport,
+	resolveRpcLimits,
 	rpcEnvelopeSchema,
 	rpcHelloEnvelopeSchema,
 	rpcPeerIdentitySchema,
 	rpcProtocolVersionSchema,
-} from "./protocol";
-import { truncateWebSocketCloseReason } from "./websocket-utils";
+} from "@moshu/process-rpc-core";
+import {
+	hasSafeRpcJsonStructure,
+	hasUnsupportedRpcSchemaVersion,
+	invokeRpcCallback,
+	truncateWebSocketCloseReason,
+} from "@moshu/process-rpc-core/internal";
+
+import {
+	type RpcHandshakeAuthenticator,
+	RpcHandshakeHttpError,
+	type RpcHttpRequestContext,
+} from "./authentication";
 
 export interface RpcServerBaseOptions extends RpcEndpointOptions {
 	readonly identity: RpcPeerIdentity;

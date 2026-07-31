@@ -101,6 +101,20 @@ export const switchRuntimeBoxOutputSchema = z
 	})
 	.strict();
 
+// A stable client identity (the authenticated peer's `peerId`). Runtime Box selection is a
+// per-client preference keyed by this identity so Desktop and a future Mobile client can each
+// hold their own active Runtime Box; the server derives it from the authenticated peer and never
+// trusts a caller-supplied value. Mirrors the RPC identifier bounds used for peer identities.
+export const runtimeBoxClientIdSchema = z.string().min(1).max(256);
+
+export const clientRuntimeBoxPreferenceSchema = z
+	.object({
+		clientId: runtimeBoxClientIdSchema,
+		runtimeBoxId: runtimeBoxIdSchema,
+		revision: z.int().positive().safe(),
+	})
+	.strict();
+
 const pairingSecretSchema = z
 	.string()
 	.min(22)
@@ -283,6 +297,12 @@ export const remoteAccessStateSchema = z.enum([
 	"repair_required",
 ]);
 
+// The Remote Access status wire contract stays at v1: a single scalar Runtime ingress
+// (runtimeIngressPort + top-level publicUrl). The tunnel service manages an expected ingress *set*
+// internally (see DevTunnelService.getIngressReadiness), but Layer 1 deliberately does NOT expose
+// the second/typed ingress descriptors over the wire. A future Mobile ingress (Layer 3) will add
+// multi-ingress readiness through an explicit versioned status method rather than widening this
+// strict v1 schema, so existing Desktop clients keep parsing unchanged status payloads.
 export const remoteAccessStatusOutputSchema = z
 	.object({
 		enabled: z.boolean(),
@@ -386,6 +406,8 @@ export type ActiveRuntimeBoxSelection = z.infer<typeof activeRuntimeBoxSelection
 export type ListRuntimeBoxesOutput = z.infer<typeof listRuntimeBoxesOutputSchema>;
 export type SwitchRuntimeBoxInput = z.infer<typeof switchRuntimeBoxInputSchema>;
 export type SwitchRuntimeBoxOutput = z.infer<typeof switchRuntimeBoxOutputSchema>;
+export type RuntimeBoxClientId = z.infer<typeof runtimeBoxClientIdSchema>;
+export type ClientRuntimeBoxPreference = z.infer<typeof clientRuntimeBoxPreferenceSchema>;
 export type CreateRuntimeBoxPairingOutput = z.infer<typeof createRuntimeBoxPairingOutputSchema>;
 export type ClaimRuntimeBoxPairingInput = z.infer<typeof claimRuntimeBoxPairingInputSchema>;
 export type ClaimRuntimeBoxPairingOutput = z.infer<typeof claimRuntimeBoxPairingOutputSchema>;

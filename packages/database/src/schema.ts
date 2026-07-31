@@ -1,5 +1,6 @@
 import {
 	agentModeValues,
+	approvalStateValues,
 	chatRunEventSourceKindValues,
 	chatRunEventVisibilityValues,
 	chatRunStatusValues,
@@ -195,12 +196,26 @@ export const appSettingsTable = sqliteTable("app_settings", {
 	actionJournalEpoch: text("action_journal_epoch").notNull(),
 });
 
+// Per-client active Runtime Box preference keyed by the authenticated client identity (the peer's
+// `peerId`). `app_settings.active_runtime_box_id` remains the global default that seeds a client's
+// first read; each client thereafter revisions its own selection independently. Session/Project/Run
+// still persist their own `runtime_box_id`, so this table only records UI selection, not routing.
+export const clientRuntimeBoxPreferencesTable = sqliteTable("client_runtime_box_preferences", {
+	clientId: text("client_id").primaryKey(),
+	runtimeBoxId: text("runtime_box_id")
+		.notNull()
+		.references(() => runtimeBoxesTable.id),
+	revision: integer("revision").notNull(),
+	updatedAtMs: integer("updated_at_ms").notNull(),
+});
+
 export const remoteAccessSettingsTable = sqliteTable("remote_access_settings", {
 	id: integer("id").primaryKey(),
 	enabled: integer("enabled", { mode: "boolean" }).notNull(),
 	tunnelId: text("tunnel_id"),
 	publicUrl: text("public_url"),
 	runtimeIngressPort: integer("runtime_ingress_port"),
+	mobileIngressPort: integer("mobile_ingress_port"),
 	trafficMonth: text("traffic_month").notNull(),
 	trafficReceivedBytes: integer("traffic_received_bytes").notNull(),
 	trafficSentBytes: integer("traffic_sent_bytes").notNull(),
@@ -258,6 +273,77 @@ export const runtimeBoxPairingSessionsTable = sqliteTable(
 	(table) => [
 		uniqueIndex("runtime_box_pairing_sessions_code_hash_unique").on(table.codeHash),
 		index("runtime_box_pairing_sessions_state_expiry_idx").on(table.state, table.expiresAtMs),
+	],
+);
+
+// Layer 3 — Mobile ingress persistence. Deliberately separate from the Runtime Box tables so a
+// Mobile device identity, its keys, its pairing sessions and its generation fence live and are
+// revoked entirely independently of the Runtime Box surface.
+export const mobileDevicesTable = sqliteTable("mobile_devices", {
+	id: text("id").primaryKey(),
+	displayName: text("display_name").notNull(),
+	model: text("model").notNull(),
+	platform: text("platform", { enum: ["ios", "ipados", "android"] }).notNull(),
+	appVersion: text("app_version").notNull(),
+	createdAtMs: integer("created_at_ms").notNull(),
+	updatedAtMs: integer("updated_at_ms").notNull(),
+	approvedAtMs: integer("approved_at_ms").notNull(),
+	lastSeenAtMs: integer("last_seen_at_ms"),
+	revokedAtMs: integer("revoked_at_ms"),
+});
+
+export const mobileDeviceKeysTable = sqliteTable(
+	"mobile_device_keys",
+	{
+		keyId: text("key_id").notNull(),
+		mobileClientId: text("mobile_client_id")
+			.notNull()
+			.references(() => mobileDevicesTable.id, { onDelete: "cascade" }),
+		publicKey: text("public_key").notNull(),
+		publicKeyFingerprint: text("public_key_fingerprint").notNull(),
+		createdAtMs: integer("created_at_ms").notNull(),
+		revokedAtMs: integer("revoked_at_ms"),
+	},
+	(table) => [
+		primaryKey({ columns: [table.mobileClientId, table.keyId] }),
+		index("mobile_device_keys_client_revoked_idx").on(table.mobileClientId, table.revokedAtMs),
+	],
+);
+
+export const mobileDeviceGenerationFencesTable = sqliteTable("mobile_device_generation_fences", {
+	mobileClientId: text("mobile_client_id")
+		.primaryKey()
+		.references(() => mobileDevicesTable.id, { onDelete: "cascade" }),
+	acceptedGeneration: integer("accepted_generation").notNull(),
+	acceptedInstanceId: text("accepted_instance_id").notNull(),
+	updatedAtMs: integer("updated_at_ms").notNull(),
+});
+
+export const mobilePairingSessionsTable = sqliteTable(
+	"mobile_pairing_sessions",
+	{
+		id: text("id").primaryKey(),
+		codeHash: text("code_hash").notNull(),
+		claimTokenHash: text("claim_token_hash"),
+		state: text("state", {
+			enum: ["open", "claimed", "approved", "rejected"],
+		}).notNull(),
+		deviceKeyId: text("device_key_id"),
+		publicKey: text("public_key"),
+		publicKeyFingerprint: text("public_key_fingerprint"),
+		displayName: text("display_name"),
+		model: text("model"),
+		platform: text("platform", { enum: ["ios", "ipados", "android"] }),
+		appVersion: text("app_version"),
+		mobileClientId: text("mobile_client_id").references(() => mobileDevicesTable.id),
+		createdAtMs: integer("created_at_ms").notNull(),
+		expiresAtMs: integer("expires_at_ms").notNull(),
+		claimedAtMs: integer("claimed_at_ms"),
+		decidedAtMs: integer("decided_at_ms"),
+	},
+	(table) => [
+		uniqueIndex("mobile_pairing_sessions_code_hash_unique").on(table.codeHash),
+		index("mobile_pairing_sessions_state_expiry_idx").on(table.state, table.expiresAtMs),
 	],
 );
 
@@ -478,6 +564,52 @@ export const executionGrantsTable = sqliteTable(
 	],
 );
 
+export const actionApprovalRequestsTable = sqliteTable(
+	"action_approval_requests",
+	{
+		id: text("id").primaryKey(),
+		sessionId: text("session_id")
+			.notNull()
+			.references(() => chatSessionsTable.id, { onDelete: "cascade" }),
+		runId: text("run_id")
+			.notNull()
+			.references(() => chatRunsTable.id, { onDelete: "cascade" }),
+		actionId: text("action_id").notNull(),
+		toolCallId: text("tool_call_id").notNull(),
+		tool: text("tool").notNull(),
+		operation: text("operation").notNull(),
+		actionSummaryJson: text("action_summary_json").notNull(),
+		riskTier: text("risk_tier").notNull(),
+		riskOverridable: integer("risk_overridable").notNull(),
+		riskJson: text("risk_json").notNull(),
+		state: text("state", { enum: approvalStateValues }).notNull(),
+		revision: integer("revision").notNull(),
+		decisionIdempotencyKey: text("decision_idempotency_key"),
+		decisionJson: text("decision_json"),
+		policyEvidenceJson: text("policy_evidence_json"),
+		createdAtMs: integer("created_at_ms").notNull(),
+		expiresAtMs: integer("expires_at_ms").notNull(),
+		decidedAtMs: integer("decided_at_ms"),
+	},
+	(table) => [
+		uniqueIndex("action_approval_requests_action_unique").on(table.actionId),
+		uniqueIndex("action_approval_requests_idempotency_unique").on(table.decisionIdempotencyKey),
+		index("action_approval_requests_session_state_idx").on(table.sessionId, table.state),
+		index("action_approval_requests_state_expiry_idx").on(table.state, table.expiresAtMs),
+	],
+);
+
+export const sessionApprovalPoliciesTable = sqliteTable("session_approval_policies", {
+	sessionId: text("session_id")
+		.primaryKey()
+		.references(() => chatSessionsTable.id, { onDelete: "cascade" }),
+	allowAll: integer("allow_all").notNull(),
+	revision: integer("revision").notNull(),
+	updatedByJson: text("updated_by_json"),
+	lastIdempotencyKey: text("last_idempotency_key"),
+	updatedAtMs: integer("updated_at_ms").notNull(),
+});
+
 export const chatRunEventsTable = sqliteTable(
 	"chat_run_events",
 	{
@@ -529,6 +661,71 @@ export const agentSessionCleanupOutboxTable = sqliteTable(
 	(table) => [index("agent_session_cleanup_outbox_next_attempt_idx").on(table.nextAttemptAtMs)],
 );
 
+export const mobileAttentionFeedMetaTable = sqliteTable("mobile_attention_feed_meta", {
+	id: integer("id").primaryKey(),
+	nextSeq: integer("next_seq").notNull(),
+	prunedThroughSeq: integer("pruned_through_seq").notNull(),
+});
+
+export const mobileAttentionEventsTable = sqliteTable(
+	"mobile_attention_events",
+	{
+		seq: integer("seq").primaryKey(),
+		eventId: text("event_id").notNull(),
+		dedupeKey: text("dedupe_key").notNull(),
+		type: text("type", {
+			enum: ["approval_required", "run_completed", "run_failed", "run_cancelled"],
+		}).notNull(),
+		sessionId: text("session_id"),
+		runId: text("run_id"),
+		approvalId: text("approval_id"),
+		titleKey: text("title_key").notNull(),
+		bodyKey: text("body_key").notNull(),
+		createdAtMs: integer("created_at_ms").notNull(),
+	},
+	(table) => [
+		uniqueIndex("mobile_attention_events_event_id_unique").on(table.eventId),
+		uniqueIndex("mobile_attention_events_dedupe_key_unique").on(table.dedupeKey),
+		index("mobile_attention_events_created_idx").on(table.createdAtMs),
+	],
+);
+
+export const mobileAttentionAckCursorsTable = sqliteTable("mobile_attention_ack_cursors", {
+	mobileClientId: text("mobile_client_id").primaryKey(),
+	ackedSeq: integer("acked_seq").notNull(),
+	updatedAtMs: integer("updated_at_ms").notNull(),
+});
+
+// Transactional outbox for the durable Mobile attention feed. A desensitized attention row is written
+// here in the SAME SQLite transaction as the business write (approval → pending, Run → terminal), so a
+// crash between the business commit and the feed projection can never permanently lose unread. An
+// independent, idempotent drainer projects each row into `mobile_attention_events` and marks it
+// processed; failures are retained (attempts/last_error) and retried, never swallowed as success.
+export const mobileAttentionOutboxTable = sqliteTable(
+	"mobile_attention_outbox",
+	{
+		id: integer("id").primaryKey(),
+		dedupeKey: text("dedupe_key").notNull(),
+		type: text("type", {
+			enum: ["approval_required", "run_completed", "run_failed", "run_cancelled"],
+		}).notNull(),
+		sessionId: text("session_id"),
+		runId: text("run_id"),
+		approvalId: text("approval_id"),
+		titleKey: text("title_key").notNull(),
+		bodyKey: text("body_key").notNull(),
+		createdAtMs: integer("created_at_ms").notNull(),
+		enqueuedAtMs: integer("enqueued_at_ms").notNull(),
+		processedAtMs: integer("processed_at_ms"),
+		attempts: integer("attempts").notNull().default(0),
+		lastError: text("last_error"),
+	},
+	(table) => [
+		uniqueIndex("mobile_attention_outbox_dedupe_key_unique").on(table.dedupeKey),
+		index("mobile_attention_outbox_pending_idx").on(table.processedAtMs, table.id),
+	],
+);
+
 export const appSchema = {
 	agentGlobalProfilesTable,
 	agentRuntimeProfilesTable,
@@ -541,6 +738,7 @@ export const appSchema = {
 	agentServerSkillPendingContentDeletionsTable,
 	agentServerSkillVersionsTable,
 	appSettingsTable,
+	clientRuntimeBoxPreferencesTable,
 	remoteAccessSettingsTable,
 	projectsTable,
 	projectDeletionJobsTable,
@@ -548,6 +746,8 @@ export const appSchema = {
 	chatRunEventsTable,
 	chatRunsTable,
 	actionIntentsTable,
+	actionApprovalRequestsTable,
+	sessionApprovalPoliciesTable,
 	executionGrantsTable,
 	chatSessionCreateRequestsTable,
 	chatSessionsTable,
@@ -558,4 +758,12 @@ export const appSchema = {
 	runtimeBoxDeviceKeysTable,
 	runtimeBoxPairingSessionsTable,
 	runtimeBoxesTable,
+	mobileDevicesTable,
+	mobileDeviceKeysTable,
+	mobileDeviceGenerationFencesTable,
+	mobilePairingSessionsTable,
+	mobileAttentionFeedMetaTable,
+	mobileAttentionEventsTable,
+	mobileAttentionAckCursorsTable,
+	mobileAttentionOutboxTable,
 };

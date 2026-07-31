@@ -7,24 +7,24 @@ import {
 	probeAgentRuntime,
 } from "@moshu/agent-runtime";
 import {
-	agentsProductEventMethods,
 	agentsRuntimeInfoSchema,
-	type ChatRunEvent,
-	chatEventDeliverySchema,
-	chatRunEventSchema,
-	chatSessionsRetiredEventSchema,
+	approvalRpcErrorCodes,
 	clientProductRequestMethods,
 	currentRuntimeBoxProtocolVersion,
 	getAgentGlobalProfileOutputSchema,
 	getRuntimeProfileOutputSchema,
 	type ListRuntimeBoxesOutput,
 	listMcpServersOutputSchema,
+	listMobileDevicesOutputSchema,
 	listRuntimeBoxesOutputSchema,
 	listRuntimeBoxInventoryOutputSchema,
 	listRuntimeBoxMcpServerSummariesOutputSchema,
 	listRuntimeBoxSkillsOutputSchema,
 	listSkillsOutputSchema,
 	mcpServerMutationResultSchema,
+	mobileAccessStatusOutputSchema,
+	mobileProtocolMaxVersion,
+	mobileProtocolMinVersion,
 	productRpcEvents,
 	productRpcInternalHandlerErrorCode,
 	productRpcMethods,
@@ -51,9 +51,13 @@ import {
 	AgentGlobalProfileRevisionConflictError,
 	type AgentServerMcpRepository,
 	type AgentServerSkillRepository,
+	ApprovalRequestNotFoundError,
+	ApprovalRevisionConflictError,
 	ChatSessionNotFoundError,
 	McpResourceNotFoundError,
 	McpResourceVersionConflictError,
+	type MobileAttentionRepository,
+	type MobileDeviceRepository,
 	PairingFingerprintMismatchError,
 	PairingSessionNotFoundError,
 	PairingSessionStateError,
@@ -66,6 +70,7 @@ import {
 	type RuntimeBoxRepository,
 	type RuntimeProfileRepository,
 	RuntimeProfileRevisionConflictError,
+	SessionApprovalPolicyRevisionConflictError,
 	SessionCreateCapacityError,
 	SessionCreateKeyConflictError,
 	SkillOwnerCapabilityError,
@@ -74,7 +79,6 @@ import {
 	SkillResourceVersionConflictError,
 } from "@moshu/database";
 import {
-	isSameRpcPeerIdentity,
 	type JsonValue,
 	RpcHandlerError,
 	type RpcHandlers,
@@ -85,9 +89,19 @@ import {
 	rpcJsonValueSchema,
 } from "@moshu/process-rpc";
 import { ZodError, type ZodType, type z } from "zod";
-
+import { ApprovalRunUnavailableError, type ApprovalService } from "./approval-service";
 import type { ChatApplicationService } from "./chat-application-service";
 import type { DevTunnelService } from "./dev-tunnel-service";
+import type { MobileIngressAuth } from "./mobile-ingress-auth";
+import { mobileAttentionRequestHandlers } from "./mobile-ingress-composition";
+import { revokeMobileDevice } from "./mobile-ingress-handlers";
+import {
+	broadcastApprovalActivityChanged,
+	broadcastMobileAttentionChanged,
+	ProductEventRouter,
+	publishChatEvent,
+	publishRetiredChatSessions,
+} from "./product-event-hub";
 import {
 	type ProjectApplicationService,
 	ProjectArchivedError,
@@ -110,9 +124,14 @@ import type { RuntimeIngressAuth } from "./runtime-ingress-auth";
 
 export interface ProductRpcDependencies {
 	chatService: ChatApplicationService;
+	approvalService: ApprovalService;
 	runtimeBoxRegistry: RuntimeBoxRegistry;
 	runtimeBoxes: RuntimeBoxRepository;
 	runtimeBoxPairings?: RuntimeBoxPairingRepository;
+	mobileIngressAuth?: MobileIngressAuth;
+	mobileDevices?: MobileDeviceRepository;
+	mobileAttention?: MobileAttentionRepository;
+	disconnectMobileDevice?: (mobileClientId: string, reason: string) => void;
 	projectService?: ProjectApplicationService;
 	runtimeBoxInventory?: RuntimeBoxInventoryRepository;
 	runtimeProfiles?: RuntimeProfileRepository;
@@ -127,110 +146,14 @@ export interface ProductRpcDependencies {
 	getRuntimeDiagnostics?: () => RuntimeDiagnosticsOutput;
 }
 
-interface ProductEventRouteBinding {
-	readonly peerId: string;
-	readonly peerIdentity: RpcPeer["remoteIdentity"];
-}
-
-export interface ProductEventRouteLease {
-	readonly requestId: string;
-	readonly binding: ProductEventRouteBinding;
-	readonly created: boolean;
-	readonly previousBinding: ProductEventRouteBinding | undefined;
-}
-
-export class ProductEventRouter {
-	readonly #bindingsByRequestId = new Map<string, ProductEventRouteBinding>();
-
-	bind(requestId: string, peer: RpcPeer): ProductEventRouteLease {
-		const existing = this.#bindingsByRequestId.get(requestId);
-		if (existing !== undefined && existing.peerId !== peer.remoteIdentity.peerId) {
-			throw new RpcHandlerError(
-				"REQUEST_OWNER_MISMATCH",
-				"Chat send request belongs to another client peer.",
-			);
-		}
-		if (existing !== undefined) {
-			return {
-				requestId,
-				binding: createRouteBinding(peer),
-				created: false,
-				previousBinding: existing,
-			};
-		}
-		if (this.#bindingsByRequestId.size >= 1_024) {
-			throw new RpcHandlerError("REQUEST_OWNER_LIMIT", "Too many active Chat send request owners.");
-		}
-		const binding = createRouteBinding(peer);
-		this.#bindingsByRequestId.set(requestId, binding);
-		return { requestId, binding, created: true, previousBinding: undefined };
-	}
-
-	commit(lease: ProductEventRouteLease): boolean {
-		const current = this.#bindingsByRequestId.get(lease.requestId);
-		if (lease.created) {
-			return current === lease.binding;
-		}
-		if (current === lease.previousBinding) {
-			this.#bindingsByRequestId.set(lease.requestId, lease.binding);
-			return true;
-		}
-		return current === lease.binding;
-	}
-
-	rollback(lease: ProductEventRouteLease): void {
-		if (lease.created && this.#bindingsByRequestId.get(lease.requestId) === lease.binding) {
-			this.#bindingsByRequestId.delete(lease.requestId);
-		}
-	}
-
-	release(lease: ProductEventRouteLease): void {
-		if (this.#bindingsByRequestId.get(lease.requestId) === lease.binding) {
-			this.#bindingsByRequestId.delete(lease.requestId);
-		}
-	}
-
-	releasePeer(peer: RpcPeer): void {
-		for (const [requestId, binding] of this.#bindingsByRequestId) {
-			if (isSameRpcPeerIdentity(binding.peerIdentity, peer.remoteIdentity)) {
-				this.#bindingsByRequestId.delete(requestId);
-			}
-		}
-	}
-
-	publish(peers: readonly RpcPeer[], event: ChatRunEvent, clientRequestId: string): void {
-		const binding = this.#bindingsByRequestId.get(clientRequestId);
-		if (binding === undefined) {
-			return;
-		}
-		publishChatEvent(
-			peers.filter(
-				(peer) =>
-					peer.remoteIdentity.role === "client" &&
-					isSameRpcPeerIdentity(peer.remoteIdentity, binding.peerIdentity),
-			),
-			event,
-			clientRequestId,
-		);
-		if (
-			event.type === "run.status" &&
-			(event.payload.status === "completed" ||
-				event.payload.status === "failed" ||
-				event.payload.status === "cancelled")
-		) {
-			if (this.#bindingsByRequestId.get(clientRequestId) === binding) {
-				this.#bindingsByRequestId.delete(clientRequestId);
-			}
-		}
-	}
-}
-
-function createRouteBinding(peer: RpcPeer): ProductEventRouteBinding {
-	return {
-		peerId: peer.remoteIdentity.peerId,
-		peerIdentity: peer.remoteIdentity,
-	};
-}
+export type { ProductEventRouteLease } from "./product-event-hub";
+export {
+	broadcastApprovalActivityChanged,
+	broadcastMobileAttentionChanged,
+	ProductEventRouter,
+	publishChatEvent,
+	publishRetiredChatSessions,
+};
 
 export const agentsServerClientMethodAllowlist: RpcMethodAllowlist = {
 	client: { requests: clientProductRequestMethods },
@@ -243,12 +166,23 @@ export const agentsServerRuntimeMethodAllowlist: RpcMethodAllowlist = {
 	},
 };
 
+// The Mobile ingress reuses the shared Product handlers but is pinned to its own strict allowlist so
+// an authenticated Mobile client can only reach the MVP subset. The allowlist now lives with the
+// pi-free `createMobileIngressComposition` (the single source of truth shared by this Product wiring
+// and the ingress smoke); it is re-exported here for the existing agents-server import sites.
+export { agentsServerMobileMethodAllowlist } from "./mobile-ingress-composition";
+
 export function createProductRpcHandlers(dependencies: ProductRpcDependencies): RpcHandlers {
 	const {
 		chatService,
+		approvalService,
 		runtimeBoxRegistry,
 		runtimeBoxes,
 		runtimeBoxPairings,
+		mobileIngressAuth,
+		mobileDevices,
+		mobileAttention,
+		disconnectMobileDevice,
 		projectService,
 		runtimeBoxInventory,
 		runtimeProfiles,
@@ -266,6 +200,24 @@ export function createProductRpcHandlers(dependencies: ProductRpcDependencies): 
 			throw new Error("Project application service is not initialized.");
 		}
 		return projectService;
+	};
+	const requireMobileIngressAuth = (): MobileIngressAuth => {
+		if (mobileIngressAuth === undefined) {
+			throw new Error("Mobile ingress auth is not initialized.");
+		}
+		return mobileIngressAuth;
+	};
+	const requireMobileDevices = (): MobileDeviceRepository => {
+		if (mobileDevices === undefined) {
+			throw new Error("Mobile device repository is not initialized.");
+		}
+		return mobileDevices;
+	};
+	const requireMobileAttention = (): MobileAttentionRepository => {
+		if (mobileAttention === undefined) {
+			throw new Error("Mobile attention repository is not initialized.");
+		}
+		return mobileAttention;
 	};
 	const getRuntimeBoxInventory = (): RuntimeBoxInventoryRepository => {
 		if (runtimeBoxInventory === undefined) {
@@ -335,7 +287,7 @@ export function createProductRpcHandlers(dependencies: ProductRpcDependencies): 
 		requests: {
 			[productRpcMethods.runtimeGet]: createRequestHandler(
 				productRpcRequestSchemas[productRpcMethods.runtimeGet],
-				() =>
+				(_input, peer) =>
 					agentsRuntimeInfoSchema.parse({
 						apiVersion: 3,
 						serverVersion: dependencies.serverVersion,
@@ -343,18 +295,25 @@ export function createProductRpcHandlers(dependencies: ProductRpcDependencies): 
 						platform: process.platform,
 						arch: process.arch,
 						agentRuntime: probeAgentRuntime(),
-						activeRuntimeBoxId: runtimeBoxes.getActive().runtimeBoxId,
+						activeRuntimeBoxId: runtimeBoxes.getActiveForClient(resolveProductClientId(peer))
+							.runtimeBoxId,
 						runtimeBoxes: runtimeBoxRegistry.listInfo(),
 					}),
 			),
 			[productRpcMethods.runtimeBoxesList]: createRequestHandler(
 				productRpcRequestSchemas[productRpcMethods.runtimeBoxesList],
-				() => createRuntimeBoxesSnapshot(runtimeBoxes, runtimeBoxRegistry, runtimeBoxPairings),
+				(_input, peer) =>
+					createRuntimeBoxesSnapshot(
+						runtimeBoxes,
+						runtimeBoxRegistry,
+						runtimeBoxPairings,
+						resolveProductClientId(peer),
+					),
 			),
 			[productRpcMethods.runtimeBoxesSwitch]: createRequestHandler(
 				productRpcRequestSchemas[productRpcMethods.runtimeBoxesSwitch],
-				(input) => {
-					const active = runtimeBoxes.switchActive(input);
+				(input, peer) => {
+					const active = runtimeBoxes.switchActiveForClient(resolveProductClientId(peer), input);
 					runtimeBoxRegistry.setActiveRuntimeBoxId(active.runtimeBoxId);
 					return switchRuntimeBoxOutputSchema.parse({ active });
 				},
@@ -398,6 +357,74 @@ export function createProductRpcHandlers(dependencies: ProductRpcDependencies): 
 					return output;
 				},
 			),
+			[productRpcMethods.mobileAccessStatus]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.mobileAccessStatus],
+				() => {
+					const service = getDevTunnelService();
+					const status = service.getStatus();
+					const ingress = service.getIngressReadiness().find((entry) => entry.kind === "mobile");
+					if (ingress === undefined) {
+						throw new RpcHandlerError(
+							"MOBILE_INGRESS_UNAVAILABLE",
+							"The Mobile ingress is not configured.",
+						);
+					}
+					return mobileAccessStatusOutputSchema.parse({
+						schemaVersion: 1,
+						remoteAccessEnabled: status.enabled,
+						remoteAccessState: status.state,
+						ingressPort: ingress.port,
+						ingressReady: ingress.ready,
+						...(ingress.publicUrl === undefined ? {} : { publicUrl: ingress.publicUrl }),
+						protocolMinVersion: mobileProtocolMinVersion,
+						protocolMaxVersion: mobileProtocolMaxVersion,
+						transportSecurity: "relay-tls",
+						supportedTransportSecurity: ["relay-tls"],
+					});
+				},
+			),
+			[productRpcMethods.mobilePairingCreate]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.mobilePairingCreate],
+				() => requireMobileIngressAuth().createPairing(),
+			),
+			[productRpcMethods.mobilePairingListClaims]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.mobilePairingListClaims],
+				() => requireMobileIngressAuth().listPendingClaims(),
+			),
+			[productRpcMethods.mobilePairingApprove]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.mobilePairingApprove],
+				(input) => requireMobileIngressAuth().approve(input),
+			),
+			[productRpcMethods.mobilePairingReject]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.mobilePairingReject],
+				(input) => requireMobileIngressAuth().reject(input),
+			),
+			[productRpcMethods.mobileDeviceList]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.mobileDeviceList],
+				(input) => listMobileDevicesOutputSchema.parse(requireMobileDevices().list(input)),
+			),
+			[productRpcMethods.mobileDeviceRevoke]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.mobileDeviceRevoke],
+				// Shared revoke logic (single source of truth, also exercised by the ingress smoke): revoke
+				// the durable key, drop the device's server-side unread cursor so a re-paired client id can
+				// never inherit stale read state, and tear down any live peer.
+				(input) =>
+					revokeMobileDevice(
+						{
+							mobileAttention: requireMobileAttention(),
+							revokeDeviceKey: (revokeInput) =>
+								requireMobileIngressAuth().revokeDevice(revokeInput),
+							disconnectMobileDevice,
+						},
+						input,
+					),
+			),
+			// Durable Mobile attention list/ack. The handlers are the single source of truth shared with
+			// `createMobileIngressComposition` (and thus the ingress smoke): peer identity is server-derived
+			// from the authenticated Mobile ingress session, never from request input, so a caller can
+			// neither forge another device's clientId nor read a Desktop feed. Desktop product clients are
+			// rejected outright.
+			...mobileAttentionRequestHandlers(requireMobileAttention),
 			[productRpcMethods.remoteAccessStatus]: createRequestHandler(
 				productRpcRequestSchemas[productRpcMethods.remoteAccessStatus],
 				async (_input, _peer, context) =>
@@ -445,11 +472,13 @@ export function createProductRpcHandlers(dependencies: ProductRpcDependencies): 
 			),
 			[productRpcMethods.projectsPreviewPath]: createRequestHandler(
 				productRpcRequestSchemas[productRpcMethods.projectsPreviewPath],
-				(input, _peer, context) => getProjectService().previewPath(input, context.signal),
+				(input, peer, context) =>
+					getProjectService().previewPath(input, resolveProductClientId(peer), context.signal),
 			),
 			[productRpcMethods.projectsCreate]: createRequestHandler(
 				productRpcRequestSchemas[productRpcMethods.projectsCreate],
-				(input, _peer, context) => getProjectService().create(input, context.signal),
+				(input, peer, context) =>
+					getProjectService().create(input, resolveProductClientId(peer), context.signal),
 			),
 			[productRpcMethods.projectsList]: createRequestHandler(
 				productRpcRequestSchemas[productRpcMethods.projectsList],
@@ -1027,9 +1056,94 @@ export function createProductRpcHandlers(dependencies: ProductRpcDependencies): 
 				productRpcRequestSchemas[productRpcMethods.chatReplay],
 				(input) => chatService.replayEvents(input),
 			),
+			[productRpcMethods.chatSubscribe]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.chatSubscribe],
+				(input, peer) => {
+					chatService.assertSessionVisible(input.sessionId);
+					eventRouter.subscribe(peer, input.sessionId);
+					return {
+						schemaVersion: 1 as const,
+						sessionId: input.sessionId,
+						subscribed: true as const,
+					};
+				},
+			),
+			[productRpcMethods.chatUnsubscribe]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.chatUnsubscribe],
+				(input, peer) => {
+					eventRouter.unsubscribe(peer, input.sessionId);
+					return {
+						schemaVersion: 1 as const,
+						sessionId: input.sessionId,
+						subscribed: false as const,
+					};
+				},
+			),
 			[productRpcMethods.chatRetiredSessionsList]: createRequestHandler(
 				productRpcRequestSchemas[productRpcMethods.chatRetiredSessionsList],
 				(input) => chatService.listRetiredSessions(input),
+			),
+			[productRpcMethods.approvalsList]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.approvalsList],
+				(input) => {
+					if (input.sessionId !== undefined) {
+						// Scoped listing is authorization-checked against Session visibility; an
+						// unscoped listing is the cross-session Activity snapshot for this client.
+						chatService.assertSessionVisible(input.sessionId);
+					}
+					return approvalService.listApprovals({
+						...(input.sessionId === undefined ? {} : { sessionId: input.sessionId }),
+						...(input.states === undefined ? {} : { states: input.states }),
+						...(input.limit === undefined ? {} : { limit: input.limit }),
+					});
+				},
+			),
+			[productRpcMethods.approvalsGet]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.approvalsGet],
+				(input) => {
+					const result = approvalService.getApproval(input.approvalId);
+					chatService.assertSessionVisible(result.request.sessionId);
+					return { schemaVersion: 1 as const, ...result };
+				},
+			),
+			[productRpcMethods.approvalsDecide]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.approvalsDecide],
+				(input, peer) => {
+					// Resolve + authorize the Session before applying the decision so a client
+					// cannot decide an approval for a Session it cannot see.
+					const existing = approvalService.getApproval(input.approvalId);
+					chatService.assertSessionVisible(existing.request.sessionId);
+					return approvalService.decideApproval({
+						approvalId: input.approvalId,
+						expectedRevision: input.expectedRevision,
+						decision: input.decision,
+						idempotencyKey: input.idempotencyKey,
+						source: approvalDecisionSource(peer),
+					});
+				},
+			),
+			[productRpcMethods.sessionApprovalPolicyGet]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.sessionApprovalPolicyGet],
+				(input) => {
+					chatService.assertSessionVisible(input.sessionId);
+					return {
+						schemaVersion: 1 as const,
+						policy: approvalService.getSessionPolicy(input.sessionId),
+					};
+				},
+			),
+			[productRpcMethods.sessionApprovalPolicyUpdate]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.sessionApprovalPolicyUpdate],
+				(input, peer) => {
+					chatService.assertSessionVisible(input.sessionId);
+					return approvalService.updateSessionPolicy({
+						sessionId: input.sessionId,
+						allowAll: input.allowAll,
+						expectedRevision: input.expectedRevision,
+						idempotencyKey: input.idempotencyKey,
+						updatedBy: approvalDecisionSource(peer),
+					});
+				},
 			),
 			[productRpcMethods.runtimeBoxRegister]: createRequestHandler(
 				productRpcRequestSchemas[productRpcMethods.runtimeBoxRegister],
@@ -1111,9 +1225,11 @@ export function createRuntimeBoxesSnapshot(
 	runtimeBoxes: RuntimeBoxRepository,
 	registry: RuntimeBoxRegistry,
 	pairings?: RuntimeBoxPairingRepository,
+	clientId?: string,
 ): ListRuntimeBoxesOutput {
 	return listRuntimeBoxesOutputSchema.parse({
-		active: runtimeBoxes.getActive(),
+		active:
+			clientId === undefined ? runtimeBoxes.getActive() : runtimeBoxes.getActiveForClient(clientId),
 		items: registry.listInfo().map((item) => ({
 			...item,
 			deviceKeyIds:
@@ -1122,58 +1238,22 @@ export function createRuntimeBoxesSnapshot(
 	});
 }
 
-export function publishChatEvent(
-	peers: readonly RpcPeer[],
-	event: ChatRunEvent,
-	clientRequestId: string,
-): void {
-	const payload = encodeJsonValue(
-		chatEventDeliverySchema.parse({
-			clientRequestId,
-			event: chatRunEventSchema.parse(event),
-		}),
-	);
-	for (const peer of peers) {
-		if (peer.remoteIdentity.role === "client") {
-			try {
-				peer.emitEvent(agentsProductEventMethods[0], payload, { eventId: event.id });
-			} catch (error) {
-				peer.close(1011, "Chat event publication failed.");
-				console.error(
-					`Failed to publish chat event to client ${peer.remoteIdentity.peerId}.`,
-					error,
-				);
-			}
-		}
+// Runtime Box selection is a per-client preference. The client identity is the authenticated peer's
+// stable `peerId`; the server never trusts a caller-supplied client id. Only product clients (the
+// Desktop app today, a Mobile client in a later layer) hold a selection.
+function resolveProductClientId(peer: RpcPeer): string {
+	if (peer.remoteIdentity.role !== "client" && peer.remoteIdentity.role !== "mobile-client") {
+		throw new RpcHandlerError(
+			"CLIENT_IDENTITY_REQUIRED",
+			"Runtime Box selection is only available to authenticated product clients.",
+		);
 	}
+	return peer.remoteIdentity.peerId;
 }
 
-export function publishRetiredChatSessions(
-	peers: readonly RpcPeer[],
-	sessionIds: readonly string[],
-	reportDiagnostic: (message: string) => void = console.error,
-): void {
-	const payload = encodeJsonValue(
-		chatSessionsRetiredEventSchema.parse({
-			schemaVersion: 1,
-			sessionIds,
-		}),
-	);
-	for (const peer of peers) {
-		if (peer.remoteIdentity.role !== "client") {
-			continue;
-		}
-		try {
-			peer.emitEvent(productRpcEvents.chatSessionsRetired, payload);
-		} catch {
-			peer.close(1011, "Session retirement publication failed.");
-			reportDiagnostic(
-				`Failed to publish Session retirement to client ${peer.remoteIdentity.peerId}; replay will recover it.`,
-			);
-		}
-	}
-}
-
+// The Mobile attention feed is per-device unread state, so its handlers must bind strictly to an
+// authenticated Mobile client. Desktop product clients are rejected — a Desktop peer must never be
+// able to read or advance a phone's unread cursor, and a Mobile caller can only address its own feed.
 function createRequestHandler<TInputSchema extends ZodType, TOutputSchema extends ZodType>(
 	contract: { input: TInputSchema; output: TOutputSchema },
 	execute: (
@@ -1219,12 +1299,46 @@ function toSkillSourceKind(source: string): "inline-editor" | "local-upload" | "
 	return "local-upload";
 }
 
+// The decision source is server-derived from the authenticated peer identity, never
+// trusted from request input, so a client cannot forge who decided an approval.
+function approvalDecisionSource(peer: RpcPeer): {
+	kind: "client";
+	clientId: string;
+	clientRole: string;
+} {
+	return {
+		kind: "client",
+		clientId: peer.remoteIdentity.peerId,
+		clientRole: peer.remoteIdentity.role,
+	};
+}
+
 function rethrowProductHandlerError(error: unknown): never {
 	if (error instanceof RpcHandlerError) {
 		throw error;
 	}
 	if (error instanceof ChatSessionNotFoundError) {
 		throw new RpcHandlerError("SESSION_NOT_FOUND", "The chat Session was not found.");
+	}
+	if (error instanceof ApprovalRequestNotFoundError) {
+		throw new RpcHandlerError(approvalRpcErrorCodes.notFound, "The approval was not found.");
+	}
+	if (error instanceof ApprovalRevisionConflictError) {
+		throw new RpcHandlerError(
+			approvalRpcErrorCodes.revisionConflict,
+			"The approval was decided by another client.",
+			{ currentRevision: error.currentRevision },
+		);
+	}
+	if (error instanceof SessionApprovalPolicyRevisionConflictError) {
+		throw new RpcHandlerError(
+			approvalRpcErrorCodes.policyRevisionConflict,
+			"The Session approval policy changed concurrently.",
+			{ currentRevision: error.currentRevision },
+		);
+	}
+	if (error instanceof ApprovalRunUnavailableError) {
+		throw new RpcHandlerError(approvalRpcErrorCodes.notFound, "The approval Run is unavailable.");
 	}
 	if (error instanceof ProviderNotFoundError) {
 		throw new RpcHandlerError("PROVIDER_NOT_FOUND", "The Provider was not found.");

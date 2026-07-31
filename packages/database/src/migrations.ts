@@ -1,6 +1,6 @@
 import type Database from "bun:sqlite";
 
-export const currentAppDatabaseVersion = 21;
+export const currentAppDatabaseVersion = 26;
 
 export class AppDatabaseResetRequiredError extends Error {
 	readonly currentVersion: number;
@@ -68,6 +68,8 @@ export function applyAppMigrations(client: Database): void {
 			DROP TABLE IF EXISTS runtime_box_inventory_cache;
 			DROP TABLE IF EXISTS runtime_box_inventory_state;
 			DROP TABLE IF EXISTS execution_grants;
+			DROP TABLE IF EXISTS action_approval_requests;
+			DROP TABLE IF EXISTS session_approval_policies;
 			DROP TABLE IF EXISTS action_intents;
 			DROP TABLE IF EXISTS chat_run_events;
 			DROP TABLE IF EXISTS chat_runs;
@@ -79,7 +81,16 @@ export function applyAppMigrations(client: Database): void {
 			DROP TABLE IF EXISTS runtime_box_generation_fences;
 			DROP TABLE IF EXISTS runtime_box_device_keys;
 			DROP TABLE IF EXISTS runtime_box_pairing_sessions;
+			DROP TABLE IF EXISTS mobile_attention_ack_cursors;
+			DROP TABLE IF EXISTS mobile_attention_events;
+			DROP TABLE IF EXISTS mobile_attention_feed_meta;
+			DROP TABLE IF EXISTS mobile_attention_outbox;
+			DROP TABLE IF EXISTS mobile_device_generation_fences;
+			DROP TABLE IF EXISTS mobile_device_keys;
+			DROP TABLE IF EXISTS mobile_pairing_sessions;
+			DROP TABLE IF EXISTS mobile_devices;
 			DROP TABLE IF EXISTS projects;
+			DROP TABLE IF EXISTS client_runtime_box_preferences;
 			DROP TABLE IF EXISTS app_settings;
 			DROP TABLE IF EXISTS remote_access_settings;
 			DROP TABLE IF EXISTS runtime_boxes;
@@ -232,12 +243,20 @@ export function applyAppMigrations(client: Database): void {
 				action_journal_epoch TEXT NOT NULL
 			);
 
+			CREATE TABLE client_runtime_box_preferences (
+				client_id TEXT PRIMARY KEY NOT NULL,
+				runtime_box_id TEXT NOT NULL REFERENCES runtime_boxes(id),
+				revision INTEGER NOT NULL,
+				updated_at_ms INTEGER NOT NULL
+			);
+
 			CREATE TABLE remote_access_settings (
 				id INTEGER PRIMARY KEY NOT NULL CHECK (id = 1),
 				enabled INTEGER NOT NULL,
 				tunnel_id TEXT,
 				public_url TEXT,
 				runtime_ingress_port INTEGER,
+				mobile_ingress_port INTEGER,
 				traffic_month TEXT NOT NULL,
 				traffic_received_bytes INTEGER NOT NULL,
 				traffic_sent_bytes INTEGER NOT NULL,
@@ -283,6 +302,121 @@ export function applyAppMigrations(client: Database): void {
 			);
 			CREATE INDEX runtime_box_pairing_sessions_state_expiry_idx
 				ON runtime_box_pairing_sessions(state, expires_at_ms);
+
+			CREATE TABLE mobile_devices (
+				id TEXT PRIMARY KEY NOT NULL,
+				display_name TEXT NOT NULL,
+				model TEXT NOT NULL,
+				platform TEXT NOT NULL,
+				app_version TEXT NOT NULL,
+				created_at_ms INTEGER NOT NULL,
+				updated_at_ms INTEGER NOT NULL,
+				approved_at_ms INTEGER NOT NULL,
+				last_seen_at_ms INTEGER,
+				revoked_at_ms INTEGER
+			);
+
+			CREATE TABLE mobile_device_keys (
+				key_id TEXT NOT NULL,
+				mobile_client_id TEXT NOT NULL REFERENCES mobile_devices(id) ON DELETE CASCADE,
+				public_key TEXT NOT NULL,
+				public_key_fingerprint TEXT NOT NULL,
+				created_at_ms INTEGER NOT NULL,
+				revoked_at_ms INTEGER,
+				PRIMARY KEY (mobile_client_id, key_id)
+			);
+			CREATE INDEX mobile_device_keys_client_revoked_idx
+				ON mobile_device_keys(mobile_client_id, revoked_at_ms);
+
+			CREATE TABLE mobile_device_generation_fences (
+				mobile_client_id TEXT PRIMARY KEY NOT NULL
+					REFERENCES mobile_devices(id) ON DELETE CASCADE,
+				accepted_generation INTEGER NOT NULL,
+				accepted_instance_id TEXT NOT NULL,
+				updated_at_ms INTEGER NOT NULL
+			);
+
+			CREATE TABLE mobile_pairing_sessions (
+				id TEXT PRIMARY KEY NOT NULL,
+				code_hash TEXT NOT NULL UNIQUE,
+				claim_token_hash TEXT,
+				state TEXT NOT NULL,
+				device_key_id TEXT,
+				public_key TEXT,
+				public_key_fingerprint TEXT,
+				display_name TEXT,
+				model TEXT,
+				platform TEXT,
+				app_version TEXT,
+				mobile_client_id TEXT REFERENCES mobile_devices(id),
+				created_at_ms INTEGER NOT NULL,
+				expires_at_ms INTEGER NOT NULL,
+				claimed_at_ms INTEGER,
+				decided_at_ms INTEGER
+			);
+			CREATE INDEX mobile_pairing_sessions_state_expiry_idx
+				ON mobile_pairing_sessions(state, expires_at_ms);
+
+			-- Durable, Agent Server-owned Mobile attention / unread feed. Each event carries only the
+			-- minimal, desensitized signal a phone needs (stable monotonic seq + opaque ids +
+			-- localization keys) so a lock-screen notification can never leak business content. A
+			-- single-row meta table owns the monotonic sequence and the retention floor so the feed is
+			-- append-only, idempotent, and survives restart.
+			CREATE TABLE mobile_attention_feed_meta (
+				id INTEGER PRIMARY KEY NOT NULL CHECK (id = 1),
+				next_seq INTEGER NOT NULL,
+				pruned_through_seq INTEGER NOT NULL
+			);
+
+			CREATE TABLE mobile_attention_events (
+				seq INTEGER PRIMARY KEY NOT NULL,
+				event_id TEXT NOT NULL UNIQUE,
+				dedupe_key TEXT NOT NULL UNIQUE,
+				type TEXT NOT NULL,
+				session_id TEXT,
+				run_id TEXT,
+				approval_id TEXT,
+				title_key TEXT NOT NULL,
+				body_key TEXT NOT NULL,
+				created_at_ms INTEGER NOT NULL
+			);
+			CREATE INDEX mobile_attention_events_created_idx
+				ON mobile_attention_events(created_at_ms);
+
+			-- Per-device server-side acknowledgement cursor. Monotonic: it only ever advances, so a
+			-- replayed or out-of-order ack can never resurrect already-read unread. The phone stores no
+			-- business events; this cursor is the single source of truth for its unread state.
+			CREATE TABLE mobile_attention_ack_cursors (
+				mobile_client_id TEXT PRIMARY KEY NOT NULL,
+				acked_seq INTEGER NOT NULL,
+				updated_at_ms INTEGER NOT NULL
+			);
+
+			INSERT INTO mobile_attention_feed_meta (id, next_seq, pruned_through_seq)
+				VALUES (1, 1, 0);
+
+			-- Transactional outbox that makes the durable attention feed crash-consistent: an approval
+			-- reaching "pending" or a Run reaching a terminal status writes a desensitized row here in
+			-- the SAME transaction as the business write. An idempotent drainer projects each row into
+			-- mobile_attention_events and marks it processed; a crash between business commit and
+			-- projection replays from the outbox on startup rather than losing unread.
+			CREATE TABLE mobile_attention_outbox (
+				id INTEGER PRIMARY KEY NOT NULL,
+				dedupe_key TEXT NOT NULL UNIQUE,
+				type TEXT NOT NULL,
+				session_id TEXT,
+				run_id TEXT,
+				approval_id TEXT,
+				title_key TEXT NOT NULL,
+				body_key TEXT NOT NULL,
+				created_at_ms INTEGER NOT NULL,
+				enqueued_at_ms INTEGER NOT NULL,
+				processed_at_ms INTEGER,
+				attempts INTEGER NOT NULL DEFAULT 0,
+				last_error TEXT
+			);
+			CREATE INDEX mobile_attention_outbox_pending_idx
+				ON mobile_attention_outbox(processed_at_ms, id);
 
 			CREATE TABLE projects (
 				id TEXT PRIMARY KEY NOT NULL,
@@ -452,6 +586,46 @@ export function applyAppMigrations(client: Database): void {
 				consumed_at_ms INTEGER
 			);
 			CREATE INDEX execution_grants_expiry_idx ON execution_grants(expires_at_ms);
+
+			CREATE TABLE action_approval_requests (
+				id TEXT PRIMARY KEY NOT NULL,
+				session_id TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+				run_id TEXT NOT NULL REFERENCES chat_runs(id) ON DELETE CASCADE,
+				action_id TEXT NOT NULL,
+				tool_call_id TEXT NOT NULL,
+				tool TEXT NOT NULL,
+				operation TEXT NOT NULL,
+				action_summary_json TEXT NOT NULL,
+				risk_tier TEXT NOT NULL,
+				risk_overridable INTEGER NOT NULL,
+				risk_json TEXT NOT NULL,
+				state TEXT NOT NULL,
+				revision INTEGER NOT NULL,
+				decision_idempotency_key TEXT,
+				decision_json TEXT,
+				policy_evidence_json TEXT,
+				created_at_ms INTEGER NOT NULL,
+				expires_at_ms INTEGER NOT NULL,
+				decided_at_ms INTEGER
+			);
+			CREATE UNIQUE INDEX action_approval_requests_action_unique
+				ON action_approval_requests(action_id);
+			CREATE UNIQUE INDEX action_approval_requests_idempotency_unique
+				ON action_approval_requests(decision_idempotency_key);
+			CREATE INDEX action_approval_requests_session_state_idx
+				ON action_approval_requests(session_id, state);
+			CREATE INDEX action_approval_requests_state_expiry_idx
+				ON action_approval_requests(state, expires_at_ms);
+
+			CREATE TABLE session_approval_policies (
+				session_id TEXT PRIMARY KEY NOT NULL
+					REFERENCES chat_sessions(id) ON DELETE CASCADE,
+				allow_all INTEGER NOT NULL,
+				revision INTEGER NOT NULL,
+				updated_by_json TEXT,
+				last_idempotency_key TEXT,
+				updated_at_ms INTEGER NOT NULL
+			);
 
 			CREATE TABLE chat_run_events (
 				id TEXT PRIMARY KEY NOT NULL,

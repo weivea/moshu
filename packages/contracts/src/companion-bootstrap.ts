@@ -20,7 +20,7 @@ export const actionJournalEpochSchema = z.string().uuid();
 
 export const processPeerIdentitySchema = z
 	.object({
-		role: z.enum(["agents", "client", "runtime-box"]),
+		role: z.enum(["agents", "client", "runtime-box", "mobile-client"]),
 		peerId: identifierSchema,
 		instanceId: identifierSchema,
 		generation: generationSchema,

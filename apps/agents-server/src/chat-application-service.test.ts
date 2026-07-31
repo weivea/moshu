@@ -891,6 +891,33 @@ describe("ChatApplicationService", () => {
 		database.close();
 	});
 
+	test("notifies retirement on a direct session delete so subscriptions are cleaned up centrally", async () => {
+		const database = openAppDatabase(":memory:");
+		const retiredBatches: string[][] = [];
+		const service = createService(database, new FakeAskChatRuntime({}), new ManualScheduler(), {
+			onSessionsRetired: (sessionIds) => {
+				retiredBatches.push([...sessionIds]);
+			},
+		});
+		try {
+			const { session } = service.createSession();
+			await expect(service.deleteSession({ sessionId: session.id })).resolves.toEqual({
+				sessionId: session.id,
+			});
+			// The direct delete path must publish retirement exactly like a Project retirement so the
+			// event hub tears down any live subscriptions for the deleted Session.
+			expect(retiredBatches).toEqual([[session.id]]);
+			// Re-deleting an already-retired Session must not re-notify.
+			await expect(service.deleteSession({ sessionId: session.id })).resolves.toEqual({
+				sessionId: session.id,
+			});
+			expect(retiredBatches).toEqual([[session.id]]);
+		} finally {
+			await service.shutdown();
+			database.close();
+		}
+	});
+
 	test("replays a committed Session create key while its Runtime Box is offline", async () => {
 		const database = openAppDatabase(":memory:");
 		let ready = true;
@@ -3184,6 +3211,7 @@ function createService(
 		agentSessionCleanupStartupTimeoutMs?: number;
 		agentSessionCleanupStartupMaxAttempts?: number;
 		shutdownTimeoutMs?: number;
+		onSessionsRetired?: (sessionIds: readonly string[]) => void;
 	} = {},
 ) {
 	return new ChatApplicationService({
@@ -3227,6 +3255,9 @@ function createService(
 		...(options.shutdownTimeoutMs === undefined
 			? {}
 			: { shutdownTimeoutMs: options.shutdownTimeoutMs }),
+		...(options.onSessionsRetired === undefined
+			? {}
+			: { onSessionsRetired: options.onSessionsRetired }),
 	});
 }
 

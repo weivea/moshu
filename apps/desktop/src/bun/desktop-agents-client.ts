@@ -1,5 +1,8 @@
 import {
+	type ApprovalEventDelivery,
 	agentsProductEventMethods,
+	approvalActivityChangedEventSchema,
+	approvalEventDeliverySchema,
 	type ChatRunEvent,
 	type ChatSendAcceptedOutput,
 	type CreateChatSessionOutput,
@@ -8,6 +11,8 @@ import {
 	chatEventDeliverySchema,
 	chatSendAcceptedOutputSchema,
 	chatSessionsRetiredEventSchema,
+	chatSubscribeInputSchema,
+	chatSubscribeOutputSchema,
 	createChatSessionOutputSchema,
 	createProcessChatSessionInputSchema,
 	deleteChatSessionInputSchema,
@@ -30,8 +35,10 @@ import {
 	remoteAccessMutationRpcTimeoutMs,
 	replayChatEventsInputSchema,
 	replayChatEventsOutputSchema,
+	type SessionApprovalPolicyEvent,
 	type SessionModelSelection,
 	sendAskChatMessageInputSchema,
+	sessionApprovalPolicyEventSchema,
 	setChatSessionArchivedInputSchema,
 	updateChatSessionInputSchema,
 	uuidV7Schema,
@@ -79,6 +86,9 @@ type ChatEventListener = (event: ChatRunEvent) => void | PromiseLike<void>;
 type ChatSessionInvalidationListener = (invalidation: ChatSessionInvalidation) => void;
 type DesktopAgentsReadyListener = () => void;
 type RuntimeBoxesChangedListener = (snapshot: ListRuntimeBoxesOutput) => void;
+type ApprovalEventListener = (delivery: ApprovalEventDelivery) => void;
+type SessionApprovalPolicyChangedListener = (event: SessionApprovalPolicyEvent) => void;
+type ApprovalActivityChangedListener = () => void;
 type ProductMethod = keyof typeof productRpcRequestSchemas;
 const remoteAccessMutationMethodSet = new Set<string>(remoteAccessMutationMethods);
 export type DesktopAgentsRpcPeer = Pick<RpcPeer, "close" | "remoteIdentity" | "request">;
@@ -205,6 +215,9 @@ export class DesktopAgentsClient {
 	readonly #chatSessionInvalidationListeners = new Set<ChatSessionInvalidationListener>();
 	readonly #readyListeners = new Set<DesktopAgentsReadyListener>();
 	readonly #runtimeBoxesChangedListeners = new Set<RuntimeBoxesChangedListener>();
+	readonly #approvalEventListeners = new Set<ApprovalEventListener>();
+	readonly #sessionApprovalPolicyListeners = new Set<SessionApprovalPolicyChangedListener>();
+	readonly #approvalActivityListeners = new Set<ApprovalActivityChangedListener>();
 	readonly #activeRunCursors = new Map<string, ActiveRunCursor>();
 	readonly #sendReservations = new Map<string, SendReservation>();
 	readonly #runReservations = new Map<string, SendReservation>();
@@ -350,6 +363,24 @@ export class DesktopAgentsClient {
 								listener(snapshot);
 							}
 						},
+						[productRpcEvents.approvalEvent]: (payload) => {
+							const delivery = approvalEventDeliverySchema.parse(payload);
+							for (const listener of this.#approvalEventListeners) {
+								listener(delivery);
+							}
+						},
+						[productRpcEvents.sessionApprovalPolicyChanged]: (payload) => {
+							const event = sessionApprovalPolicyEventSchema.parse(payload);
+							for (const listener of this.#sessionApprovalPolicyListeners) {
+								listener(event);
+							}
+						},
+						[productRpcEvents.approvalActivityChanged]: (payload) => {
+							approvalActivityChangedEventSchema.parse(payload);
+							for (const listener of this.#approvalActivityListeners) {
+								listener();
+							}
+						},
 					},
 				},
 				methodAllowlist: {
@@ -379,18 +410,35 @@ export class DesktopAgentsClient {
 			await this.#readCursorSupport(peer, recoveryDeadline);
 			await this.#recoverRetiredSessions(peer, recoveryDeadline, connectionGeneration);
 			await this.#retryPendingSessionRetirements(recoveryDeadline, connectionGeneration);
+			await this.#installLiveSubscriptions(peer, recoveryDeadline, connectionGeneration);
 			await this.#replayProgressively(peer, recoveryDeadline, connectionGeneration, deliver);
 			await this.#flushProvisionalEvents(provisionalQueue, recoveryDeadline, deliver);
 			this.#deleteCommittedTerminalCursors();
 			await this.#reconcileUnboundReservations(peer, recoveryDeadline, connectionGeneration);
 			await this.#reconcilePendingSessionCreates(peer, recoveryDeadline);
-			await this.#flushProvisionalEvents(provisionalQueue, recoveryDeadline, deliver);
-			await this.#retryPendingSessionRetirements(recoveryDeadline, connectionGeneration);
-			this.#deleteCommittedTerminalCursors();
 			if (this.#shutdown || connectionClosed) {
 				throw new AgentsUnavailableError("The local agents service disconnected during recovery.");
 			}
 			this.#assertRecoveryDeadline(recoveryDeadline);
+			// Atomic drain-and-activate fence. Drain provisional chat events AND pending Session
+			// retirements together until BOTH are quiescent, because either can be produced during the
+			// other's renderer await (a retirement staged mid chat-event flush; a chat event enqueued mid
+			// retirement finalization). This unified loop is the LAST await before the connection is
+			// marked active: because no await follows it, nothing can be enqueued-then-stranded between
+			// reaching quiescence and the synchronous flip below. Any event that arrives while
+			// connectionActive is still false is therefore drained here or delivered live after the flip;
+			// events that straddle the boundary still commit exactly once via the per-run cursor in
+			// #deliverThenCommit.
+			await this.#drainRecoveryUntilQuiescent(
+				provisionalQueue,
+				recoveryDeadline,
+				connectionGeneration,
+				deliver,
+			);
+			this.#deleteCommittedTerminalCursors();
+			if (this.#shutdown || connectionClosed) {
+				throw new AgentsUnavailableError("The local agents service disconnected during recovery.");
+			}
 			this.#provisionalPeer = null;
 			this.#peer = peer;
 			this.#closeActiveConnection = () => closeExactPeer("Desktop agents client closed.");
@@ -531,9 +579,16 @@ export class DesktopAgentsClient {
 					? { timeoutMs: remoteAccessMutationRpcTimeoutMs }
 					: undefined,
 			);
+			// A successful sessionDelete response is authoritative: the delete completed, and the server
+			// broadcasts the resulting retirement to every peer — including this initiating peer, which may
+			// observe it before the response settles. The delete operation therefore owns its own Session's
+			// retirement and must not be rejected by it. Every other in-flight operation still fails closed
+			// when its Session retires concurrently.
 			if (
-				sessionOperation?.retired ||
-				(sessionOperation !== undefined && this.#sessionRetirements.has(sessionOperation.sessionId))
+				method !== productRpcMethods.sessionDelete &&
+				(sessionOperation?.retired ||
+					(sessionOperation !== undefined &&
+						this.#sessionRetirements.has(sessionOperation.sessionId)))
 			) {
 				throw new ChatSessionNotFoundError();
 			}
@@ -855,12 +910,7 @@ export class DesktopAgentsClient {
 		if (this.#sessionRetirements.has(delivery.event.sessionId)) {
 			return null;
 		}
-		const retainedCursor = this.#activeRunCursors.get(delivery.event.runId);
-		const reservation =
-			this.#sendReservations.get(delivery.clientRequestId) ??
-			(retainedCursor?.reservation.requestId === delivery.clientRequestId
-				? retainedCursor.reservation
-				: undefined);
+		const reservation = this.#correlateDeliveryReservation(delivery);
 		if (reservation === undefined) {
 			throw new Error("Chat event correlation did not match an active send reservation.");
 		}
@@ -882,6 +932,28 @@ export class DesktopAgentsClient {
 			});
 		}
 		return delivery.event;
+	}
+
+	#correlateDeliveryReservation(
+		delivery: z.output<typeof chatEventDeliverySchema>,
+	): SendReservation | undefined {
+		// Correlate live events by their stable Run id first. This keeps delivery working without the
+		// originating request id, which the Session-scoped event hub now treats as an optional echo.
+		const runReservation = this.#runReservations.get(delivery.event.runId);
+		if (runReservation !== undefined) {
+			return runReservation;
+		}
+		const retainedCursor = this.#activeRunCursors.get(delivery.event.runId);
+		if (retainedCursor !== undefined) {
+			return retainedCursor.reservation;
+		}
+		// Fall back to the optional origin echo for the race where the first live event arrives before
+		// the chat.send accept response has bound the Run id locally.
+		const clientRequestId = delivery.clientRequestId;
+		if (clientRequestId !== undefined) {
+			return this.#sendReservations.get(clientRequestId);
+		}
+		return undefined;
 	}
 
 	#bindReservationRun(reservation: SendReservation, runId: string, sessionId: string): void {
@@ -928,6 +1000,29 @@ export class DesktopAgentsClient {
 		this.#runtimeBoxesChangedListeners.add(listener);
 		return () => {
 			this.#runtimeBoxesChangedListeners.delete(listener);
+		};
+	}
+
+	subscribeApprovalEvents(listener: ApprovalEventListener): () => void {
+		this.#approvalEventListeners.add(listener);
+		return () => {
+			this.#approvalEventListeners.delete(listener);
+		};
+	}
+
+	subscribeSessionApprovalPolicyChanged(
+		listener: SessionApprovalPolicyChangedListener,
+	): () => void {
+		this.#sessionApprovalPolicyListeners.add(listener);
+		return () => {
+			this.#sessionApprovalPolicyListeners.delete(listener);
+		};
+	}
+
+	subscribeApprovalActivityChanged(listener: ApprovalActivityChangedListener): () => void {
+		this.#approvalActivityListeners.add(listener);
+		return () => {
+			this.#approvalActivityListeners.delete(listener);
 		};
 	}
 
@@ -992,10 +1087,65 @@ export class DesktopAgentsClient {
 		this.#implicitSessionCreateKey = undefined;
 		this.#chatEventListeners.clear();
 		this.#runtimeBoxesChangedListeners.clear();
+		this.#approvalEventListeners.clear();
+		this.#sessionApprovalPolicyListeners.clear();
+		this.#approvalActivityListeners.clear();
 		this.#chatSessionInvalidationListeners.clear();
 		this.#readyListeners.clear();
 		closeActiveConnection?.();
 		provisionalPeer?.close(1000, "Provisional desktop agents client shutting down.");
+	}
+
+	/**
+	 * Installs live Session subscriptions on the freshly connected peer BEFORE replay so the server
+	 * routes live ChatRunEvents for every recovering Session into the provisional buffer while replay
+	 * is still in flight. This is the head of the gap-free recovery loop:
+	 * subscribe -> buffer live -> replay from durable cursor -> dedupe/merge by (runId, seq) -> flush
+	 * -> ready. Because the subscription is armed at-or-before the replay snapshot boundary, any event
+	 * committed after the snapshot is delivered live into the buffer, and any overlap with the replay
+	 * response is deduplicated by the per-run cursor in #deliverThenCommit — so no event committed
+	 * between the subscribe and the replay response is ever lost or double-delivered.
+	 *
+	 * A Session that has been retired since the last connection answers with SESSION_NOT_FOUND; that is
+	 * expected and handled by the per-Run replay path below, so we skip it here rather than failing
+	 * recovery.
+	 */
+	async #installLiveSubscriptions(
+		peer: DesktopAgentsRpcPeer,
+		deadline: number,
+		connectionGeneration: number,
+	): Promise<void> {
+		const sessionIds = new Set<string>();
+		for (const cursor of this.#activeRunCursors.values()) {
+			if (!this.#sessionRetirements.has(cursor.sessionId)) {
+				sessionIds.add(cursor.sessionId);
+			}
+		}
+		for (const sessionId of sessionIds) {
+			this.#assertRecoveryDeadline(deadline);
+			if (this.#shutdown) {
+				throw new AgentsUnavailableError("The desktop agents client is shutting down.");
+			}
+			const input = chatSubscribeInputSchema.parse({ sessionId });
+			const encoded = rpcJsonValueSchema.parse(JSON.parse(JSON.stringify(input)));
+			const remainingMs = Math.max(1, deadline - this.now());
+			try {
+				const response = await peer.request(productRpcMethods.chatSubscribe, encoded, {
+					timeoutMs: remainingMs,
+				});
+				chatSubscribeOutputSchema.parse(response);
+			} catch (error) {
+				if (error instanceof RpcRemoteError && error.code === chatSessionNotFoundCode) {
+					await this.#invalidatePendingSessionRetirement(
+						this.#stagePendingSessionRetirement(sessionId),
+						deadline,
+						connectionGeneration,
+					);
+					continue;
+				}
+				throw error;
+			}
+		}
 	}
 
 	async #replayProgressively(
@@ -1479,6 +1629,49 @@ export class DesktopAgentsClient {
 			}
 			this.#recoveredSessionCreates.delete(reservation.createKey);
 			this.#releaseSessionCreateReservation(reservation, true);
+		}
+	}
+
+	#hasPendingSessionRetirements(): boolean {
+		return (
+			this.#sessionRetirements.entries().find((entry) => entry.value.status === "pending") !==
+			undefined
+		);
+	}
+
+	/**
+	 * Drains provisional chat events and pending Session retirements together until BOTH are quiescent.
+	 *
+	 * The two recovery queues feed each other: delivering a provisional chat event awaits a renderer chat
+	 * listener, during which a `chatSessionsRetired` notification can be staged as a new pending
+	 * retirement; and finalizing a retirement awaits a renderer acknowledgement, during which a live chat
+	 * event can be enqueued into the provisional buffer. Flushing one queue and then the other exactly
+	 * once therefore leaves a tail race — e.g. a retirement staged during the final chat-event flush is
+	 * never retried, so the connection is marked ready without invalidating the renderer. Looping until a
+	 * full pass leaves both queues empty closes that race. The caller flips `connectionActive = true`
+	 * synchronously immediately after this resolves, with no interleaving await, so any later arrival is
+	 * routed through active delivery instead of the provisional buffers.
+	 */
+	async #drainRecoveryUntilQuiescent(
+		queue: ProvisionalEventQueue,
+		deadline: number,
+		connectionGeneration: number,
+		deliver: (event: ChatRunEvent, deadline?: number) => Promise<void>,
+	): Promise<void> {
+		// Each round after the first drains at least one item that was staged during the previous round's
+		// awaits. Distinct items are bounded by the provisional event and retention caps, so this is a
+		// finite backstop to the recovery deadline both inner drains already enforce.
+		const maxRounds = this.#recoveryLimits.maxProvisionalEvents + maxRetainedSessionRetirements + 1;
+		let rounds = 0;
+		while (queue.events.length > 0 || this.#hasPendingSessionRetirements()) {
+			if (rounds >= maxRounds) {
+				throw new AgentsUnavailableError(
+					"The recovery drain did not reach a quiescent state within its bounded rounds.",
+				);
+			}
+			await this.#flushProvisionalEvents(queue, deadline, deliver);
+			await this.#retryPendingSessionRetirements(deadline, connectionGeneration);
+			rounds += 1;
 		}
 	}
 
