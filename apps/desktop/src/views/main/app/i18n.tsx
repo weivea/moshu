@@ -500,8 +500,6 @@ const messages = {
 		"mobileAccess.createPairing": "Show QR code",
 		"mobileAccess.pairingHint":
 			"Enable Remote Access, then generate a one-time QR code. Scan it from the Moshu iOS app to submit a device claim for approval.",
-		"mobileAccess.pairingWaitingUrl":
-			"Waiting for the Mobile ingress to come online before the QR can be scanned.",
 		"mobileAccess.qrAlt": "Mobile pairing QR code",
 		"mobileAccess.qrUnavailable": "Could not render the QR image; use the payload below.",
 		"mobileAccess.code": "One-time code",
@@ -1195,7 +1193,6 @@ const messages = {
 		"mobileAccess.createPairing": "显示二维码",
 		"mobileAccess.pairingHint":
 			"启用远程访问后生成一次性二维码。用 Moshu iOS 应用扫码即可提交设备认领以待批准。",
-		"mobileAccess.pairingWaitingUrl": "等待 Mobile ingress 上线后二维码才能被扫描。",
 		"mobileAccess.qrAlt": "移动配对二维码",
 		"mobileAccess.qrUnavailable": "无法渲染二维码图像；请使用下方的载荷。",
 		"mobileAccess.code": "一次性配对码",

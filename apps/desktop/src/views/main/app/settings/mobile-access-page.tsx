@@ -120,6 +120,19 @@ export function MobileAccessSettingsPage() {
 			setPairingRemainingSeconds(undefined);
 			return;
 		}
+		// Legacy / degraded pairings that never received a reachable public URL must never linger as a
+		// silent "waiting for URL" state. Expire them immediately and surface the not-ready error so the
+		// operator explicitly recreates once the ingress is live, instead of staring at a blank QR.
+		if (
+			pairing.qr === undefined ||
+			typeof pairing.mobileUrl !== "string" ||
+			pairing.mobileUrl.length === 0
+		) {
+			setPairing(undefined);
+			setPairingRemainingSeconds(undefined);
+			setErrorMessage(t("mobileAccess.error.ingressNotReady"));
+			return;
+		}
 		const expiresAtMs = Date.parse(pairing.expiresAt);
 		const updateCountdown = () => {
 			const remainingMs = expiresAtMs - Date.now();
@@ -133,7 +146,7 @@ export function MobileAccessSettingsPage() {
 		updateCountdown();
 		const timer = setInterval(updateCountdown, 1_000);
 		return () => clearInterval(timer);
-	}, [pairing]);
+	}, [pairing, t]);
 
 	const createPairing = async () => {
 		setPendingAction("pair");
@@ -291,9 +304,7 @@ export function MobileAccessSettingsPage() {
 				)}
 				{pairing ? (
 					<div className="mobile-access-qr">
-						{pairing.qr === undefined ? (
-							<p role="status">{t("mobileAccess.pairingWaitingUrl")}</p>
-						) : qrImageUrl ? (
+						{qrImageUrl ? (
 							<img
 								className="mobile-access-qr__image"
 								src={qrImageUrl}

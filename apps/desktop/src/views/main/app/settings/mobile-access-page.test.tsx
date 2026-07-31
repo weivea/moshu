@@ -137,6 +137,27 @@ describe("MobileAccessSettingsPage", () => {
 		expect(screen.queryByText(/Expires in/)).not.toBeInTheDocument();
 	});
 
+	test("expires a legacy pairing that never received a public URL and lets the operator recreate", async () => {
+		// A pre-fix / degraded pairing can arrive without a reachable public URL. It must never linger
+		// as a blank QR — the UI expires it, surfaces the not-ready error, and re-enables creation.
+		rpcMocks.createMobilePairing.mockResolvedValue({ ...pairingOutput(), mobileUrl: "" });
+
+		render(
+			<I18nProvider>
+				<MobileAccessSettingsPage />
+			</I18nProvider>,
+		);
+
+		const button = await screen.findByRole("button", { name: "Show QR code" });
+		await waitFor(() => expect(button).toBeEnabled());
+		fireEvent.click(button);
+
+		expect(await screen.findByText(/is not exposed yet/)).toBeVisible();
+		expect(screen.queryByText(PAIRING_CODE)).not.toBeInTheDocument();
+		expect(screen.queryByText(/Expires in/)).not.toBeInTheDocument();
+		expect(screen.getByRole("button", { name: "Show QR code" })).toBeEnabled();
+	});
+
 	test("approves a claim by pinning its fingerprint", async () => {
 		rpcMocks.listMobilePairingClaims.mockResolvedValue({ items: [pendingClaim()] });
 		rpcMocks.approveMobilePairing.mockResolvedValue({ device: approvedDevice() });

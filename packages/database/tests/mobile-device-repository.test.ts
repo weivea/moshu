@@ -63,9 +63,11 @@ describe("SqliteMobileDeviceRepository", () => {
 		const database = openAppDatabase(":memory:");
 		try {
 			const activeIds = new Set<string>();
-			// Seed more than one page (>128) of lifetime devices, revoking a third of them so the roster
-			// mixes active and revoked rows — exactly the case that used to overflow the max(128) schema.
-			for (let index = 0; index < 200; index += 1) {
+			// Seed well beyond one page (>205) of lifetime devices, revoking a third of them so the
+			// roster mixes active and revoked rows — exactly the case that used to overflow the
+			// max(128) schema. 205 comfortably exceeds both the schema cap and a single page.
+			const totalDevices = 205;
+			for (let index = 0; index < totalDevices; index += 1) {
 				const clientId = seedApprovedDevice(database, `device-key-${index}`);
 				if (index % 3 === 0) {
 					database.mobileDevices.revokeDevice(clientId);
@@ -102,7 +104,7 @@ describe("SqliteMobileDeviceRepository", () => {
 			} while (cursor !== undefined);
 
 			// The whole lifetime roster is reachable exactly once across pages.
-			expect(seen.size).toBe(200);
+			expect(seen.size).toBe(totalDevices);
 			expect(pages).toBeGreaterThan(1);
 			// Every active device is traversable and comes before any revoked device.
 			expect(activeOrder).toHaveLength(activeIds.size);
