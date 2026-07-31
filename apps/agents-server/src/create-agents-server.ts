@@ -349,8 +349,12 @@ export async function createAgentsServer(
 			actionJournalEpoch: database.runtimeBoxes.getActionJournalEpoch(),
 			// A pairing QR is only publishable once the Mobile ingress port is live with a public URL AND
 			// Remote Access is still enabled. disable() persists enabled=false before the async stop
-			// clears readiness/URL, so both signals are gated here to fail closed during that window.
+			// clears readiness/URL, so the enabled flag is folded directly into the URL provider (and
+			// re-checked via isRemoteAccessEnabled) to fail closed during that transition window.
 			getMobilePublicUrl: () => {
+				if (devTunnelService?.getStatus().enabled !== true) {
+					return undefined;
+				}
 				const ingress = devTunnelService
 					?.getIngressReadiness()
 					.find((entry) => entry.kind === "mobile");
