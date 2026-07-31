@@ -396,7 +396,7 @@ export function createProductRpcHandlers(dependencies: ProductRpcDependencies): 
 			),
 			[productRpcMethods.mobileDeviceList]: createRequestHandler(
 				productRpcRequestSchemas[productRpcMethods.mobileDeviceList],
-				() => listMobileDevicesOutputSchema.parse({ items: requireMobileDevices().list() }),
+				(input) => listMobileDevicesOutputSchema.parse(requireMobileDevices().list(input)),
 			),
 			[productRpcMethods.mobileDeviceRevoke]: createRequestHandler(
 				productRpcRequestSchemas[productRpcMethods.mobileDeviceRevoke],

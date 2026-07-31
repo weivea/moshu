@@ -55,6 +55,7 @@ import {
 	listChatSessionsOutputSchema,
 	listMcpServersInputSchema,
 	listMcpServersOutputSchema,
+	listMobileDevicesInputSchema,
 	listMobileDevicesOutputSchema,
 	listMobilePairingClaimsOutputSchema,
 	listProjectsInputSchema,
@@ -277,7 +278,7 @@ export function createDesktopRpc({ agentsClient }: DesktopRpcDependencies) {
 					agentsClient.request(
 						productRpcMethods.mobileDeviceList,
 						params,
-						emptyParamsSchema,
+						listMobileDevicesInputSchema,
 						listMobileDevicesOutputSchema,
 					),
 				revokeMobileDevice: (params) =>

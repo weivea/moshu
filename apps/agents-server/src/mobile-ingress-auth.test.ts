@@ -14,7 +14,8 @@ import {
 	mobilePairingQrPayloadSchema,
 	mobilePairingStatusOutputSchema,
 } from "@moshu/contracts";
-import { openAppDatabase } from "@moshu/database";
+import { type MobilePairingRepository, openAppDatabase } from "@moshu/database";
+import { RpcHandlerError } from "@moshu/process-rpc";
 
 import { AgentServerIdentity } from "./agent-server-identity";
 import { MobileIngressAuth } from "./mobile-ingress-auth";
@@ -240,15 +241,59 @@ describe("MobileIngressAuth", () => {
 		}
 	});
 
-	test("omits the QR until the Mobile ingress has a public URL", async () => {
+	test("fails closed without creating a pairing until the Mobile ingress has a public URL", async () => {
 		const directory = mkdtempSync(join(tmpdir(), "moshu-mobile-ingress-noqr-"));
 		const database = openAppDatabase(":memory:");
 		try {
-			const { auth } = createAuth(directory, database);
+			// Count create() calls so we can prove a not-ready pairing consumes no durable state.
+			let createCalls = 0;
+			const realPairings = database.mobilePairings;
+			const countingPairings: MobilePairingRepository = {
+				create: (input) => {
+					createCalls += 1;
+					return realPairings.create(input);
+				},
+				claim: (input) => realPairings.claim(input),
+				listPendingClaims: () => realPairings.listPendingClaims(),
+				approve: (pairingId, fingerprint) => realPairings.approve(pairingId, fingerprint),
+				reject: (pairingId) => realPairings.reject(pairingId),
+				getStatus: (pairingId, hash) => realPairings.getStatus(pairingId, hash),
+				listActiveDeviceKeys: (mobileClientId) => realPairings.listActiveDeviceKeys(mobileClientId),
+				getActiveDeviceKey: (mobileClientId, keyId) =>
+					realPairings.getActiveDeviceKey(mobileClientId, keyId),
+				revokeDeviceKey: (mobileClientId, keyId) =>
+					realPairings.revokeDeviceKey(mobileClientId, keyId),
+			};
+			let mobileUrl: string | undefined;
+			const identity = AgentServerIdentity.open(join(directory, "identity.json"));
+			const auth = new MobileIngressAuth({
+				pairings: countingPairings,
+				identity,
+				rpcIdentity,
+				actionJournalEpoch,
+				getMobilePublicUrl: () => mobileUrl,
+			});
+
+			// Not ready: refuses with a stable code and never touches the pairing store.
+			let thrown: unknown;
+			try {
+				auth.createPairing();
+			} catch (error) {
+				thrown = error;
+			}
+			expect(thrown).toBeInstanceOf(RpcHandlerError);
+			expect((thrown as RpcHandlerError).code).toBe("MOBILE_INGRESS_NOT_READY");
+			expect(createCalls).toBe(0);
+			expect(auth.listPendingClaims().items).toHaveLength(0);
+
+			// Once the ingress is exposed, the very next create succeeds and publishes a full QR.
+			mobileUrl = "https://mobile.example.devtunnels.ms";
 			const pairing = auth.createPairing();
-			expect(pairing.qr).toBeUndefined();
-			expect(pairing.mobileUrl).toBeUndefined();
-			expect(pairing.code.length).toBeGreaterThanOrEqual(22);
+			expect(createCalls).toBe(1);
+			expect(pairing.mobileUrl).toBe(mobileUrl);
+			const qr = mobilePairingQrPayloadSchema.parse(pairing.qr);
+			expect(qr.mobileUrl).toBe(mobileUrl);
+			expect(qr.code).toBe(pairing.code);
 		} finally {
 			database.close();
 			rmSync(directory, { recursive: true, force: true });

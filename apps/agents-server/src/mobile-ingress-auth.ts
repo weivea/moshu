@@ -35,6 +35,7 @@ import {
 	MobilePairingSessionStateError,
 } from "@moshu/database";
 import {
+	RpcHandlerError,
 	type RpcHandshakeAuthenticator,
 	RpcHandshakeHttpError,
 	type RpcHttpRequestContext,
@@ -112,6 +113,16 @@ export class MobileIngressAuth {
 	}
 
 	createPairing(): CreateMobilePairingOutput {
+		// Fail closed: a pairing is only useful once the Mobile ingress is live and has an exact public
+		// URL to embed in the QR. If it is not ready we refuse *before* minting any state, so we never
+		// create a code the phone could never reach and never leave a dangling, QR-less pairing record.
+		const mobileUrl = this.#getMobilePublicUrl();
+		if (mobileUrl === undefined) {
+			throw new RpcHandlerError(
+				"MOBILE_INGRESS_NOT_READY",
+				"The Mobile ingress is not exposed yet, so a pairing QR cannot be published.",
+			);
+		}
 		const code = randomBytes(24).toString("base64url");
 		const pairingId = randomUUID();
 		const expiresAtMs = this.#now() + pairingTtlMs;
@@ -121,10 +132,6 @@ export class MobileIngressAuth {
 			codeHash: hashSecret(code),
 			expiresAtMs,
 		});
-		const mobileUrl = this.#getMobilePublicUrl();
-		if (mobileUrl === undefined) {
-			return createMobilePairingOutputSchema.parse({ pairingId, code, expiresAt });
-		}
 		return createMobilePairingOutputSchema.parse({
 			pairingId,
 			code,

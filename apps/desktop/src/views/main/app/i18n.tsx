@@ -526,6 +526,11 @@ const messages = {
 		"mobileAccess.error.pairing": "Unable to create a Mobile pairing code.",
 		"mobileAccess.error.decision": "Unable to update the Mobile pairing.",
 		"mobileAccess.error.revoke": "Unable to revoke the Mobile device.",
+		"mobileAccess.error.ingressNotReady":
+			"The Mobile ingress is not exposed yet, so a pairing code cannot be created. Wait for it to come online and try again.",
+		"mobileAccess.notReadyHint":
+			"Waiting for the Mobile ingress to come online and publish its public URL before you can create a pairing code.",
+		"mobileAccess.loadMore": "Load more devices",
 		"providers.title": "LLM Providers",
 		"providers.description":
 			"Configure one or more model providers. Fetch each provider's model list, then tick the models you want to use.",
@@ -1215,6 +1220,10 @@ const messages = {
 		"mobileAccess.error.pairing": "无法创建移动配对码。",
 		"mobileAccess.error.decision": "无法更新移动配对。",
 		"mobileAccess.error.revoke": "无法吊销移动设备。",
+		"mobileAccess.error.ingressNotReady":
+			"Mobile ingress 尚未公开，暂时无法创建配对码。请等待其上线后重试。",
+		"mobileAccess.notReadyHint": "需等待 Mobile ingress 上线并公开其 URL 后，才能创建配对码。",
+		"mobileAccess.loadMore": "加载更多设备",
 		"providers.title": "模型服务商",
 		"providers.description": "配置一个或多个模型服务商。拉取各自的模型列表后，勾选需要启用的模型。",
 		"providers.loading": "正在加载服务商…",

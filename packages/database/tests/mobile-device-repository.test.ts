@@ -1,6 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import { createHash, generateKeyPairSync, randomBytes, randomUUID } from "node:crypto";
-import { MobileDeviceNotFoundError, MobileDeviceRevokedError, openAppDatabase } from "../src";
+import {
+	MobileDeviceCursorError,
+	MobileDeviceNotFoundError,
+	MobileDeviceRevokedError,
+	openAppDatabase,
+} from "../src";
 
 function hashSecret(secret: string): string {
 	return createHash("sha256").update(secret, "ascii").digest("base64url");
@@ -44,11 +49,80 @@ describe("SqliteMobileDeviceRepository", () => {
 		const database = openAppDatabase(":memory:");
 		try {
 			const mobileClientId = seedApprovedDevice(database);
-			expect(database.mobileDevices.list()).toHaveLength(1);
+			expect(database.mobileDevices.list().items).toHaveLength(1);
 			const device = database.mobileDevices.get(mobileClientId);
 			expect(device.mobileClientId).toBe(mobileClientId);
 			expect(device.revoked).toBe(false);
 			expect(device.lastSeenAt).toBeUndefined();
+		} finally {
+			database.close();
+		}
+	});
+
+	test("paginates the lifetime roster active-first and keeps every active device reachable", () => {
+		const database = openAppDatabase(":memory:");
+		try {
+			const activeIds = new Set<string>();
+			// Seed more than one page (>128) of lifetime devices, revoking a third of them so the roster
+			// mixes active and revoked rows — exactly the case that used to overflow the max(128) schema.
+			for (let index = 0; index < 200; index += 1) {
+				const clientId = seedApprovedDevice(database, `device-key-${index}`);
+				if (index % 3 === 0) {
+					database.mobileDevices.revokeDevice(clientId);
+				} else {
+					activeIds.add(clientId);
+				}
+			}
+
+			const seen = new Set<string>();
+			const activeOrder: string[] = [];
+			let sawRevoked = false;
+			let cursor: string | undefined;
+			let pages = 0;
+			do {
+				const page = database.mobileDevices.list(
+					cursor === undefined ? { limit: 50 } : { cursor, limit: 50 },
+				);
+				// Every page stays within the schema bound.
+				expect(page.items.length).toBeLessThanOrEqual(50);
+				for (const device of page.items) {
+					// No device is ever duplicated across pages.
+					expect(seen.has(device.mobileClientId)).toBe(false);
+					seen.add(device.mobileClientId);
+					if (device.revoked) {
+						sawRevoked = true;
+					} else {
+						// An active device must never appear after a revoked one.
+						expect(sawRevoked).toBe(false);
+						activeOrder.push(device.mobileClientId);
+					}
+				}
+				cursor = page.nextCursor;
+				pages += 1;
+			} while (cursor !== undefined);
+
+			// The whole lifetime roster is reachable exactly once across pages.
+			expect(seen.size).toBe(200);
+			expect(pages).toBeGreaterThan(1);
+			// Every active device is traversable and comes before any revoked device.
+			expect(activeOrder).toHaveLength(activeIds.size);
+			for (const id of activeIds) {
+				expect(seen.has(id)).toBe(true);
+			}
+			// And every active device remains individually revocable.
+			for (const id of activeIds) {
+				database.mobileDevices.revokeDevice(id);
+				expect(database.mobileDevices.get(id).revoked).toBe(true);
+			}
+		} finally {
+			database.close();
+		}
+	});
+
+	test("rejects a malformed device list cursor", () => {
+		const database = openAppDatabase(":memory:");
+		try {
+			expect(() => database.mobileDevices.list({ cursor: "abc" })).toThrow(MobileDeviceCursorError);
 		} finally {
 			database.close();
 		}

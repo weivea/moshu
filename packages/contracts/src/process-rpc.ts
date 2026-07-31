@@ -53,6 +53,7 @@ import {
 	approveMobilePairingInputSchema,
 	approveMobilePairingOutputSchema,
 	createMobilePairingOutputSchema,
+	listMobileDevicesInputSchema,
 	listMobileDevicesOutputSchema,
 	listMobilePairingClaimsOutputSchema,
 	mobileAccessStatusOutputSchema,
@@ -544,7 +545,7 @@ export const productRpcRequestSchemas = {
 		output: rejectMobilePairingOutputSchema,
 	},
 	[productRpcMethods.mobileDeviceList]: {
-		input: emptyParamsSchema,
+		input: listMobileDevicesInputSchema,
 		output: listMobileDevicesOutputSchema,
 	},
 	[productRpcMethods.mobileDeviceRevoke]: {

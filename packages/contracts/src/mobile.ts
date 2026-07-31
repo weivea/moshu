@@ -58,9 +58,27 @@ export const mobileDeviceSchema = z
 	})
 	.strict();
 
+// The Mobile device roster is a lifetime audit log: revoked devices are retained forever so a
+// stolen key can never silently reappear. To keep the wire response bounded (and schema-valid) no
+// matter how many historical pairings accumulate, the roster is paginated with a stable, opaque
+// keyset cursor. Active devices are always ordered first so the managing UI can reach and revoke
+// every live device without paging through revoked history.
+export const mobileDeviceListPageSize = 128 as const;
+
+export const mobileDeviceListCursorSchema = z.string().min(1).max(512);
+
+export const listMobileDevicesInputSchema = z
+	.object({
+		cursor: mobileDeviceListCursorSchema.optional(),
+		limit: z.int().min(1).max(mobileDeviceListPageSize).optional(),
+	})
+	.strict();
+
 export const listMobileDevicesOutputSchema = z
 	.object({
-		items: z.array(mobileDeviceSchema).max(128),
+		items: z.array(mobileDeviceSchema).max(mobileDeviceListPageSize),
+		// Present only when more devices remain; pass it back as `cursor` to fetch the next page.
+		nextCursor: mobileDeviceListCursorSchema.optional(),
 	})
 	.strict();
 
@@ -241,6 +259,7 @@ export type MobileProtocolVersion = z.infer<typeof mobileProtocolVersionSchema>;
 export type MobileTransportSecurity = z.infer<typeof mobileTransportSecuritySchema>;
 export type MobilePlatform = z.infer<typeof mobilePlatformSchema>;
 export type MobileDevice = z.infer<typeof mobileDeviceSchema>;
+export type ListMobileDevicesInput = z.infer<typeof listMobileDevicesInputSchema>;
 export type ListMobileDevicesOutput = z.infer<typeof listMobileDevicesOutputSchema>;
 export type MobilePairingQrPayload = z.infer<typeof mobilePairingQrPayloadSchema>;
 export type CreateMobilePairingOutput = z.infer<typeof createMobilePairingOutputSchema>;

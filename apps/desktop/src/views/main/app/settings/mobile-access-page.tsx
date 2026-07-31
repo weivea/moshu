@@ -19,6 +19,8 @@ export function MobileAccessSettingsPage() {
 	const [pairingRemainingSeconds, setPairingRemainingSeconds] = useState<number>();
 	const [claims, setClaims] = useState<MobilePairingClaim[]>([]);
 	const [devices, setDevices] = useState<MobileDevice[]>([]);
+	const [devicesNextCursor, setDevicesNextCursor] = useState<string>();
+	const [devicesPageCount, setDevicesPageCount] = useState(1);
 	const [pendingAction, setPendingAction] = useState<string>();
 	const [errorMessage, setErrorMessage] = useState<string>();
 
@@ -38,13 +40,33 @@ export function MobileAccessSettingsPage() {
 		}
 	}, [t]);
 
+	// The device roster is a lifetime audit log, so the server paginates it (active devices first).
+	// We walk every page the operator has expanded so polling keeps the whole visible set fresh, and
+	// dedupe by client id in case a device shifts between the active/revoked groups mid-walk.
 	const loadDevices = useCallback(async () => {
 		try {
-			setDevices((await desktopClient.listMobileDevices()).items);
+			const collected = new Map<string, MobileDevice>();
+			let cursor: string | undefined;
+			let nextCursor: string | undefined;
+			for (let page = 0; page < devicesPageCount; page += 1) {
+				const result = await desktopClient.listMobileDevices(
+					cursor === undefined ? {} : { cursor },
+				);
+				for (const device of result.items) {
+					collected.set(device.mobileClientId, device);
+				}
+				nextCursor = result.nextCursor;
+				if (nextCursor === undefined) {
+					break;
+				}
+				cursor = nextCursor;
+			}
+			setDevices([...collected.values()]);
+			setDevicesNextCursor(nextCursor);
 		} catch (error) {
 			setErrorMessage(error instanceof Error ? error.message : t("mobileAccess.error.devices"));
 		}
-	}, [t]);
+	}, [t, devicesPageCount]);
 
 	useEffect(() => {
 		void loadStatus();
@@ -117,13 +139,32 @@ export function MobileAccessSettingsPage() {
 		setPendingAction("pair");
 		setErrorMessage(undefined);
 		try {
-			setPairing(await desktopClient.createMobilePairing());
+			const created = await desktopClient.createMobilePairing();
+			if (created.qr === undefined) {
+				// The server only returns a pairing once the Mobile ingress can publish a reachable URL.
+				// A QR-less response means the ingress dropped mid-request — surface it instead of
+				// leaving a code that could never be scanned.
+				setPairing(undefined);
+				setErrorMessage(t("mobileAccess.error.ingressNotReady"));
+				return;
+			}
+			setPairing(created);
 			await loadClaims();
 		} catch (error) {
-			setErrorMessage(error instanceof Error ? error.message : t("mobileAccess.error.pairing"));
+			setErrorMessage(
+				isIngressNotReadyError(error)
+					? t("mobileAccess.error.ingressNotReady")
+					: error instanceof Error
+						? error.message
+						: t("mobileAccess.error.pairing"),
+			);
 		} finally {
 			setPendingAction(undefined);
 		}
+	};
+
+	const loadMoreDevices = () => {
+		setDevicesPageCount((count) => count + 1);
 	};
 
 	const approveClaim = async (claim: MobilePairingClaim) => {
@@ -175,6 +216,10 @@ export function MobileAccessSettingsPage() {
 				: status.ingressReady
 					? t("mobileAccess.ready")
 					: t("mobileAccess.notReady");
+
+	// A pairing QR is only reachable once the Mobile ingress is live and has published its public URL,
+	// so the create action stays disabled until both hold — the server fails closed regardless.
+	const canCreatePairing = status?.ingressReady === true && typeof status.publicUrl === "string";
 
 	return (
 		<section className="settings-section mobile-access-settings">
@@ -233,12 +278,17 @@ export function MobileAccessSettingsPage() {
 					</div>
 					<Button
 						className="chat-button chat-button--primary"
-						isDisabled={pendingAction !== undefined || status?.remoteAccessEnabled !== true}
+						isDisabled={pendingAction !== undefined || !canCreatePairing}
 						onPress={() => void createPairing()}
 					>
 						{t("mobileAccess.createPairing")}
 					</Button>
 				</div>
+				{canCreatePairing ? null : (
+					<p className="mobile-access-pairing__hint" role="status">
+						{t("mobileAccess.notReadyHint")}
+					</p>
+				)}
 				{pairing ? (
 					<div className="mobile-access-qr">
 						{pairing.qr === undefined ? (
@@ -353,9 +403,24 @@ export function MobileAccessSettingsPage() {
 						</article>
 					))
 				)}
+				{devicesNextCursor === undefined ? null : (
+					<div className="mobile-access-devices__more">
+						<Button className="chat-button" onPress={() => loadMoreDevices()}>
+							{t("mobileAccess.loadMore")}
+						</Button>
+					</div>
+				)}
 			</section>
 		</section>
 	);
+}
+
+function isIngressNotReadyError(error: unknown): boolean {
+	if (!(error instanceof Error)) {
+		return false;
+	}
+	const code = (error as { code?: unknown }).code;
+	return code === "MOBILE_INGRESS_NOT_READY" || error.message.includes("MOBILE_INGRESS_NOT_READY");
 }
 
 function formatCountdown(totalSeconds: number): string {

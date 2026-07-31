@@ -60,6 +60,44 @@ describe("MobileAccessSettingsPage", () => {
 		expect(screen.getByRole("button", { name: "Show QR code" })).toBeDisabled();
 	});
 
+	test("keeps pairing disabled until the Mobile ingress is ready with a public URL", async () => {
+		rpcMocks.getMobileAccessStatus.mockResolvedValue(mobileStatus({ ready: false, enabled: true }));
+
+		render(
+			<I18nProvider>
+				<MobileAccessSettingsPage />
+			</I18nProvider>,
+		);
+
+		expect(
+			await screen.findByText(
+				"Waiting for the Mobile ingress to come online and publish its public URL before you can create a pairing code.",
+			),
+		).toBeVisible();
+		expect(screen.getByRole("button", { name: "Show QR code" })).toBeDisabled();
+		expect(rpcMocks.createMobilePairing).not.toHaveBeenCalled();
+	});
+
+	test("surfaces a fail-closed error when the ingress refuses a pairing", async () => {
+		rpcMocks.createMobilePairing.mockRejectedValue(
+			Object.assign(new Error("MOBILE_INGRESS_NOT_READY: not exposed"), {
+				code: "MOBILE_INGRESS_NOT_READY",
+			}),
+		);
+
+		render(
+			<I18nProvider>
+				<MobileAccessSettingsPage />
+			</I18nProvider>,
+		);
+
+		const button = await screen.findByRole("button", { name: "Show QR code" });
+		await waitFor(() => expect(button).toBeEnabled());
+		fireEvent.click(button);
+
+		expect(await screen.findByText(/is not exposed yet/)).toBeVisible();
+	});
+
 	test("shows a pairing code with a countdown and never persists the payload", async () => {
 		vi.useFakeTimers();
 		vi.setSystemTime(new Date("2026-07-29T13:00:00.000Z"));
@@ -157,6 +195,33 @@ describe("MobileAccessSettingsPage", () => {
 			}),
 		);
 	});
+
+	test("pages through the device roster with load more", async () => {
+		rpcMocks.listMobileDevices.mockImplementation(async (input?: { cursor?: string }) => {
+			if (input?.cursor === undefined) {
+				return { items: [approvedDevice()], nextCursor: "cursor-1" };
+			}
+			if (input.cursor === "cursor-1") {
+				return { items: [secondDevice()] };
+			}
+			return { items: [] };
+		});
+
+		render(
+			<I18nProvider>
+				<MobileAccessSettingsPage />
+			</I18nProvider>,
+		);
+
+		expect(await screen.findByText("Jane's iPhone")).toBeVisible();
+		fireEvent.click(screen.getByRole("button", { name: "Load more devices" }));
+
+		expect(await screen.findByText("Sam's iPad")).toBeVisible();
+		expect(screen.getByText("Jane's iPhone")).toBeVisible();
+		await waitFor(() =>
+			expect(rpcMocks.listMobileDevices).toHaveBeenCalledWith({ cursor: "cursor-1" }),
+		);
+	});
 });
 
 const PAIRING_CODE = "2KNeqXtxLMX9_ywjA1Kha4x33EXzP68t";
@@ -225,5 +290,19 @@ function approvedDevice(): MobileDevice {
 		approvedAt: "2026-07-29T13:01:00.000Z",
 		lastSeenAt: "2026-07-29T13:02:00.000Z",
 		revoked: false,
+	};
+}
+
+function secondDevice(): MobileDevice {
+	return {
+		schemaVersion: 1,
+		mobileClientId: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+		displayName: "Sam's iPad",
+		model: "iPad Pro",
+		platform: "ipados",
+		appVersion: "1.0.0",
+		deviceKeyIds: ["device-key-2"],
+		approvedAt: "2026-07-28T13:01:00.000Z",
+		revoked: true,
 	};
 }

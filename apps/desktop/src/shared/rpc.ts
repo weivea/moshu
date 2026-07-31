@@ -54,6 +54,7 @@ import {
 	type ListChatSessionsOutput,
 	type ListMcpServersInput,
 	type ListMcpServersOutput,
+	type ListMobileDevicesInput,
 	type ListMobileDevicesOutput,
 	type ListMobilePairingClaimsOutput,
 	type ListProjectsInput,
@@ -236,7 +237,7 @@ export type DesktopRpc = {
 				response: RejectMobilePairingOutput;
 			};
 			listMobileDevices: {
-				params: EmptyParams;
+				params: ListMobileDevicesInput;
 				response: ListMobileDevicesOutput;
 			};
 			revokeMobileDevice: {

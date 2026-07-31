@@ -59,6 +59,7 @@ import {
 	type InstallRuntimeBoxSkillInput,
 	installRuntimeBoxSkillInputSchema,
 	type ListApprovalsInput,
+	type ListMobileDevicesInput,
 	type ListProjectsInput,
 	listApprovalsInputSchema,
 	listApprovalsOutputSchema,
@@ -67,6 +68,7 @@ import {
 	listChatSessionsOutputSchema,
 	listMcpServersInputSchema,
 	listMcpServersOutputSchema,
+	listMobileDevicesInputSchema,
 	listMobileDevicesOutputSchema,
 	listMobilePairingClaimsOutputSchema,
 	listProjectsInputSchema,
@@ -385,9 +387,10 @@ export const desktopClient = {
 			await requestDesktop(() => getRequest().rejectMobilePairing(parsedInput)),
 		);
 	},
-	async listMobileDevices() {
+	async listMobileDevices(input: ListMobileDevicesInput = {}) {
+		const parsedInput = listMobileDevicesInputSchema.parse(input);
 		return listMobileDevicesOutputSchema.parse(
-			await requestDesktop(() => getRequest().listMobileDevices({})),
+			await requestDesktop(() => getRequest().listMobileDevices(parsedInput)),
 		);
 	},
 	async revokeMobileDevice(input: RevokeMobileDeviceInput) {
