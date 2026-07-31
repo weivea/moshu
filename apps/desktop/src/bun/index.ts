@@ -46,6 +46,17 @@ const unsubscribeChatSessionInvalidations = agentsClient.subscribeChatSessionInv
 const unsubscribeRuntimeBoxesChanged = agentsClient.subscribeRuntimeBoxesChanged((snapshot) => {
 	desktopRpc.send.runtimeBoxesChanged(snapshot);
 });
+const unsubscribeApprovalEvents = agentsClient.subscribeApprovalEvents((delivery) => {
+	desktopRpc.send.approvalEvent(delivery);
+});
+const unsubscribeSessionApprovalPolicy = agentsClient.subscribeSessionApprovalPolicyChanged(
+	(event) => {
+		desktopRpc.send.sessionApprovalPolicyChanged(event);
+	},
+);
+const unsubscribeApprovalActivity = agentsClient.subscribeApprovalActivityChanged(() => {
+	desktopRpc.send.approvalActivityChanged({});
+});
 
 let shutdownStarted = false;
 let companionSupervisor: CompanionProcessSupervisor | undefined;
@@ -58,6 +69,9 @@ const shutdownCoordinator = createDesktopShutdownCoordinator({
 		unsubscribeChatEvents();
 		unsubscribeChatSessionInvalidations();
 		unsubscribeRuntimeBoxesChanged();
+		unsubscribeApprovalEvents();
+		unsubscribeSessionApprovalPolicy();
+		unsubscribeApprovalActivity();
 		agentsClient.close();
 		try {
 			await companionSupervisor?.shutdown();

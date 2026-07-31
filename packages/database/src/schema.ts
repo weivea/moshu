@@ -1,5 +1,6 @@
 import {
 	agentModeValues,
+	approvalStateValues,
 	chatRunEventSourceKindValues,
 	chatRunEventVisibilityValues,
 	chatRunStatusValues,
@@ -491,6 +492,52 @@ export const executionGrantsTable = sqliteTable(
 	],
 );
 
+export const actionApprovalRequestsTable = sqliteTable(
+	"action_approval_requests",
+	{
+		id: text("id").primaryKey(),
+		sessionId: text("session_id")
+			.notNull()
+			.references(() => chatSessionsTable.id, { onDelete: "cascade" }),
+		runId: text("run_id")
+			.notNull()
+			.references(() => chatRunsTable.id, { onDelete: "cascade" }),
+		actionId: text("action_id").notNull(),
+		toolCallId: text("tool_call_id").notNull(),
+		tool: text("tool").notNull(),
+		operation: text("operation").notNull(),
+		actionSummaryJson: text("action_summary_json").notNull(),
+		riskTier: text("risk_tier").notNull(),
+		riskOverridable: integer("risk_overridable").notNull(),
+		riskJson: text("risk_json").notNull(),
+		state: text("state", { enum: approvalStateValues }).notNull(),
+		revision: integer("revision").notNull(),
+		decisionIdempotencyKey: text("decision_idempotency_key"),
+		decisionJson: text("decision_json"),
+		policyEvidenceJson: text("policy_evidence_json"),
+		createdAtMs: integer("created_at_ms").notNull(),
+		expiresAtMs: integer("expires_at_ms").notNull(),
+		decidedAtMs: integer("decided_at_ms"),
+	},
+	(table) => [
+		uniqueIndex("action_approval_requests_action_unique").on(table.actionId),
+		uniqueIndex("action_approval_requests_idempotency_unique").on(table.decisionIdempotencyKey),
+		index("action_approval_requests_session_state_idx").on(table.sessionId, table.state),
+		index("action_approval_requests_state_expiry_idx").on(table.state, table.expiresAtMs),
+	],
+);
+
+export const sessionApprovalPoliciesTable = sqliteTable("session_approval_policies", {
+	sessionId: text("session_id")
+		.primaryKey()
+		.references(() => chatSessionsTable.id, { onDelete: "cascade" }),
+	allowAll: integer("allow_all").notNull(),
+	revision: integer("revision").notNull(),
+	updatedByJson: text("updated_by_json"),
+	lastIdempotencyKey: text("last_idempotency_key"),
+	updatedAtMs: integer("updated_at_ms").notNull(),
+});
+
 export const chatRunEventsTable = sqliteTable(
 	"chat_run_events",
 	{
@@ -562,6 +609,8 @@ export const appSchema = {
 	chatRunEventsTable,
 	chatRunsTable,
 	actionIntentsTable,
+	actionApprovalRequestsTable,
+	sessionApprovalPoliciesTable,
 	executionGrantsTable,
 	chatSessionCreateRequestsTable,
 	chatSessionsTable,

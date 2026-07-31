@@ -1,5 +1,7 @@
 import {
+	type ApprovalEventDelivery,
 	type ApproveRuntimeBoxPairingInput,
+	approvalEventDeliverySchema,
 	approveRuntimeBoxPairingInputSchema,
 	approveRuntimeBoxPairingOutputSchema,
 	type ChatRunEvent,
@@ -15,8 +17,11 @@ import {
 	createChatSessionOutputSchema,
 	createProviderInputSchema,
 	createRuntimeBoxPairingOutputSchema,
+	type DecideApprovalInput,
 	type DeleteRuntimeBoxMcpServerInput,
 	type DeleteRuntimeBoxSkillInput,
+	decideApprovalInputSchema,
+	decideApprovalOutputSchema,
 	deleteChatSessionInputSchema,
 	deleteChatSessionOutputSchema,
 	deleteMcpServerInputSchema,
@@ -28,8 +33,12 @@ import {
 	emptyParamsSchema,
 	fetchProviderModelsInputSchema,
 	fetchProviderModelsOutputSchema,
+	type GetApprovalInput,
+	type GetSessionApprovalPolicyInput,
 	getAgentGlobalProfileInputSchema,
 	getAgentGlobalProfileOutputSchema,
+	getApprovalInputSchema,
+	getApprovalOutputSchema,
 	getChatSessionInputSchema,
 	getChatSessionSnapshotOutputSchema,
 	getDefaultModelOutputSchema,
@@ -41,9 +50,14 @@ import {
 	getProjectSidebarOutputSchema,
 	getRuntimeProfileInputSchema,
 	getRuntimeProfileOutputSchema,
+	getSessionApprovalPolicyInputSchema,
+	getSessionApprovalPolicyOutputSchema,
 	type InstallRuntimeBoxSkillInput,
 	installRuntimeBoxSkillInputSchema,
+	type ListApprovalsInput,
 	type ListProjectsInput,
+	listApprovalsInputSchema,
+	listApprovalsOutputSchema,
 	listAvailableModelsOutputSchema,
 	listChatSessionsInputSchema,
 	listChatSessionsOutputSchema,
@@ -100,6 +114,7 @@ import {
 	type SetRuntimeBoxMcpServerEnabledInput,
 	type StartProviderAuthInput,
 	type SwitchRuntimeBoxInput,
+	sessionApprovalPolicyEventSchema,
 	setChatSessionArchivedInputSchema,
 	setChatSessionArchivedOutputSchema,
 	setChatSessionModelInputSchema,
@@ -123,6 +138,7 @@ import {
 	type UpdateProjectInput,
 	type UpdateProviderInput,
 	type UpdateRuntimeProfileInput,
+	type UpdateSessionApprovalPolicyInput,
 	type UpsertRuntimeBoxMcpServerInput,
 	updateAgentGlobalProfileInputSchema,
 	updateChatSessionInputSchema,
@@ -131,6 +147,8 @@ import {
 	updateProjectOutputSchema,
 	updateProviderInputSchema,
 	updateRuntimeProfileInputSchema,
+	updateSessionApprovalPolicyInputSchema,
+	updateSessionApprovalPolicyOutputSchema,
 	upsertMcpServerInputSchema,
 	upsertRuntimeBoxMcpServerInputSchema,
 	upsertSkillInputSchema,
@@ -156,6 +174,11 @@ const agentsReadyListeners = new Set<() => void>();
 const runtimeBoxesChangedListeners = new Set<
 	(snapshot: ReturnType<typeof listRuntimeBoxesOutputSchema.parse>) => void
 >();
+const approvalEventListeners = new Set<(delivery: ApprovalEventDelivery) => void>();
+const sessionApprovalPolicyChangedListeners = new Set<
+	(event: ReturnType<typeof sessionApprovalPolicyEventSchema.parse>) => void
+>();
+const approvalActivityChangedListeners = new Set<() => void>();
 const chatSessionInvalidationBridge = new ChatSessionInvalidationBridge({
 	timeoutMs: invalidationListenerTimeoutMs,
 	maxPending: maxPendingChatSessionInvalidations,
@@ -186,6 +209,24 @@ const rpc = Electroview.defineRPC<DesktopRpc>({
 				const snapshot = listRuntimeBoxesOutputSchema.parse(payload);
 				for (const listener of runtimeBoxesChangedListeners) {
 					listener(snapshot);
+				}
+			},
+			approvalEvent: (payload) => {
+				const delivery = approvalEventDeliverySchema.parse(payload);
+				for (const listener of approvalEventListeners) {
+					listener(delivery);
+				}
+			},
+			sessionApprovalPolicyChanged: (payload) => {
+				const event = sessionApprovalPolicyEventSchema.parse(payload);
+				for (const listener of sessionApprovalPolicyChangedListeners) {
+					listener(event);
+				}
+			},
+			approvalActivityChanged: (payload) => {
+				emptyParamsSchema.parse(payload);
+				for (const listener of approvalActivityChangedListeners) {
+					listener();
 				}
 			},
 		},
@@ -224,6 +265,50 @@ export const desktopClient = {
 	async listRuntimeBoxes() {
 		return listRuntimeBoxesOutputSchema.parse(
 			await requestDesktop(() => getRequest().listRuntimeBoxes({})),
+		);
+	},
+	subscribeApprovalEvents(listener: (delivery: ApprovalEventDelivery) => void) {
+		approvalEventListeners.add(listener);
+		return () => approvalEventListeners.delete(listener);
+	},
+	subscribeSessionApprovalPolicyChanged(
+		listener: (event: ReturnType<typeof sessionApprovalPolicyEventSchema.parse>) => void,
+	) {
+		sessionApprovalPolicyChangedListeners.add(listener);
+		return () => sessionApprovalPolicyChangedListeners.delete(listener);
+	},
+	subscribeApprovalActivityChanged(listener: () => void) {
+		approvalActivityChangedListeners.add(listener);
+		return () => approvalActivityChangedListeners.delete(listener);
+	},
+	async listApprovals(input: ListApprovalsInput) {
+		const parsedInput = listApprovalsInputSchema.parse(input);
+		return listApprovalsOutputSchema.parse(
+			await requestDesktop(() => getRequest().listApprovals(parsedInput)),
+		);
+	},
+	async getApproval(input: GetApprovalInput) {
+		const parsedInput = getApprovalInputSchema.parse(input);
+		return getApprovalOutputSchema.parse(
+			await requestDesktop(() => getRequest().getApproval(parsedInput)),
+		);
+	},
+	async decideApproval(input: DecideApprovalInput) {
+		const parsedInput = decideApprovalInputSchema.parse(input);
+		return decideApprovalOutputSchema.parse(
+			await requestDesktop(() => getRequest().decideApproval(parsedInput)),
+		);
+	},
+	async getSessionApprovalPolicy(input: GetSessionApprovalPolicyInput) {
+		const parsedInput = getSessionApprovalPolicyInputSchema.parse(input);
+		return getSessionApprovalPolicyOutputSchema.parse(
+			await requestDesktop(() => getRequest().getSessionApprovalPolicy(parsedInput)),
+		);
+	},
+	async updateSessionApprovalPolicy(input: UpdateSessionApprovalPolicyInput) {
+		const parsedInput = updateSessionApprovalPolicyInputSchema.parse(input);
+		return updateSessionApprovalPolicyOutputSchema.parse(
+			await requestDesktop(() => getRequest().updateSessionApprovalPolicy(parsedInput)),
 		);
 	},
 	async switchRuntimeBox(input: SwitchRuntimeBoxInput) {

@@ -11,6 +11,8 @@ import {
 	confirmCreateProjectOutputSchema,
 	createProviderInputSchema,
 	createRuntimeBoxPairingOutputSchema,
+	decideApprovalInputSchema,
+	decideApprovalOutputSchema,
 	deleteChatSessionInputSchema,
 	deleteChatSessionOutputSchema,
 	deleteMcpServerInputSchema,
@@ -25,6 +27,8 @@ import {
 	type GetChatSessionPageOutput,
 	getAgentGlobalProfileInputSchema,
 	getAgentGlobalProfileOutputSchema,
+	getApprovalInputSchema,
+	getApprovalOutputSchema,
 	getChatSessionInputSchema,
 	getChatSessionPageInputSchema,
 	getChatSessionPageOutputSchema,
@@ -38,7 +42,11 @@ import {
 	getProjectSidebarOutputSchema,
 	getRuntimeProfileInputSchema,
 	getRuntimeProfileOutputSchema,
+	getSessionApprovalPolicyInputSchema,
+	getSessionApprovalPolicyOutputSchema,
 	installRuntimeBoxSkillInputSchema,
+	listApprovalsInputSchema,
+	listApprovalsOutputSchema,
 	listAvailableModelsOutputSchema,
 	listChatSessionsInputSchema,
 	listChatSessionsOutputSchema,
@@ -111,6 +119,8 @@ import {
 	updateProjectOutputSchema,
 	updateProviderInputSchema,
 	updateRuntimeProfileInputSchema,
+	updateSessionApprovalPolicyInputSchema,
+	updateSessionApprovalPolicyOutputSchema,
 	upsertMcpServerInputSchema,
 	upsertRuntimeBoxMcpServerInputSchema,
 	upsertSkillInputSchema,
@@ -684,6 +694,41 @@ export function createDesktopRpc({ agentsClient }: DesktopRpcDependencies) {
 					);
 					return {};
 				},
+				listApprovals: (params) =>
+					agentsClient.request(
+						productRpcMethods.approvalsList,
+						params,
+						listApprovalsInputSchema,
+						listApprovalsOutputSchema,
+					),
+				getApproval: (params) =>
+					agentsClient.request(
+						productRpcMethods.approvalsGet,
+						params,
+						getApprovalInputSchema,
+						getApprovalOutputSchema,
+					),
+				decideApproval: (params) =>
+					agentsClient.request(
+						productRpcMethods.approvalsDecide,
+						params,
+						decideApprovalInputSchema,
+						decideApprovalOutputSchema,
+					),
+				getSessionApprovalPolicy: (params) =>
+					agentsClient.request(
+						productRpcMethods.sessionApprovalPolicyGet,
+						params,
+						getSessionApprovalPolicyInputSchema,
+						getSessionApprovalPolicyOutputSchema,
+					),
+				updateSessionApprovalPolicy: (params) =>
+					agentsClient.request(
+						productRpcMethods.sessionApprovalPolicyUpdate,
+						params,
+						updateSessionApprovalPolicyInputSchema,
+						updateSessionApprovalPolicyOutputSchema,
+					),
 			},
 			messages: {},
 		},

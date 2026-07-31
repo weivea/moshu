@@ -8,6 +8,7 @@ import {
 } from "@moshu/agent-runtime";
 import {
 	agentsRuntimeInfoSchema,
+	approvalRpcErrorCodes,
 	clientProductRequestMethods,
 	currentRuntimeBoxProtocolVersion,
 	getAgentGlobalProfileOutputSchema,
@@ -46,6 +47,8 @@ import {
 	AgentGlobalProfileRevisionConflictError,
 	type AgentServerMcpRepository,
 	type AgentServerSkillRepository,
+	ApprovalRequestNotFoundError,
+	ApprovalRevisionConflictError,
 	ChatSessionNotFoundError,
 	McpResourceNotFoundError,
 	McpResourceVersionConflictError,
@@ -61,6 +64,7 @@ import {
 	type RuntimeBoxRepository,
 	type RuntimeProfileRepository,
 	RuntimeProfileRevisionConflictError,
+	SessionApprovalPolicyRevisionConflictError,
 	SessionCreateCapacityError,
 	SessionCreateKeyConflictError,
 	SkillOwnerCapabilityError,
@@ -79,10 +83,11 @@ import {
 	rpcJsonValueSchema,
 } from "@moshu/process-rpc";
 import { ZodError, type ZodType, type z } from "zod";
-
+import { ApprovalRunUnavailableError, type ApprovalService } from "./approval-service";
 import type { ChatApplicationService } from "./chat-application-service";
 import type { DevTunnelService } from "./dev-tunnel-service";
 import {
+	broadcastApprovalActivityChanged,
 	ProductEventRouter,
 	publishChatEvent,
 	publishRetiredChatSessions,
@@ -109,6 +114,7 @@ import type { RuntimeIngressAuth } from "./runtime-ingress-auth";
 
 export interface ProductRpcDependencies {
 	chatService: ChatApplicationService;
+	approvalService: ApprovalService;
 	runtimeBoxRegistry: RuntimeBoxRegistry;
 	runtimeBoxes: RuntimeBoxRepository;
 	runtimeBoxPairings?: RuntimeBoxPairingRepository;
@@ -127,7 +133,12 @@ export interface ProductRpcDependencies {
 }
 
 export type { ProductEventRouteLease } from "./product-event-hub";
-export { ProductEventRouter, publishChatEvent, publishRetiredChatSessions };
+export {
+	broadcastApprovalActivityChanged,
+	ProductEventRouter,
+	publishChatEvent,
+	publishRetiredChatSessions,
+};
 
 export const agentsServerClientMethodAllowlist: RpcMethodAllowlist = {
 	client: { requests: clientProductRequestMethods },
@@ -143,6 +154,7 @@ export const agentsServerRuntimeMethodAllowlist: RpcMethodAllowlist = {
 export function createProductRpcHandlers(dependencies: ProductRpcDependencies): RpcHandlers {
 	const {
 		chatService,
+		approvalService,
 		runtimeBoxRegistry,
 		runtimeBoxes,
 		runtimeBoxPairings,
@@ -960,6 +972,68 @@ export function createProductRpcHandlers(dependencies: ProductRpcDependencies): 
 				productRpcRequestSchemas[productRpcMethods.chatRetiredSessionsList],
 				(input) => chatService.listRetiredSessions(input),
 			),
+			[productRpcMethods.approvalsList]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.approvalsList],
+				(input) => {
+					if (input.sessionId !== undefined) {
+						// Scoped listing is authorization-checked against Session visibility; an
+						// unscoped listing is the cross-session Activity snapshot for this client.
+						chatService.assertSessionVisible(input.sessionId);
+					}
+					return approvalService.listApprovals({
+						...(input.sessionId === undefined ? {} : { sessionId: input.sessionId }),
+						...(input.states === undefined ? {} : { states: input.states }),
+						...(input.limit === undefined ? {} : { limit: input.limit }),
+					});
+				},
+			),
+			[productRpcMethods.approvalsGet]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.approvalsGet],
+				(input) => {
+					const result = approvalService.getApproval(input.approvalId);
+					chatService.assertSessionVisible(result.request.sessionId);
+					return { schemaVersion: 1 as const, ...result };
+				},
+			),
+			[productRpcMethods.approvalsDecide]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.approvalsDecide],
+				(input, peer) => {
+					// Resolve + authorize the Session before applying the decision so a client
+					// cannot decide an approval for a Session it cannot see.
+					const existing = approvalService.getApproval(input.approvalId);
+					chatService.assertSessionVisible(existing.request.sessionId);
+					return approvalService.decideApproval({
+						approvalId: input.approvalId,
+						expectedRevision: input.expectedRevision,
+						decision: input.decision,
+						idempotencyKey: input.idempotencyKey,
+						source: approvalDecisionSource(peer),
+					});
+				},
+			),
+			[productRpcMethods.sessionApprovalPolicyGet]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.sessionApprovalPolicyGet],
+				(input) => {
+					chatService.assertSessionVisible(input.sessionId);
+					return {
+						schemaVersion: 1 as const,
+						policy: approvalService.getSessionPolicy(input.sessionId),
+					};
+				},
+			),
+			[productRpcMethods.sessionApprovalPolicyUpdate]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.sessionApprovalPolicyUpdate],
+				(input, peer) => {
+					chatService.assertSessionVisible(input.sessionId);
+					return approvalService.updateSessionPolicy({
+						sessionId: input.sessionId,
+						allowAll: input.allowAll,
+						expectedRevision: input.expectedRevision,
+						idempotencyKey: input.idempotencyKey,
+						updatedBy: approvalDecisionSource(peer),
+					});
+				},
+			),
 			[productRpcMethods.runtimeBoxRegister]: createRequestHandler(
 				productRpcRequestSchemas[productRpcMethods.runtimeBoxRegister],
 				async (input, peer) => {
@@ -1111,12 +1185,46 @@ function toSkillSourceKind(source: string): "inline-editor" | "local-upload" | "
 	return "local-upload";
 }
 
+// The decision source is server-derived from the authenticated peer identity, never
+// trusted from request input, so a client cannot forge who decided an approval.
+function approvalDecisionSource(peer: RpcPeer): {
+	kind: "client";
+	clientId: string;
+	clientRole: string;
+} {
+	return {
+		kind: "client",
+		clientId: peer.remoteIdentity.peerId,
+		clientRole: peer.remoteIdentity.role,
+	};
+}
+
 function rethrowProductHandlerError(error: unknown): never {
 	if (error instanceof RpcHandlerError) {
 		throw error;
 	}
 	if (error instanceof ChatSessionNotFoundError) {
 		throw new RpcHandlerError("SESSION_NOT_FOUND", "The chat Session was not found.");
+	}
+	if (error instanceof ApprovalRequestNotFoundError) {
+		throw new RpcHandlerError(approvalRpcErrorCodes.notFound, "The approval was not found.");
+	}
+	if (error instanceof ApprovalRevisionConflictError) {
+		throw new RpcHandlerError(
+			approvalRpcErrorCodes.revisionConflict,
+			"The approval was decided by another client.",
+			{ currentRevision: error.currentRevision },
+		);
+	}
+	if (error instanceof SessionApprovalPolicyRevisionConflictError) {
+		throw new RpcHandlerError(
+			approvalRpcErrorCodes.policyRevisionConflict,
+			"The Session approval policy changed concurrently.",
+			{ currentRevision: error.currentRevision },
+		);
+	}
+	if (error instanceof ApprovalRunUnavailableError) {
+		throw new RpcHandlerError(approvalRpcErrorCodes.notFound, "The approval Run is unavailable.");
 	}
 	if (error instanceof ProviderNotFoundError) {
 		throw new RpcHandlerError("PROVIDER_NOT_FOUND", "The Provider was not found.");

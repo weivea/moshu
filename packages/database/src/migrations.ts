@@ -1,6 +1,6 @@
 import type Database from "bun:sqlite";
 
-export const currentAppDatabaseVersion = 22;
+export const currentAppDatabaseVersion = 23;
 
 export class AppDatabaseResetRequiredError extends Error {
 	readonly currentVersion: number;
@@ -68,6 +68,8 @@ export function applyAppMigrations(client: Database): void {
 			DROP TABLE IF EXISTS runtime_box_inventory_cache;
 			DROP TABLE IF EXISTS runtime_box_inventory_state;
 			DROP TABLE IF EXISTS execution_grants;
+			DROP TABLE IF EXISTS action_approval_requests;
+			DROP TABLE IF EXISTS session_approval_policies;
 			DROP TABLE IF EXISTS action_intents;
 			DROP TABLE IF EXISTS chat_run_events;
 			DROP TABLE IF EXISTS chat_runs;
@@ -460,6 +462,46 @@ export function applyAppMigrations(client: Database): void {
 				consumed_at_ms INTEGER
 			);
 			CREATE INDEX execution_grants_expiry_idx ON execution_grants(expires_at_ms);
+
+			CREATE TABLE action_approval_requests (
+				id TEXT PRIMARY KEY NOT NULL,
+				session_id TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+				run_id TEXT NOT NULL REFERENCES chat_runs(id) ON DELETE CASCADE,
+				action_id TEXT NOT NULL,
+				tool_call_id TEXT NOT NULL,
+				tool TEXT NOT NULL,
+				operation TEXT NOT NULL,
+				action_summary_json TEXT NOT NULL,
+				risk_tier TEXT NOT NULL,
+				risk_overridable INTEGER NOT NULL,
+				risk_json TEXT NOT NULL,
+				state TEXT NOT NULL,
+				revision INTEGER NOT NULL,
+				decision_idempotency_key TEXT,
+				decision_json TEXT,
+				policy_evidence_json TEXT,
+				created_at_ms INTEGER NOT NULL,
+				expires_at_ms INTEGER NOT NULL,
+				decided_at_ms INTEGER
+			);
+			CREATE UNIQUE INDEX action_approval_requests_action_unique
+				ON action_approval_requests(action_id);
+			CREATE UNIQUE INDEX action_approval_requests_idempotency_unique
+				ON action_approval_requests(decision_idempotency_key);
+			CREATE INDEX action_approval_requests_session_state_idx
+				ON action_approval_requests(session_id, state);
+			CREATE INDEX action_approval_requests_state_expiry_idx
+				ON action_approval_requests(state, expires_at_ms);
+
+			CREATE TABLE session_approval_policies (
+				session_id TEXT PRIMARY KEY NOT NULL
+					REFERENCES chat_sessions(id) ON DELETE CASCADE,
+				allow_all INTEGER NOT NULL,
+				revision INTEGER NOT NULL,
+				updated_by_json TEXT,
+				last_idempotency_key TEXT,
+				updated_at_ms INTEGER NOT NULL
+			);
 
 			CREATE TABLE chat_run_events (
 				id TEXT PRIMARY KEY NOT NULL,

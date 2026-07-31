@@ -1,10 +1,15 @@
 import {
+	type ApprovalEventDelivery,
 	agentsProductEventMethods,
+	approvalActivityChangedEventSchema,
+	approvalEventDeliverySchema,
 	type ChatRunEvent,
 	chatEventDeliverySchema,
 	chatRunEventSchema,
 	chatSessionsRetiredEventSchema,
 	productRpcEvents,
+	type SessionApprovalPolicyEvent,
+	sessionApprovalPolicyEventSchema,
 } from "@moshu/contracts";
 import {
 	isSameRpcPeerIdentity,
@@ -275,6 +280,72 @@ export class ProductEventRouter {
 			if (this.#bindingsByRequestId.get(clientRequestId) === originBinding) {
 				this.#bindingsByRequestId.delete(clientRequestId);
 			}
+		}
+	}
+
+	// Delivers an approval.created/updated event to the authenticated clients subscribed to the
+	// approval's Session. Approval events are Session-scoped: a client only observes approvals for
+	// Sessions it explicitly subscribed to, mirroring ChatRunEvent authorization. No secret or raw
+	// unredacted command content is carried — the summary is already server-redacted.
+	publishApproval(peers: readonly RpcPeer[], delivery: ApprovalEventDelivery): void {
+		const recipients = this.#sessionRecipients(peers, delivery.request.sessionId);
+		if (recipients.length === 0) {
+			return;
+		}
+		const payload = encodeJsonValue(approvalEventDeliverySchema.parse(delivery));
+		emitToClients(recipients, productRpcEvents.approvalEvent, payload, "Approval event");
+	}
+
+	// Delivers a Session "Allow all" policy change to that Session's subscribers.
+	publishSessionApprovalPolicy(peers: readonly RpcPeer[], event: SessionApprovalPolicyEvent): void {
+		const recipients = this.#sessionRecipients(peers, event.policy.sessionId);
+		if (recipients.length === 0) {
+			return;
+		}
+		const payload = encodeJsonValue(sessionApprovalPolicyEventSchema.parse(event));
+		emitToClients(
+			recipients,
+			productRpcEvents.sessionApprovalPolicyChanged,
+			payload,
+			"Session approval policy event",
+		);
+	}
+
+	#sessionRecipients(peers: readonly RpcPeer[], sessionId: string): RpcPeer[] {
+		const subscriptions = this.#subscriptionsBySession.get(sessionId);
+		if (subscriptions === undefined) {
+			return [];
+		}
+		return peers.filter(
+			(peer) =>
+				peer.remoteIdentity.role === "client" && subscriptions.has(peer.remoteIdentity.peerId),
+		);
+	}
+}
+
+// A no-payload hint broadcast to every authenticated client so a cross-session "pending approvals"
+// Activity view can refresh its snapshot. It intentionally carries no Session-scoped or secret
+// content; the snapshot itself is fetched via the authorization-checked approvals.list request.
+export function broadcastApprovalActivityChanged(peers: readonly RpcPeer[]): void {
+	const payload = encodeJsonValue(approvalActivityChangedEventSchema.parse({ schemaVersion: 1 }));
+	emitToClients(peers, productRpcEvents.approvalActivityChanged, payload, "Approval activity hint");
+}
+
+function emitToClients(
+	peers: readonly RpcPeer[],
+	method: string,
+	payload: JsonValue,
+	label: string,
+): void {
+	for (const peer of peers) {
+		if (peer.remoteIdentity.role !== "client") {
+			continue;
+		}
+		try {
+			peer.emitEvent(method, payload);
+		} catch (error) {
+			peer.close(1011, `${label} publication failed.`);
+			console.error(`Failed to publish ${label} to client ${peer.remoteIdentity.peerId}.`, error);
 		}
 	}
 }

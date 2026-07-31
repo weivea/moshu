@@ -142,8 +142,11 @@ Agent Server
 
 ## 5. 当前明确未实现
 
-- 当前 POC 的 Policy 默认信任已认证且绑定的 Agent Server，包括 Remote `bash`；用户级命令审批与 shell
-  sandbox 明确后置。现有 grant 用于 durable dispatch、单次消费、generation fencing 和恢复，不是交互审批。
+- 当前 POC 的 Policy 默认信任已认证且绑定的 Agent Server 用于 durable dispatch、单次消费、generation
+  fencing 和恢复。**用户级 Tool/Action 交互审批已由 Mobile stack Layer 2 实现**（server-authoritative 风险分级、
+  durable approval request + Session Allow-all、CAS/idempotent 决策、多 client 事件同步、Desktop 卡片/待办面板；
+  见 architecture §9.0.1 与 data-contracts §9.2/§10.2）。仍后置的是：把该审批门与最终 execution grant / Action
+  intent / outcome recovery 完整串起来，以及 shell sandbox 与 Mobile client。
 - Remote 普通 Chat 的 path tools 受 Box workspace canonical containment；Project Chat 文件 Tool 受
   Project root containment。`bash` 按当前完全信任决策不受文件 containment 限制。
 - 尚无独立 Git Tool；Agent 可经 `bash` 调用环境中可用的 Git，但没有 Git 专用合同、Diff journal 或 revert。

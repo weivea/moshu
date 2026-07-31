@@ -18,6 +18,7 @@ import {
 	type AgentServerSkillRepository,
 	SqliteAgentServerSkillRepository,
 } from "./agent-server-skill-repository";
+import { type ApprovalRepository, SqliteApprovalRepository } from "./approval-repository";
 import {
 	applyAppMigrations,
 	currentAppDatabaseVersion,
@@ -53,6 +54,7 @@ export interface AppDatabase {
 	sessions: SessionRepository;
 	runs: RunJournalRepository;
 	actions: ActionRepository;
+	approvals: ApprovalRepository;
 	runtimeBoxes: RuntimeBoxRepository;
 	projects: ProjectRepository;
 	runtimeBoxPairings: RuntimeBoxPairingRepository;
@@ -180,6 +182,7 @@ export function openAppDatabase(
 		sessions: createSessionRepository({ orm, runtimeBoxes, projects }),
 		runs: createRunJournalRepository({ client, orm }),
 		actions: new SqliteActionRepository(orm),
+		approvals: new SqliteApprovalRepository(orm),
 		close: () => client.close(),
 	};
 }

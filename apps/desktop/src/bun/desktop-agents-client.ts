@@ -1,5 +1,8 @@
 import {
+	type ApprovalEventDelivery,
 	agentsProductEventMethods,
+	approvalActivityChangedEventSchema,
+	approvalEventDeliverySchema,
 	type ChatRunEvent,
 	type ChatSendAcceptedOutput,
 	type CreateChatSessionOutput,
@@ -32,8 +35,10 @@ import {
 	remoteAccessMutationRpcTimeoutMs,
 	replayChatEventsInputSchema,
 	replayChatEventsOutputSchema,
+	type SessionApprovalPolicyEvent,
 	type SessionModelSelection,
 	sendAskChatMessageInputSchema,
+	sessionApprovalPolicyEventSchema,
 	setChatSessionArchivedInputSchema,
 	updateChatSessionInputSchema,
 	uuidV7Schema,
@@ -81,6 +86,9 @@ type ChatEventListener = (event: ChatRunEvent) => void | PromiseLike<void>;
 type ChatSessionInvalidationListener = (invalidation: ChatSessionInvalidation) => void;
 type DesktopAgentsReadyListener = () => void;
 type RuntimeBoxesChangedListener = (snapshot: ListRuntimeBoxesOutput) => void;
+type ApprovalEventListener = (delivery: ApprovalEventDelivery) => void;
+type SessionApprovalPolicyChangedListener = (event: SessionApprovalPolicyEvent) => void;
+type ApprovalActivityChangedListener = () => void;
 type ProductMethod = keyof typeof productRpcRequestSchemas;
 const remoteAccessMutationMethodSet = new Set<string>(remoteAccessMutationMethods);
 export type DesktopAgentsRpcPeer = Pick<RpcPeer, "close" | "remoteIdentity" | "request">;
@@ -207,6 +215,9 @@ export class DesktopAgentsClient {
 	readonly #chatSessionInvalidationListeners = new Set<ChatSessionInvalidationListener>();
 	readonly #readyListeners = new Set<DesktopAgentsReadyListener>();
 	readonly #runtimeBoxesChangedListeners = new Set<RuntimeBoxesChangedListener>();
+	readonly #approvalEventListeners = new Set<ApprovalEventListener>();
+	readonly #sessionApprovalPolicyListeners = new Set<SessionApprovalPolicyChangedListener>();
+	readonly #approvalActivityListeners = new Set<ApprovalActivityChangedListener>();
 	readonly #activeRunCursors = new Map<string, ActiveRunCursor>();
 	readonly #sendReservations = new Map<string, SendReservation>();
 	readonly #runReservations = new Map<string, SendReservation>();
@@ -350,6 +361,24 @@ export class DesktopAgentsClient {
 							const snapshot = listRuntimeBoxesOutputSchema.parse(payload);
 							for (const listener of this.#runtimeBoxesChangedListeners) {
 								listener(snapshot);
+							}
+						},
+						[productRpcEvents.approvalEvent]: (payload) => {
+							const delivery = approvalEventDeliverySchema.parse(payload);
+							for (const listener of this.#approvalEventListeners) {
+								listener(delivery);
+							}
+						},
+						[productRpcEvents.sessionApprovalPolicyChanged]: (payload) => {
+							const event = sessionApprovalPolicyEventSchema.parse(payload);
+							for (const listener of this.#sessionApprovalPolicyListeners) {
+								listener(event);
+							}
+						},
+						[productRpcEvents.approvalActivityChanged]: (payload) => {
+							approvalActivityChangedEventSchema.parse(payload);
+							for (const listener of this.#approvalActivityListeners) {
+								listener();
 							}
 						},
 					},
@@ -974,6 +1003,29 @@ export class DesktopAgentsClient {
 		};
 	}
 
+	subscribeApprovalEvents(listener: ApprovalEventListener): () => void {
+		this.#approvalEventListeners.add(listener);
+		return () => {
+			this.#approvalEventListeners.delete(listener);
+		};
+	}
+
+	subscribeSessionApprovalPolicyChanged(
+		listener: SessionApprovalPolicyChangedListener,
+	): () => void {
+		this.#sessionApprovalPolicyListeners.add(listener);
+		return () => {
+			this.#sessionApprovalPolicyListeners.delete(listener);
+		};
+	}
+
+	subscribeApprovalActivityChanged(listener: ApprovalActivityChangedListener): () => void {
+		this.#approvalActivityListeners.add(listener);
+		return () => {
+			this.#approvalActivityListeners.delete(listener);
+		};
+	}
+
 	subscribeChatSessionInvalidations(listener: ChatSessionInvalidationListener): () => void {
 		this.#chatSessionInvalidationListeners.add(listener);
 		return () => {
@@ -1035,6 +1087,9 @@ export class DesktopAgentsClient {
 		this.#implicitSessionCreateKey = undefined;
 		this.#chatEventListeners.clear();
 		this.#runtimeBoxesChangedListeners.clear();
+		this.#approvalEventListeners.clear();
+		this.#sessionApprovalPolicyListeners.clear();
+		this.#approvalActivityListeners.clear();
 		this.#chatSessionInvalidationListeners.clear();
 		this.#readyListeners.clear();
 		closeActiveConnection?.();

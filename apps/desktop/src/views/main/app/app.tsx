@@ -1,4 +1,5 @@
 import { RouterProvider } from "react-router-dom";
+import { ApprovalsProvider } from "./approvals";
 import { I18nProvider } from "./i18n";
 import { LocalProfileProvider } from "./local-profile";
 import { ProjectDataProvider } from "./projects/project-data";
@@ -13,7 +14,9 @@ export function App() {
 				<LocalProfileProvider>
 					<RuntimeBoxesProvider>
 						<ProjectDataProvider>
-							<RouterProvider router={router} />
+							<ApprovalsProvider>
+								<RouterProvider router={router} />
+							</ApprovalsProvider>
 						</ProjectDataProvider>
 					</RuntimeBoxesProvider>
 				</LocalProfileProvider>

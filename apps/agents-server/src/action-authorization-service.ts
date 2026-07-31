@@ -1,6 +1,13 @@
 import { createHash, randomBytes, randomUUID } from "node:crypto";
-import { DefaultActionPolicy, getExecutorToolMetadata } from "@moshu/action-broker";
 import {
+	classifyExecutorAction,
+	classifyMcpAction,
+	DefaultActionPolicy,
+	getExecutorToolMetadata,
+} from "@moshu/action-broker";
+import {
+	type ActionRisk,
+	type ApprovalActionSummary,
 	createExecutorToolParameterPayload,
 	createMcpToolParameterPayload,
 	type ExecutorExecutionContext,
@@ -19,6 +26,7 @@ import {
 } from "@moshu/contracts";
 import type { ActionRepository, RunJournalRepository } from "@moshu/database";
 import type { RpcPeerIdentity } from "@moshu/process-rpc";
+import type { ActionApprovalGate, ApprovalGateRequest } from "./approval-service";
 import type { RuntimeBoxActionAuthorizer } from "./runtime-box-registry";
 
 const executionGrantLifetimeMs = 60_000;
@@ -33,15 +41,19 @@ export class ActionPolicyDeniedError extends Error {
 export class DurableActionAuthorizationService implements RuntimeBoxActionAuthorizer {
 	readonly #policy: DefaultActionPolicy;
 	readonly #allowMcpTools: boolean;
+	readonly #approvalGate: ActionApprovalGate | undefined;
 
 	constructor(
 		private readonly actions: ActionRepository,
 		private readonly runs: Pick<RunJournalRepository, "get">,
 		private readonly authority: ProcessPeerIdentity,
-		options: { allowSideEffects: boolean } = { allowSideEffects: true },
+		options: { allowSideEffects: boolean; approvalGate?: ActionApprovalGate } = {
+			allowSideEffects: true,
+		},
 	) {
 		this.#policy = new DefaultActionPolicy(options.allowSideEffects);
 		this.#allowMcpTools = options.allowSideEffects;
+		this.#approvalGate = options.approvalGate;
 	}
 
 	async authorize(
@@ -49,6 +61,7 @@ export class DurableActionAuthorizationService implements RuntimeBoxActionAuthor
 		input: ExecutorToolInvokeInput,
 		targetIdentity: RpcPeerIdentity,
 		executionContext: ExecutorExecutionContext,
+		options: { signal?: AbortSignal } = {},
 	): Promise<ExecutorToolInvokeInput> {
 		if (input.authorization !== undefined) {
 			throw new ActionPolicyDeniedError("Tool invocation authorization is Server-owned.");
@@ -71,6 +84,32 @@ export class DurableActionAuthorizationService implements RuntimeBoxActionAuthor
 			input,
 			executionContext,
 		);
+		// User-level Action approval gate: server-authoritative risk is computed here
+		// from the validated Tool call, and no execution grant is issued or consumed
+		// until the Action is approved (interactively or by a Session Allow-all policy).
+		if (this.#approvalGate !== undefined) {
+			const classification = classifyExecutorAction(input.call);
+			if (classification.requiresApproval) {
+				await this.#requireApproval(
+					input,
+					actionId,
+					{
+						tool: input.call.tool,
+						operation: classification.operation,
+						target: { kind: "runtime-box", id: runtimeBoxId },
+						...(classification.summary.command === undefined
+							? {}
+							: { command: classification.summary.command }),
+						...(classification.summary.path === undefined
+							? {}
+							: { path: classification.summary.path }),
+						redactedParams: classification.summary.redactedParams,
+					},
+					classification.risk,
+					options.signal,
+				);
+			}
+		}
 		const parameterDigest = sha256(createExecutorToolParameterPayload(input, authoritativeContext));
 		const expiresAtMs = Date.now() + executionGrantLifetimeMs;
 		const authorization: RuntimeBoxToolAuthorization = {
@@ -152,10 +191,51 @@ export class DurableActionAuthorizationService implements RuntimeBoxActionAuthor
 		};
 	}
 
+	#buildMcpSummary(
+		input: RuntimeBoxMcpToolInvokeInput,
+		target: { kind: "runtime-box" | "agent-server"; id: string },
+	): ApprovalActionSummary {
+		const classification = classifyMcpAction(input);
+		return {
+			tool: `mcp:${input.mcpServerId}:${input.stableToolId}`,
+			operation: classification.operation,
+			target,
+			...(classification.summary.mcpServerId === undefined
+				? {}
+				: { mcpServerId: classification.summary.mcpServerId }),
+			...(classification.summary.mcpToolId === undefined
+				? {}
+				: { mcpToolId: classification.summary.mcpToolId }),
+			redactedParams: classification.summary.redactedParams,
+		};
+	}
+
+	async #requireApproval(
+		input: ExecutorToolInvokeInput | RuntimeBoxMcpToolInvokeInput,
+		actionId: string,
+		action: ApprovalActionSummary,
+		risk: ActionRisk,
+		signal: AbortSignal | undefined,
+	): Promise<void> {
+		if (this.#approvalGate === undefined) {
+			return;
+		}
+		const request: ApprovalGateRequest = {
+			runId: input.runId,
+			invocationId: input.invocationId,
+			toolCallId: input.toolCallId,
+			actionId,
+			action,
+			risk,
+		};
+		await this.#approvalGate.requireApproval(request, signal === undefined ? {} : { signal });
+	}
+
 	async authorizeMcp(
 		runtimeBoxId: string,
 		input: RuntimeBoxMcpToolInvokeInput,
 		targetIdentity: RpcPeerIdentity,
+		options: { signal?: AbortSignal } = {},
 	): Promise<RuntimeBoxMcpToolInvokeInput> {
 		if (input.authorization !== undefined) {
 			throw new ActionPolicyDeniedError("MCP Tool authorization is Server-owned.");
@@ -169,6 +249,16 @@ export class DurableActionAuthorizationService implements RuntimeBoxActionAuthor
 		const actionId = randomUUID();
 		const grantId = randomUUID();
 		const grantToken = randomBytes(32).toString("base64url");
+		if (this.#approvalGate !== undefined) {
+			const classification = classifyMcpAction(input);
+			await this.#requireApproval(
+				input,
+				actionId,
+				this.#buildMcpSummary(input, { kind: "runtime-box", id: runtimeBoxId }),
+				classification.risk,
+				options.signal,
+			);
+		}
 		const parameterDigest = sha256(createMcpToolParameterPayload(input));
 		const expiresAtMs = Date.now() + executionGrantLifetimeMs;
 		const authorization: RuntimeBoxToolAuthorization = {
@@ -217,6 +307,7 @@ export class DurableActionAuthorizationService implements RuntimeBoxActionAuthor
 	async authorizeAgentServerMcp(
 		agentServerId: string,
 		input: RuntimeBoxMcpToolInvokeInput,
+		options: { signal?: AbortSignal } = {},
 	): Promise<RuntimeBoxMcpToolInvokeInput> {
 		if (input.authorization !== undefined) {
 			throw new ActionPolicyDeniedError("MCP Tool authorization is Server-owned.");
@@ -227,6 +318,16 @@ export class DurableActionAuthorizationService implements RuntimeBoxActionAuthor
 		const actionId = randomUUID();
 		const grantId = randomUUID();
 		const grantToken = randomBytes(32).toString("base64url");
+		if (this.#approvalGate !== undefined) {
+			const classification = classifyMcpAction(input);
+			await this.#requireApproval(
+				input,
+				actionId,
+				this.#buildMcpSummary(input, { kind: "agent-server", id: agentServerId }),
+				classification.risk,
+				options.signal,
+			);
+		}
 		const parameterDigest = sha256(createMcpToolParameterPayload(input));
 		const expiresAtMs = Date.now() + executionGrantLifetimeMs;
 		this.actions.createGrant({

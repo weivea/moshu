@@ -114,8 +114,8 @@ interface AppError {
 | `sessions` | id, runtime_box_id, project_id, agent_version_id, mode, title, status, revision | 永久归属一个 Box 的产品会话 |
 | `runs` | id, session_id, runtime_box_id, mode, status, config_snapshot_json | 一次 Agent 执行；snapshot 只含 resource refs/hashes，不含 Skill 正文 |
 | `run_events` | id, run_id, seq, type, payload_json, created_at | durable append-only 轨迹 |
-| `approval_requests` | id, run_id, tool_call_id, state, action_snapshot_json | server 的不可变审批请求 |
-| `approval_decisions` | id, approval_request_id, decision, decided_at | server 持久化决定 |
+| `action_approval_requests` | id, session_id, run_id, action_id, tool_call_id, tool, operation, action_summary_json, risk_tier, risk_overridable, risk_json, state, revision, decision_idempotency_key, decision_json, policy_evidence_json, created_at_ms, expires_at_ms, decided_at_ms | Layer 2 已落地的 durable 审批请求；action_id 与 decision idempotency key 唯一，revision 支持 CAS |
+| `session_approval_policies` | session_id, allow_all, revision, updated_by_json, last_idempotency_key, updated_at_ms | session-scoped、revisioned、server-owned 的 Session Allow-all 策略；随 session 级联删除 |
 | `action_executions` | id, run_id, tool_call_id, target_kind, target_id, state, intent_json, result_json | server 的 Action 事实；target 为 agent-server 或 runtime-box |
 | `execution_grants` | id, action_id, invocation_id, target_kind, target_id, instance_id, generation, digest, state, expires_at | 只存 grant 元数据/使用状态 |
 | `invocation_results` | invocation_id, action_id, state, result_json, received_at | Runtime Box typed result 的 server 投影 |
@@ -426,7 +426,17 @@ Live delivery 从「单 request-owner」模型演进为 Session/Run/seq scoped �
 - 订阅是**连接作用域**的，按稳定 `peerId` 记录并携带 authenticated peer 的精确身份（`instanceId`/generation/deviceKeyId）。**无 gap 的恢复顺序**为 `subscribe → buffer live → replay(durable per-run cursor) → dedupe/merge by (runId, seq) → flush buffer → ready`：Client 在连接建立后**先**按已知 `sessionId` 安装 `chat.subscribe`（先于 replay），使 server 在 replay 仍在进行时即把 live event 路由进 provisional buffer；随后 replay 从持久 per-Run cursor 拉取快照，任何在 subscribe 与 replay 响应之间提交的事件都已进入 buffer，与 replay 的重叠按 `(runId, seq)` cursor 去重合并；在 replay→live 衔接（flush）完成前不标记 ready。因此不会丢失或重复投递两次请求之间提交的事件。恢复末尾用**原子 drain-and-activate fence**：由于投递一个 buffered event 会 await renderer listener（其间可能被 staged 一个新的 session retirement），而 retirement 的 invalidation 又会 await renderer ack（其间可能有新的 live event 入队），两个队列会相互喂给对方，故 fence 是对 **provisional event buffer 与 pending retirement invalidations 两个队列的 drain-until-quiescent 循环**：反复 flush events + retry retirements，直到两队列同时排空，再**同步**切换 `connectionActive=true`；drain 返回后到切换之间没有任何 await，故没有 live event handler 或 retirement 能在「两队列排空」与「切换 `connectionActive=true`」之间穿插，因而在 `connectionActive` 仍为 false 期间（含最后的 retirement retry 或最后一次 event flush）到达的 live event / retirement 只会被本轮 drain 排空或在切换后按 live 投递，绝不会入队后被遗留。旧连接（gen N）迟到的断开清理用精确身份逐 Session 比对，只回收 gen N 自己且未被 gen N+1 重新订阅的条目，不会误删新连接已接管的订阅（transport fence 保证 per-`peerId` 单一 live 连接与单调 generation）。不保留陈旧 socket 订阅。
 - 订阅在 handler 层做**存在性/可见性校验**：`chat.subscribe` 先经 Chat Session repository 确认 `sessionId` 存在且未在删除/退休中，否则以稳定 `RpcHandlerError`（`SESSION_NOT_FOUND`）拒绝。容量有 **per-peer（256）与 global（8192）上限**，越界返回稳定 `RpcHandlerError`（`SESSION_SUBSCRIPTION_PEER_LIMIT` / `SESSION_SUBSCRIPTION_LIMIT`）。Session **retirement** 时 hub 主动清理相关订阅（`retireSessions`）。退休通知在 agents-server 内**集中化**（`notifySessionsRetired`）：Project 退休与 product-rpc 直接 `session.delete`（经 `ChatApplicationService.deleteSession` 的 `onSessionsRetired`）都会走同一路径拆除订阅，避免只在单一 handler 打补丁导致其他删除路径遗漏。**发起删除的 Client 拥有该删除自身产生的退休通知**：成功的 `session.delete` 响应是权威的，不会因这次删除同步广播回发起端的退休通知而被误判为 `SESSION_NOT_FOUND`；其余 in-flight 操作仍对并发退休 fail closed。
 - 单用户 MVP 下授权边界按 Session **结构化**，不做全局裸 broadcast 调试事件。Desktop 现在在**连接恢复期间先安装 `chat.subscribe`（先于 replay）**以闭合 replay/live 衔接；稳定态下每个事件按连接（request-owner ∪ subscriber 并集）去重投递，逐事件投递内容与既有实现完全一致。
-- 本层不实现 Mobile ingress/pairing 与 approvals（属于后续层）。
+- 本层（Layer 1）不实现 Mobile ingress/pairing 与 approvals。approvals 已由 Layer 2 落地（见 §9.2）；Mobile ingress/pairing 仍属后续层。
+
+### 9.2 审批事件与 Product RPC（Layer 2，已实现）
+
+Layer 2 在同一 authorization-aware 事件 hub 上新增了 client-neutral 的审批合同（见 `packages/contracts/src/approval.ts`、`apps/agents-server/src/approval-service.ts`、`product-rpc.ts`、`product-event-hub.ts`）：
+
+- **Product RPC**：`approvals.list` / `approvals.get` / `approvals.decide`、`sessionApprovalPolicy.get` / `sessionApprovalPolicy.update`。`decide` 与 `policy.update` 均带 `expectedRevision` + `idempotencyKey`；`decide` 返回 `outcome ∈ {applied, idempotent, superseded}` 与 authoritative final request。稳定错误码：`APPROVAL_NOT_FOUND`、`APPROVAL_REVISION_CONFLICT`、`APPROVAL_ALREADY_DECIDED`、`SESSION_APPROVAL_POLICY_REVISION_CONFLICT`。
+- **事件**：`approval.created` / `approval.updated` 与 `sessionApprovalPolicy.changed` 只投递给该 **Session** 的已认证订阅 client（复用 chat 订阅的可见性/退休语义）；`approvalActivityChanged` 为**无 payload** 的提示，广播给所有已认证 client，供跨 Session 待办面板按 `approvals.list` 拉快照刷新——它不携带任何 session-scoped 或 secret 内容。
+- **恢复**：client 重连后依赖 durable `approvals.list`/snapshot 恢复，不依赖纯 live；快照 + 事件按 revision 合并去重。
+- **决策来源权威**：`decision.source` 由 server 从 authenticated peer 身份（`{kind:"client", clientId, clientRole}`）派生，绝不信任请求体传入的身份。
+
 
 ## 10. Policy、Approval 与 Execution Grant
 
@@ -453,23 +463,51 @@ interface ActionRequest<TAction extends ActionType = ActionType> {
 
 server 不信任模型、Tool wrapper 或 Runtime Box 提供的 risk/approval 结论；Policy Engine 根据持久配置重新计算并持久化。
 
-### 10.2 ApprovalRequest
+### 10.2 ApprovalRequest（Layer 2 已实现，见 `packages/contracts/src/approval.ts`）
+
+真实实现的 versioned、client-neutral wire 合同（server 权威）：
 
 ```ts
 interface ApprovalRequest {
+  schemaVersion: 1;
   id: string;
+  sessionId: string;
   runId: string;
+  actionId: string;
   toolCallId: string;
-  runtimeBoxId: string;
-  action: RedactedActionSnapshot;
-  risk: "low" | "medium" | "high";
-  allowedDecisions: Array<"approve" | "edit" | "reject" | "respond">;
-  policyVersion: string;
+  action: {
+    tool: string;
+    operation: "read" | "search" | "list" | "edit" | "write" | "bash" | "mcp" | "other";
+    target: { kind: "runtime-box" | "agent-server"; id: string };
+    command?: string; // 脱敏
+    path?: string;
+    mcpServerId?: string;
+    mcpToolId?: string;
+    redactedParams: Record<string, Json>; // 仅键名/脱敏值，绝不含内容或 secret
+  };
+  risk: {
+    tier: "low" | "medium" | "high" | "critical";
+    overridable: boolean; // false = 不可被 Allow-all 绕过
+    reasons: string[];
+  };
+  state: "pending" | "approved" | "rejected" | "expired" | "cancelled";
+  revision: number; // 每次状态转换 +1，作为 CAS token
   createdAt: string;
+  expiresAt: string;
+  decidedAt?: string;
+  decision?: { kind: "approve_once" | "reject"; source: DecisionSource; decidedAt: string };
+  policyEvidence?: { allowAllRevision: number }; // Allow-all 自动通过时记录
 }
 ```
 
-编辑后的 Action 重新经过 Schema、Policy 和 intent 持久化，不能复用旧 grant。
+- **风险由 server 权威计算**（`@moshu/action-broker`），从 Tool identity + 校验后 normalized 参数得出，不信任模型/Tool wrapper/Runtime Box 自报：read/search → low（不审批）；edit/write → medium 可覆盖；bash → high 可覆盖，危险模式 → critical **不可覆盖**；MCP → high 可覆盖。
+- **状态机**：`pending → approved | rejected | expired | cancelled`（终态不可逆）。approve/reject 由 client CAS decision 驱动；expire 由过期扫描或惰性检查驱动；cancel 由 waiter abort（Run/连接结束）驱动。
+- **并发**：`approvals.decide(expectedRevision, idempotencyKey)`。两 client 竞争只有一个 `applied`，另一个得到 `superseded` 的 authoritative final state；相同 idempotency key 重试得到 `idempotent`。
+- **Session Allow all**：`SessionApprovalPolicy{ sessionId, allowAll, revision, updatedBy?, updatedAt }` session-scoped、revisioned、server-owned。对 `overridable` 的普通 action 自动 `approve_once` 并写入 `policyEvidence`；**`overridable=false` 的 critical action 永不被绕过**。策略在 session retire 时 reset，不跨 Session 泄漏。
+- **执行门**：request 处于 `pending` 期间**不签发/消费 execution grant，不调用 Runtime Box**。agents-server 重启对 pending request 保守 expire（无法恢复进程内 waiter），已决定 action 不重复 grant/执行。
+- **决策来源**：`decision.source` 由 server 从 authenticated peer 身份派生，不信任请求体。
+- **仍未实现**：`edit` 决策与 Mobile client。当前只支持 `approve_once` / `reject` 两种 per-request 决策 + Session Allow-all 策略切换。
+
 
 ### 10.3 ExecutionGrant
 

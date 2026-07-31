@@ -1,4 +1,5 @@
 import {
+	type ApprovalEventDelivery,
 	type ApproveRuntimeBoxPairingInput,
 	type ApproveRuntimeBoxPairingOutput,
 	type CancelChatRunInput,
@@ -12,6 +13,8 @@ import {
 	type CreateChatSessionOutput,
 	type CreateProviderInput,
 	type CreateRuntimeBoxPairingOutput,
+	type DecideApprovalInput,
+	type DecideApprovalOutput,
 	type DeleteChatSessionInput,
 	type DeleteChatSessionOutput,
 	type DeleteMcpServerInput,
@@ -25,6 +28,8 @@ import {
 	type FetchProviderModelsOutput,
 	type GetAgentGlobalProfileInput,
 	type GetAgentGlobalProfileOutput,
+	type GetApprovalInput,
+	type GetApprovalOutput,
 	type GetChatSessionInput,
 	type GetChatSessionSnapshotOutput,
 	type GetDefaultModelOutput,
@@ -36,7 +41,11 @@ import {
 	type GetProjectSidebarOutput,
 	type GetRuntimeProfileInput,
 	type GetRuntimeProfileOutput,
+	type GetSessionApprovalPolicyInput,
+	type GetSessionApprovalPolicyOutput,
 	type InstallRuntimeBoxSkillInput,
+	type ListApprovalsInput,
+	type ListApprovalsOutput,
 	type ListAvailableModelsOutput,
 	type ListChatSessionsInput,
 	type ListChatSessionsOutput,
@@ -76,6 +85,7 @@ import {
 	type RuntimeBoxResourceMutationResult,
 	type RuntimeDiagnosticsOutput,
 	type RuntimeInfo,
+	type SessionApprovalPolicyEvent,
 	type SessionModelSelection,
 	type SetChatSessionArchivedInput,
 	type SetChatSessionArchivedOutput,
@@ -103,6 +113,8 @@ import {
 	type UpdateProjectOutput,
 	type UpdateProviderInput,
 	type UpdateRuntimeProfileInput,
+	type UpdateSessionApprovalPolicyInput,
+	type UpdateSessionApprovalPolicyOutput,
 	type UpsertMcpServerInput,
 	type UpsertRuntimeBoxMcpServerInput,
 	type UpsertSkillInput,
@@ -457,6 +469,26 @@ export type DesktopRpc = {
 				params: AcknowledgeChatSessionInvalidationInput;
 				response: EmptyParams;
 			};
+			listApprovals: {
+				params: ListApprovalsInput;
+				response: ListApprovalsOutput;
+			};
+			getApproval: {
+				params: GetApprovalInput;
+				response: GetApprovalOutput;
+			};
+			decideApproval: {
+				params: DecideApprovalInput;
+				response: DecideApprovalOutput;
+			};
+			getSessionApprovalPolicy: {
+				params: GetSessionApprovalPolicyInput;
+				response: GetSessionApprovalPolicyOutput;
+			};
+			updateSessionApprovalPolicy: {
+				params: UpdateSessionApprovalPolicyInput;
+				response: UpdateSessionApprovalPolicyOutput;
+			};
 		};
 		messages: EmptyRpcMap;
 	}>;
@@ -467,6 +499,9 @@ export type DesktopRpc = {
 			chatEvent: ChatRunEvent;
 			chatSessionInvalidated: ChatSessionInvalidation;
 			runtimeBoxesChanged: ListRuntimeBoxesOutput;
+			approvalEvent: ApprovalEventDelivery;
+			sessionApprovalPolicyChanged: SessionApprovalPolicyEvent;
+			approvalActivityChanged: EmptyParams;
 		};
 	}>;
 };

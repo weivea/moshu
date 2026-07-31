@@ -1,4 +1,5 @@
 import { createHashRouter, Navigate } from "react-router-dom";
+import { ActivityPage } from "./activity-page";
 import {
 	ChatHomePage,
 	ChatSessionPage,
@@ -59,6 +60,10 @@ export const router = createHashRouter([
 			{
 				path: "tasks",
 				element: <PlaceholderPage titleKey="page.tasks.title" icon="tasks" />,
+			},
+			{
+				path: "activity",
+				element: <ActivityPage />,
 			},
 			{
 				path: "agents",

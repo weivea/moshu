@@ -44,6 +44,8 @@ server 先根据 Agent mode、持久 Policy、Session grant 和 Action 参数做
 
 Runtime Box 在实际执行前验证 grant。Allow all 只改变 server 的审批决定，不能跳过 grant，也不能让 Runtime Box自行放宽路径、命令或网络约束。
 
+> **Layer 2 实现状态（已落地）**：用户级 Tool/Action 审批已从设计变为真实实现（`ApprovalService` + 注入 `DurableActionAuthorizationService` 的执行门，见 §9.0.1 架构文档）。风险 tier 由 agents-server 用 `@moshu/action-broker` 从 Tool identity + 校验后参数**权威计算**，绝不信任模型/Tool wrapper/Runtime Box 自报；审批 request 与 Session Allow-all 策略 durable 持久（`action_approval_requests`、`session_approval_policies`），带 revision/CAS 与唯一 idempotency key；request 处于 pending 期间**不签发/消费 grant、不调用 Runtime Box**。Desktop 客户端已提供 Chat 等待审批卡片与全局待办面板；同一 Session 的多 client 通过事件实时同步，竞争由 server CAS 解决（一个 `applied`，其余 `superseded`）。审批 summary 只含脱敏 command/path/operation 与 redacted 参数键，绝不广播原始 command/env 或 secret。**Mobile client 仍未实现**（后续层）。
+
 | 动作 | Ask | Plan（批准前） | Agent 默认 | Agent + Allow all |
 | --- | --- | --- | --- | --- |
 | 读取会话附件 | 允许 | 允许 | 允许 | 允许 |
@@ -70,6 +72,8 @@ Runtime Box 在实际执行前验证 grant。Allow all 只改变 server 的审�
 - 应用重启、Session 复制或 Project 重新授权后自动关闭。
 - 有效性绑定当前 client instance/generation；stable `clientId` 不会让 grant 跨重启延续。
 - 状态在输入框和会话头持续可见。
+
+> **Layer 2 实现边界**：Allow-all 策略为 session-scoped、revisioned、server-owned（`session_approval_policies`），随 Session retire（删除/退休）reset，**不跨 Session 泄漏**。它只对 `overridable` 的普通 action 自动 `approve_once` 并记录 policy evidence；server 判定的 **不可覆盖（critical）高危 action 永不被绕过**，仍需单独 approve/reject。Desktop 卡片在开启时展示提示并说明该边界。当前策略在 server 重启后仍从 DB 恢复（尚未实现“重启自动关闭”）；跨设备/instance 的 generation 绑定属后续层。
 
 ### 5.2 开启确认
 

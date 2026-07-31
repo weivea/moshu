@@ -1,6 +1,21 @@
 import { z } from "zod";
 
 import {
+	approvalActivityChangedEventSchema,
+	approvalEventDeliverySchema,
+	decideApprovalInputSchema,
+	decideApprovalOutputSchema,
+	getApprovalInputSchema,
+	getApprovalOutputSchema,
+	getSessionApprovalPolicyInputSchema,
+	getSessionApprovalPolicyOutputSchema,
+	listApprovalsInputSchema,
+	listApprovalsOutputSchema,
+	sessionApprovalPolicyEventSchema,
+	updateSessionApprovalPolicyInputSchema,
+	updateSessionApprovalPolicyOutputSchema,
+} from "./approval";
+import {
 	cancelChatRunInputSchema,
 	cancelChatRunOutputSchema,
 	chatMessageSchema,
@@ -236,6 +251,11 @@ export const productRpcMethods = {
 	chatSubscribe: "moshu.v1.chat.subscribe",
 	chatUnsubscribe: "moshu.v1.chat.unsubscribe",
 	chatRetiredSessionsList: "moshu.v1.chat.retiredSessions.list",
+	approvalsList: "moshu.v1.approvals.list",
+	approvalsGet: "moshu.v1.approvals.get",
+	approvalsDecide: "moshu.v1.approvals.decide",
+	sessionApprovalPolicyGet: "moshu.v1.approvals.policy.get",
+	sessionApprovalPolicyUpdate: "moshu.v1.approvals.policy.update",
 	runtimeBoxRegister: "moshu.v1.runtimeBox.register",
 	runtimeBoxReady: "moshu.v1.runtimeBox.ready",
 	runtimeBoxToolInvoke: "moshu.v1.runtimeBox.tool.invoke",
@@ -271,6 +291,9 @@ export const productRpcEvents = {
 	runtimeBoxesChanged: "moshu.v1.runtimeBoxes.changed",
 	runtimeBoxToolProgress: "moshu.v1.runtimeBox.tool.progress",
 	runtimeBoxInventoryChanged: "moshu.v1.runtimeBox.inventory.changed",
+	approvalEvent: "moshu.v1.approvals.event",
+	sessionApprovalPolicyChanged: "moshu.v1.approvals.policy.changed",
+	approvalActivityChanged: "moshu.v1.approvals.activity.changed",
 } as const;
 
 export const productRpcMaxFrameBytes = 4 * 1024 * 1024;
@@ -837,6 +860,26 @@ export const productRpcRequestSchemas = {
 		input: getRuntimeBoxSkillContentInputSchema,
 		output: getRuntimeBoxSkillContentOutputSchema,
 	},
+	[productRpcMethods.approvalsList]: {
+		input: listApprovalsInputSchema,
+		output: listApprovalsOutputSchema,
+	},
+	[productRpcMethods.approvalsGet]: {
+		input: getApprovalInputSchema,
+		output: getApprovalOutputSchema,
+	},
+	[productRpcMethods.approvalsDecide]: {
+		input: decideApprovalInputSchema,
+		output: decideApprovalOutputSchema,
+	},
+	[productRpcMethods.sessionApprovalPolicyGet]: {
+		input: getSessionApprovalPolicyInputSchema,
+		output: getSessionApprovalPolicyOutputSchema,
+	},
+	[productRpcMethods.sessionApprovalPolicyUpdate]: {
+		input: updateSessionApprovalPolicyInputSchema,
+		output: updateSessionApprovalPolicyOutputSchema,
+	},
 } as const;
 
 export const productRpcEventSchemas = {
@@ -844,6 +887,9 @@ export const productRpcEventSchemas = {
 	[productRpcEvents.runtimeBoxesChanged]: listRuntimeBoxesOutputSchema,
 	[productRpcEvents.runtimeBoxToolProgress]: runtimeBoxToolProgressEventSchema,
 	[productRpcEvents.runtimeBoxInventoryChanged]: runtimeBoxInventoryChangedHintSchema,
+	[productRpcEvents.approvalEvent]: approvalEventDeliverySchema,
+	[productRpcEvents.sessionApprovalPolicyChanged]: sessionApprovalPolicyEventSchema,
+	[productRpcEvents.approvalActivityChanged]: approvalActivityChangedEventSchema,
 } as const;
 
 export const clientProductRequestMethods = [
@@ -924,6 +970,11 @@ export const clientProductRequestMethods = [
 	productRpcMethods.chatSubscribe,
 	productRpcMethods.chatUnsubscribe,
 	productRpcMethods.chatRetiredSessionsList,
+	productRpcMethods.approvalsList,
+	productRpcMethods.approvalsGet,
+	productRpcMethods.approvalsDecide,
+	productRpcMethods.sessionApprovalPolicyGet,
+	productRpcMethods.sessionApprovalPolicyUpdate,
 ] as const;
 
 export const runtimeBoxProductRequestMethods = [
@@ -935,6 +986,9 @@ export const agentsProductEventMethods = [
 	productRpcEvents.chatEvent,
 	productRpcEvents.chatSessionsRetired,
 	productRpcEvents.runtimeBoxesChanged,
+	productRpcEvents.approvalEvent,
+	productRpcEvents.sessionApprovalPolicyChanged,
+	productRpcEvents.approvalActivityChanged,
 ] as const;
 export const agentsRuntimeBoxRequestMethods = [
 	productRpcMethods.runtimeBoxToolInvoke,

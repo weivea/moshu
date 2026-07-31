@@ -39,6 +39,7 @@ import {
 import { FileSkillContentStore } from "@moshu/skill-runtime";
 import { DurableActionAuthorizationService } from "./action-authorization-service";
 import { AgentServerIdentity } from "./agent-server-identity";
+import { ApprovalService } from "./approval-service";
 import { ChatApplicationService } from "./chat-application-service";
 import { DevTunnelService } from "./dev-tunnel-service";
 import { resolveEffectiveSkills } from "./effective-skill-resolver";
@@ -47,6 +48,7 @@ import { McpActionDispatcher } from "./mcp-action-dispatcher";
 import {
 	agentsServerClientMethodAllowlist,
 	agentsServerRuntimeMethodAllowlist,
+	broadcastApprovalActivityChanged,
 	createProductRpcHandlers,
 	createRuntimeBoxesSnapshot,
 	ProductEventRouter,
@@ -163,6 +165,8 @@ export async function createAgentsServer(
 	let runtimeRpcServer: RpcServer | undefined;
 	let devTunnelService: DevTunnelService | undefined;
 	let unsubscribe: (() => void) | undefined;
+	let unsubscribeApprovals: (() => void) | undefined;
+	let approvalSweepTimer: ReturnType<typeof setInterval> | undefined;
 	let authController: HeadlessAuthController | undefined;
 	let agentServerMcpLifecycle: McpLifecycleManager | undefined;
 	try {
@@ -188,10 +192,21 @@ export async function createAgentsServer(
 		await serverMcpLifecycle.start();
 		const activeRuntimeBox = database.runtimeBoxes.getActive();
 		let publishRuntimeBoxesChanged = () => undefined;
+		// The approval service is the durable execution gate + event hub for real Tool/Action
+		// approvals. Injecting it into the authorizer makes side-effecting Actions wait for a client
+		// decision (or a Session Allow-all policy) before any grant is issued or Runtime Box invoked.
+		const approvalService = new ApprovalService(database.approvals, database.runs);
+		const approvalRecovery = approvalService.recoverOnStartup();
+		if (approvalRecovery.expired > 0) {
+			reportDiagnostic(
+				`Expired ${approvalRecovery.expired} pending Tool approvals that could not resume after restart.`,
+			);
+		}
 		const actionAuthorizer = new DurableActionAuthorizationService(
 			database.actions,
 			database.runs,
 			options.bootstrap.serverIdentity,
+			{ allowSideEffects: true, approvalGate: approvalService },
 		);
 		const runtimeBoxRegistry = new RuntimeBoxRegistry({
 			descriptors: database.runtimeBoxes.list(),
@@ -274,6 +289,16 @@ export async function createAgentsServer(
 		// would leave the other path leaking subscriptions.
 		const notifySessionsRetired = (sessionIds: readonly string[]): void => {
 			eventRouter.retireSessions(sessionIds);
+			// Session "Allow all" is session-scoped and server-owned: when a Session is retired its
+			// policy and any pending approvals are reset so the grant can never leak into a new Session.
+			for (const sessionId of sessionIds) {
+				try {
+					approvalService.resetForSession(sessionId);
+				} catch (error) {
+					const message = error instanceof Error ? error.message.slice(0, 256) : "Unknown failure.";
+					reportDiagnostic(`Approval reset for retired Session failed: ${message}`);
+				}
+			}
 			const server = productRpcServer;
 			if (server !== undefined) {
 				try {
@@ -419,6 +444,7 @@ export async function createAgentsServer(
 
 		const handlers = createProductRpcHandlers({
 			chatService,
+			approvalService,
 			runtimeBoxRegistry,
 			runtimeBoxes: database.runtimeBoxes,
 			runtimeBoxPairings: database.runtimeBoxPairings,
@@ -563,6 +589,39 @@ export async function createAgentsServer(
 				eventRouter.publish(server.peers, event, service.getClientRequestId(event.runId));
 			}
 		});
+		// Fan approval state changes out to the multi-client event hub: Session-scoped events reach
+		// that Session's subscribers, and a no-payload activity hint tells every client to refresh its
+		// cross-session pending-approvals snapshot.
+		unsubscribeApprovals = approvalService.subscribe((event) => {
+			const server = productRpcServer;
+			if (server === undefined) {
+				return;
+			}
+			if (event.type === "sessionApprovalPolicy.changed") {
+				eventRouter.publishSessionApprovalPolicy(server.peers, {
+					schemaVersion: 1,
+					policy: event.policy,
+				});
+			} else {
+				eventRouter.publishApproval(server.peers, {
+					schemaVersion: 1,
+					kind: event.type === "approval.created" ? "created" : "updated",
+					request: event.request,
+				});
+			}
+			broadcastApprovalActivityChanged(server.peers);
+		});
+		// Lazily-expired approvals are settled on read, but a periodic sweep bounds the worst-case time
+		// a waiting Action lingers past its deadline when no client is actively polling.
+		approvalSweepTimer = setInterval(() => {
+			try {
+				approvalService.sweepExpired();
+			} catch (error) {
+				const message = error instanceof Error ? error.message.slice(0, 256) : "Unknown failure.";
+				reportDiagnostic(`Approval expiry sweep failed: ${message}`);
+			}
+		}, 30_000);
+		approvalSweepTimer.unref?.();
 
 		let shutdownPromise: Promise<void> | undefined;
 		return {
@@ -578,6 +637,10 @@ export async function createAgentsServer(
 				}
 				const execution = (async () => {
 					unsubscribe?.();
+					unsubscribeApprovals?.();
+					if (approvalSweepTimer !== undefined) {
+						clearInterval(approvalSweepTimer);
+					}
 					productRpcServer?.stop();
 					runtimeRpcServer?.stop();
 					await devTunnelService?.shutdown();

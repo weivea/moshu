@@ -356,8 +356,8 @@ agentDataDirectory/
 
 ### 9.0 当前临时可信本机桥接
 
-当前七工具先完成了 Runtime Box-only 执行不变量，但**尚未**实现下述最终 Policy/approval/Action
-intent/execution grant 流程：
+当前七工具先完成了 Runtime Box-only 执行不变量。用户级 Tool/Action **审批**已由 Layer 2 落地（见 §9.0.1）；
+本节其余的最终 execution grant / Action intent / outcome recovery 流程仍在推进中：
 
 - agents-server 将 Pi custom Tool call 直接路由到当前已认证 Runtime Box peer；Runtime Box 只接受已认证
   `agents` role 的严格版本化 RPC。
@@ -380,6 +380,39 @@ intent/execution grant 流程：
   `rg`/`fd` 使用绝对路径，不依赖该 `PATH`。
 - 这是有意接受的开发期高权限边界，不是 approval 或授权实现。A3 Policy、durable intent、single-use grant、
   outcome recovery 和审计完成后，必须替换这条直接桥接，不能在其旁边再保留绕过路径。
+
+### 9.0.1 Layer 2 真实 Tool/Action 审批（已实现）
+
+> Mobile stack Layer 2 在 Layer 1 协议底座之上，落地了真实、durable、server-authoritative 的
+> 用户级 Tool/Action 审批闭环。Desktop 与未来 iOS 客户端都能看到并决策真实审批。
+
+- **执行门**：`DurableActionAuthorizationService.authorize` 注入可选 `ActionApprovalGate`。存在 gate 时，
+  side-effecting / MCP Tool 在**签发或消费 execution grant、调用 Runtime Box 之前**先 `await gate.requireApproval(...)`；
+  只读工具（read/grep/find/ls）自动放行。gate 缺省时保持 Layer 1 legacy 行为，既有测试不变。
+- **权威风险分级**：由 agents-server 基于 Tool identity + 校验后的 normalized 参数用 `@moshu/action-broker`
+  重新计算，**从不信任** Runtime Box 或模型自报的 tier。read/search → low（不审批）；edit/write → medium 可覆盖；
+  bash → high 可覆盖，命中危险模式（sudo、`rm -rf`、mkfs、`dd of=`、fork bomb、`curl|sh` 等）→ critical
+  **不可覆盖**；MCP → high 可覆盖。summary 仅含脱敏 command/path/operation 与 redacted 参数键，绝不泄漏
+  edit/write 内容、MCP 参数值或 secret/env。
+- **持久化与并发**：approval request 与 session allow-all policy 持久到 SQLite，带 monotonic revision/CAS 与
+  唯一 decision idempotency key。Action intent 与 Approval 状态转换在事务边界内，不会“决定成功但 action 未持久”。
+- **决策语义**：approve → CAS decision → grant → resume；reject/expire/cancel → 持久终态并让 Tool/Run 得到
+  稳定 typed 结果。两个 client 同时决定只有一个 `applied`，loser 得到 `superseded` 的 authoritative final state
+  而非重复 side effect；相同 idempotency key 重试返回 `idempotent` 先前结果。
+- **Session Allow all**：session-scoped、revisioned、server-owned。对可覆盖普通 action 自动通过并记录
+  policy evidence（allowAllRevision）；server 判定的 non-overridable 高危 action **永不被绕过**。策略在 session
+  retire 时 reset，不跨 Session 泄漏。
+- **恢复**：agents-server 重启时对 pending request 执行保守 recovery——将其 expire（无法恢复进程内 waiter），
+  避免“批准了却无法执行”；已决定的 action 不重复 grant/执行。
+- **Product RPC / 事件**：新增 client-neutral 合同 `approvals.list/get/decide`、
+  `sessionApprovalPolicy.get/update`（均带 expectedRevision + idempotencyKey）。approval.created/updated 与
+  sessionApprovalPolicy.changed 只投递给该 Session 的已认证订阅 client；另有无 payload 的
+  approvalActivityChanged 广播给所有已认证 client，供跨 Session 待办面板刷新快照（不含任何 secret/session 内容）。
+  重连后依赖 durable list/snapshot 恢复，不依赖纯 live。
+- **Desktop UX**：Chat 流内的等待审批卡片（Tool、目标、脱敏 command/path/operation、风险原因、时间/状态；
+  Approve once / Reject / Allow all for this Session，处理 loading、已被另一端决定、冲突、离线、过期、取消）；
+  侧栏全局 Activity 入口列出跨 Session 待办并可导航到 Session。
+- **仍未实现**：Mobile client（ingress/pairing、apps/mobile、native plugin、通知）不在本层，属后续层。
 
 ### 9.1 请求流程
 

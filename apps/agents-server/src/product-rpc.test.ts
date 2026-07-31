@@ -33,7 +33,7 @@ import {
 import { RpcHandlerError, type RpcPeer, rpcJsonValueSchema } from "@moshu/process-rpc";
 import { FileSkillContentStore } from "@moshu/skill-runtime";
 import { z } from "zod";
-
+import type { ApprovalService } from "./approval-service";
 import type { ChatApplicationService } from "./chat-application-service";
 import type { DevTunnelService } from "./dev-tunnel-service";
 import {
@@ -51,6 +51,9 @@ const authController = {} as HeadlessAuthController;
 const runtimeBoxes = {} as RuntimeBoxRepository;
 const runtimeIngressAuth = {} as RuntimeIngressAuth;
 const devTunnelService = {} as DevTunnelService;
+// Approval handlers are covered by approval-service.test.ts; these Runtime Box / product tests
+// only need a placeholder so the required dependency is satisfied.
+const approvalService = {} as unknown as ApprovalService;
 
 describe("Runtime Box product RPC", () => {
 	test("lists and switches the persisted active Runtime Box with CAS", async () => {
@@ -74,6 +77,7 @@ describe("Runtime Box product RPC", () => {
 			});
 
 			const handlers = createProductRpcHandlers({
+				approvalService,
 				authController,
 				chatService: {} as ChatApplicationService,
 				runtimeBoxRegistry: registry,
@@ -121,6 +125,7 @@ describe("Runtime Box product RPC", () => {
 
 	test("returns redacted version, registry, inventory, and integrity diagnostics", async () => {
 		const handler = createProductRpcHandlers({
+			approvalService,
 			authController,
 			chatService: {} as ChatApplicationService,
 			runtimeBoxRegistry: new RuntimeBoxRegistry(),
@@ -219,6 +224,7 @@ describe("Runtime Box product RPC", () => {
 			}),
 		});
 		const handler = createProductRpcHandlers({
+			approvalService,
 			authController,
 			chatService: {} as ChatApplicationService,
 			runtimeBoxRegistry: registry,
@@ -255,6 +261,7 @@ describe("Runtime Box product RPC", () => {
 		const database = openAppDatabase(":memory:");
 		try {
 			const handlers = createProductRpcHandlers({
+				approvalService,
 				authController,
 				chatService: {} as ChatApplicationService,
 				runtimeBoxRegistry: new RuntimeBoxRegistry(),
@@ -363,6 +370,7 @@ describe("Runtime Box product RPC", () => {
 		});
 		try {
 			const handlers = createProductRpcHandlers({
+				approvalService,
 				authController,
 				chatService: {} as ChatApplicationService,
 				runtimeBoxRegistry: new RuntimeBoxRegistry(),
@@ -556,6 +564,7 @@ describe("Runtime Box product RPC", () => {
 				},
 			} as unknown as ChatApplicationService;
 			const handlers = createProductRpcHandlers({
+				approvalService,
 				authController,
 				chatService,
 				runtimeBoxRegistry: registry,
@@ -769,6 +778,7 @@ describe("Runtime Box product RPC", () => {
 				],
 			});
 			const handlers = createProductRpcHandlers({
+				approvalService,
 				authController,
 				chatService: {} as ChatApplicationService,
 				runtimeBoxRegistry: registry,
@@ -1147,6 +1157,7 @@ describe("product RPC event broadcast", () => {
 		const peer = createPeer({ emitEvent: () => "event", close() {} });
 		let malformedInputDispatched = false;
 		const malformedInputHandler = createProductRpcHandlers({
+			approvalService,
 			authController,
 			chatService: {
 				getSessionPage() {
@@ -1162,6 +1173,7 @@ describe("product RPC event broadcast", () => {
 			serverVersion: "test",
 		}).requests?.[productRpcMethods.sessionGet];
 		const malformedOutputHandler = createProductRpcHandlers({
+			approvalService,
 			authController,
 			chatService: {
 				getSessionPage() {
@@ -1176,6 +1188,7 @@ describe("product RPC event broadcast", () => {
 			serverVersion: "test",
 		}).requests?.[productRpcMethods.sessionGet];
 		const internalZodHandler = createProductRpcHandlers({
+			approvalService,
 			authController,
 			chatService: {
 				getSessionPage() {
@@ -1236,6 +1249,7 @@ describe("product RPC event broadcast", () => {
 		const peer = createPeer({ emitEvent: () => "event", close() {} });
 		const completedOperations: string[] = [];
 		const handlers = createProductRpcHandlers({
+			approvalService,
 			authController,
 			chatService: {
 				createSessionIdempotently() {
@@ -1291,6 +1305,7 @@ describe("product RPC event broadcast", () => {
 	test("maps a conclusive missing Session to a stable product RPC error", async () => {
 		const peer = createPeer({ emitEvent: () => "event", close() {} });
 		const handler = createProductRpcHandlers({
+			approvalService,
 			authController,
 			chatService: {
 				getSessionPage() {
@@ -1336,6 +1351,7 @@ describe("product RPC event broadcast", () => {
 		const database = openAppDatabase(":memory:");
 		const peer = createPeer({ emitEvent: () => "event", close() {} });
 		const handler = createProductRpcHandlers({
+			approvalService,
 			authController,
 			chatService: {
 				deleteSession(input) {
@@ -1383,6 +1399,7 @@ describe("product RPC event broadcast", () => {
 		const session = database.sessions.create({ title: "Delete through RPC" }).session;
 		const peer = createPeer({ emitEvent: () => "event", close() {} });
 		const handler = createProductRpcHandlers({
+			approvalService,
 			authController,
 			chatService: {
 				deleteSession(input) {
@@ -1430,6 +1447,7 @@ describe("product RPC event broadcast", () => {
 			{ instanceId: "other-create-instance", generation: 4 },
 		);
 		const handler = createProductRpcHandlers({
+			approvalService,
 			authController,
 			chatService: {
 				async createSessionIdempotently(input, peerIdentity) {
@@ -1616,6 +1634,7 @@ describe("product RPC provider and model handlers", () => {
 			setSessionModel: record("setSessionModel", sessionOutput),
 		} as unknown as ChatApplicationService;
 		const handlers = createProductRpcHandlers({
+			approvalService,
 			authController,
 			chatService,
 			runtimeBoxRegistry: {} as RuntimeBoxRegistry,
@@ -1761,6 +1780,7 @@ describe("product RPC provider and model handlers", () => {
 				},
 			} as unknown as ChatApplicationService;
 			const handler = createProductRpcHandlers({
+				approvalService,
 				authController,
 				chatService,
 				runtimeBoxRegistry: {} as RuntimeBoxRegistry,
@@ -1819,6 +1839,7 @@ describe("product RPC provider and model handlers", () => {
 			},
 		} as unknown as HeadlessAuthController;
 		const handlers = createProductRpcHandlers({
+			approvalService,
 			authController: fakeAuthController,
 			chatService: {} as ChatApplicationService,
 			runtimeBoxRegistry: {} as RuntimeBoxRegistry,
@@ -1863,6 +1884,7 @@ describe("product RPC provider and model handlers", () => {
 
 	test("registers a handler for every client and Runtime Box product request method", () => {
 		const handlers = createProductRpcHandlers({
+			approvalService,
 			authController,
 			chatService: {} as unknown as ChatApplicationService,
 			runtimeBoxRegistry: {} as RuntimeBoxRegistry,
@@ -1886,6 +1908,7 @@ describe("product RPC provider and model handlers", () => {
 		const retiredSessionId = "01984df0-cf17-7e6e-9a7d-4d98c1f0d5ce";
 		const received: unknown[] = [];
 		const handlers = createProductRpcHandlers({
+			approvalService,
 			authController,
 			chatService: {
 				listRetiredSessions(input: unknown) {
