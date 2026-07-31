@@ -58,6 +58,7 @@ interface PendingChallenge {
 }
 
 export type MobilePublicUrlProvider = () => string | undefined;
+export type MobileRemoteAccessEnabledProvider = () => boolean;
 
 interface MobileIngressAuthOptions {
 	pairings: MobilePairingRepository;
@@ -65,6 +66,7 @@ interface MobileIngressAuthOptions {
 	rpcIdentity: ProcessPeerIdentity;
 	actionJournalEpoch: string;
 	getMobilePublicUrl: MobilePublicUrlProvider;
+	isRemoteAccessEnabled: MobileRemoteAccessEnabledProvider;
 	now?: () => number;
 	preAuthRequestTimeoutMs?: number;
 	maxConcurrentPreAuthRequests?: number;
@@ -76,6 +78,7 @@ export class MobileIngressAuth {
 	readonly #rpcIdentity: ProcessPeerIdentity;
 	readonly #actionJournalEpoch: string;
 	readonly #getMobilePublicUrl: MobilePublicUrlProvider;
+	readonly #isRemoteAccessEnabled: MobileRemoteAccessEnabledProvider;
 	readonly #now: () => number;
 	readonly #challenges = new Map<string, PendingChallenge>();
 	readonly #httpLimiters = new Map([
@@ -98,6 +101,7 @@ export class MobileIngressAuth {
 		this.#rpcIdentity = options.rpcIdentity;
 		this.#actionJournalEpoch = options.actionJournalEpoch;
 		this.#getMobilePublicUrl = options.getMobilePublicUrl;
+		this.#isRemoteAccessEnabled = options.isRemoteAccessEnabled;
 		this.#now = options.now ?? Date.now;
 		this.#preAuthRequestTimeoutMs = options.preAuthRequestTimeoutMs ?? preAuthRequestTimeoutMs;
 		this.#maxConcurrentPreAuthRequests =
@@ -113,11 +117,13 @@ export class MobileIngressAuth {
 	}
 
 	createPairing(): CreateMobilePairingOutput {
-		// Fail closed: a pairing is only useful once the Mobile ingress is live and has an exact public
-		// URL to embed in the QR. If it is not ready we refuse *before* minting any state, so we never
-		// create a code the phone could never reach and never leave a dangling, QR-less pairing record.
+		// Fail closed on the whole readiness surface, not just the URL. Remote Access can be toggled off
+		// (enabled=false) a beat before the ingress actually stops, so readiness/publicUrl may still look
+		// live during that transition window. If Remote Access is disabled — or the Mobile ingress has no
+		// exact public URL yet — we refuse *before* minting any state, so we never create a code the phone
+		// could never reach and never leave a dangling, QR-less pairing record.
 		const mobileUrl = this.#getMobilePublicUrl();
-		if (mobileUrl === undefined) {
+		if (!this.#isRemoteAccessEnabled() || mobileUrl === undefined) {
 			throw new RpcHandlerError(
 				"MOBILE_INGRESS_NOT_READY",
 				"The Mobile ingress is not exposed yet, so a pairing QR cannot be published.",

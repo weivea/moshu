@@ -96,6 +96,7 @@ describe("Mobile ingress transport smoke", () => {
 				rpcIdentity,
 				actionJournalEpoch,
 				getMobilePublicUrl: () => "https://mobile.example.devtunnels.ms",
+				isRemoteAccessEnabled: () => true,
 			});
 			const fence = new MobileIngressGenerationFence(database.mobileDevices);
 			const runtimeGetCalls: string[] = [];

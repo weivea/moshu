@@ -230,9 +230,14 @@ export function MobileAccessSettingsPage() {
 					? t("mobileAccess.ready")
 					: t("mobileAccess.notReady");
 
-	// A pairing QR is only reachable once the Mobile ingress is live and has published its public URL,
-	// so the create action stays disabled until both hold — the server fails closed regardless.
-	const canCreatePairing = status?.ingressReady === true && typeof status.publicUrl === "string";
+	// A pairing QR is only reachable once Remote Access is enabled AND the Mobile ingress is live with a
+	// published public URL. Remote Access can flip to disabled a beat before the ingress actually stops,
+	// so we gate on the persisted enabled flag too and disable the button immediately — the server also
+	// fails closed regardless during that transition window.
+	const canCreatePairing =
+		status?.remoteAccessEnabled === true &&
+		status.ingressReady === true &&
+		typeof status.publicUrl === "string";
 
 	return (
 		<section className="settings-section mobile-access-settings">

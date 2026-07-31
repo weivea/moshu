@@ -41,6 +41,7 @@ function createAuth(
 	database: ReturnType<typeof openAppDatabase>,
 	options: {
 		mobileUrl?: string;
+		remoteAccessEnabled?: boolean;
 		preAuthRequestTimeoutMs?: number;
 		maxConcurrentPreAuthRequests?: number;
 	} = {},
@@ -52,6 +53,7 @@ function createAuth(
 		rpcIdentity,
 		actionJournalEpoch,
 		getMobilePublicUrl: () => options.mobileUrl,
+		isRemoteAccessEnabled: () => options.remoteAccessEnabled ?? true,
 		...(options.preAuthRequestTimeoutMs === undefined
 			? {}
 			: { preAuthRequestTimeoutMs: options.preAuthRequestTimeoutMs }),
@@ -272,6 +274,7 @@ describe("MobileIngressAuth", () => {
 				rpcIdentity,
 				actionJournalEpoch,
 				getMobilePublicUrl: () => mobileUrl,
+				isRemoteAccessEnabled: () => true,
 			});
 
 			// Not ready: refuses with a stable code and never touches the pairing store.
@@ -294,6 +297,90 @@ describe("MobileIngressAuth", () => {
 			const qr = mobilePairingQrPayloadSchema.parse(pairing.qr);
 			expect(qr.mobileUrl).toBe(mobileUrl);
 			expect(qr.code).toBe(pairing.code);
+		} finally {
+			database.close();
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+
+	test("refuses to create a pairing while Remote Access is disabling even if the URL is still live", () => {
+		const directory = mkdtempSync(join(tmpdir(), "moshu-mobile-ingress-disable-"));
+		const database = openAppDatabase(":memory:");
+		try {
+			// Count create() calls so we can prove the disable-transition window consumes no durable state.
+			let createCalls = 0;
+			const realPairings = database.mobilePairings;
+			const countingPairings: MobilePairingRepository = {
+				create: (input) => {
+					createCalls += 1;
+					return realPairings.create(input);
+				},
+				claim: (input) => realPairings.claim(input),
+				listPendingClaims: () => realPairings.listPendingClaims(),
+				approve: (pairingId, fingerprint) => realPairings.approve(pairingId, fingerprint),
+				reject: (pairingId) => realPairings.reject(pairingId),
+				getStatus: (pairingId, hash) => realPairings.getStatus(pairingId, hash),
+				listActiveDeviceKeys: (mobileClientId) => realPairings.listActiveDeviceKeys(mobileClientId),
+				getActiveDeviceKey: (mobileClientId, keyId) =>
+					realPairings.getActiveDeviceKey(mobileClientId, keyId),
+				revokeDeviceKey: (mobileClientId, keyId) =>
+					realPairings.revokeDeviceKey(mobileClientId, keyId),
+			};
+			// Mirror the create-agents-server providers over a DevTunnel-like state: getMobilePublicUrl
+			// reflects ingress readiness/URL, isRemoteAccessEnabled reflects the persisted enabled flag.
+			const tunnel = {
+				enabled: true,
+				ready: true,
+				publicUrl: "https://mobile.example.devtunnels.ms" as string | undefined,
+			};
+			const identity = AgentServerIdentity.open(join(directory, "identity.json"));
+			const auth = new MobileIngressAuth({
+				pairings: countingPairings,
+				identity,
+				rpcIdentity,
+				actionJournalEpoch,
+				getMobilePublicUrl: () => (tunnel.ready ? tunnel.publicUrl : undefined),
+				isRemoteAccessEnabled: () => tunnel.enabled,
+			});
+
+			const expectRefused = () => {
+				let thrown: unknown;
+				try {
+					auth.createPairing();
+				} catch (error) {
+					thrown = error;
+				}
+				expect(thrown).toBeInstanceOf(RpcHandlerError);
+				expect((thrown as RpcHandlerError).code).toBe("MOBILE_INGRESS_NOT_READY");
+			};
+
+			// Online: a pairing can be created and its QR embeds the live URL.
+			const firstPairing = auth.createPairing();
+			expect(createCalls).toBe(1);
+			expect(firstPairing.mobileUrl).toBe(tunnel.publicUrl);
+
+			// disable() persists enabled=false first, but the async stop has not cleared readiness/URL yet.
+			tunnel.enabled = false;
+			expectRefused();
+			expect(createCalls).toBe(1);
+			expect(auth.listPendingClaims().items).toHaveLength(0);
+
+			// Stop completes: readiness and URL fall away — still refused, still no durable state.
+			tunnel.ready = false;
+			tunnel.publicUrl = undefined;
+			expectRefused();
+			expect(createCalls).toBe(1);
+			expect(auth.listPendingClaims().items).toHaveLength(0);
+
+			// Re-enable and re-expose: creation works again and mints exactly one new pairing.
+			tunnel.enabled = true;
+			tunnel.ready = true;
+			tunnel.publicUrl = "https://mobile-2.example.devtunnels.ms";
+			const secondPairing = auth.createPairing();
+			expect(createCalls).toBe(2);
+			expect(secondPairing.mobileUrl).toBe(tunnel.publicUrl);
+			const qr = mobilePairingQrPayloadSchema.parse(secondPairing.qr);
+			expect(qr.mobileUrl).toBe(tunnel.publicUrl);
 		} finally {
 			database.close();
 			rmSync(directory, { recursive: true, force: true });

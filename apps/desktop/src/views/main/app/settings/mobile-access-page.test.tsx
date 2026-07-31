@@ -78,6 +78,45 @@ describe("MobileAccessSettingsPage", () => {
 		expect(rpcMocks.createMobilePairing).not.toHaveBeenCalled();
 	});
 
+	test("keeps pairing disabled while Remote Access is disabling even though the URL is still live", async () => {
+		// enabled=false persists before the async stop clears readiness, so ready/publicUrl still look
+		// live. The button must be disabled immediately and no pairing request may be attempted.
+		rpcMocks.getMobileAccessStatus.mockResolvedValue(mobileStatus({ ready: true, enabled: false }));
+
+		render(
+			<I18nProvider>
+				<MobileAccessSettingsPage />
+			</I18nProvider>,
+		);
+
+		const button = await screen.findByRole("button", { name: "Show QR code" });
+		expect(button).toBeDisabled();
+		expect(rpcMocks.createMobilePairing).not.toHaveBeenCalled();
+	});
+
+	test("disables the create button when Remote Access flips off mid-session while the URL lingers", async () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(new Date("2026-07-29T13:00:00.000Z"));
+		rpcMocks.getMobileAccessStatus.mockResolvedValue(mobileStatus({ ready: true, enabled: true }));
+
+		render(
+			<I18nProvider>
+				<MobileAccessSettingsPage />
+			</I18nProvider>,
+		);
+		await act(async () => {
+			await vi.advanceTimersByTimeAsync(0);
+		});
+		expect(screen.getByRole("button", { name: "Show QR code" })).toBeEnabled();
+
+		// Remote Access disabled; the ingress stop is still pending so ready/publicUrl remain visible.
+		rpcMocks.getMobileAccessStatus.mockResolvedValue(mobileStatus({ ready: true, enabled: false }));
+		await act(async () => {
+			await vi.advanceTimersByTimeAsync(2_000);
+		});
+		expect(screen.getByRole("button", { name: "Show QR code" })).toBeDisabled();
+	});
+
 	test("surfaces a fail-closed error when the ingress refuses a pairing", async () => {
 		rpcMocks.createMobilePairing.mockRejectedValue(
 			Object.assign(new Error("MOBILE_INGRESS_NOT_READY: not exposed"), {

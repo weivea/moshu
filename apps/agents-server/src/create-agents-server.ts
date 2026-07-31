@@ -347,14 +347,16 @@ export async function createAgentsServer(
 			identity: agentServerIdentity,
 			rpcIdentity: options.bootstrap.serverIdentity,
 			actionJournalEpoch: database.runtimeBoxes.getActionJournalEpoch(),
-			// A pairing QR is only publishable once the Mobile ingress port is live and has a public URL;
-			// until then createPairing() returns the code without a QR so we never advertise a dead URL.
+			// A pairing QR is only publishable once the Mobile ingress port is live with a public URL AND
+			// Remote Access is still enabled. disable() persists enabled=false before the async stop
+			// clears readiness/URL, so both signals are gated here to fail closed during that window.
 			getMobilePublicUrl: () => {
 				const ingress = devTunnelService
 					?.getIngressReadiness()
 					.find((entry) => entry.kind === "mobile");
 				return ingress?.ready ? ingress.publicUrl : undefined;
 			},
+			isRemoteAccessEnabled: () => devTunnelService?.getStatus().enabled === true,
 		});
 		const mobileGenerationFence = new MobileIngressGenerationFence(database.mobileDevices);
 		// Revoking a Mobile device immediately tears down any live peer for that client id; the durable

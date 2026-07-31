@@ -26,6 +26,7 @@ function seedApprovedDevice(
 		rpcIdentity,
 		actionJournalEpoch: "550e8400-e29b-41d4-a716-446655440099",
 		getMobilePublicUrl: () => "https://mobile.example.devtunnels.ms",
+		isRemoteAccessEnabled: () => true,
 	});
 	const publicKey = generateKeyPairSync("ed25519")
 		.publicKey.export({ format: "der", type: "spki" })
