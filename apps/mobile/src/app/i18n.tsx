@@ -51,6 +51,8 @@ const en = {
 
 	"error.authRevoked.title": "This device was unpaired",
 	"error.authRevoked.body": "Your Agent Server revoked this device. Pair again to reconnect.",
+	"error.authFailed.title": "Authorization failed",
+	"error.authFailed.body": "Your Agent Server refused this device's credentials. Unpair and pair again from your Desktop to reconnect.",
 	"error.protocolMismatch.title": "Update required",
 	"error.protocolMismatch.body": "This app and your Agent Server speak different protocol versions. Update both to the latest release.",
 	"error.identityMismatch.title": "Server identity changed",
@@ -78,6 +80,7 @@ const en = {
 	"chat.composer.send": "Send",
 	"chat.composer.stop": "Stop",
 	"chat.composer.stopping": "Stopping…",
+	"chat.composer.retryHint": "Last send's result is unknown. Sending again reuses the same request so it won't duplicate.",
 	"chat.streaming": "Assistant is responding…",
 	"chat.empty": "No messages yet. Say hello.",
 	"chat.loadError": "Unable to load this chat.",
@@ -199,6 +202,8 @@ const zh: Record<MessageKey, string> = {
 
 	"error.authRevoked.title": "此设备已被解绑",
 	"error.authRevoked.body": "你的 Agent Server 已吊销此设备。请重新配对以连接。",
+	"error.authFailed.title": "授权失败",
+	"error.authFailed.body": "你的 Agent Server 拒绝了此设备的凭据。请在桌面端解绑并重新配对以连接。",
 	"error.protocolMismatch.title": "需要更新",
 	"error.protocolMismatch.body": "此应用与 Agent Server 的协议版本不一致，请将两端都更新到最新版本。",
 	"error.identityMismatch.title": "服务器身份已变更",
@@ -226,6 +231,7 @@ const zh: Record<MessageKey, string> = {
 	"chat.composer.send": "发送",
 	"chat.composer.stop": "停止",
 	"chat.composer.stopping": "停止中…",
+	"chat.composer.retryHint": "上一条发送结果未知。再次发送会复用同一请求，不会重复创建。",
 	"chat.streaming": "智能体正在回复…",
 	"chat.empty": "还没有消息，打个招呼吧。",
 	"chat.loadError": "无法加载此对话。",

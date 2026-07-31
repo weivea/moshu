@@ -16,6 +16,7 @@ import { buildMobileRpcHandlers, MobileProductClient, mobileInboundAllowlist } f
 
 export type FatalConnectionCode =
 	| "auth-revoked"
+	| "auth-failed"
 	| "protocol-mismatch"
 	| "identity-mismatch"
 	| "url-invalid"
@@ -61,10 +62,21 @@ function errorCode(error: unknown): string | undefined {
 // failure (offline/reconnecting) and retried; we never fake a "connected" state on failure.
 const fatalCodeMap: Record<string, FatalConnectionCode> = {
 	AUTH_REVOKED: "auth-revoked",
+	AUTH_FAILED: "auth-failed",
 	PROTOCOL_MISMATCH: "protocol-mismatch",
 	IDENTITY_MISMATCH: "identity-mismatch",
 	URL_INVALID: "url-invalid",
 	PAIRING_REJECTED: "pairing-rejected",
+};
+
+// Stable native close-reason tokens (from `TransportStateEvent.fatalReason`) → fatal UI states.
+// These arrive on the WebSocket close path (server revoke / rejected upgrade), which does NOT surface
+// as a native reject code, so they must be consulted separately when a connection drops or a
+// handshake fails.
+const fatalReasonMap: Record<string, FatalConnectionCode> = {
+	AUTH_REVOKED: "auth-revoked",
+	AUTH_FAILED: "auth-failed",
+	PROTOCOL_MISMATCH: "protocol-mismatch",
 };
 
 const rpcLimits = resolveRpcLimits({
@@ -168,35 +180,42 @@ export class ConnectionController {
 				await connection.dispose();
 				return;
 			}
-			const result = await this.#transport.connect();
-			if (token !== this.#generationToken) {
-				await connection.dispose();
-				return;
+			try {
+				const result = await this.#transport.connect();
+				if (token !== this.#generationToken) {
+					await connection.dispose();
+					return;
+				}
+				connection.bind(result.connectionId);
+				const bus = new MobileEventBus();
+				const peer = await this.#handshake({
+					connection,
+					localIdentity: result.localIdentity,
+					expectedServerIdentity: result.serverIdentity,
+					limits: rpcLimits,
+					handlers: buildMobileRpcHandlers(bus),
+					methodAllowlist: mobileInboundAllowlist,
+					onClose: () => {
+						this.#handlePeerClose(token, binding);
+					},
+				});
+				if (token !== this.#generationToken) {
+					peer.close(1000, "Superseded.");
+					await connection.dispose();
+					return;
+				}
+				this.#connection = connection;
+				this.#peer = peer;
+				this.#bus = bus;
+				this.#setState({ kind: "connected", binding, client: new MobileProductClient(peer), bus });
+			} catch (error) {
+				// Any failure/abort after the provisional connection exists must dispose it — removing
+				// its plugin listeners and closing the native socket — so a failed attempt never leaks
+				// listeners or leaves a live socket behind.
+				await this.#handleConnectFailure(token, binding, error, connection);
 			}
-			connection.bind(result.connectionId);
-			const bus = new MobileEventBus();
-			const peer = await this.#handshake({
-				connection,
-				localIdentity: result.localIdentity,
-				expectedServerIdentity: result.serverIdentity,
-				limits: rpcLimits,
-				handlers: buildMobileRpcHandlers(bus),
-				methodAllowlist: mobileInboundAllowlist,
-				onClose: () => {
-					this.#handlePeerClose(token, binding);
-				},
-			});
-			if (token !== this.#generationToken) {
-				peer.close(1000, "Superseded.");
-				await connection.dispose();
-				return;
-			}
-			this.#connection = connection;
-			this.#peer = peer;
-			this.#bus = bus;
-			this.#setState({ kind: "connected", binding, client: new MobileProductClient(peer), bus });
 		} catch (error) {
-			await this.#handleConnectFailure(token, binding, error);
+			await this.#handleConnectFailure(token, binding, error, null);
 		}
 	}
 
@@ -204,8 +223,20 @@ export class ConnectionController {
 		token: number,
 		binding: MobileTransportBinding,
 		error: unknown,
+		connection: NativeRpcConnection | null,
 	): Promise<void> {
+		// A stable native close-reason captured on the provisional connection outranks the thrown
+		// error: a fatal WSS close (revoke / rejected upgrade) surfaces to the handshake only as a
+		// generic "connection closed" error, so classify it from the token, not the message.
+		const fatalReason = connection?.fatalReason ?? null;
+		if (connection) {
+			await connection.dispose();
+		}
 		if (token !== this.#generationToken || this.#disposed) {
+			return;
+		}
+		if (fatalReason && fatalReasonMap[fatalReason]) {
+			this.#setState({ kind: "error", code: fatalReasonMap[fatalReason], binding });
 			return;
 		}
 		const code = errorCode(error);
@@ -229,7 +260,16 @@ export class ConnectionController {
 		}
 		this.#peer = null;
 		this.#bus = null;
-		// Verify the binding still exists (a close could be a server-side revocation) before retrying.
+		// A stable fatal close-reason (server revoke / rejected upgrade) means the client must stop
+		// blind reconnecting, clear business state, and surface a Desktop-reauthorize / unpair prompt.
+		const fatalReason = this.#connection?.fatalReason ?? null;
+		if (fatalReason && fatalReasonMap[fatalReason]) {
+			void this.#teardownConnection();
+			this.#setState({ kind: "error", code: fatalReasonMap[fatalReason], binding });
+			return;
+		}
+		// Otherwise re-check the binding: a close could still be a server-side revocation that only
+		// shows up as the binding being gone. Anything else is transient — reconnect.
 		void this.#transport
 			.getStatus()
 			.then((status) => {
@@ -237,6 +277,7 @@ export class ConnectionController {
 					return;
 				}
 				if (status.state === "unpaired") {
+					void this.#teardownConnection();
 					this.#setState({ kind: "error", code: "auth-revoked", binding });
 					return;
 				}

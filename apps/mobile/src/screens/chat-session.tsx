@@ -9,7 +9,6 @@ import { useWorkspace } from "../app/workspace";
 import { ApprovalCard } from "../components/approval-card";
 import { CenteredState, LoadingState } from "../components/layout";
 import { ChatSessionController } from "../rpc/chat-session-controller";
-import { newUuid } from "../lib/uuid";
 
 function modelKey(providerId: string, modelId: string): string {
 	return `${providerId}\u0000${modelId}`;
@@ -130,10 +129,12 @@ export function ChatSessionScreen() {
 		}
 		setSending(true);
 		try {
-			await controller.send(content, newUuid());
+			// The controller owns the requestId reservation: retrying the same draft reuses it so the
+			// server dedupes to one run; only editing the draft mints a new id.
+			await controller.send(content);
 			setDraft("");
 		} catch {
-			/* Do not auto-resend an unknown send; leave the draft for the user to retry. */
+			/* Do not auto-resend an unknown send; leave the draft so a Retry reuses the same requestId. */
 		} finally {
 			setSending(false);
 		}
@@ -195,6 +196,14 @@ export function ChatSessionScreen() {
 			</div>
 
 			<div className="composer-inset border-t border-[var(--line)] bg-[var(--surface)] px-3 pt-2">
+				{view.pendingSendAmbiguous ? (
+					<div
+						role="status"
+						className="mb-2 rounded-md bg-[var(--warning-soft,var(--surface-muted))] px-2 py-1 text-xs text-[var(--text-muted)]"
+					>
+						{t("chat.composer.retryHint")}
+					</div>
+				) : null}
 				<div className="mb-2 flex items-center gap-2 overflow-x-auto text-xs">
 					<label className="flex items-center gap-1 text-[var(--text-muted)]">
 						<span className="sr-only">{t("chat.model")}</span>

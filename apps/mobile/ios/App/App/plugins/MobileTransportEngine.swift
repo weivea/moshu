@@ -9,7 +9,8 @@ protocol MobileTransportEngineDelegate: AnyObject {
 		connectionId: String,
 		state: String,
 		code: Int?,
-		reason: String?
+		reason: String?,
+		fatalReason: String?
 	)
 }
 
@@ -34,6 +35,7 @@ final class MobileTransportEngine: NSObject {
 	private var webSocketTask: URLSessionWebSocketTask?
 	private var activeConnectionId: String?
 	private let inboundSequencer = InboundFrameSequencer()
+	private let inboundGuard = InboundFrameGuard.productDefault
 	private let outboundQueue = OutboundFrameQueue()
 
 	init(service: String = "dev.moshu.mobile") {
@@ -195,18 +197,17 @@ final class MobileTransportEngine: NSObject {
 
 		return [
 			"connectionId": connectionId,
-			"localIdentity": [
-				"role": "mobile-client",
-				"peerId": binding.mobileClientId,
-				"instanceId": instanceId,
-				"generation": generation,
-			],
-			"serverIdentity": [
-				"role": challenge.rpcIdentity.role,
-				"peerId": challenge.rpcIdentity.peerId,
-				"instanceId": challenge.rpcIdentity.instanceId,
-				"generation": challenge.rpcIdentity.generation,
-			],
+			"localIdentity": MobileHandshakeIdentity.local(
+				binding: binding,
+				instanceId: instanceId,
+				generation: generation
+			).asDictionary(),
+			"serverIdentity": MobileHandshakeIdentity.server(
+				role: challenge.rpcIdentity.role,
+				peerId: challenge.rpcIdentity.peerId,
+				instanceId: challenge.rpcIdentity.instanceId,
+				generation: challenge.rpcIdentity.generation
+			).asDictionary(),
 			"negotiatedProtocolVersion": challenge.negotiatedProtocolVersion,
 			"transportSecurity": challenge.transportSecurity,
 		]
@@ -269,7 +270,7 @@ final class MobileTransportEngine: NSObject {
 		activeConnectionId = connectionId
 		inboundSequencer.activate(connectionId: connectionId)
 		task.resume()
-		delegate?.transportDidChangeState(connectionId: connectionId, state: "open", code: nil, reason: nil)
+		delegate?.transportDidChangeState(connectionId: connectionId, state: "open", code: nil, reason: nil, fatalReason: nil)
 		receiveNext(connectionId: connectionId)
 	}
 
@@ -282,31 +283,66 @@ final class MobileTransportEngine: NSObject {
 				case let .success(message):
 					switch message {
 					case let .string(text):
-						if let seq = self.inboundSequencer.nextSequence(for: connectionId) {
-							self.delegate?.transportDidReceiveFrame(connectionId: connectionId, seq: seq, text: text)
+						// Enforce the inbound byte budget (UTF-8, not character count) BEFORE bridging.
+						switch self.inboundGuard.evaluateText(text) {
+						case .accept:
+							if let seq = self.inboundSequencer.nextSequence(for: connectionId) {
+								self.delegate?.transportDidReceiveFrame(connectionId: connectionId, seq: seq, text: text)
+							}
+							self.receiveNext(connectionId: connectionId)
+						case .rejectOversize:
+							// Oversized frame: protocol-close with a stable code and stop the loop.
+							self.teardown(connectionId: connectionId, code: 1009, reason: "inbound-frame-too-large")
+						case .rejectBinary:
+							break
 						}
 					case .data:
-						// Binary frames are not part of the text-only RPC transport; drop them.
-						break
+						// Binary frames are not part of the text-only RPC transport. Protocol-close
+						// instead of silently consuming, so a misbehaving peer can't smuggle data.
+						self.teardown(connectionId: connectionId, code: 1003, reason: "binary-frame-rejected")
 					@unknown default:
-						break
+						self.receiveNext(connectionId: connectionId)
 					}
-					self.receiveNext(connectionId: connectionId)
 				case .failure:
-					self.teardown(connectionId: connectionId, code: nil, reason: "receive-failed")
+					// Derive a stable, non-secret close reason from the numeric close code / HTTP upgrade
+					// status only — never from the (localized) error string. This lets JS distinguish a
+					// server revoke (1008) or an auth/protocol rejection (401/403/426) from a transient
+					// drop and stop blind reconnecting on the fatal cases.
+					let closeCode = self.webSocketTask?.closeCode.rawValue
+					let httpStatus = (self.webSocketTask?.response as? HTTPURLResponse)?.statusCode
+					let classification = MobileConnectionCloseClassifier.classify(
+						closeCode: closeCode,
+						httpStatus: httpStatus
+					)
+					self.teardown(
+						connectionId: connectionId,
+						code: closeCode,
+						reason: "receive-failed",
+						fatalReason: classification.isFatal ? classification : nil
+					)
 				}
 			}
 		}
 	}
 
-	private func teardown(connectionId: String, code: Int?, reason: String?) {
+	private func teardown(
+		connectionId: String,
+		code: Int?,
+		reason: String?,
+		fatalReason: MobileConnectionCloseReason? = nil
+	) {
 		guard connectionId == activeConnectionId else { return }
-		delegate?.transportDidChangeState(connectionId: connectionId, state: "closing", code: code, reason: reason)
+		let fatal = fatalReason?.isFatal == true ? fatalReason?.rawValue : nil
+		delegate?.transportDidChangeState(
+			connectionId: connectionId, state: "closing", code: code, reason: reason, fatalReason: fatal
+		)
 		webSocketTask?.cancel(with: .goingAway, reason: reason?.data(using: .utf8))
 		webSocketTask = nil
 		activeConnectionId = nil
 		inboundSequencer.deactivate(connectionId: connectionId)
-		delegate?.transportDidChangeState(connectionId: connectionId, state: "closed", code: code, reason: reason)
+		delegate?.transportDidChangeState(
+			connectionId: connectionId, state: "closed", code: code, reason: reason, fatalReason: fatal
+		)
 	}
 
 	// MARK: Serial execution helper

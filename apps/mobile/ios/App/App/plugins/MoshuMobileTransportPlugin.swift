@@ -130,10 +130,11 @@ public class MoshuMobileTransportPlugin: CAPPlugin, CAPBridgedPlugin, MobileTran
 		notifyListeners("frame", data: ["connectionId": connectionId, "seq": seq, "text": text])
 	}
 
-	func transportDidChangeState(connectionId: String, state: String, code: Int?, reason: String?) {
+	func transportDidChangeState(connectionId: String, state: String, code: Int?, reason: String?, fatalReason: String?) {
 		var data: [String: Any] = ["connectionId": connectionId, "state": state]
 		if let code = code { data["code"] = code }
 		if let reason = reason { data["reason"] = reason }
+		if let fatalReason = fatalReason { data["fatalReason"] = fatalReason }
 		notifyListeners("connectionState", data: data)
 	}
 

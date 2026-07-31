@@ -1,16 +1,23 @@
 import type { ChatEventDelivery } from "@moshu/contracts";
+import { RpcRemoteError } from "@moshu/process-rpc-core";
 import { describe, expect, it } from "vitest";
 import { ChatSessionController } from "../src/rpc/chat-session-controller";
 import { MobileEventBus } from "../src/rpc/events";
 import {
 	makeAssistantMessage,
 	makeFakeChatClient,
+	makePagedSnapshot,
 	makeRun,
 	makeSessionPage,
+	makeUserMessage,
 	messageCompletedEvent,
 	messageDeltaEvent,
 	v7,
 } from "./helpers";
+
+function remoteError(code: string): RpcRemoteError {
+	return new RpcRemoteError("req", { code, message: `${code} rejected` });
+}
 
 function emitChat(bus: MobileEventBus, event: unknown): void {
 	bus.emit("chatEvent", { event } as ChatEventDelivery);
@@ -86,18 +93,27 @@ describe("ChatSessionController recovery drain", () => {
 		expect(controller.getView().messages[0]?.content).toBe("live");
 	});
 
-	it("forwards the caller requestId for idempotent sends and unsubscribes on dispose", async () => {
+	it("owns a generated requestId for idempotent sends and unsubscribes on dispose", async () => {
 		const sessionId = v7();
 		const snapshot = makeSessionPage(sessionId);
 		const { client, script } = makeFakeChatClient({ sessionId, snapshot });
 		const bus = new MobileEventBus();
-		const controller = new ChatSessionController({ client, bus, sessionId, onChange: () => {} });
+		let seq = 0;
+		const controller = new ChatSessionController({
+			client,
+			bus,
+			sessionId,
+			onChange: () => {},
+			generateRequestId: () => `req-${++seq}`,
+		});
 		await controller.start();
 
-		await controller.send("hello there", "req-123");
-		expect(script.sendCalls).toEqual([{ requestId: "req-123", content: "hello there" }]);
+		await controller.send("hello there");
+		expect(script.sendCalls).toEqual([{ requestId: "req-1", content: "hello there" }]);
 		// The user message is seeded immediately without waiting for an event.
 		expect(controller.getView().messages.some((m) => m.role === "user")).toBe(true);
+		// A definitive success releases the reservation, so the next distinct send uses a fresh id.
+		expect(controller.hasPendingSend()).toBe(false);
 
 		await controller.dispose();
 		expect(script.unsubscribes).toEqual([sessionId]);
@@ -116,5 +132,176 @@ describe("ChatSessionController recovery drain", () => {
 		await controller.start();
 		await controller.cancel();
 		expect(script.cancelCalls).toEqual([{ runId }]);
+	});
+});
+
+describe("ChatSessionController history pagination (f6)", () => {
+	it("drains every page so more than 2 runs — including the active run on the last page — load", async () => {
+		const sessionId = v7();
+		// Layer 3 caps a page at 2 runs and orders oldest→newest, so the active run is on the LAST
+		// page. Three pages here would be invisible if the controller only fetched the first page.
+		const oldRun1 = v7();
+		const oldRun2 = v7();
+		const oldRun3 = v7();
+		const activeRun = v7();
+		const msgOld = v7();
+		const msgActive = v7();
+		const getPage = makePagedSnapshot(sessionId, [
+			{
+				runs: [makeRun(oldRun1, sessionId, "completed"), makeRun(oldRun2, sessionId, "completed")],
+				messages: [makeAssistantMessage(msgOld, sessionId, 1, "oldest", "complete")],
+				eventCursors: [{ runId: oldRun1, lastSeq: 3 }],
+			},
+			{
+				runs: [makeRun(oldRun3, sessionId, "completed"), makeRun(activeRun, sessionId, "running")],
+				messages: [makeAssistantMessage(msgActive, sessionId, 2, "live", "streaming")],
+				eventCursors: [{ runId: activeRun, lastSeq: 5 }],
+			},
+		]);
+		const { client, script } = makeFakeChatClient({ sessionId, snapshot: makeSessionPage(sessionId), getPage });
+		const bus = new MobileEventBus();
+		const controller = new ChatSessionController({ client, bus, sessionId, onChange: () => {} });
+		await controller.start();
+
+		const view = controller.getView();
+		expect(view.phase).toBe("ready");
+		// It followed nextCursor: first page with no cursor, then "p1".
+		expect(script.pageCalls).toEqual([undefined, "p1"]);
+		// The active run is present (responding true only if the streaming run was ingested).
+		expect(view.responding).toBe(true);
+		expect(view.messages.map((m) => m.content)).toContain("live");
+	});
+
+	it("fails closed when the pagination cursor does not advance (loops)", async () => {
+		const sessionId = v7();
+		const runId = v7();
+		// A broken server that always echoes the same nextCursor must not loop forever.
+		const getPage = (): ReturnType<typeof makeSessionPage> =>
+			makeSessionPage(sessionId, {
+				runs: [makeRun(runId, sessionId, "running")],
+				nextCursor: "stuck",
+			});
+		const { client } = makeFakeChatClient({ sessionId, snapshot: makeSessionPage(sessionId), getPage });
+		const bus = new MobileEventBus();
+		const controller = new ChatSessionController({ client, bus, sessionId, onChange: () => {} });
+		await controller.start();
+
+		expect(controller.getView().phase).toBe("error");
+	});
+});
+
+describe("ChatSessionController send reservation (f7)", () => {
+	function makeController(options: {
+		sessionId: string;
+		ids: string[];
+		send?: (content: string, requestId: string) => never | ReturnType<typeof successResult>;
+	}) {
+		const idQueue = [...options.ids];
+		const { client, script } = makeFakeChatClient({
+			sessionId: options.sessionId,
+			snapshot: makeSessionPage(options.sessionId),
+			...(options.send ? { send: options.send } : {}),
+		});
+		const bus = new MobileEventBus();
+		const controller = new ChatSessionController({
+			client,
+			bus,
+			sessionId: options.sessionId,
+			onChange: () => {},
+			generateRequestId: () => idQueue.shift() ?? "exhausted",
+		});
+		return { controller, script };
+	}
+
+	function successResult(sessionId: string, content: string) {
+		return {
+			run: makeRun(v7(), sessionId, "running"),
+			userMessage: makeUserMessage(v7(), sessionId, 1, content),
+			assistantMessage: makeAssistantMessage(v7(), sessionId, 2, "", "streaming"),
+		};
+	}
+
+	it("reuses the same requestId when retrying after an ambiguous (lost) response", async () => {
+		const sessionId = v7();
+		let attempt = 0;
+		const { controller, script } = makeController({
+			sessionId,
+			ids: ["req-A", "req-B"],
+			send: (content) => {
+				attempt += 1;
+				if (attempt === 1) {
+					// First attempt: the server may have accepted it, but the response was lost.
+					throw new Error("socket dropped");
+				}
+				return successResult(sessionId, content);
+			},
+		});
+		await controller.start();
+
+		await expect(controller.send("hello")).rejects.toThrow();
+		expect(controller.hasPendingSend()).toBe(true);
+		expect(controller.getView().pendingSendAmbiguous).toBe(true);
+
+		// Retry of the SAME content must reuse req-A so the server dedupes to one run.
+		await controller.send("hello");
+		expect(script.sendCalls).toEqual([
+			{ requestId: "req-A", content: "hello" },
+			{ requestId: "req-A", content: "hello" },
+		]);
+		expect(controller.hasPendingSend()).toBe(false);
+	});
+
+	it("mints a new requestId after a definitive rejection", async () => {
+		const sessionId = v7();
+		let attempt = 0;
+		const { controller, script } = makeController({
+			sessionId,
+			ids: ["req-A", "req-B"],
+			send: (content) => {
+				attempt += 1;
+				if (attempt === 1) {
+					// INVALID_ARGUMENT definitively proves no run was created.
+					throw remoteError("INVALID_ARGUMENT");
+				}
+				return successResult(sessionId, content);
+			},
+		});
+		await controller.start();
+
+		await expect(controller.send("hello")).rejects.toBeInstanceOf(RpcRemoteError);
+		expect(controller.hasPendingSend()).toBe(false);
+
+		await controller.send("hello");
+		expect(script.sendCalls).toEqual([
+			{ requestId: "req-A", content: "hello" },
+			{ requestId: "req-B", content: "hello" },
+		]);
+	});
+
+	it("mints a new requestId when the user edits the draft after an ambiguous send", async () => {
+		const sessionId = v7();
+		let attempt = 0;
+		const { controller, script } = makeController({
+			sessionId,
+			ids: ["req-A", "req-B"],
+			send: (content) => {
+				attempt += 1;
+				if (attempt === 1) {
+					throw new Error("timeout");
+				}
+				return successResult(sessionId, content);
+			},
+		});
+		await controller.start();
+
+		await expect(controller.send("hello")).rejects.toThrow();
+		expect(controller.hasPendingSend()).toBe(true);
+
+		// The user edited the content — a new request, since the old one's result is unknown.
+		await controller.send("hello world");
+		expect(script.sendCalls).toEqual([
+			{ requestId: "req-A", content: "hello" },
+			{ requestId: "req-B", content: "hello world" },
+		]);
 	});
 });

@@ -60,4 +60,48 @@ describe("NativeRpcConnection frame discipline", () => {
 		connection.bind("conn-4");
 		expect(closes).toEqual([1011]);
 	});
+
+	it("fails closed when the pre-bind frame buffer overflows its count bound", async () => {
+		const transport = new FakeTransport();
+		const connection = await NativeRpcConnection.create(transport);
+		connection.setFrameSink(() => {});
+
+		// Flood frames before bind(); after the 64-frame bound is exceeded the socket is closed 1009.
+		for (let seq = 1; seq <= 65; seq += 1) {
+			transport.pushFrame({ connectionId: "conn-1", seq, text: "x" });
+		}
+
+		expect(connection.isOpen()).toBe(false);
+		expect(transport.closeArgs.some((c) => c.code === 1009)).toBe(true);
+	});
+
+	it("captures a fatal close reason so the controller can stop retrying", async () => {
+		const transport = new FakeTransport();
+		const connection = await NativeRpcConnection.create(transport);
+		connection.setCloseSink(() => {});
+		connection.bind("conn-1");
+
+		transport.pushState({
+			connectionId: "conn-1",
+			state: "closed",
+			code: 1008,
+			reason: "revoked",
+			fatalReason: "AUTH_REVOKED",
+		});
+		expect(connection.fatalReason).toBe("AUTH_REVOKED");
+	});
+
+	it("closes the native socket and removes listeners on dispose", async () => {
+		const transport = new FakeTransport();
+		const connection = await NativeRpcConnection.create(transport);
+		connection.bind("conn-1");
+		expect(transport.activeFrameListenerCount).toBe(1);
+		expect(transport.activeStateListenerCount).toBe(1);
+
+		await connection.dispose();
+
+		expect(transport.activeFrameListenerCount).toBe(0);
+		expect(transport.activeStateListenerCount).toBe(0);
+		expect(transport.closeArgs.some((c) => c.connectionId === "conn-1")).toBe(true);
+	});
 });

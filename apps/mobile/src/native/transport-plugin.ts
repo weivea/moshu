@@ -101,6 +101,12 @@ export interface TransportStateEvent {
 	readonly state: TransportConnectionState;
 	readonly code?: number;
 	readonly reason?: string;
+	/**
+	 * A stable, non-localized token classifying a permanent failure the client cannot fix by
+	 * retrying: `AUTH_REVOKED` (server closed a live device with WS 1008), `AUTH_FAILED` (upgrade
+	 * rejected 401/403), or `PROTOCOL_MISMATCH` (upgrade 426). Absent for transient/benign closes.
+	 */
+	readonly fatalReason?: string;
 }
 
 export type MobileTransportEventName = "frame" | "connectionState";

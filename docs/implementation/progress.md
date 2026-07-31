@@ -86,11 +86,18 @@ Agent Server
   URLSession claim/轮询 status → 核对 server 公钥指纹后原子持久化；重连持久单调 generation、每连接新 instanceId，
   验证 Agent Server challenge 签名后用设备 key 签 canonical upgrade payload，经 `URLSessionWebSocketTask` 带
   `x-moshu-*` headers 连 WSS，帧按 connectionId + 单调 sequence 上送、限制帧/队列大小、拒绝 binary、丢弃旧连接。
-  canonical payload 有从 TS contracts 固定的共享 test vectors，Swift `MoshuMobileCore` 纯包（30 XCTest）验证
-  Swift/TS 逐字节一致、SPKI DER、base64url、challenge 签名、generation 递增、单绑定/unpair 与帧序列/限额；
-  Web 侧 47 Vitest（native plugin mock、pairing 状态、断线清业务态、无持久化、RPC schema/allowlist、
+  canonical payload 有从 TS contracts 固定的共享 test vectors，Swift `MoshuMobileCore` 纯包（47 XCTest）验证
+  Swift/TS 逐字节一致、SPKI DER、base64url、challenge 签名、generation 递增/并发原子、单绑定/unpair、
+  hello identity（含 deviceKeyId）、close code 分类与入站帧限额；
+  Web 侧 60 Vitest（native plugin mock、pairing 状态、断线清业务态、无持久化、RPC schema/allowlist、
   subscribe/replay 边界、stream/cancel、approval race/allow-all、Projects、RuntimeBox 独立选择、
-  responsive/键盘、i18n parity）。iOS simulator `xcodebuild`（禁签名）构建通过。传输边界仍是 relay TLS +
+  responsive/键盘、i18n parity、hello 握手 accepted、fatal-auth 关闭无盲重连、pre-bind 溢出、历史分页、
+  ambiguous-send 幂等）。iOS simulator `xcodebuild`（禁签名）构建通过。**PR #8 审查加固**：hello 必含
+  `deviceKeyId`；致命关闭按 close code/HTTP 状态数值分类（1008→AUTH_REVOKED、401/403→AUTH_FAILED、
+  426→PROTOCOL_MISMATCH）并停止盲重连清业务态；失败路径必 dispose provisional connection、pre-bind buffer
+  有界 fail-closed；Keychain `set` update-not-delete-then-add、generation 并发 distinct/单调；入站按 UTF-8
+  字节限帧、binary protocol-close；chat 历史按 nextCursor 分页含 active run；send 复用 requestId 幂等重试。
+  传输边界仍是 relay TLS +
   应用设备签名（relay 可见），Noise 端到端与后台/suspended 可靠通知属 Layer 5。
 - Agent Server 管理 Dev Tunnel Microsoft device-code 登录、持久 cluster-qualified Tunnel ID、
   单一 Anonymous HTTP ingress port、Host watchdog、重建/修复、取消和重试；Product RPC 不暴露到 Tunnel。

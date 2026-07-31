@@ -10,6 +10,14 @@ type FrameSink = (text: string) => void;
 type CloseSink = (code: number, reason: string) => void;
 
 /**
+ * Hard bounds on the pre-bind frame buffer. Frames can legitimately arrive between `create()` and
+ * `bind()` (a handful, at most), so a flood before bind is pathological and is failed closed rather
+ * than buffered unboundedly.
+ */
+const MAX_PREBIND_FRAMES = 64;
+const MAX_PREBIND_BYTES = 1_048_576;
+
+/**
  * Bridges the native `MoshuMobileTransport` plugin to the browser-safe {@link RpcSocketTransport}
  * the {@link RpcPeer} drives. It is created BEFORE `connect()` so it never misses an early frame:
  * it registers the plugin listeners immediately and buffers frames until {@link bind} supplies the
@@ -24,9 +32,11 @@ export class NativeRpcConnection implements RpcSocketTransport {
 	#frameSink: FrameSink | null = null;
 	#closeSink: CloseSink | null = null;
 	#buffered: TransportFrameEvent[] = [];
+	#bufferedBytes = 0;
 	#frameHandle: MobileTransportListenerHandle | null = null;
 	#stateHandle: MobileTransportListenerHandle | null = null;
 	#pendingClose: TransportStateEvent | null = null;
+	#fatalReason: string | null = null;
 
 	private constructor(plugin: MobileTransportPlugin) {
 		this.#plugin = plugin;
@@ -44,11 +54,21 @@ export class NativeRpcConnection implements RpcSocketTransport {
 		return connection;
 	}
 
+	/**
+	 * The stable fatal-close token (AUTH_REVOKED / AUTH_FAILED / PROTOCOL_MISMATCH) observed on the
+	 * native `connectionState` close event, or null for a transient/benign close. The controller
+	 * reads this to decide whether to stop reconnecting.
+	 */
+	get fatalReason(): string | null {
+		return this.#fatalReason;
+	}
+
 	/** Locks the connection to a specific native connectionId and flushes any buffered frames. */
 	bind(connectionId: string): void {
 		this.#connectionId = connectionId;
 		const buffered = this.#buffered;
 		this.#buffered = [];
+		this.#bufferedBytes = 0;
 		for (const event of buffered) {
 			this.#onFrame(event);
 		}
@@ -78,7 +98,17 @@ export class NativeRpcConnection implements RpcSocketTransport {
 
 	#onFrame(event: TransportFrameEvent): void {
 		if (this.#connectionId === null) {
+			// Bound pre-bind buffer: overflow fails closed rather than accumulating unboundedly.
+			const bytes = utf8ByteLength(event.text);
+			if (
+				this.#buffered.length >= MAX_PREBIND_FRAMES ||
+				this.#bufferedBytes + bytes > MAX_PREBIND_BYTES
+			) {
+				this.#failPrebind(event.connectionId);
+				return;
+			}
 			this.#buffered.push(event);
+			this.#bufferedBytes += bytes;
 			return;
 		}
 		if (event.connectionId !== this.#connectionId) {
@@ -91,9 +121,28 @@ export class NativeRpcConnection implements RpcSocketTransport {
 		this.#frameSink?.(event.text);
 	}
 
+	/**
+	 * A pre-bind buffer overflow is a protocol violation by the peer. Close the offending native
+	 * socket and mark this connection unusable so the imminent handshake `send(hello)` throws and the
+	 * controller tears the attempt down.
+	 */
+	#failPrebind(connectionId: string): void {
+		this.#open = false;
+		this.#buffered = [];
+		this.#bufferedBytes = 0;
+		void this.#plugin
+			.close({ connectionId, code: 1009, reason: "prebind-overflow" })
+			.catch(() => {
+				// Best-effort; the connection is already logically closed.
+			});
+	}
+
 	#onState(event: TransportStateEvent): void {
 		if (event.state !== "closed") {
 			return;
+		}
+		if (event.fatalReason) {
+			this.#fatalReason = event.fatalReason;
 		}
 		if (this.#connectionId === null) {
 			this.#pendingClose = event;
@@ -144,9 +193,42 @@ export class NativeRpcConnection implements RpcSocketTransport {
 		this.#open = false;
 		this.#frameSink = null;
 		this.#closeSink = null;
+		this.#buffered = [];
+		this.#bufferedBytes = 0;
+		// Close the underlying native socket if one was bound, so a disposed (failed/superseded)
+		// attempt never leaves a live socket behind.
+		if (this.#connectionId !== null) {
+			void this.#plugin
+				.close({ connectionId: this.#connectionId, code: 1000, reason: "disposed" })
+				.catch(() => {
+					// Best-effort; the socket may already be gone.
+				});
+		}
 		await Promise.resolve(this.#frameHandle?.remove());
 		await Promise.resolve(this.#stateHandle?.remove());
 		this.#frameHandle = null;
 		this.#stateHandle = null;
 	}
+}
+
+function utf8ByteLength(text: string): number {
+	if (typeof TextEncoder !== "undefined") {
+		return new TextEncoder().encode(text).length;
+	}
+	// Fallback for environments without TextEncoder: count UTF-8 bytes manually.
+	let bytes = 0;
+	for (let i = 0; i < text.length; i += 1) {
+		const code = text.charCodeAt(i);
+		if (code < 0x80) {
+			bytes += 1;
+		} else if (code < 0x800) {
+			bytes += 2;
+		} else if (code >= 0xd800 && code <= 0xdbff) {
+			bytes += 4;
+			i += 1;
+		} else {
+			bytes += 3;
+		}
+	}
+	return bytes;
 }

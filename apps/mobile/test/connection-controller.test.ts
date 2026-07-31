@@ -183,4 +183,72 @@ describe("ConnectionController", () => {
 		expect(transport.unpairCalls).toBe(1);
 		expect(controller.getState().kind).toBe("unpaired");
 	});
+
+	it("maps a fatal WS close (AUTH_REVOKED) to auth-revoked without a blind retry, even while still paired", async () => {
+		const transport = new FakeTransport();
+		transport.status = { state: "paired", binding: makeBinding() };
+		const { handshake, captured } = fakeHandshake();
+		const controller = makeController(transport, handshake);
+		await controller.init();
+		expect(controller.getState().kind).toBe("connected");
+
+		// The native layer captured a WS 1008 close and classified it AUTH_REVOKED. The binding is
+		// still present (server hasn't been re-polled), so the ONLY signal is the fatalReason.
+		transport.pushState({
+			connectionId: "conn-1",
+			state: "closed",
+			code: 1008,
+			reason: "revoked",
+			fatalReason: "AUTH_REVOKED",
+		});
+		captured.onClose?.({ code: 1008, reason: "revoked" });
+		await Promise.resolve();
+		await Promise.resolve();
+
+		const state = controller.getState();
+		expect(state.kind).toBe("error");
+		expect(state.kind === "error" && state.code).toBe("auth-revoked");
+		// No getStatus-driven reconnect was scheduled: the state stays fatal.
+		expect("client" in state).toBe(false);
+	});
+
+	it("maps a fatal WS close (AUTH_FAILED) to a fatal auth-failed state", async () => {
+		const transport = new FakeTransport();
+		transport.status = { state: "paired", binding: makeBinding() };
+		const { handshake, captured } = fakeHandshake();
+		const controller = makeController(transport, handshake);
+		await controller.init();
+
+		transport.pushState({
+			connectionId: "conn-1",
+			state: "closed",
+			code: 1008,
+			reason: "auth failed",
+			fatalReason: "AUTH_FAILED",
+		});
+		captured.onClose?.({ code: 1008, reason: "auth failed" });
+		await Promise.resolve();
+		await Promise.resolve();
+
+		const state = controller.getState();
+		expect(state.kind).toBe("error");
+		expect(state.kind === "error" && state.code).toBe("auth-failed");
+	});
+
+	it("disposes the provisional connection on every failed attempt so listeners do not leak", async () => {
+		const transport = new FakeTransport();
+		transport.status = { state: "paired", binding: makeBinding() };
+		transport.connectResult = new Error("network down");
+		const { handshake } = fakeHandshake();
+		const controller = makeController(transport, handshake);
+
+		await controller.init();
+		expect(controller.getState().kind).toBe("offline");
+		// Retry several more times; each failed attempt must remove the frame+state listeners it added.
+		for (let i = 0; i < 5; i += 1) {
+			await controller.retry();
+		}
+		expect(transport.activeFrameListenerCount).toBe(0);
+		expect(transport.activeStateListenerCount).toBe(0);
+	});
 });

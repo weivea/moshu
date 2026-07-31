@@ -71,6 +71,10 @@ public final class DeviceIdentityRepository {
 	}
 
 	private let store: SecretStore
+	// Serializes the read-modify-write mutations (generation bump, save, unpair) so two concurrent
+	// callers can't both read the same generation and persist a duplicate, and so a save/unpair is
+	// never interleaved. Keychain writes complete before the lock is released.
+	private let mutationLock = NSLock()
 
 	public init(store: SecretStore) {
 		self.store = store
@@ -90,6 +94,8 @@ public final class DeviceIdentityRepository {
 	/// Atomically persists the device key + binding. Refuses to overwrite an existing binding — the
 	/// caller must `unpair()` first. This is the single-binding guarantee.
 	public func saveBinding(_ binding: MobileBinding, deviceKey: Ed25519DeviceKey) throws {
+		mutationLock.lock()
+		defer { mutationLock.unlock() }
 		if try hasBinding() {
 			throw MobileTransportError.alreadyPaired
 		}
@@ -118,9 +124,14 @@ public final class DeviceIdentityRepository {
 	}
 
 	/// Returns a strictly-increasing generation, persisting the new value. Each connection attempt
-	/// takes a fresh generation so an old, revoked generation can never be reused.
+	/// takes a fresh generation so an old, revoked generation can never be reused. The read →
+	/// increment → persist sequence is serialized under `mutationLock`, and the new value is written
+	/// to the store before returning, so concurrent callers get distinct, monotonic generations and a
+	/// failed write never advances (or regresses) the persisted value.
 	@discardableResult
 	public func nextGeneration() throws -> Int {
+		mutationLock.lock()
+		defer { mutationLock.unlock() }
 		let next = try currentGeneration() + 1
 		try store.set(Account.generation, data: Data(String(next).utf8))
 		return next
@@ -129,6 +140,8 @@ public final class DeviceIdentityRepository {
 	// MARK: Unpair
 
 	public func unpair() throws {
+		mutationLock.lock()
+		defer { mutationLock.unlock() }
 		try store.delete(Account.binding)
 		try store.delete(Account.privateKey)
 		try store.delete(Account.generation)

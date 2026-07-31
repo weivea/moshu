@@ -200,6 +200,7 @@ export function OfflineScreen() {
 
 const fatalCopy: Record<FatalConnectionCode, { title: MessageKey; body: MessageKey }> = {
 	"auth-revoked": { title: "error.authRevoked.title", body: "error.authRevoked.body" },
+	"auth-failed": { title: "error.authFailed.title", body: "error.authFailed.body" },
 	"protocol-mismatch": { title: "error.protocolMismatch.title", body: "error.protocolMismatch.body" },
 	"identity-mismatch": { title: "error.identityMismatch.title", body: "error.identityMismatch.body" },
 	"url-invalid": { title: "error.urlInvalid.title", body: "error.urlInvalid.body" },

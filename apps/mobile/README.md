@@ -81,6 +81,35 @@ prove Swift/TS canonical payloads are byte-for-byte identical. Note CryptoKit Ed
 signatures are randomized (not RFC 8032 deterministic), so the vectors assert
 cross-implementation **verification**, not signature byte-equality.
 
+## Correctness hardening (PR #8 review pass)
+
+A post-implementation review tightened seven correctness/robustness edges; all are
+covered by tests:
+
+- **Hello identity** — the native `connect()` result and the JS hello now carry
+  `deviceKeyId`, so the process-rpc hello exact-matches the Layer 3 authenticated
+  canonical identity (server rejects otherwise).
+- **Fatal-auth close mapping** — the receive loop classifies close signals from the WS
+  close code / HTTP upgrade status only (never a localized string):
+  `1008 → AUTH_REVOKED`, `401/403 → AUTH_FAILED`, `426 → PROTOCOL_MISMATCH`. The
+  controller stops blind reconnecting on a fatal reason, clears business state, and
+  prompts to re-authorize / unpair.
+- **No provisional-connection leak** — every failed/aborted connect disposes the
+  `NativeRpcConnection` (removing plugin listeners, closing the native socket). The
+  pre-bind frame buffer is bounded by count and bytes and fails closed on overflow.
+- **Keychain generation atomicity** — `SecretStore.set` updates in place
+  (`SecItemUpdate`, `SecItemAdd` only when absent) instead of delete-then-add, and the
+  generation read→increment→persist is serialized so concurrent callers get distinct,
+  monotonic values and a failed write never regresses the old value.
+- **Inbound WS limits** — oversized (enforced on UTF-8 byte count) and binary frames are
+  protocol-closed before bridging, pre- and post-handshake.
+- **Session history pagination** — the chat controller drains `getSessionPage` via
+  `nextCursor` to the last page (which holds the active run), bounded by page/byte caps
+  and failing closed on a non-advancing cursor.
+- **Ambiguous-send idempotency** — the chat controller owns the `requestId` reservation:
+  a retry of the same draft reuses it (server dedupes to one run); a definitive rejection
+  or a content edit mints a new id.
+
 ## Status
 
 Layer 4 (this app) is implemented and builds. Background/suspended reliable

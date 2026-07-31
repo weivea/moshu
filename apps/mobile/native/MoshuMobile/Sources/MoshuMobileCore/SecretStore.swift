@@ -45,13 +45,24 @@ public final class KeychainSecretStore: SecretStore {
 	}
 
 	public func set(_ account: String, data: Data) throws {
-		// Delete any existing item first so we can set the accessibility attribute deterministically.
-		try? delete(account)
+		// Never delete-then-add: a failed add after a successful delete would lose the old value
+		// (e.g. wiping the persisted generation, which must never regress). Update in place when the
+		// item exists, and only add when it is genuinely absent. On any error the old value survives.
+		let updateStatus = SecItemUpdate(
+			baseQuery(account) as CFDictionary,
+			[kSecValueData as String: data] as CFDictionary
+		)
+		if updateStatus == errSecSuccess {
+			return
+		}
+		guard updateStatus == errSecItemNotFound else {
+			throw MobileTransportError.keychainFailure
+		}
 		var attributes = baseQuery(account)
 		attributes[kSecValueData as String] = data
 		attributes[kSecAttrAccessible as String] = kSecAttrAccessibleWhenUnlockedThisDeviceOnly
-		let status = SecItemAdd(attributes as CFDictionary, nil)
-		guard status == errSecSuccess else {
+		let addStatus = SecItemAdd(attributes as CFDictionary, nil)
+		guard addStatus == errSecSuccess else {
 			throw MobileTransportError.keychainFailure
 		}
 	}

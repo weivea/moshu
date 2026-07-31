@@ -224,8 +224,18 @@ export class FakeTransport implements MobileTransportPlugin {
 	unpairCalls = 0;
 	sent: string[] = [];
 	closed = 0;
+	/** Records every native `close()` call so tests can assert the close code (e.g. 1009 overflow). */
+	closeArgs: { connectionId: string; code: number; reason: string }[] = [];
 	readonly #frameListeners = new Set<(event: TransportFrameEvent) => void>();
 	readonly #stateListeners = new Set<(event: TransportStateEvent) => void>();
+
+	/** Number of frame/state listeners currently registered — used to detect listener leaks. */
+	get activeFrameListenerCount(): number {
+		return this.#frameListeners.size;
+	}
+	get activeStateListenerCount(): number {
+		return this.#stateListeners.size;
+	}
 
 	async getStatus(): Promise<MobileTransportStatus> {
 		return this.status;
@@ -252,8 +262,13 @@ export class FakeTransport implements MobileTransportPlugin {
 	async send(options: { connectionId: string; text: string }): Promise<void> {
 		this.sent.push(options.text);
 	}
-	async close(): Promise<void> {
+	async close(options: { connectionId: string; code?: number; reason?: string }): Promise<void> {
 		this.closed += 1;
+		this.closeArgs.push({
+			connectionId: options.connectionId,
+			code: options.code ?? 1000,
+			reason: options.reason ?? "",
+		});
 	}
 	async unpair(): Promise<void> {
 		this.unpairCalls += 1;
@@ -266,11 +281,21 @@ export class FakeTransport implements MobileTransportPlugin {
 	): MobileTransportListenerHandle;
 	addListener(eventName: string, listener: (event: never) => void): MobileTransportListenerHandle {
 		if (eventName === "frame") {
-			this.#frameListeners.add(listener as (event: TransportFrameEvent) => void);
-		} else {
-			this.#stateListeners.add(listener as (event: TransportStateEvent) => void);
+			const typed = listener as (event: TransportFrameEvent) => void;
+			this.#frameListeners.add(typed);
+			return {
+				remove: () => {
+					this.#frameListeners.delete(typed);
+				},
+			};
 		}
-		return { remove: () => {} };
+		const typed = listener as (event: TransportStateEvent) => void;
+		this.#stateListeners.add(typed);
+		return {
+			remove: () => {
+				this.#stateListeners.delete(typed);
+			},
+		};
 	}
 
 	pushFrame(event: TransportFrameEvent): void {
@@ -291,17 +316,25 @@ interface ChatClientScript {
 	replayCalls: { runId: string; lastSeq: number }[];
 	sendCalls: { requestId: string; content: string }[];
 	cancelCalls: { runId: string }[];
+	pageCalls: (string | undefined)[];
 }
+
+type ChatSendResult = { run: ChatRun; userMessage: ChatMessage; assistantMessage: ChatMessage };
 
 /**
  * A duck-typed fake of {@link MobileProductClient} for the chat-session-controller tests. It records
  * calls and lets the test script snapshot/replay/send/cancel results.
+ *
+ * `getPage` overrides the single-`snapshot` behavior with cursor-driven pagination so tests can
+ * exercise the full-history drain (>2 runs, active run on the last page, looping cursors).
+ * `send` may return a result or throw to simulate definitive/ambiguous send outcomes.
  */
 export function makeFakeChatClient(config: {
 	sessionId: string;
 	snapshot: GetChatSessionPageOutput;
 	replay?: (runId: string, lastSeq: number) => ChatRunEvent[];
-	send?: (content: string, requestId: string) => { run: ChatRun; userMessage: ChatMessage; assistantMessage: ChatMessage };
+	send?: (content: string, requestId: string) => ChatSendResult;
+	getPage?: (cursor: string | undefined) => GetChatSessionPageOutput;
 }): { client: MobileProductClient; script: ChatClientScript } {
 	const script: ChatClientScript = {
 		subscribes: [],
@@ -309,6 +342,7 @@ export function makeFakeChatClient(config: {
 		replayCalls: [],
 		sendCalls: [],
 		cancelCalls: [],
+		pageCalls: [],
 	};
 	const client = {
 		async chatSubscribe(sessionId: string) {
@@ -317,8 +351,9 @@ export function makeFakeChatClient(config: {
 		async chatUnsubscribe(sessionId: string) {
 			script.unsubscribes.push(sessionId);
 		},
-		async getSessionPage() {
-			return config.snapshot;
+		async getSessionPage(input: { sessionId: string; limit: number; cursor?: string }) {
+			script.pageCalls.push(input.cursor);
+			return config.getPage ? config.getPage(input.cursor) : config.snapshot;
 		},
 		async chatReplay(input: { cursors: { runId: string; lastSeq: number }[] }) {
 			const cursor = input.cursors[0]!;
@@ -344,4 +379,30 @@ export function makeFakeChatClient(config: {
 		},
 	} as unknown as MobileProductClient;
 	return { client, script };
+}
+
+/**
+ * Builds a paginated `getPage` callback from an ordered list of pages (oldest→newest, matching the
+ * Layer 3 server's oldest-first run ordering). Cursors are opaque `p1`, `p2`, … tokens; the last
+ * page has no `nextCursor`, so the active run lives on the final page.
+ */
+export function makePagedSnapshot(
+	sessionId: string,
+	pages: Array<Partial<GetChatSessionPageOutput>>,
+): (cursor: string | undefined) => GetChatSessionPageOutput {
+	const built = pages.map((overrides, index) => {
+		const isLast = index === pages.length - 1;
+		return makeSessionPage(sessionId, {
+			...overrides,
+			...(isLast ? {} : { nextCursor: `p${index + 1}` }),
+		});
+	});
+	return (cursor: string | undefined) => {
+		const index = cursor === undefined ? 0 : Number(cursor.slice(1));
+		const page = built[index];
+		if (!page) {
+			throw new Error(`No page for cursor ${cursor}`);
+		}
+		return page;
+	};
 }
