@@ -210,7 +210,8 @@ MOSHU_LIVE_RUNTIME_BASE_URL='https://example.devtunnels.ms' \
 - 独立 Git Tool、Diff journal 和 revert；
 - Plan、自定义 Agent、subagent、任务中心和桌面通知；
 - MCP OAuth 2.1 浏览器授权/DCR、Git URL Skill 更新和完整包导入；
-- Mobile Client、团队共享、Docker/cloud、多租户和云端 Agent Server；
+- iOS App 本体（Layer 4：Capacitor/Swift plugin）与移动通知后台（Layer 5）；Mobile 接入面本身——独立 Mobile ingress、二维码配对与 Ed25519 设备认证——已由 Layer 3 实现（见 docs）；
+- 团队共享、Docker/cloud、多租户和云端 Agent Server；
 - 正式外部分发所需的真实 Tunnel、三平台签名 runner 和 macOS Keychain release gate。
 
 当前仍处于首次外部分发前，不兼容的旧开发数据可以明确 reset；首次发布冻结 schema 后必须使用正式 migration/rollback gate。

@@ -1,6 +1,6 @@
 import type Database from "bun:sqlite";
 
-export const currentAppDatabaseVersion = 23;
+export const currentAppDatabaseVersion = 24;
 
 export class AppDatabaseResetRequiredError extends Error {
 	readonly currentVersion: number;
@@ -81,6 +81,10 @@ export function applyAppMigrations(client: Database): void {
 			DROP TABLE IF EXISTS runtime_box_generation_fences;
 			DROP TABLE IF EXISTS runtime_box_device_keys;
 			DROP TABLE IF EXISTS runtime_box_pairing_sessions;
+			DROP TABLE IF EXISTS mobile_device_generation_fences;
+			DROP TABLE IF EXISTS mobile_device_keys;
+			DROP TABLE IF EXISTS mobile_pairing_sessions;
+			DROP TABLE IF EXISTS mobile_devices;
 			DROP TABLE IF EXISTS projects;
 			DROP TABLE IF EXISTS client_runtime_box_preferences;
 			DROP TABLE IF EXISTS app_settings;
@@ -248,6 +252,7 @@ export function applyAppMigrations(client: Database): void {
 				tunnel_id TEXT,
 				public_url TEXT,
 				runtime_ingress_port INTEGER,
+				mobile_ingress_port INTEGER,
 				traffic_month TEXT NOT NULL,
 				traffic_received_bytes INTEGER NOT NULL,
 				traffic_sent_bytes INTEGER NOT NULL,
@@ -293,6 +298,60 @@ export function applyAppMigrations(client: Database): void {
 			);
 			CREATE INDEX runtime_box_pairing_sessions_state_expiry_idx
 				ON runtime_box_pairing_sessions(state, expires_at_ms);
+
+			CREATE TABLE mobile_devices (
+				id TEXT PRIMARY KEY NOT NULL,
+				display_name TEXT NOT NULL,
+				model TEXT NOT NULL,
+				platform TEXT NOT NULL,
+				app_version TEXT NOT NULL,
+				created_at_ms INTEGER NOT NULL,
+				updated_at_ms INTEGER NOT NULL,
+				approved_at_ms INTEGER NOT NULL,
+				last_seen_at_ms INTEGER,
+				revoked_at_ms INTEGER
+			);
+
+			CREATE TABLE mobile_device_keys (
+				key_id TEXT NOT NULL,
+				mobile_client_id TEXT NOT NULL REFERENCES mobile_devices(id) ON DELETE CASCADE,
+				public_key TEXT NOT NULL,
+				public_key_fingerprint TEXT NOT NULL,
+				created_at_ms INTEGER NOT NULL,
+				revoked_at_ms INTEGER,
+				PRIMARY KEY (mobile_client_id, key_id)
+			);
+			CREATE INDEX mobile_device_keys_client_revoked_idx
+				ON mobile_device_keys(mobile_client_id, revoked_at_ms);
+
+			CREATE TABLE mobile_device_generation_fences (
+				mobile_client_id TEXT PRIMARY KEY NOT NULL
+					REFERENCES mobile_devices(id) ON DELETE CASCADE,
+				accepted_generation INTEGER NOT NULL,
+				accepted_instance_id TEXT NOT NULL,
+				updated_at_ms INTEGER NOT NULL
+			);
+
+			CREATE TABLE mobile_pairing_sessions (
+				id TEXT PRIMARY KEY NOT NULL,
+				code_hash TEXT NOT NULL UNIQUE,
+				claim_token_hash TEXT,
+				state TEXT NOT NULL,
+				device_key_id TEXT,
+				public_key TEXT,
+				public_key_fingerprint TEXT,
+				display_name TEXT,
+				model TEXT,
+				platform TEXT,
+				app_version TEXT,
+				mobile_client_id TEXT REFERENCES mobile_devices(id),
+				created_at_ms INTEGER NOT NULL,
+				expires_at_ms INTEGER NOT NULL,
+				claimed_at_ms INTEGER,
+				decided_at_ms INTEGER
+			);
+			CREATE INDEX mobile_pairing_sessions_state_expiry_idx
+				ON mobile_pairing_sessions(state, expires_at_ms);
 
 			CREATE TABLE projects (
 				id TEXT PRIMARY KEY NOT NULL,

@@ -93,10 +93,12 @@ Agent Server 使用两个独立监听器：
 | 入口 | 角色 | 地址 | 暴露 |
 | --- | --- | --- | --- |
 | Product RPC | Desktop Client | loopback 动态端口 | 不进入 Tunnel |
-| Runtime Ingress | Local/Remote Runtime Box | loopback 固定持久端口 | 唯一经 Tunnel 暴露的端口 |
+| Runtime Ingress | Local/Remote Runtime Box | loopback 固定持久端口 | 唯一经 Tunnel 暴露的 Runtime 端口 |
+| Mobile Ingress | Mobile Client（iOS） | loopback 固定持久端口 + `/mobile` | Layer 3 已实现的独立第二端口，经 Tunnel 暴露 |
 
 Runtime Ingress 使用独立 method allowlist，不接受 Session、Provider、Policy decision、任意数据库查询或 Client
-管理方法。未来 Mobile Client 必须增加独立入口和认证合同，不能复用 Runtime Box 入口。
+管理方法。Mobile Client 已按此约束落地**独立**入口（固定 loopback listener + `/mobile` 路径、独立
+allowlist/身份/数据表/generation fence），**不复用 Runtime Box 入口**（见 architecture §9.0.2、data-contracts §9.3）。
 
 固定 Runtime ingress 端口由 Agent Server 首次分配后持久化。端口冲突进入
 `runtime_ingress_port_conflict`，不能静默更换端口导致已配对 Box 永久失联。
@@ -129,10 +131,11 @@ replace 而终止时，按 host 身份清空对应 ingress readiness（`ready=fa
 `publicUrl`），**不**在严格的 `remoteAccessStatusOutputSchema` 上新增 `ingresses` 字段——旧 Client 继续无改动解析。
 per-ingress readiness 只经**内部（非线协议）** getter `DevTunnelService.getIngressReadiness()` 暴露，返回 typed
 descriptor（`kind`/`port`/`ready`/仅在 live 时携带的 `publicUrl`，pending 端口不回退到陈旧/持久 URL）。顶层 `publicUrl`
-继续向后兼容地映射到 Runtime ingress URL。当前仍只有 Runtime ingress 一个实例；`DevTunnelIngressKind` 已建模一个前瞻性的
-`mobile` descriptor，并可通过 `mobileIngressPort` 选项演练多 ingress reconcile/readiness 路径，但本层**不实际实例化**
-Mobile ingress、listener 或 pairing（属于后续层）。未来 Mobile ingress 作为**第二个端口**接入时无需再改根因逻辑，并将通过
-显式 versioned status method（v2）或协议 bump 暴露多 ingress readiness，而非放宽当前 v1 严格 schema。
+继续向后兼容地映射到 Runtime ingress URL。Layer 3 已将 `mobile` descriptor 从前瞻性建模变为**实际实例化**：
+Mobile ingress 作为 DevTunnel 的**第二个端口**通过 `mobileIngressPort` 接入同一 tunnel，逐端口
+reconcile/readiness/public URL 均复用既有根因逻辑，无需改动；多 ingress readiness 通过显式 versioned status
+method（新增 `moshu.v2.mobileAccess.status`）暴露，而**不放宽当前 v1 严格 schema**——旧 v1 Client 继续无改动解析
+（见 architecture §9.0.2、data-contracts §9.3）。
 
 启动顺序：
 

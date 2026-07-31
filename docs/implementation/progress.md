@@ -3,7 +3,7 @@
 > 更新日期：2026-07-30
 > 当前产品阶段：Phase 0
 > 当前架构里程碑：RB-09 发布加固
-> 当前代码基线：Local/Remote Runtime Box、强认证 ingress、Dev Tunnel、durable Action recovery、双 owner MCP/Skills
+> 当前代码基线：Local/Remote Runtime Box、强认证 ingress、Dev Tunnel、durable Action recovery、双 owner MCP/Skills、独立 Mobile ingress + 二维码配对 + Ed25519 设备认证
 
 本文只记录代码或自动化测试已经证明的能力。批准的目标见[技术架构](./architecture.md)，后续顺序见[工程交付计划](./delivery-plan.md)。
 
@@ -55,6 +55,22 @@ Agent Server
   rg、fd 和 Photon WASM 资源，并使用私有配置、generation 和 workspace。
 - Agent Server 暴露独立 Runtime-only ingress，使用一次性 pairing code、Ed25519 challenge、
   device-key revocation、持久 generation fence、入口限流和 canonical RPC identity。
+- Agent Server 另暴露**独立 Mobile ingress**（固定 loopback listener、`/mobile` 路径，与 Product RPC、
+  Runtime ingress 物理/逻辑隔离，不复用其入口）。Mobile 配对使用 Desktop 展示的二维码（含 mobile public URL、
+  pairingId、一次性 code、agentServerId、server 公钥/指纹、有效期、协议区间；绝不含 server secret 或长期 token），
+  iOS 端生成 Ed25519 设备 key 并提交 claim；Desktop CAS 校验设备指纹后授权，之后自动重连。校验链为
+  canonical SPKI 公钥/指纹 + `AgentServerIdentity` 签名 challenge（绑定 agentServerId、mobileClientId、
+  deviceKeyId、instanceId、persisted generation、challengeId/nonce、协议版本与 `relay-tls` transportSecurity），
+  WebSocket upgrade 前验证签名/激活 key/吊销/challenge 单次与过期/server identity，返回 role=`mobile-client`；
+  独立持久 generation high-water fence 阻止旧 generation/instance/late connection 复活，设备吊销立即关闭匹配 peer。
+  Mobile 方法走**独立 allowlist**（runtime info/list/client-scoped switch；projects list/get/sidebar；models
+  listAvailable；session list/get/create/setModel；chat send/cancel/replay/subscribe/unsubscribe/retired；
+  approvals list/get/decide + session policy get/update），Provider/Remote Access 控制/Runtime 配对/MCP/Skills/
+  Project mutation/diagnostics 等一律 deny；事件按已订阅可见 Session 严格 Zod + redaction 下发。
+  Mobile ingress 独立 frame/body/inflight/backpressure/handshake timeout、未认证连接与 HTTP 容量、per-source
+  限流与流量计量；作为 DevTunnel 第二端口按 Layer 1 multi-port 模型逐端口 readiness/public URL 公开。
+  Remote Access status v1 保持不变，新增 versioned `mobileAccess.status`（v2）向 Desktop 暴露 mobile ingress
+  状态/URL。**iOS App 本体尚未实现**（Layer 4：Capacitor/Swift plugin）；通知后台属 Layer 5。
 - Agent Server 管理 Dev Tunnel Microsoft device-code 登录、持久 cluster-qualified Tunnel ID、
   单一 Anonymous HTTP ingress port、Host watchdog、重建/修复、取消和重试；Product RPC 不暴露到 Tunnel。
 - Agent Server 在派发前持久化 Action intent，并签发参数、来源、目标 generation 与 execution scope
@@ -153,10 +169,14 @@ Agent Server
 - Plan、自定义 Agent、subagent、任务中心、Diff/撤销和桌面通知仍是后续产品范围。
 - MCP OAuth 2.1 浏览器授权/DCR、Git URL Skill 更新和完整目录/压缩包导入 UI 仍是后续产品增强。
 - macOS Provider vault 当前是权限加固的 app-owned 文件；Keychain adapter 仍是外部分发前安全工作。
+- Mobile stack Layer 3 已实现独立 Mobile ingress、二维码配对与 Ed25519 设备认证（见 §2 与 architecture
+  §9.0.2、data-contracts §9.3）。**iOS App 本体（Layer 4：Capacitor/Swift plugin）与移动通知后台（Layer 5）
+  尚未实现**；首版 Mobile client 只绑定一个 Agent Server（由 client 实现），Desktop 必须在线，relay TLS +
+  应用设备签名是当前传输边界，Noise 端到端握手后置且不会谎称已启用。
 - Remote Runtime Box 的 ingress、设备配对认证、三平台 daemon、Dev Tunnel、durable grant、断线
   outcome reconciliation、MCP/Skill ownership 和发布故障矩阵已实现。真实 Microsoft Tunnel 探针、
   macOS 正式公证和 Windows 正式签名仍是需要外部账号、证书和对应 runner 的 release 执行门。
-  Mobile Client、团队共享、Docker/cloud 和多租户仍不在当前范围。
+  团队共享、Docker/cloud 和多租户仍不在当前范围。
 
 ## 6. 架构迁移状态
 
@@ -177,6 +197,9 @@ Agent Server
 | RB-07 Grants/recovery | 已完成 | durable Action/grant、Box journal、deadline lease、三阶段结果确认和 reset epoch |
 | RB-08 MCP/Skills | 已完成 | Box private store、SecretStore、inventory sync、Runtime Profile、live validation 与 MCP grant bridge |
 | RB-09 Hardening/release | 已完成（外部 release gate 待执行） | protocol/quota/diagnostics/fault matrix/signed package gates；真实 Tunnel 与正式平台签名由 release runner 验证 |
+| M-L1 Browser-safe RPC core | 已完成 | `@moshu/process-rpc-core`、client-scoped Runtime Box、authorization-aware Chat 订阅、DevTunnel multi-port |
+| M-L2 Durable approvals | 已完成 | server-authoritative 风险分级、durable approval + Session Allow-all、CAS/幂等决策、多 client 事件、Desktop UI |
+| M-L3 Mobile ingress/pairing/auth | 已完成（iOS App 待实现） | 独立 `/mobile` ingress、二维码配对、Ed25519 设备认证、generation fence、独立 allowlist、Desktop 配对 UI；Layer 4 iOS App 与 Layer 5 通知后台后置 |
 
 ## 7. 开发数据策略
 

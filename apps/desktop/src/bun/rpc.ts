@@ -1,5 +1,7 @@
 import {
 	agentsRuntimeInfoSchema,
+	approveMobilePairingInputSchema,
+	approveMobilePairingOutputSchema,
 	approveRuntimeBoxPairingInputSchema,
 	approveRuntimeBoxPairingOutputSchema,
 	cancelChatRunInputSchema,
@@ -9,6 +11,7 @@ import {
 	checkProjectPathOutputSchema,
 	confirmCreateProjectInputSchema,
 	confirmCreateProjectOutputSchema,
+	createMobilePairingOutputSchema,
 	createProviderInputSchema,
 	createRuntimeBoxPairingOutputSchema,
 	decideApprovalInputSchema,
@@ -52,6 +55,8 @@ import {
 	listChatSessionsOutputSchema,
 	listMcpServersInputSchema,
 	listMcpServersOutputSchema,
+	listMobileDevicesOutputSchema,
+	listMobilePairingClaimsOutputSchema,
 	listProjectsInputSchema,
 	listProjectsOutputSchema,
 	listProvidersOutputSchema,
@@ -68,6 +73,7 @@ import {
 	logoutProviderInputSchema,
 	logoutProviderOutputSchema,
 	mcpServerMutationResultSchema,
+	mobileAccessStatusOutputSchema,
 	previewProjectPathInputSchema,
 	previewProjectPathOutputSchema,
 	previewProjectRelinkInputSchema,
@@ -76,6 +82,8 @@ import {
 	providerAuthAttemptInputSchema,
 	providerAuthAttemptOutputSchema,
 	providerMutationOutputSchema,
+	rejectMobilePairingInputSchema,
+	rejectMobilePairingOutputSchema,
 	rejectRuntimeBoxPairingInputSchema,
 	rejectRuntimeBoxPairingOutputSchema,
 	relinkProjectInputSchema,
@@ -87,6 +95,8 @@ import {
 	requestProjectDeletionInputSchema,
 	requestProjectDeletionOutputSchema,
 	respondProviderAuthInputSchema,
+	revokeMobileDeviceInputSchema,
+	revokeMobileDeviceOutputSchema,
 	revokeRuntimeBoxDeviceInputSchema,
 	revokeRuntimeBoxDeviceOutputSchema,
 	runtimeBoxResourceMutationResultSchema,
@@ -227,6 +237,55 @@ export function createDesktopRpc({ agentsClient }: DesktopRpcDependencies) {
 						params,
 						revokeRuntimeBoxDeviceInputSchema,
 						revokeRuntimeBoxDeviceOutputSchema,
+					),
+				getMobileAccessStatus: (params) =>
+					agentsClient.request(
+						productRpcMethods.mobileAccessStatus,
+						params,
+						emptyParamsSchema,
+						mobileAccessStatusOutputSchema,
+					),
+				createMobilePairing: (params) =>
+					agentsClient.request(
+						productRpcMethods.mobilePairingCreate,
+						params,
+						emptyParamsSchema,
+						createMobilePairingOutputSchema,
+					),
+				listMobilePairingClaims: (params) =>
+					agentsClient.request(
+						productRpcMethods.mobilePairingListClaims,
+						params,
+						emptyParamsSchema,
+						listMobilePairingClaimsOutputSchema,
+					),
+				approveMobilePairing: (params) =>
+					agentsClient.request(
+						productRpcMethods.mobilePairingApprove,
+						params,
+						approveMobilePairingInputSchema,
+						approveMobilePairingOutputSchema,
+					),
+				rejectMobilePairing: (params) =>
+					agentsClient.request(
+						productRpcMethods.mobilePairingReject,
+						params,
+						rejectMobilePairingInputSchema,
+						rejectMobilePairingOutputSchema,
+					),
+				listMobileDevices: (params) =>
+					agentsClient.request(
+						productRpcMethods.mobileDeviceList,
+						params,
+						emptyParamsSchema,
+						listMobileDevicesOutputSchema,
+					),
+				revokeMobileDevice: (params) =>
+					agentsClient.request(
+						productRpcMethods.mobileDeviceRevoke,
+						params,
+						revokeMobileDeviceInputSchema,
+						revokeMobileDeviceOutputSchema,
 					),
 				getRemoteAccessStatus: (params) =>
 					agentsClient.request(

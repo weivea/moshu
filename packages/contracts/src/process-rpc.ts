@@ -50,6 +50,18 @@ import {
 	runtimeBoxToolProgressEventSchema,
 } from "./executor-tools";
 import {
+	approveMobilePairingInputSchema,
+	approveMobilePairingOutputSchema,
+	createMobilePairingOutputSchema,
+	listMobileDevicesOutputSchema,
+	listMobilePairingClaimsOutputSchema,
+	mobileAccessStatusOutputSchema,
+	rejectMobilePairingInputSchema,
+	rejectMobilePairingOutputSchema,
+	revokeMobileDeviceInputSchema,
+	revokeMobileDeviceOutputSchema,
+} from "./mobile";
+import {
 	checkProjectPathInputSchema,
 	checkProjectPathOutputSchema,
 	confirmCreateProjectInputSchema,
@@ -182,6 +194,13 @@ export const productRpcMethods = {
 	runtimeBoxesPairingApprove: "moshu.v1.runtimeBoxes.pairing.approve",
 	runtimeBoxesPairingReject: "moshu.v1.runtimeBoxes.pairing.reject",
 	runtimeBoxesDeviceRevoke: "moshu.v1.runtimeBoxes.device.revoke",
+	mobileAccessStatus: "moshu.v2.mobileAccess.status",
+	mobilePairingCreate: "moshu.v2.mobile.pairing.create",
+	mobilePairingListClaims: "moshu.v2.mobile.pairing.listClaims",
+	mobilePairingApprove: "moshu.v2.mobile.pairing.approve",
+	mobilePairingReject: "moshu.v2.mobile.pairing.reject",
+	mobileDeviceList: "moshu.v2.mobile.device.list",
+	mobileDeviceRevoke: "moshu.v2.mobile.device.revoke",
 	remoteAccessStatus: "moshu.v1.remoteAccess.status",
 	remoteAccessAuthStart: "moshu.v1.remoteAccess.auth.start",
 	remoteAccessAuthGet: "moshu.v1.remoteAccess.auth.get",
@@ -503,6 +522,34 @@ export const productRpcRequestSchemas = {
 	[productRpcMethods.runtimeBoxesDeviceRevoke]: {
 		input: revokeRuntimeBoxDeviceInputSchema,
 		output: revokeRuntimeBoxDeviceOutputSchema,
+	},
+	[productRpcMethods.mobileAccessStatus]: {
+		input: emptyParamsSchema,
+		output: mobileAccessStatusOutputSchema,
+	},
+	[productRpcMethods.mobilePairingCreate]: {
+		input: emptyParamsSchema,
+		output: createMobilePairingOutputSchema,
+	},
+	[productRpcMethods.mobilePairingListClaims]: {
+		input: emptyParamsSchema,
+		output: listMobilePairingClaimsOutputSchema,
+	},
+	[productRpcMethods.mobilePairingApprove]: {
+		input: approveMobilePairingInputSchema,
+		output: approveMobilePairingOutputSchema,
+	},
+	[productRpcMethods.mobilePairingReject]: {
+		input: rejectMobilePairingInputSchema,
+		output: rejectMobilePairingOutputSchema,
+	},
+	[productRpcMethods.mobileDeviceList]: {
+		input: emptyParamsSchema,
+		output: listMobileDevicesOutputSchema,
+	},
+	[productRpcMethods.mobileDeviceRevoke]: {
+		input: revokeMobileDeviceInputSchema,
+		output: revokeMobileDeviceOutputSchema,
 	},
 	[productRpcMethods.remoteAccessStatus]: {
 		input: emptyParamsSchema,
@@ -901,6 +948,13 @@ export const clientProductRequestMethods = [
 	productRpcMethods.runtimeBoxesPairingApprove,
 	productRpcMethods.runtimeBoxesPairingReject,
 	productRpcMethods.runtimeBoxesDeviceRevoke,
+	productRpcMethods.mobileAccessStatus,
+	productRpcMethods.mobilePairingCreate,
+	productRpcMethods.mobilePairingListClaims,
+	productRpcMethods.mobilePairingApprove,
+	productRpcMethods.mobilePairingReject,
+	productRpcMethods.mobileDeviceList,
+	productRpcMethods.mobileDeviceRevoke,
 	productRpcMethods.remoteAccessStatus,
 	productRpcMethods.remoteAccessAuthStart,
 	productRpcMethods.remoteAccessAuthGet,
@@ -1012,6 +1066,46 @@ export const agentsRuntimeBoxRequestMethods = [
 export const runtimeBoxProductEventMethods = [
 	productRpcEvents.runtimeBoxToolProgress,
 	productRpcEvents.runtimeBoxInventoryChanged,
+] as const;
+
+// The strict MVP allowlist for authenticated Mobile clients. It is a deliberate subset of the
+// product surface: read/act on Runtime Box selection (client-scoped), Projects (no path mutation),
+// Models, Sessions, Chat and Approvals. Everything else — provider auth/config, Remote Access
+// control, Runtime Box pairing/device revoke, MCP/Skills, Project create/relink/archive/delete/
+// path checks, diagnostics, default-model mutation, agent global profile — is intentionally absent
+// so the Mobile ingress cannot reach it even though the handlers are shared.
+export const mobileClientProductRequestMethods = [
+	productRpcMethods.runtimeGet,
+	productRpcMethods.runtimeBoxesList,
+	productRpcMethods.runtimeBoxesSwitch,
+	productRpcMethods.projectsList,
+	productRpcMethods.projectsGet,
+	productRpcMethods.projectsGetSidebar,
+	productRpcMethods.modelsListAvailable,
+	productRpcMethods.sessionCreate,
+	productRpcMethods.sessionGet,
+	productRpcMethods.sessionList,
+	productRpcMethods.sessionSetModel,
+	productRpcMethods.chatSend,
+	productRpcMethods.chatCancel,
+	productRpcMethods.chatReplay,
+	productRpcMethods.chatSubscribe,
+	productRpcMethods.chatUnsubscribe,
+	productRpcMethods.chatRetiredSessionsList,
+	productRpcMethods.approvalsList,
+	productRpcMethods.approvalsGet,
+	productRpcMethods.approvalsDecide,
+	productRpcMethods.sessionApprovalPolicyGet,
+	productRpcMethods.sessionApprovalPolicyUpdate,
+] as const;
+
+export const mobileClientProductEventMethods = [
+	productRpcEvents.chatEvent,
+	productRpcEvents.chatSessionsRetired,
+	productRpcEvents.runtimeBoxesChanged,
+	productRpcEvents.approvalEvent,
+	productRpcEvents.sessionApprovalPolicyChanged,
+	productRpcEvents.approvalActivityChanged,
 ] as const;
 
 export type SendAskChatMessageInput = z.infer<typeof sendAskChatMessageInputSchema>;

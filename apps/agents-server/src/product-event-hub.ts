@@ -16,8 +16,17 @@ import {
 	type JsonValue,
 	RpcHandlerError,
 	type RpcPeer,
+	type RpcPeerRole,
 	rpcJsonValueSchema,
 } from "@moshu/process-rpc";
+
+// Product client roles eligible to hold Session subscriptions and receive Product events. Both the
+// Desktop `client` and the Layer 3 `mobile-client` are first-class product clients here; every other
+// role (agents, runtime-box) is never a Product event recipient. Authorization for which Sessions a
+// given client may observe is enforced separately at the subscribe handler (session visibility).
+function isProductClientRole(role: RpcPeerRole): boolean {
+	return role === "client" || role === "mobile-client";
+}
 
 // The event hub delivers ChatRunEvents to authenticated product clients using two complementary
 // mechanisms:
@@ -140,7 +149,7 @@ export class ProductEventRouter {
 	// handler layer validates that the Session exists/is visible before calling this. Bounds are
 	// enforced so a client cannot pin unbounded Sessions and the hub cannot grow without limit.
 	subscribe(peer: RpcPeer, sessionId: string): void {
-		if (peer.remoteIdentity.role !== "client") {
+		if (!isProductClientRole(peer.remoteIdentity.role)) {
 			throw new RpcHandlerError(
 				"CLIENT_IDENTITY_REQUIRED",
 				"Session event subscription is only available to authenticated product clients.",
@@ -256,7 +265,7 @@ export class ProductEventRouter {
 		const subscriptions = this.#subscriptionsBySession.get(event.sessionId);
 		if (originBinding !== undefined || subscriptions !== undefined) {
 			const recipients = peers.filter((peer) => {
-				if (peer.remoteIdentity.role !== "client") {
+				if (!isProductClientRole(peer.remoteIdentity.role)) {
 					return false;
 				}
 				const matchesOrigin =
@@ -318,7 +327,8 @@ export class ProductEventRouter {
 		}
 		return peers.filter(
 			(peer) =>
-				peer.remoteIdentity.role === "client" && subscriptions.has(peer.remoteIdentity.peerId),
+				isProductClientRole(peer.remoteIdentity.role) &&
+				subscriptions.has(peer.remoteIdentity.peerId),
 		);
 	}
 }
@@ -338,7 +348,7 @@ function emitToClients(
 	label: string,
 ): void {
 	for (const peer of peers) {
-		if (peer.remoteIdentity.role !== "client") {
+		if (!isProductClientRole(peer.remoteIdentity.role)) {
 			continue;
 		}
 		try {
@@ -369,7 +379,7 @@ export function publishChatEvent(
 		}),
 	);
 	for (const peer of peers) {
-		if (peer.remoteIdentity.role === "client") {
+		if (isProductClientRole(peer.remoteIdentity.role)) {
 			try {
 				peer.emitEvent(agentsProductEventMethods[0], payload, { eventId: event.id });
 			} catch (error) {
@@ -395,7 +405,7 @@ export function publishRetiredChatSessions(
 		}),
 	);
 	for (const peer of peers) {
-		if (peer.remoteIdentity.role !== "client") {
+		if (!isProductClientRole(peer.remoteIdentity.role)) {
 			continue;
 		}
 		try {

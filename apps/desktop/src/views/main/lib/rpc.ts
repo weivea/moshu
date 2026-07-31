@@ -1,7 +1,10 @@
 import {
 	type ApprovalEventDelivery,
+	type ApproveMobilePairingInput,
 	type ApproveRuntimeBoxPairingInput,
 	approvalEventDeliverySchema,
+	approveMobilePairingInputSchema,
+	approveMobilePairingOutputSchema,
 	approveRuntimeBoxPairingInputSchema,
 	approveRuntimeBoxPairingOutputSchema,
 	type ChatRunEvent,
@@ -15,6 +18,7 @@ import {
 	confirmCreateProjectInputSchema,
 	confirmCreateProjectOutputSchema,
 	createChatSessionOutputSchema,
+	createMobilePairingOutputSchema,
 	createProviderInputSchema,
 	createRuntimeBoxPairingOutputSchema,
 	type DecideApprovalInput,
@@ -63,6 +67,8 @@ import {
 	listChatSessionsOutputSchema,
 	listMcpServersInputSchema,
 	listMcpServersOutputSchema,
+	listMobileDevicesOutputSchema,
+	listMobilePairingClaimsOutputSchema,
 	listProjectsInputSchema,
 	listProjectsOutputSchema,
 	listProvidersOutputSchema,
@@ -79,6 +85,7 @@ import {
 	logoutProviderInputSchema,
 	logoutProviderOutputSchema,
 	mcpServerMutationResultSchema,
+	mobileAccessStatusOutputSchema,
 	previewProjectPathInputSchema,
 	previewProjectPathOutputSchema,
 	previewProjectRelinkInputSchema,
@@ -86,9 +93,13 @@ import {
 	providerAuthAttemptInputSchema,
 	providerAuthAttemptOutputSchema,
 	providerMutationOutputSchema,
+	type RejectMobilePairingInput,
 	type RejectRuntimeBoxPairingInput,
 	type RespondProviderAuthInput,
+	type RevokeMobileDeviceInput,
 	type RevokeRuntimeBoxDeviceInput,
+	rejectMobilePairingInputSchema,
+	rejectMobilePairingOutputSchema,
 	rejectRuntimeBoxPairingInputSchema,
 	rejectRuntimeBoxPairingOutputSchema,
 	relinkProjectInputSchema,
@@ -100,6 +111,8 @@ import {
 	requestProjectDeletionInputSchema,
 	requestProjectDeletionOutputSchema,
 	respondProviderAuthInputSchema,
+	revokeMobileDeviceInputSchema,
+	revokeMobileDeviceOutputSchema,
 	revokeRuntimeBoxDeviceInputSchema,
 	revokeRuntimeBoxDeviceOutputSchema,
 	runtimeBoxResourceMutationResultSchema,
@@ -343,6 +356,44 @@ export const desktopClient = {
 		const parsedInput = revokeRuntimeBoxDeviceInputSchema.parse(input);
 		return revokeRuntimeBoxDeviceOutputSchema.parse(
 			await requestDesktop(() => getRequest().revokeRuntimeBoxDevice(parsedInput)),
+		);
+	},
+	async getMobileAccessStatus() {
+		return mobileAccessStatusOutputSchema.parse(
+			await requestDesktop(() => getRequest().getMobileAccessStatus({})),
+		);
+	},
+	async createMobilePairing() {
+		return createMobilePairingOutputSchema.parse(
+			await requestDesktop(() => getRequest().createMobilePairing({})),
+		);
+	},
+	async listMobilePairingClaims() {
+		return listMobilePairingClaimsOutputSchema.parse(
+			await requestDesktop(() => getRequest().listMobilePairingClaims({})),
+		);
+	},
+	async approveMobilePairing(input: ApproveMobilePairingInput) {
+		const parsedInput = approveMobilePairingInputSchema.parse(input);
+		return approveMobilePairingOutputSchema.parse(
+			await requestDesktop(() => getRequest().approveMobilePairing(parsedInput)),
+		);
+	},
+	async rejectMobilePairing(input: RejectMobilePairingInput) {
+		const parsedInput = rejectMobilePairingInputSchema.parse(input);
+		return rejectMobilePairingOutputSchema.parse(
+			await requestDesktop(() => getRequest().rejectMobilePairing(parsedInput)),
+		);
+	},
+	async listMobileDevices() {
+		return listMobileDevicesOutputSchema.parse(
+			await requestDesktop(() => getRequest().listMobileDevices({})),
+		);
+	},
+	async revokeMobileDevice(input: RevokeMobileDeviceInput) {
+		const parsedInput = revokeMobileDeviceInputSchema.parse(input);
+		return revokeMobileDeviceOutputSchema.parse(
+			await requestDesktop(() => getRequest().revokeMobileDevice(parsedInput)),
 		);
 	},
 	async getRemoteAccessStatus() {

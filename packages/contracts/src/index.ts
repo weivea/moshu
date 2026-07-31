@@ -4,6 +4,7 @@ export * from "./chat";
 export * from "./companion-bootstrap";
 export * from "./executor-tool-assets";
 export * from "./executor-tools";
+export * from "./mobile";
 export * from "./mode";
 export * from "./process-rpc";
 export * from "./project";

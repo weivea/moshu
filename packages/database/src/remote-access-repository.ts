@@ -8,6 +8,7 @@ export interface RemoteAccessSettings {
 	tunnelId?: string;
 	publicUrl?: string;
 	runtimeIngressPort?: number;
+	mobileIngressPort?: number;
 	trafficMonth: string;
 	trafficReceivedBytes: number;
 	trafficSentBytes: number;
@@ -17,6 +18,8 @@ export interface RemoteAccessRepository {
 	get(): RemoteAccessSettings;
 	setRuntimeIngressPort(port: number): void;
 	replaceRuntimeIngressPort(port: number): void;
+	setMobileIngressPort(port: number): void;
+	replaceMobileIngressPort(port: number): void;
 	setEnabled(enabled: boolean): void;
 	setTunnel(tunnelId: string, publicUrl?: string): void;
 	setPublicUrl(publicUrl: string): void;
@@ -54,6 +57,7 @@ export class SqliteRemoteAccessRepository implements RemoteAccessRepository {
 			...(row.tunnelId === null ? {} : { tunnelId: row.tunnelId }),
 			...(row.publicUrl === null ? {} : { publicUrl: row.publicUrl }),
 			...(row.runtimeIngressPort === null ? {} : { runtimeIngressPort: row.runtimeIngressPort }),
+			...(row.mobileIngressPort === null ? {} : { mobileIngressPort: row.mobileIngressPort }),
 			trafficMonth: row.trafficMonth,
 			trafficReceivedBytes: row.trafficReceivedBytes,
 			trafficSentBytes: row.trafficSentBytes,
@@ -76,6 +80,24 @@ export class SqliteRemoteAccessRepository implements RemoteAccessRepository {
 			throw new TypeError("Runtime ingress port must be between 1 and 65535.");
 		}
 		this.#update({ runtimeIngressPort: port });
+	}
+
+	setMobileIngressPort(port: number): void {
+		if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) {
+			throw new TypeError("Mobile ingress port must be between 1 and 65535.");
+		}
+		const current = this.get().mobileIngressPort;
+		if (current !== undefined && current !== port) {
+			throw new Error(`Mobile ingress port conflict: expected ${current}, bound ${port}.`);
+		}
+		this.#update({ mobileIngressPort: port });
+	}
+
+	replaceMobileIngressPort(port: number): void {
+		if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) {
+			throw new TypeError("Mobile ingress port must be between 1 and 65535.");
+		}
+		this.#update({ mobileIngressPort: port });
 	}
 
 	setEnabled(enabled: boolean): void {

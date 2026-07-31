@@ -9,6 +9,7 @@ const settingsGroups = [
 		items: [
 			{ to: "/settings/general", icon: "person", label: "settings.general" },
 			{ to: "/settings/runtime-boxes", icon: "terminal", label: "settings.runtimeBoxes" },
+			{ to: "/settings/mobile-access", icon: "smartphone", label: "settings.mobileAccess" },
 			{ to: "/settings/usage", icon: "tasks", label: "settings.usage" },
 			{ to: "/settings/security", icon: "globe", label: "settings.security" },
 		],

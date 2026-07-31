@@ -26,6 +26,7 @@ import {
 	Person,
 	Picture,
 	Plus,
+	Smartphone,
 	Sun,
 	Terminal,
 } from "@gravity-ui/icons";
@@ -59,6 +60,7 @@ const icons = {
 	search: Magnifier,
 	send: PaperPlane,
 	settings: Gear,
+	smartphone: Smartphone,
 	sun: Sun,
 	tasks: ListUl,
 	terminal: Terminal,

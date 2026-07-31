@@ -15,12 +15,18 @@ import {
 	getRuntimeProfileOutputSchema,
 	type ListRuntimeBoxesOutput,
 	listMcpServersOutputSchema,
+	listMobileDevicesOutputSchema,
 	listRuntimeBoxesOutputSchema,
 	listRuntimeBoxInventoryOutputSchema,
 	listRuntimeBoxMcpServerSummariesOutputSchema,
 	listRuntimeBoxSkillsOutputSchema,
 	listSkillsOutputSchema,
 	mcpServerMutationResultSchema,
+	mobileAccessStatusOutputSchema,
+	mobileClientProductEventMethods,
+	mobileClientProductRequestMethods,
+	mobileProtocolMaxVersion,
+	mobileProtocolMinVersion,
 	productRpcEvents,
 	productRpcInternalHandlerErrorCode,
 	productRpcMethods,
@@ -52,6 +58,7 @@ import {
 	ChatSessionNotFoundError,
 	McpResourceNotFoundError,
 	McpResourceVersionConflictError,
+	type MobileDeviceRepository,
 	PairingFingerprintMismatchError,
 	PairingSessionNotFoundError,
 	PairingSessionStateError,
@@ -86,6 +93,7 @@ import { ZodError, type ZodType, type z } from "zod";
 import { ApprovalRunUnavailableError, type ApprovalService } from "./approval-service";
 import type { ChatApplicationService } from "./chat-application-service";
 import type { DevTunnelService } from "./dev-tunnel-service";
+import type { MobileIngressAuth } from "./mobile-ingress-auth";
 import {
 	broadcastApprovalActivityChanged,
 	ProductEventRouter,
@@ -118,6 +126,9 @@ export interface ProductRpcDependencies {
 	runtimeBoxRegistry: RuntimeBoxRegistry;
 	runtimeBoxes: RuntimeBoxRepository;
 	runtimeBoxPairings?: RuntimeBoxPairingRepository;
+	mobileIngressAuth?: MobileIngressAuth;
+	mobileDevices?: MobileDeviceRepository;
+	disconnectMobileDevice?: (mobileClientId: string, reason: string) => void;
 	projectService?: ProjectApplicationService;
 	runtimeBoxInventory?: RuntimeBoxInventoryRepository;
 	runtimeProfiles?: RuntimeProfileRepository;
@@ -151,6 +162,18 @@ export const agentsServerRuntimeMethodAllowlist: RpcMethodAllowlist = {
 	},
 };
 
+// The Mobile ingress reuses the shared Product handlers but is pinned to its own strict allowlist so
+// an authenticated Mobile client can only reach the MVP subset — never Provider auth, Remote Access
+// control, Runtime Box pairing/device revoke, MCP/Skills, Project mutations, diagnostics, or any
+// Desktop-only surface. Requests/events outside this set are rejected by the RPC layer before a
+// handler runs, even though the same handler map backs the Product ingress.
+export const agentsServerMobileMethodAllowlist: RpcMethodAllowlist = {
+	"mobile-client": {
+		requests: mobileClientProductRequestMethods,
+		events: mobileClientProductEventMethods,
+	},
+};
+
 export function createProductRpcHandlers(dependencies: ProductRpcDependencies): RpcHandlers {
 	const {
 		chatService,
@@ -158,6 +181,9 @@ export function createProductRpcHandlers(dependencies: ProductRpcDependencies): 
 		runtimeBoxRegistry,
 		runtimeBoxes,
 		runtimeBoxPairings,
+		mobileIngressAuth,
+		mobileDevices,
+		disconnectMobileDevice,
 		projectService,
 		runtimeBoxInventory,
 		runtimeProfiles,
@@ -175,6 +201,18 @@ export function createProductRpcHandlers(dependencies: ProductRpcDependencies): 
 			throw new Error("Project application service is not initialized.");
 		}
 		return projectService;
+	};
+	const requireMobileIngressAuth = (): MobileIngressAuth => {
+		if (mobileIngressAuth === undefined) {
+			throw new Error("Mobile ingress auth is not initialized.");
+		}
+		return mobileIngressAuth;
+	};
+	const requireMobileDevices = (): MobileDeviceRepository => {
+		if (mobileDevices === undefined) {
+			throw new Error("Mobile device repository is not initialized.");
+		}
+		return mobileDevices;
 	};
 	const getRuntimeBoxInventory = (): RuntimeBoxInventoryRepository => {
 		if (runtimeBoxInventory === undefined) {
@@ -311,6 +349,60 @@ export function createProductRpcHandlers(dependencies: ProductRpcDependencies): 
 						input.runtimeBoxId,
 						"Runtime Box device key revoked.",
 					);
+					return output;
+				},
+			),
+			[productRpcMethods.mobileAccessStatus]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.mobileAccessStatus],
+				() => {
+					const service = getDevTunnelService();
+					const status = service.getStatus();
+					const ingress = service.getIngressReadiness().find((entry) => entry.kind === "mobile");
+					if (ingress === undefined) {
+						throw new RpcHandlerError(
+							"MOBILE_INGRESS_UNAVAILABLE",
+							"The Mobile ingress is not configured.",
+						);
+					}
+					return mobileAccessStatusOutputSchema.parse({
+						schemaVersion: 1,
+						remoteAccessEnabled: status.enabled,
+						remoteAccessState: status.state,
+						ingressPort: ingress.port,
+						ingressReady: ingress.ready,
+						...(ingress.publicUrl === undefined ? {} : { publicUrl: ingress.publicUrl }),
+						protocolMinVersion: mobileProtocolMinVersion,
+						protocolMaxVersion: mobileProtocolMaxVersion,
+						transportSecurity: "relay-tls",
+						supportedTransportSecurity: ["relay-tls"],
+					});
+				},
+			),
+			[productRpcMethods.mobilePairingCreate]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.mobilePairingCreate],
+				() => requireMobileIngressAuth().createPairing(),
+			),
+			[productRpcMethods.mobilePairingListClaims]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.mobilePairingListClaims],
+				() => requireMobileIngressAuth().listPendingClaims(),
+			),
+			[productRpcMethods.mobilePairingApprove]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.mobilePairingApprove],
+				(input) => requireMobileIngressAuth().approve(input),
+			),
+			[productRpcMethods.mobilePairingReject]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.mobilePairingReject],
+				(input) => requireMobileIngressAuth().reject(input),
+			),
+			[productRpcMethods.mobileDeviceList]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.mobileDeviceList],
+				() => listMobileDevicesOutputSchema.parse({ items: requireMobileDevices().list() }),
+			),
+			[productRpcMethods.mobileDeviceRevoke]: createRequestHandler(
+				productRpcRequestSchemas[productRpcMethods.mobileDeviceRevoke],
+				(input) => {
+					const output = requireMobileIngressAuth().revokeDevice(input);
+					disconnectMobileDevice?.(input.mobileClientId, "Mobile device revoked.");
 					return output;
 				},
 			),
@@ -1131,7 +1223,7 @@ export function createRuntimeBoxesSnapshot(
 // stable `peerId`; the server never trusts a caller-supplied client id. Only product clients (the
 // Desktop app today, a Mobile client in a later layer) hold a selection.
 function resolveProductClientId(peer: RpcPeer): string {
-	if (peer.remoteIdentity.role !== "client") {
+	if (peer.remoteIdentity.role !== "client" && peer.remoteIdentity.role !== "mobile-client") {
 		throw new RpcHandlerError(
 			"CLIENT_IDENTITY_REQUIRED",
 			"Runtime Box selection is only available to authenticated product clients.",

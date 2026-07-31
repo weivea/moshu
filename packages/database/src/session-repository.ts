@@ -172,8 +172,8 @@ export class SqliteSessionRepository implements SessionRepository {
 	createIdempotently(input: IdempotentSessionCreateInput): CreateChatSessionOutput {
 		const request = createProcessChatSessionInputSchema.parse(input.request);
 		const origin = processPeerIdentitySchema.parse(input.origin);
-		if (origin.role !== "client") {
-			throw new TypeError("Idempotent Session creation requires a client origin.");
+		if (origin.role !== "client" && origin.role !== "mobile-client") {
+			throw new TypeError("Idempotent Session creation requires a product client origin.");
 		}
 
 		return this.orm.transaction((transaction) => {
@@ -231,8 +231,8 @@ export class SqliteSessionRepository implements SessionRepository {
 	findIdempotent(input: IdempotentSessionCreateInput): CreateChatSessionOutput | undefined {
 		const request = createProcessChatSessionInputSchema.parse(input.request);
 		const origin = processPeerIdentitySchema.parse(input.origin);
-		if (origin.role !== "client") {
-			throw new TypeError("Idempotent Session creation requires a client origin.");
+		if (origin.role !== "client" && origin.role !== "mobile-client") {
+			throw new TypeError("Idempotent Session creation requires a product client origin.");
 		}
 		return this.#findIdempotent(this.orm, request, origin);
 	}

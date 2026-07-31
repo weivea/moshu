@@ -11,7 +11,7 @@ export const rpcProtocolVersionSchema = z
 	})
 	.strict();
 
-export const rpcPeerRoleSchema = z.enum(["agents", "client", "runtime-box"]);
+export const rpcPeerRoleSchema = z.enum(["agents", "client", "runtime-box", "mobile-client"]);
 export const rpcJsonValueSchema = z.json();
 
 const rpcIdentifierSchema = z.string().min(1).max(256);

@@ -215,6 +215,7 @@ export const remoteAccessSettingsTable = sqliteTable("remote_access_settings", {
 	tunnelId: text("tunnel_id"),
 	publicUrl: text("public_url"),
 	runtimeIngressPort: integer("runtime_ingress_port"),
+	mobileIngressPort: integer("mobile_ingress_port"),
 	trafficMonth: text("traffic_month").notNull(),
 	trafficReceivedBytes: integer("traffic_received_bytes").notNull(),
 	trafficSentBytes: integer("traffic_sent_bytes").notNull(),
@@ -272,6 +273,77 @@ export const runtimeBoxPairingSessionsTable = sqliteTable(
 	(table) => [
 		uniqueIndex("runtime_box_pairing_sessions_code_hash_unique").on(table.codeHash),
 		index("runtime_box_pairing_sessions_state_expiry_idx").on(table.state, table.expiresAtMs),
+	],
+);
+
+// Layer 3 — Mobile ingress persistence. Deliberately separate from the Runtime Box tables so a
+// Mobile device identity, its keys, its pairing sessions and its generation fence live and are
+// revoked entirely independently of the Runtime Box surface.
+export const mobileDevicesTable = sqliteTable("mobile_devices", {
+	id: text("id").primaryKey(),
+	displayName: text("display_name").notNull(),
+	model: text("model").notNull(),
+	platform: text("platform", { enum: ["ios", "ipados", "android"] }).notNull(),
+	appVersion: text("app_version").notNull(),
+	createdAtMs: integer("created_at_ms").notNull(),
+	updatedAtMs: integer("updated_at_ms").notNull(),
+	approvedAtMs: integer("approved_at_ms").notNull(),
+	lastSeenAtMs: integer("last_seen_at_ms"),
+	revokedAtMs: integer("revoked_at_ms"),
+});
+
+export const mobileDeviceKeysTable = sqliteTable(
+	"mobile_device_keys",
+	{
+		keyId: text("key_id").notNull(),
+		mobileClientId: text("mobile_client_id")
+			.notNull()
+			.references(() => mobileDevicesTable.id, { onDelete: "cascade" }),
+		publicKey: text("public_key").notNull(),
+		publicKeyFingerprint: text("public_key_fingerprint").notNull(),
+		createdAtMs: integer("created_at_ms").notNull(),
+		revokedAtMs: integer("revoked_at_ms"),
+	},
+	(table) => [
+		primaryKey({ columns: [table.mobileClientId, table.keyId] }),
+		index("mobile_device_keys_client_revoked_idx").on(table.mobileClientId, table.revokedAtMs),
+	],
+);
+
+export const mobileDeviceGenerationFencesTable = sqliteTable("mobile_device_generation_fences", {
+	mobileClientId: text("mobile_client_id")
+		.primaryKey()
+		.references(() => mobileDevicesTable.id, { onDelete: "cascade" }),
+	acceptedGeneration: integer("accepted_generation").notNull(),
+	acceptedInstanceId: text("accepted_instance_id").notNull(),
+	updatedAtMs: integer("updated_at_ms").notNull(),
+});
+
+export const mobilePairingSessionsTable = sqliteTable(
+	"mobile_pairing_sessions",
+	{
+		id: text("id").primaryKey(),
+		codeHash: text("code_hash").notNull(),
+		claimTokenHash: text("claim_token_hash"),
+		state: text("state", {
+			enum: ["open", "claimed", "approved", "rejected"],
+		}).notNull(),
+		deviceKeyId: text("device_key_id"),
+		publicKey: text("public_key"),
+		publicKeyFingerprint: text("public_key_fingerprint"),
+		displayName: text("display_name"),
+		model: text("model"),
+		platform: text("platform", { enum: ["ios", "ipados", "android"] }),
+		appVersion: text("app_version"),
+		mobileClientId: text("mobile_client_id").references(() => mobileDevicesTable.id),
+		createdAtMs: integer("created_at_ms").notNull(),
+		expiresAtMs: integer("expires_at_ms").notNull(),
+		claimedAtMs: integer("claimed_at_ms"),
+		decidedAtMs: integer("decided_at_ms"),
+	},
+	(table) => [
+		uniqueIndex("mobile_pairing_sessions_code_hash_unique").on(table.codeHash),
+		index("mobile_pairing_sessions_state_expiry_idx").on(table.state, table.expiresAtMs),
 	],
 );
 
@@ -621,4 +693,8 @@ export const appSchema = {
 	runtimeBoxDeviceKeysTable,
 	runtimeBoxPairingSessionsTable,
 	runtimeBoxesTable,
+	mobileDevicesTable,
+	mobileDeviceKeysTable,
+	mobileDeviceGenerationFencesTable,
+	mobilePairingSessionsTable,
 };

@@ -18,6 +18,7 @@ import { ProjectDetailPage, ProjectsPage } from "./projects-page";
 import { useRuntimeBoxes } from "./runtime-boxes";
 import { DefaultModelSettingsPage } from "./settings/default-model-page";
 import { GeneralSettingsPage } from "./settings/general-page";
+import { MobileAccessSettingsPage } from "./settings/mobile-access-page";
 import { ProvidersSettingsPage } from "./settings/providers/providers-page";
 import { RuntimeBoxesSettingsPage } from "./settings/runtime-boxes-page";
 import { McpServersSettingsPage, SkillsSettingsPage } from "./settings/runtime-resources-page";
@@ -259,6 +260,10 @@ export function GeneralSettingsRoutePage() {
 
 export function RuntimeBoxesSettingsRoutePage() {
 	return <RuntimeBoxesSettingsPage />;
+}
+
+export function MobileAccessSettingsRoutePage() {
+	return <MobileAccessSettingsPage />;
 }
 
 export function McpServersSettingsRoutePage() {

@@ -419,7 +419,54 @@ agentDataDirectory/
 - **Desktop UX**：Chat 流内的等待审批卡片（Tool、目标、脱敏 command/path/operation、风险原因、时间/状态；
   Approve once / Reject / Allow all for this Session，处理 loading、已被另一端决定、冲突、离线、过期、取消）；
   侧栏全局 Activity 入口列出跨 Session 待办并可导航到 Session。
-- **仍未实现**：Mobile client（ingress/pairing、apps/mobile、native plugin、通知）不在本层，属后续层。
+- **仍未实现**：Mobile client 的 iOS App 本体（apps/mobile、native plugin、通知）不在本层；Mobile ingress、
+  配对与设备认证已由 Layer 3 落地（见 §9.0.2）。
+
+### 9.0.2 Layer 3 Mobile ingress、二维码配对与设备认证（已实现）
+
+> Mobile stack Layer 3 在 Layer 1 的 browser-safe RPC/multi-client/multi-port 底座与 Layer 2 的 durable
+> approvals 之上，落地了**独立的 Mobile 接入面**：专属 ingress、二维码配对、Ed25519 设备认证与严格 allowlist。
+> **iOS App 本体（Layer 4：Capacitor/Swift plugin）与移动通知后台（Layer 5）尚未实现**；本层交付的是移动端可
+> 安全接入所需的 server + Desktop 侧全部合同与实现。
+
+- **独立 Mobile ingress**：Agent Server 启动一个固定 loopback listener，路径 `/mobile`，作为独立 `RpcServer`
+  与 Product RPC、Runtime ingress **物理/逻辑隔离**，不复用其入口，也**绝不 fallback**。它拥有独立的
+  frame/body/inflight/backpressure/handshake timeout、全局未认证连接与 HTTP request 容量、per-source 限流与
+  流量计量。作为 DevTunnel 的**第二个 expected ingress**按 Layer 1 multi-port 模型接入同一 tunnel，逐端口
+  readiness/public URL/traffic；只有 mobile ingress ready 且拿到 public URL 时才对相应 pairing 公开 URL。
+- **状态合同版本化**：Remote Access status **v1 保持不变**（单标量 Runtime ingress，旧 strict client 仍可用），
+  新增独立 versioned `moshu.v2.mobileAccess.status`（v2 schema）向 Desktop 暴露 mobile ingress 状态、端口、
+  readiness、public URL、协议区间与 transportSecurity。
+- **配对流程**：Desktop 本地 Product RPC 创建 pairing 并展示二维码。versioned QR payload 只含 mobile public
+  URL、pairingId、一次性 code、agentServerId、server 公钥 + 指纹、有效期与协议区间，**绝不含 server secret 或
+  任何长期 token，也不写入日志/持久化 client 存储**。配对 code ≥128-bit 熵、5 分钟有效、server 只存 hash、
+  single-use；claim token 同样只存 hash。状态机 pending/approved/rejected/expired。iOS 端生成 Ed25519 设备 key、
+  通过 pre-auth HTTP endpoint（claim/status/challenge/compatibility，统一小响应，不泄漏 device/key/code 是否
+  存在）提交 claim；Desktop 列出 pending claim（设备名/平台/型号/App 版本/公钥指纹）并在 **CAS 校验 expected
+  fingerprint** 后 approve（防止审批错 claim），或 reject。
+- **设备认证与连接身份**：独立 `MobileIngressAuth`（参考 `RuntimeIngressAuth` 但不复制业务耦合）。claim 校验
+  canonical Ed25519 SPKI 公钥/指纹；challenge 由 `AgentServerIdentity` 签名，canonical signed payload 至少绑定
+  agentServerId、mobileClientId、deviceKeyId、instanceId、persisted generation、challengeId/nonce、mobile 协议
+  版本与 transportSecurity。WebSocket upgrade 前验证设备签名、active key、吊销、challenge 单次/过期、server
+  identity/协议；Authenticator 返回 canonical role=`mobile-client` identity，RPC hello 必须 exact match。
+- **Generation fence**：独立持久 generation high-water（`MobileIngressGenerationFence`），旧 generation/instance/
+  late connection 不能抢占或复活；重连产生新 instance/generation；设备吊销立即关闭匹配 peer 并阻止新
+  challenge/upgrade。transportSecurity 预留 negotiation（含 `relay-tls`），Noise 不可谎称已启用。
+- **严格 method/event 授权**：process-rpc role 扩展 `mobile-client`；Mobile ingress 有**独立 allowlist**，只允许
+  MVP：runtime info/list/client-scoped switch；projects list/get/sidebar（无 path mutation）；models
+  listAvailable；session list/get/create/setModel；chat send/cancel/replay/subscribe/unsubscribe/retired list；
+  approvals list/get/decide 与 session policy get/update。**明确拒绝**：Provider auth/config/credential、Remote
+  Access 控制、Runtime Box pairing/device revoke、MCP/Skills、Project create/relink/archive/delete/path check、
+  diagnostics、任意 DB 查询、Desktop native actions。Product handler 从 authenticated peer identity 解析 client
+  preference/decision source，**不接受伪造 clientId**。Layer 1 event hub 只向 mobile-client 下发其可见/已订阅
+  Session 的 Chat/Approval/retirement/runtime 状态 event，payload 继续严格 Zod + redaction，shell preview 固定
+  常量不泄漏 raw command。
+- **Desktop 配对 UX**：设置新增 Mobile Access 区域，显示 mobile ingress 状态、创建二维码（`qrcode` 渲染，版本
+  锁定并测试）、过期倒计时、pending claim 的设备名/平台/公钥指纹、approve/reject、已配对设备列表/revoke。
+  **只有本地 Desktop Product RPC 能 create/approve/revoke，Mobile ingress 不能自批**；二维码 payload 不写
+  localStorage/日志，组件 unmount/过期即清理显示。中英 i18n、a11y、loading/error/expired/revoked 状态齐备。
+- **仍未实现**：apps/mobile 的 Capacitor/Swift plugin（Layer 4）与移动通知后台（Layer 5）；首版 Mobile client
+  只绑定一个 Agent Server（由 client 实现），Desktop 必须在线；URL/server identity 变化需要重新配对。
 
 ### 9.1 请求流程
 

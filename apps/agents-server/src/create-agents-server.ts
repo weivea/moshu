@@ -33,6 +33,7 @@ import {
 	CURRENT_PROCESS_RPC_PROTOCOL,
 	createRpcBearerAuthenticator,
 	createRpcServer,
+	type RpcPeer,
 	type RpcServer,
 	rpcJsonValueSchema,
 } from "@moshu/process-rpc";
@@ -45,8 +46,11 @@ import { DevTunnelService } from "./dev-tunnel-service";
 import { resolveEffectiveSkills } from "./effective-skill-resolver";
 import { FileProviderRegistryStore } from "./file-provider-registry-store";
 import { McpActionDispatcher } from "./mcp-action-dispatcher";
+import { MobileIngressAuth } from "./mobile-ingress-auth";
+import { MobileIngressGenerationFence } from "./mobile-ingress-generation-fence";
 import {
 	agentsServerClientMethodAllowlist,
+	agentsServerMobileMethodAllowlist,
 	agentsServerRuntimeMethodAllowlist,
 	broadcastApprovalActivityChanged,
 	createProductRpcHandlers,
@@ -63,6 +67,7 @@ import { RuntimeIngressAuth } from "./runtime-ingress-auth";
 export interface AgentsServerInstance {
 	readonly productRpcServer: RpcServer;
 	readonly runtimeRpcServer: RpcServer;
+	readonly mobileRpcServer: RpcServer;
 	readonly devTunnelService: DevTunnelService;
 	readonly runtimeBoxRegistry: RuntimeBoxRegistry;
 	readonly actionJournalEpoch: string;
@@ -163,6 +168,7 @@ export async function createAgentsServer(
 	let projectService: ProjectApplicationService | undefined;
 	let productRpcServer: RpcServer | undefined;
 	let runtimeRpcServer: RpcServer | undefined;
+	let mobileRpcServer: RpcServer | undefined;
 	let devTunnelService: DevTunnelService | undefined;
 	let unsubscribe: (() => void) | undefined;
 	let unsubscribeApprovals: (() => void) | undefined;
@@ -292,6 +298,14 @@ export async function createAgentsServer(
 		// direct product-rpc session.delete) funnels through here so live event subscriptions are always
 		// torn down and retired-session invalidations are always published. Patching only one handler
 		// would leave the other path leaking subscriptions.
+		// Product events fan out to every product-client peer regardless of ingress: Desktop clients on
+		// the Product RPC server and authenticated Mobile clients on the dedicated Mobile ingress. The
+		// event hub still applies per-Session subscription authorization, so combining the peer sets only
+		// widens the candidate set, never the visibility rules.
+		const productEventPeers = (): readonly RpcPeer[] => [
+			...(productRpcServer?.peers ?? []),
+			...(mobileRpcServer?.peers ?? []),
+		];
 		const notifySessionsRetired = (sessionIds: readonly string[]): void => {
 			eventRouter.retireSessions(sessionIds);
 			// Session "Allow all" is session-scoped and server-owned: when a Session is retired its
@@ -304,16 +318,13 @@ export async function createAgentsServer(
 					reportDiagnostic(`Approval reset for retired Session failed: ${message}`);
 				}
 			}
-			const server = productRpcServer;
-			if (server !== undefined) {
-				try {
-					publishRetiredChatSessions(server.peers, sessionIds, reportDiagnostic);
-				} catch (error) {
-					const message = error instanceof Error ? error.message.slice(0, 256) : "Unknown failure.";
-					reportDiagnostic(
-						`Session retirement publication failed; replay will recover it: ${message}`,
-					);
-				}
+			try {
+				publishRetiredChatSessions(productEventPeers(), sessionIds, reportDiagnostic);
+			} catch (error) {
+				const message = error instanceof Error ? error.message.slice(0, 256) : "Unknown failure.";
+				reportDiagnostic(
+					`Session retirement publication failed; replay will recover it: ${message}`,
+				);
 			}
 		};
 		const runtimeIngressAuth = new RuntimeIngressAuth({
@@ -327,6 +338,34 @@ export async function createAgentsServer(
 			),
 			onUpgradeRequired: (runtimeBoxId) => runtimeBoxRegistry.markUpgradeRequired(runtimeBoxId),
 		});
+		// Dedicated Mobile ingress auth — its own pairing repository, device identity path, and pre-auth
+		// HTTP endpoints. It never shares the Runtime ingress bearer/local path: a Mobile client always
+		// authenticates with a signed Ed25519 device challenge, so there is no fallback to Product or
+		// Runtime credentials.
+		const mobileIngressAuth = new MobileIngressAuth({
+			pairings: database.mobilePairings,
+			identity: agentServerIdentity,
+			rpcIdentity: options.bootstrap.serverIdentity,
+			actionJournalEpoch: database.runtimeBoxes.getActionJournalEpoch(),
+			// A pairing QR is only publishable once the Mobile ingress port is live and has a public URL;
+			// until then createPairing() returns the code without a QR so we never advertise a dead URL.
+			getMobilePublicUrl: () => {
+				const ingress = devTunnelService
+					?.getIngressReadiness()
+					.find((entry) => entry.kind === "mobile");
+				return ingress?.ready ? ingress.publicUrl : undefined;
+			},
+		});
+		const mobileGenerationFence = new MobileIngressGenerationFence(database.mobileDevices);
+		// Revoking a Mobile device immediately tears down any live peer for that client id; the durable
+		// revoke flag then blocks any future challenge/upgrade so a stale connection cannot be revived.
+		const disconnectMobileDevice = (mobileClientId: string, reason: string): void => {
+			for (const peer of mobileRpcServer?.peers ?? []) {
+				if (peer.remoteIdentity.peerId === mobileClientId && !peer.isClosed) {
+					peer.close(1008, reason);
+				}
+			}
+		};
 		const initializedProjectService = new ProjectApplicationService({
 			projects: database.projects,
 			runs: database.runs,
@@ -453,6 +492,9 @@ export async function createAgentsServer(
 			runtimeBoxRegistry,
 			runtimeBoxes: database.runtimeBoxes,
 			runtimeBoxPairings: database.runtimeBoxPairings,
+			mobileIngressAuth,
+			mobileDevices: database.mobileDevices,
+			disconnectMobileDevice,
 			projectService,
 			runtimeBoxInventory: database.runtimeBoxInventory,
 			runtimeProfiles: database.runtimeProfiles,
@@ -578,9 +620,60 @@ export async function createAgentsServer(
 		if (persistedRuntimePort === undefined) {
 			database.remoteAccess.setRuntimeIngressPort(runtimeRpcServer.port);
 		}
+		// Physically separate Mobile ingress listener: its own loopback port and `/mobile` path, its own
+		// authenticator (device-signature only), generation fence, and strict allowlist. It shares the
+		// process handler map but never the Runtime/Product accepted-role set, so a Mobile peer can only
+		// ever reach the Mobile allowlist surface.
+		const createMobileRpcServer = (port?: number): RpcServer =>
+			createRpcServer({
+				identity: options.bootstrap.serverIdentity,
+				hostname: "127.0.0.1",
+				...(port === undefined ? {} : { port }),
+				path: "/mobile",
+				maxRequestBodyBytes: 32 * 1024,
+				authenticate: mobileIngressAuth.authenticate,
+				handleHttpRequest: mobileIngressAuth.handleHttpRequest,
+				acceptedPeerRoles: ["mobile-client"],
+				generationFence: mobileGenerationFence,
+				handlers,
+				methodAllowlist: agentsServerMobileMethodAllowlist,
+				limits: {
+					maxFrameBytes: productRpcMaxFrameBytes,
+					maxBufferedOutboundBytes: productRpcMaxBufferedOutboundBytes,
+				},
+				onTraffic(direction, bytes, peer) {
+					if (peer.remoteIdentity.deviceKeyId !== undefined) {
+						devTunnelService?.recordTraffic(direction, bytes);
+					}
+				},
+				onClose(_info, peer) {
+					eventRouter.releasePeer(peer);
+				},
+				onError(error) {
+					console.error("agents-server Mobile ingress RPC error.", error);
+				},
+			});
+		const persistedMobilePort = database.remoteAccess.get().mobileIngressPort;
+		try {
+			mobileRpcServer = createMobileRpcServer(persistedMobilePort);
+		} catch (error) {
+			if (persistedMobilePort === undefined || !isAddressInUseError(error)) {
+				throw error;
+			}
+			mobileRpcServer = createMobileRpcServer();
+			reportDiagnostic(
+				`Mobile ingress port ${persistedMobilePort} is unavailable; rebound to ${mobileRpcServer.port}.`,
+			);
+		}
+		if (persistedMobilePort === undefined) {
+			database.remoteAccess.setMobileIngressPort(mobileRpcServer.port);
+		} else if (persistedMobilePort !== mobileRpcServer.port) {
+			database.remoteAccess.replaceMobileIngressPort(mobileRpcServer.port);
+		}
 		devTunnelService = new DevTunnelService({
 			repository: database.remoteAccess,
 			runtimeIngressPort: runtimeRpcServer.port,
+			mobileIngressPort: mobileRpcServer.port,
 			reportDiagnostic,
 			...(portConflict === undefined ? {} : { portConflict }),
 		});
@@ -589,32 +682,26 @@ export async function createAgentsServer(
 		});
 		const service = chatService;
 		unsubscribe = service.subscribe((event) => {
-			const server = productRpcServer;
-			if (server !== undefined) {
-				eventRouter.publish(server.peers, event, service.getClientRequestId(event.runId));
-			}
+			eventRouter.publish(productEventPeers(), event, service.getClientRequestId(event.runId));
 		});
 		// Fan approval state changes out to the multi-client event hub: Session-scoped events reach
 		// that Session's subscribers, and a no-payload activity hint tells every client to refresh its
 		// cross-session pending-approvals snapshot.
 		unsubscribeApprovals = approvalService.subscribe((event) => {
-			const server = productRpcServer;
-			if (server === undefined) {
-				return;
-			}
+			const peers = productEventPeers();
 			if (event.type === "sessionApprovalPolicy.changed") {
-				eventRouter.publishSessionApprovalPolicy(server.peers, {
+				eventRouter.publishSessionApprovalPolicy(peers, {
 					schemaVersion: 1,
 					policy: event.policy,
 				});
 			} else {
-				eventRouter.publishApproval(server.peers, {
+				eventRouter.publishApproval(peers, {
 					schemaVersion: 1,
 					kind: event.type === "approval.created" ? "created" : "updated",
 					request: event.request,
 				});
 			}
-			broadcastApprovalActivityChanged(server.peers);
+			broadcastApprovalActivityChanged(peers);
 		});
 		// Lazily-expired approvals are settled on read, but a periodic sweep bounds the worst-case time
 		// a waiting Action lingers past its deadline when no client is actively polling.
@@ -632,6 +719,7 @@ export async function createAgentsServer(
 		return {
 			productRpcServer,
 			runtimeRpcServer,
+			mobileRpcServer,
 			devTunnelService,
 			runtimeBoxRegistry,
 			actionJournalEpoch: database.runtimeBoxes.getActionJournalEpoch(),
@@ -648,6 +736,7 @@ export async function createAgentsServer(
 					}
 					productRpcServer?.stop();
 					runtimeRpcServer?.stop();
+					mobileRpcServer?.stop();
 					await devTunnelService?.shutdown();
 					await authController?.dispose();
 					await projectService?.shutdown();
@@ -670,6 +759,7 @@ export async function createAgentsServer(
 		await devTunnelService?.shutdown();
 		productRpcServer?.stop();
 		runtimeRpcServer?.stop();
+		mobileRpcServer?.stop();
 		await authController?.dispose();
 		await projectService?.shutdown();
 		await chatService?.shutdown();
