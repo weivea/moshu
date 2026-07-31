@@ -540,8 +540,9 @@ VoIP/background-processing 伪保活、设备不落业务数据、Desktop 必须
 
 ### 21.7 验证命令（本层，实际运行结果）
 
-- `bun run --cwd apps/mobile test`（**110 Vitest**，含 notification-tap / attention route (>100 events) /
-  production-root tap→navigate + surviving-socket foreground resnapshot / release-gate）、
+- `bun run --cwd apps/mobile test`（**116 Vitest**，含 notification-tap / attention route (>100 events) /
+  **gap→`safeActivity` 安全路由 + 异步走查后 re-validate（前台化/换连接不补发）** /
+  production-root tap→navigate + safe-activity gap tap→Activity + surviving-socket foreground resnapshot / release-gate）、
   `typecheck`（clean）、`build`（vite production）、`cap:sync`（copy dist→`ios/App/App/public`，含
   `@capacitor/local-notifications`）。
 - `swift test`（`apps/mobile/native/MoshuMobile`，**70 XCTest**，含 `BackgroundActivityCoordinator` 陈旧/

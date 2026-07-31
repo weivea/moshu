@@ -568,7 +568,10 @@ agentDataDirectory/
   prompt/command/path/secret），id 由 attention `seq` 稳定派生（`NotificationContentBuilder`/`notificationIdForSeq`）防重复。
   schedule 只挂**校验过的 opaque route**（`sessionId`/`approvalId`/`attentionEventId`，`parseNotificationRoute` 白名单过滤）。
   route 解析用**有界 server cursor 走查**（`MAX_ROUTE_LOOKUP_PAGES`）按 latestSeq 精确定位事件，覆盖 >100 事件与 retention gap
-  （gap/未解析→安全 Activity，不使用 stale opaque id）。tap 由 `NotificationTapCoordinator` 处理（注册 `localNotificationActionPerformed`、start/dispose 单一 listener 无泄漏）：未配对/fatal
+  （gap/走查耗尽→显式 **id-less `{ safeActivity: true }` 安全路由**，`parseNotificationRoute` 识别该 marker 使 tap 仍**可点**并落到安全 Activity，
+  绝不用 stale opaque id，也绝不给 tap 一个空 payload 被静默丢弃）。因 route 走查为异步，controller 在 notify 时捕获连接 **generation**，
+  走查完成后、schedule 之前**重新校验**（App 仍 background、通知仍启用、generation/client 未变），使前台化或换连接后完成的旧走查不会补发陈旧通知。
+  tap 由 `NotificationTapCoordinator` 处理（注册 `localNotificationActionPerformed`、start/dispose 单一 listener 无泄漏）：未配对/fatal
   显示安全状态**不导航**；否则**等到 authenticated connection + attention snapshot 刷新成功后**才用 opaque id 导航，绝不直接展示 stale
   payload。`AttentionProvider` 在 app root（`main.tsx` HashRouter 内）用真实 React Router（`useNavigate`）装配 navigate/safe-state
   默认实现（**非 optional no-op**）：validated route → 导航 Chat/Activity approval，unpaired/fatal/invalid → 明确安全页面。**suspended/terminated 无通知保证**；重连从 server feed 恢复 missed 未读并显示 badge，但不为历史事件批量补发系统通知。
@@ -582,8 +585,9 @@ agentDataDirectory/
   或 `--release`）要求发布方设 `MOSHU_MOBILE_RELEASE_BUNDLE_ID`（或 `release.config.json` `bundleId.release`）为永久非 dev id，
   拒绝空值/`dev.moshu.mobile`，并用 `xcodebuild -showBuildSettings -configuration Release` 解析的 `PRODUCT_BUNDLE_IDENTIFIER`
   精确比对；export compliance（CryptoKit Ed25519 + TLS）问卷/豁免由发布方确认，工程不武断写 `ITSAppUsesNonExemptEncryption`。详见 quality-release。
-- **验证（实际运行）**：**110 Vitest**（含 attention 恢复无 replay、badge、ack 单调、resyncRequired、notification 短后台 gating、opaque
-  route 只带白名单 id、notification tap offline→connect→refresh→navigate / unpaired-fatal 安全态 / dispose、production root
+- **验证（实际运行）**：**116 Vitest**（含 attention 恢复无 replay、badge、ack 单调、resyncRequired、notification 短后台 gating、opaque
+  route 只带白名单 id、**gap/走查耗尽→ `safeActivity` 安全路由 + 异步走查后 re-validate（前台化/换连接不补发通知）**、notification tap
+  offline→connect→refresh→navigate / unpaired-fatal 安全态 / **safe-activity gap tap→Activity** / dispose、production root
   tap→navigate + surviving-socket foreground resnapshot、`UNSUPPORTED_PROTOCOL` fatal 无重连、background close→offline）、**70 Swift XCTest**
   （含 background task 幂等/有界/expiration cleanup、**stale/late-A vs B/synchronous expiration no-op**、稳定 notification id、generic 键、
   opaque route id）、`tsc` strict、`vite build`、`cap sync ios`、release gate 全绿（dev 10 checks；real-release 正确 FAIL 于 dev/缺失 bundle id）；

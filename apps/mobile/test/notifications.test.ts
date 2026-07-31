@@ -71,4 +71,26 @@ describe("parseNotificationRoute", () => {
 		// A payload with only non-whitelisted keys is not actionable.
 		expect(parseNotificationRoute({ prompt: "leak" })).toBeNull();
 	});
+
+	it("recognizes the Moshu-owned safe-activity marker as an actionable, id-less route", () => {
+		// A retention-gap / lookup-exhausted notification carries this marker so its tap is NOT dropped.
+		expect(parseNotificationRoute({ safeActivity: true })).toEqual({ safeActivity: true });
+	});
+
+	it("drops any ids carried alongside the safe-activity marker (never resurrect a stale id)", () => {
+		expect(
+			parseNotificationRoute({
+				safeActivity: true,
+				sessionId: "s-stale",
+				approvalId: "a-stale",
+				attentionEventId: "e-stale",
+			}),
+		).toEqual({ safeActivity: true });
+	});
+
+	it("honors only a strict boolean true for the safe-activity marker", () => {
+		expect(parseNotificationRoute({ safeActivity: false })).toBeNull();
+		expect(parseNotificationRoute({ safeActivity: "true" })).toBeNull();
+		expect(parseNotificationRoute({ safeActivity: 1 })).toBeNull();
+	});
 });

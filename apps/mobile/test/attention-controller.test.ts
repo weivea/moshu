@@ -96,6 +96,15 @@ function makeScheduler() {
 
 const TEXT = { title: "Moshu", body: "New activity" };
 
+/** A tiny externally-resolvable promise, used to pause an in-flight page walk from the test. */
+function deferred<T = void>() {
+	let resolve!: (value: T | PromiseLike<T>) => void;
+	const promise = new Promise<T>((r) => {
+		resolve = r;
+	});
+	return { promise, resolve };
+}
+
 /** Build a minimal, valid desensitized attention event for a given sequence. */
 function makeEvent(
 	seq: number,
@@ -196,7 +205,7 @@ describe("AttentionController", () => {
 		});
 	});
 
-	it("omits a route when the newest event is not present in the page", async () => {
+	it("routes to safe Activity when the newest event is not present in the page", async () => {
 		const feed = makeFeedClient();
 		const { scheduler, scheduled } = makeScheduler();
 		feed.enqueue(listOutput({ unreadCount: 0, latestSeq: 0 }));
@@ -208,13 +217,15 @@ describe("AttentionController", () => {
 		controller.attach(feed.client, bus);
 		await controller.whenSettled();
 
-		// latestSeq advances but the page carries no matching item → never fabricate a route.
+		// latestSeq advances but the page carries no matching item → never fabricate an opaque route;
+		// the notification stays actionable via the id-less safe-activity marker instead of an empty
+		// (silently-dropped) payload.
 		feed.enqueue(listOutput({ unreadCount: 1, latestSeq: 5, items: [] }));
 		bus.emit("mobileAttentionChanged", { schemaVersion: 1 });
 		await controller.whenSettled();
 
 		expect(scheduled).toHaveLength(1);
-		expect(scheduled[0]?.route).toBeUndefined();
+		expect(scheduled[0]?.route).toEqual({ safeActivity: true });
 	});
 
 	it("resolves the newest-event route by walking pages when the feed exceeds one page (>100 events)", async () => {
@@ -260,7 +271,7 @@ describe("AttentionController", () => {
 		expect(feed.listCalls).toContainEqual({ cursor: "cursor-page-2" });
 	});
 
-	it("omits the route (safe Activity) when a retention gap appears while walking pages", async () => {
+	it("routes to safe Activity (id-less) when a retention gap appears while walking pages", async () => {
 		const feed = makeFeedClient();
 		const { scheduler, scheduled } = makeScheduler();
 		feed.enqueue(listOutput({ unreadCount: 0, latestSeq: 0 }));
@@ -279,7 +290,8 @@ describe("AttentionController", () => {
 			nextCursor: "cursor-page-2",
 		});
 		// The next page reports a retention gap: our opaque ids may be stale, so we must NOT guess a
-		// route from them. The notification still fires (badge/awareness) but a tap lands on safe state.
+		// route from them. The notification still fires (badge/awareness) and its tap lands on the safe
+		// Activity hub via the id-less marker — never silently dropped.
 		const gapPage = listOutput({ unreadCount: 100, latestSeq: 150, resyncRequired: true });
 		feed.enqueue(firstPage);
 		feed.enqueue(gapPage);
@@ -288,7 +300,7 @@ describe("AttentionController", () => {
 
 		expect(scheduled).toHaveLength(1);
 		expect(scheduled[0]?.id).toBe(150);
-		expect(scheduled[0]?.route).toBeUndefined();
+		expect(scheduled[0]?.route).toEqual({ safeActivity: true });
 	});
 
 	it("does NOT notify for a live hint while the app is active (badge only)", async () => {
@@ -406,5 +418,101 @@ describe("AttentionController", () => {
 		await controller.whenSettled();
 
 		expect(feed.listCalls.length).toBe(callsBefore);
+	});
+
+	it("does NOT schedule if the app foregrounds during the async multi-page route lookup", async () => {
+		const { scheduler, scheduled } = makeScheduler();
+		let active = false;
+		const reachedPage2 = deferred();
+		const releasePage2 = deferred();
+		const newest = makeEvent(150, { sessionId: "session-150", approvalId: "approval-150" });
+		// Non-cursor list calls: initial attach snapshot, then the live-hint first page.
+		const rootPages: ListMobileAttentionOutput[] = [
+			listOutput({ latestSeq: 0 }),
+			listOutput({
+				unreadCount: 100,
+				latestSeq: 150,
+				items: [makeEvent(1)],
+				nextCursor: "cursor-page-2",
+			}),
+		];
+		const client: AttentionFeedClient = {
+			async listAttention(input) {
+				if (input?.cursor === "cursor-page-2") {
+					reachedPage2.resolve();
+					await releasePage2.promise; // pause the walk mid-flight
+					return listOutput({ unreadCount: 100, latestSeq: 150, items: [makeEvent(149), newest] });
+				}
+				return rootPages.shift() ?? listOutput();
+			},
+			async ackAttention() {
+				return { schemaVersion: 1, ackSeq: 0, unreadCount: 0, latestSeq: 0 };
+			},
+		};
+		const controller = new AttentionController({
+			scheduler,
+			isAppActive: () => active,
+			notificationText: () => TEXT,
+		});
+		controller.attach(client, bus);
+		await controller.whenSettled(); // initial snapshot taken while backgrounded
+
+		bus.emit("mobileAttentionChanged", { schemaVersion: 1 });
+		await reachedPage2.promise; // the route lookup is now paused deep in the page walk
+		active = true; // the user brings the app to the foreground mid-lookup
+		releasePage2.resolve();
+		await controller.whenSettled();
+
+		// The lookup completed but the app is now active: the stale notification is suppressed.
+		expect(scheduled).toHaveLength(0);
+	});
+
+	it("does NOT schedule if the connection is replaced during the route lookup (old generation)", async () => {
+		const { scheduler, scheduled } = makeScheduler();
+		const reachedPage2 = deferred();
+		const releasePage2 = deferred();
+		const newest = makeEvent(150, { sessionId: "session-150", approvalId: "approval-150" });
+		const rootPages: ListMobileAttentionOutput[] = [
+			listOutput({ latestSeq: 0 }),
+			listOutput({
+				unreadCount: 100,
+				latestSeq: 150,
+				items: [makeEvent(1)],
+				nextCursor: "cursor-page-2",
+			}),
+		];
+		const oldClient: AttentionFeedClient = {
+			async listAttention(input) {
+				if (input?.cursor === "cursor-page-2") {
+					reachedPage2.resolve();
+					await releasePage2.promise;
+					return listOutput({ unreadCount: 100, latestSeq: 150, items: [makeEvent(149), newest] });
+				}
+				return rootPages.shift() ?? listOutput();
+			},
+			async ackAttention() {
+				return { schemaVersion: 1, ackSeq: 0, unreadCount: 0, latestSeq: 0 };
+			},
+		};
+		const newFeed = makeFeedClient();
+		newFeed.enqueue(listOutput({ latestSeq: 0 }));
+		const controller = new AttentionController({
+			scheduler,
+			isAppActive: () => false,
+			notificationText: () => TEXT,
+		});
+		controller.attach(oldClient, bus);
+		await controller.whenSettled();
+
+		bus.emit("mobileAttentionChanged", { schemaVersion: 1 });
+		await reachedPage2.promise;
+		// The socket is torn down and replaced (e.g. a foreground resnapshot) while the lookup is paused.
+		controller.detach();
+		controller.attach(newFeed.client, bus);
+		releasePage2.resolve();
+		await controller.whenSettled();
+
+		// The old lookup completed on a superseded connection: its notification must never fire.
+		expect(scheduled).toHaveLength(0);
 	});
 });

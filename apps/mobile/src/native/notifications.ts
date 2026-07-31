@@ -21,30 +21,46 @@ export type NotificationPermissionState = "granted" | "denied" | "prompt" | "una
  * The ONLY payload a notification is allowed to carry across the tap boundary: opaque, server-issued
  * identifiers. There is never any business content here (no prompt/command/path/secret and no
  * human-readable text) — just ids the app re-resolves against a freshly authenticated session before
- * it navigates. Every field is optional; a route with no ids is not actionable and is rejected.
+ * it navigates. Every id field is optional; a route with no navigable id AND no {@link safeActivity}
+ * marker is not actionable and is rejected.
  */
 export interface NotificationRoute {
 	readonly sessionId?: string;
 	readonly approvalId?: string;
 	readonly attentionEventId?: string;
+	/**
+	 * Moshu-owned marker set when the durable feed hit a retention gap or the bounded route lookup was
+	 * exhausted, so no trustworthy opaque id could be resolved. It carries NO business ids at all; a tap
+	 * on such a notification is still actionable but lands on the safe Activity hub (after auth + a
+	 * fresh snapshot) instead of being silently dropped. Only a `true` boolean is honored.
+	 */
+	readonly safeActivity?: boolean;
 }
 
-// The closed set of keys allowed to survive the notification tap boundary. Anything else in the
-// plugin-delivered `extra` bag is dropped, so a malformed or hostile payload can never smuggle
-// business content (or arbitrary keys) into navigation.
+// The closed set of string-id keys allowed to survive the notification tap boundary. Anything else in
+// the plugin-delivered `extra` bag is dropped, so a malformed or hostile payload can never smuggle
+// business content (or arbitrary keys) into navigation. The `safeActivity` boolean marker is handled
+// separately below.
 const NOTIFICATION_ROUTE_KEYS = ["sessionId", "approvalId", "attentionEventId"] as const;
 
 /**
  * Validate and narrow an opaque notification `extra` bag into a {@link NotificationRoute}. Only the
- * whitelisted keys are kept, and only when their value is a non-empty string. Returns `null` when the
- * payload is missing, malformed, or carries no actionable id — callers must then show a safe state
- * instead of navigating.
+ * whitelisted keys are kept, and only when their value is a non-empty string. A Moshu-owned
+ * safe-activity payload (`safeActivity === true`) is recognized first and returned WITHOUT any ids, so
+ * a retention-gap tap is actionable (routes to the safe Activity hub) rather than silently dropped.
+ * Returns `null` when the payload is missing, malformed, or carries neither an actionable id nor the
+ * safe-activity marker — callers must then show a safe state instead of navigating.
  */
 export function parseNotificationRoute(extra: unknown): NotificationRoute | null {
 	if (typeof extra !== "object" || extra === null) {
 		return null;
 	}
 	const source = extra as Record<string, unknown>;
+	// A Moshu-owned safe-activity notification is intentionally id-less: honor only the strict boolean
+	// marker and drop everything else so it can never smuggle (or resurrect) a stale opaque id.
+	if (source.safeActivity === true) {
+		return { safeActivity: true };
+	}
 	const route: { -readonly [K in keyof NotificationRoute]: NotificationRoute[K] } = {};
 	for (const key of NOTIFICATION_ROUTE_KEYS) {
 		const value = source[key];

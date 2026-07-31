@@ -71,11 +71,15 @@ const NOTIFICATION_SAFE_PATH = "/activity";
 /**
  * Map an opaque, validated {@link NotificationRoute} to the in-app path a tap navigates to AFTER the
  * session is authenticated and freshly snapshotted. Approvals live on the Activity screen; a
- * session-scoped event deep-links to that chat. A route carrying only an opaque `attentionEventId`
- * (or nothing navigable) falls back to the safe Activity hub. Never derives a path from business
- * content — only server-issued ids.
+ * session-scoped event deep-links to that chat. A Moshu-owned safe-activity marker (retention gap /
+ * route lookup exhausted) and any route carrying only an opaque `attentionEventId` (or nothing
+ * navigable) fall back to the safe Activity hub. Never derives a path from business content — only
+ * server-issued ids.
  */
 export function notificationRouteToPath(route: NotificationRoute): string {
+	if (route.safeActivity) {
+		return NOTIFICATION_SAFE_PATH;
+	}
 	if (route.approvalId) {
 		return NOTIFICATION_SAFE_PATH;
 	}

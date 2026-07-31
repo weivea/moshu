@@ -36,6 +36,12 @@ export interface AttentionFeedClient {
 // between calls, so a busy feed never triggers an unbounded page crawl.
 const MAX_ROUTE_LOOKUP_PAGES = 12;
 
+// The id-less route carried by a Moshu-owned notification when the durable feed hit a retention gap
+// or the bounded route lookup was exhausted, so no trustworthy opaque id could be resolved. A tap on
+// such a notification stays actionable (it is not silently dropped) but lands on the safe Activity hub
+// after auth + a fresh snapshot, never navigating with a stale/guessed opaque id.
+const SAFE_ACTIVITY_ROUTE: NotificationRoute = { safeActivity: true };
+
 /** Generic, already-localized notification copy. Must never contain business content. */
 export interface AttentionNotificationText {
 	readonly title: string;
@@ -73,6 +79,10 @@ export class AttentionController {
 
 	#client: AttentionFeedClient | null = null;
 	#unsubscribe: (() => void) | null = null;
+	// Monotonic id for the currently-bound connection/client. Bumped on every attach and detach so a
+	// long-running async route lookup that outlives its connection (app foregrounded, socket replaced,
+	// or detached) can detect the change and refuse to fire a stale notification.
+	#generation = 0;
 	// The highest sequence we've already observed. Live events beyond this baseline are the only ones
 	// eligible to raise a system notification; a reconnect snapshot re-baselines without notifying.
 	#seenSeq = 0;
@@ -111,6 +121,7 @@ export class AttentionController {
 	attach(client: AttentionFeedClient, bus: MobileEventBus): void {
 		this.detach();
 		this.#client = client;
+		this.#generation += 1;
 		this.#unsubscribe = bus.on("mobileAttentionChanged", () => {
 			this.#enqueue(() => this.#refresh({ notify: true }));
 		});
@@ -122,6 +133,7 @@ export class AttentionController {
 		this.#unsubscribe?.();
 		this.#unsubscribe = null;
 		this.#client = null;
+		this.#generation += 1;
 	}
 
 	/** Acknowledge every event up to and including `seq` (monotonic on the server). */
@@ -167,14 +179,20 @@ export class AttentionController {
 		if (!client) {
 			return;
 		}
+		// Capture the connection identity that owns this refresh. If it is replaced (detach/re-attach)
+		// while we await the network, we must abandon rather than write another connection's state.
+		const generation = this.#generation;
 		const page = await client.listAttention();
+		if (this.#generation !== generation || this.#client !== client) {
+			return;
+		}
 		this.#unreadCount = page.unreadCount;
 		this.#ackSeq = page.ackSeq;
 		this.#latestSeq = page.latestSeq;
 		this.#resyncRequired = page.resyncRequired;
 
 		if (notify && page.latestSeq > this.#seenSeq) {
-			await this.#maybeNotify(page);
+			await this.#maybeNotify(page, generation, client);
 		}
 		// Whether or not we notified, everything up to latestSeq is now "seen": a later reconnect
 		// snapshot must not resurface these as notifications.
@@ -184,20 +202,36 @@ export class AttentionController {
 		this.#emit();
 	}
 
-	async #maybeNotify(firstPage: ListMobileAttentionOutput): Promise<void> {
-		// Active app → Activity badge only, no lock-screen banner.
+	async #maybeNotify(
+		firstPage: ListMobileAttentionOutput,
+		generation: number,
+		client: AttentionFeedClient,
+	): Promise<void> {
+		// Gate at decision time: active app → Activity badge only, no lock-screen banner.
 		if (this.#isAppActive() || !this.#isNotificationsEnabled()) {
 			return;
 		}
 		const text = this.#notificationText();
+		// The route resolves the NEWEST event, which is on the LAST page (feed is ascending). This walk
+		// is async and may span multiple pages, during which the app can foreground, notifications can
+		// be disabled, or the connection can be replaced.
+		const route = await this.#resolveRoute(firstPage, generation, client);
+		// Re-validate EVERY gate after the async lookup: an old lookup completing after the app returned
+		// to the foreground, after the user disabled notifications, or on a superseded connection must
+		// NOT fire a (now stale) system notification.
+		if (
+			this.#isAppActive() ||
+			!this.#isNotificationsEnabled() ||
+			this.#generation !== generation ||
+			this.#client !== client
+		) {
+			return;
+		}
 		await this.#scheduler.schedule({
 			id: notificationIdForSeq(firstPage.latestSeq),
 			title: text.title,
 			body: text.body,
-			// The route resolves the NEWEST event, which is on the LAST page (feed is ascending). When
-			// the newest event is beyond the first page we walk forward via the opaque cursor rather than
-			// giving up, so a busy feed (>1 page) still produces an actionable tap route.
-			route: await this.#resolveRoute(firstPage),
+			route,
 		});
 	}
 
@@ -208,16 +242,19 @@ export class AttentionController {
 	 * strictly bounded walk (the feed is capped at {@link mobileAttentionRetentionMaxEvents}) — until we
 	 * reach the page containing the target seq.
 	 *
-	 * Retention-gap safety: if any page reports `resyncRequired`, events have aged out and the opaque
-	 * ids we hold may be stale, so we return `undefined` (no route). A tap then lands on a safe Activity
-	 * state that re-snapshots the server feed rather than navigating with a stale/guessed id.
+	 * Retention-gap / exhaustion safety: if any page reports `resyncRequired`, the bounded walk runs out
+	 * of pages, or the connection is replaced mid-walk, the opaque ids we hold may be stale/foreign, so
+	 * we return the id-less {@link SAFE_ACTIVITY_ROUTE}. The notification stays actionable but a tap
+	 * lands on a safe Activity state that re-snapshots the server feed rather than navigating with a
+	 * stale/guessed id.
 	 */
 	async #resolveRoute(
 		firstPage: ListMobileAttentionOutput,
-	): Promise<NotificationRoute | undefined> {
-		const client = this.#client;
-		if (!client || firstPage.resyncRequired) {
-			return undefined;
+		generation: number,
+		client: AttentionFeedClient,
+	): Promise<NotificationRoute> {
+		if (this.#client !== client || this.#generation !== generation || firstPage.resyncRequired) {
+			return SAFE_ACTIVITY_ROUTE;
 		}
 		const targetSeq = firstPage.latestSeq;
 		const direct = firstPage.items.find((item) => item.seq === targetSeq);
@@ -226,10 +263,15 @@ export class AttentionController {
 		}
 		let cursor = firstPage.nextCursor;
 		for (let page = 0; page < MAX_ROUTE_LOOKUP_PAGES && cursor !== undefined; page += 1) {
+			// The connection was replaced while we were walking: never surface a route resolved against a
+			// superseded/foreign connection.
+			if (this.#client !== client || this.#generation !== generation) {
+				return SAFE_ACTIVITY_ROUTE;
+			}
 			const next: ListMobileAttentionOutput = await client.listAttention({ cursor });
 			// A gap opening up mid-walk means our opaque ids may be stale: fail safe, never guess.
 			if (next.resyncRequired) {
-				return undefined;
+				return SAFE_ACTIVITY_ROUTE;
 			}
 			const found = next.items.find((item) => item.seq === targetSeq);
 			if (found) {
@@ -237,8 +279,8 @@ export class AttentionController {
 			}
 			cursor = next.nextCursor;
 		}
-		// Bounded walk exhausted without locating the target (e.g. it aged out between pages): no route.
-		return undefined;
+		// Bounded walk exhausted without locating the target (e.g. it aged out between pages): safe hub.
+		return SAFE_ACTIVITY_ROUTE;
 	}
 
 	/**

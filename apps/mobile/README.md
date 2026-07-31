@@ -186,8 +186,14 @@ re-runs a **non-notifying** refresh + snapshot-freshness check (`onAppActive` re
 surviving `connected` state) so unread updates without re-firing historical local
 notifications. Notification routes are resolved by walking the server cursor up to a bounded
 page count (`MAX_ROUTE_LOOKUP_PAGES`) so a tap on the newest event still resolves past the
-first page (150+ events); a retention gap falls back to the safe Activity screen rather than
-using a stale opaque id.
+first page (150+ events); a retention gap or an exhausted walk yields an explicit **id-less
+`{ safeActivity: true }` route** (never a `undefined`/empty payload that a tap would silently
+drop) so the tap stays actionable and lands on the safe Activity screen after auth + refresh
+rather than using a stale opaque id. Because that route walk is async, the controller captures
+the connection **generation** at notify time and re-checks — app still backgrounded,
+notifications still enabled, same generation/client — **after** the walk and **before**
+scheduling, so a lookup that finishes once the app has foregrounded (or on a superseded socket)
+never fires a stale notification.
 
 ## Lifecycle & reconnect (Layer 5)
 

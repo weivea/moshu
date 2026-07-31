@@ -313,6 +313,28 @@ describe("AttentionProvider notification-tap production wiring (#1)", () => {
 		await waitFor(() => expect(screen.getByTestId("path")).toHaveTextContent("/activity"));
 		expect(screen.getByTestId("path")).not.toHaveTextContent("/chats/sess-1");
 	});
+
+	it("routes a Moshu-owned safe-activity tap (retention gap) to the Activity hub after readiness", async () => {
+		const client = makeFakeClient();
+		const controller = new FakeController(connectedState(client, bus));
+		const lifecycle = new FakeLifecycle();
+		const scheduler = new FakeScheduler();
+
+		renderApp({ controller, lifecycle, scheduler, initialPath: "/chats" });
+		await waitFor(() => expect(scheduler.hasTapListener).toBe(true));
+
+		// A retention-gap / lookup-exhausted notification delivers the id-less safe-activity marker. The
+		// tap must still be actionable (not silently dropped) and, after the session is authenticated and
+		// re-snapshotted, land on the safe Activity hub without using any stale opaque id.
+		await act(async () => {
+			scheduler.fireTap({ safeActivity: true });
+			await Promise.resolve();
+		});
+
+		await waitFor(() => expect(screen.getByTestId("path")).toHaveTextContent("/activity"));
+		// A fresh snapshot was taken before navigating (never surface stale content on a gap tap).
+		expect(client.listAttention).toHaveBeenCalled();
+	});
 });
 
 describe("AttentionProvider surviving-socket foreground resnapshot (#2)", () => {
