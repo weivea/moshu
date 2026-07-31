@@ -72,176 +72,57 @@ const criticalBashPatterns: { pattern: RegExp; reason: string }[] = [
 	},
 ];
 
-// --- Fail-closed command preview ------------------------------------------
+// --- Fail-closed shell command preview ------------------------------------
 //
-// The command preview stored in the (persisted, broadcast) Approval summary must
-// never contain a raw credential. It is generated fail-closed:
-//   * recognised secret-bearing positions are masked (auth/api-key/cookie/user/
-//     password/token flags + headers, URL credentials + secret query params,
-//     secret env assignments, and known secret literals anywhere), and
-//   * any command we cannot safely tokenise (command substitution, backticks,
-//     process substitution, or unbalanced quotes) is reduced to
-//     "<executable> [arguments hidden]".
-// The raw validated command stays on the server-only execution path (the Action
-// intent) — only this preview reaches the Approval contract, events, UI, and logs.
+// A shell command's public preview must never expose a credential. The argument
+// surface of a shell is unbounded — attached credential flags (`-uuser:secret`,
+// `-pSECRET`), arbitrary/unknown flags, URL userinfo, query secrets, env
+// assignments, and operator right-hand sides — so no denylist can be trusted.
+// The preview is therefore fully fail-closed: it discloses ONLY the safely
+// parsed executable basename (or "shell" when that cannot be proven), followed
+// by "[arguments hidden]". No argv, flag value, URL, env assignment, or operator
+// right-hand side is ever shown. The raw validated command stays exclusively on
+// the server-only execution path (the Action intent); it never reaches the
+// Approval contract, events, UI, or logs.
 
-const redactedPlaceholder = "[redacted]";
 const hiddenArgumentsLabel = "[arguments hidden]";
-
-// Flags whose *following* argument is a credential (curl/http clients, ssh, …).
-const credentialValueFlags = new Set([
-	"-u",
-	"--user",
-	"-p",
-	"--password",
-	"--passwd",
-	"--pass",
-	"--token",
-	"--api-key",
-	"--apikey",
-	"--access-key",
-	"--secret",
-	"--auth",
-	"--authorization",
-	"--bearer",
-	"--cookie",
-	"--proxy-user",
-	"--tlspassword",
-	"--key-password",
-]);
-
-// Flags whose following argument is an HTTP header (value masked when sensitive).
-const headerValueFlags = new Set(["-H", "--header"]);
-
-// Inline "--flag=value" credential forms.
-const sensitiveInlineFlag =
-	/^(--?(?:user|password|passwd|pass|token|api[-_]?key|access[-_]?key|secret|auth|authorization|bearer|cookie|proxy-user|tlspassword|key-password))=/i;
-
-// Header names whose value must never be shown.
-const sensitiveHeaderName =
-	/^(?:authorization|proxy-authorization|cookie|set-cookie|x-api-key|api-key|x-auth-token|x-access-token|x-amz-security-token|x-goog-api-key)$/i;
-
-// Environment-assignment names that carry secrets.
-const sensitiveEnvName =
-	/(?:secret|token|password|passwd|api[-_]?key|access[-_]?key|auth|credential|private[-_]?key|session[-_]?key|passphrase)/i;
-
-// Query-string parameter names whose value must never be shown.
-const sensitiveQueryParam =
-	/(?:token|secret|password|passwd|api[-_]?key|access[-_]?key|auth|signature|sig|credential|session)/i;
-
-// High-signal standalone secret literals (masked wherever they appear).
-const secretLiteralPatterns: RegExp[] = [
-	/A(?:KIA|SIA|GPA|IDA|ROA|IPA|NPA|NVA|CCA)[0-9A-Z]{12,}/, // AWS keys
-	/gh[posur]_[A-Za-z0-9]{20,}/, // GitHub tokens
-	/github_pat_[A-Za-z0-9_]{20,}/,
-	/xox[baprs]-[A-Za-z0-9-]{10,}/, // Slack
-	/sk-[A-Za-z0-9_-]{16,}/, // OpenAI-style keys
-	/AIza[0-9A-Za-z_-]{20,}/, // Google API key
-	/ya29\.[0-9A-Za-z_-]{20,}/, // Google OAuth token
-	/eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{4,}/, // JWT
-	/-----BEGIN[A-Z0-9 ]*PRIVATE KEY-----/, // PEM private key
-];
-
-// Constructs whose contents we cannot statically reason about → hide all args.
-const unsafeSubstitution = /\$\(|`|<\(|>\(/;
+const shellFallbackLabel = "shell";
 
 export function buildSafeCommandPreview(command: string): string {
-	if (unsafeSubstitution.test(command)) {
-		return truncate(fallbackPreview(command), maxCommandSummaryLength);
-	}
+	return truncate(
+		`${shellExecutableLabel(command)} ${hiddenArgumentsLabel}`,
+		maxCommandSummaryLength,
+	);
+}
+
+// Discloses only the executable basename we can *prove* safe to show. Unbalanced
+// quotes, command/process substitution, a quoted or metacharacter-bearing
+// program word, or an empty command all collapse to "shell".
+function shellExecutableLabel(command: string): string {
 	const tokens = tokenizeCommand(command);
 	if (tokens === null) {
-		return truncate(fallbackPreview(command), maxCommandSummaryLength);
+		return shellFallbackLabel;
 	}
-	const masked: string[] = [];
-	let pending: "credential" | "header" | null = null;
-	for (const token of tokens) {
-		if (pending === "credential") {
-			masked.push(redactedPlaceholder);
-			pending = null;
-			continue;
-		}
-		if (pending === "header") {
-			masked.push(maskHeaderValue(token));
-			pending = null;
-			continue;
-		}
-		const lower = token.toLowerCase();
-		if (credentialValueFlags.has(lower)) {
-			masked.push(token);
-			pending = "credential";
-			continue;
-		}
-		// `-H` (curl header) is case-sensitive; `--header` is not.
-		if (headerValueFlags.has(token) || headerValueFlags.has(lower)) {
-			masked.push(token);
-			pending = "header";
-			continue;
-		}
-		masked.push(maskToken(token));
+	let index = 0;
+	// Skip leading `NAME=VALUE` environment assignments; their value may be secret.
+	while (index < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[index] ?? "")) {
+		index += 1;
 	}
-	return truncate(masked.join(" "), maxCommandSummaryLength);
-}
-
-function maskToken(token: string): string {
-	const inline = token.match(sensitiveInlineFlag);
-	if (inline !== null) {
-		return `${inline[1]}=${redactedPlaceholder}`;
+	const executable = tokens[index];
+	if (executable === undefined || executable.length === 0) {
+		return shellFallbackLabel;
 	}
-	const env = token.match(/^([A-Za-z_][A-Za-z0-9_]*)=([\s\S]*)$/);
-	if (env !== null) {
-		const name = env[1] ?? "";
-		const value = env[2] ?? "";
-		if (sensitiveEnvName.test(name) || containsSecretLiteral(value) || hasUrlCredentials(value)) {
-			return `${name}=${redactedPlaceholder}`;
-		}
+	const basename = executable.slice(executable.lastIndexOf("/") + 1);
+	// Only a clean, metacharacter-free program name is ever disclosed.
+	if (!/^[A-Za-z0-9._+-]{1,64}$/.test(basename)) {
+		return shellFallbackLabel;
 	}
-	return maskSecretLiterals(maskUrl(token));
-}
-
-function maskHeaderValue(token: string): string {
-	const colon = token.indexOf(":");
-	if (colon > 0) {
-		const name = token.slice(0, colon).trim();
-		if (sensitiveHeaderName.test(name)) {
-			return `${name}: ${redactedPlaceholder}`;
-		}
-	}
-	return maskToken(token);
-}
-
-function maskUrl(token: string): string {
-	if (!token.includes("://")) {
-		return token;
-	}
-	let out = token.replace(
-		/([a-z][a-z0-9+.-]*:\/\/)([^/@\s]+)@/i,
-		(_match, scheme: string) => `${scheme}${redactedPlaceholder}@`,
-	);
-	out = out.replace(/([?&]([^=&\s]+)=)([^&\s]+)/g, (match, prefix: string, key: string) =>
-		sensitiveQueryParam.test(key) ? `${prefix}${redactedPlaceholder}` : match,
-	);
-	return out;
-}
-
-function maskSecretLiterals(token: string): string {
-	let out = token;
-	for (const pattern of secretLiteralPatterns) {
-		out = out.replace(new RegExp(pattern.source, "g"), () => redactedPlaceholder);
-	}
-	return out;
-}
-
-function containsSecretLiteral(value: string): boolean {
-	return secretLiteralPatterns.some((pattern) => pattern.test(value));
-}
-
-function hasUrlCredentials(value: string): boolean {
-	return /[a-z][a-z0-9+.-]*:\/\/[^/@\s]+@/i.test(value);
+	return basename;
 }
 
 // Conservative POSIX-ish tokenizer. Returns null on unbalanced quotes so the
-// caller fails closed instead of guessing.
+// caller fails closed instead of guessing. Only used to locate the executable;
+// argument contents are never surfaced.
 function tokenizeCommand(command: string): string[] | null {
 	const tokens: string[] = [];
 	let current = "";
@@ -297,25 +178,6 @@ function tokenizeCommand(command: string): string[] | null {
 		tokens.push(current);
 	}
 	return tokens;
-}
-
-function fallbackPreview(command: string): string {
-	return `${safeExecutableLabel(command)} ${hiddenArgumentsLabel}`;
-}
-
-function safeExecutableLabel(command: string): string {
-	for (const token of command.trim().split(/\s+/)) {
-		// Skip leading environment assignments (their value may be a secret).
-		if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(token)) {
-			continue;
-		}
-		const cleaned = token.replace(/[;&|<>()`'"$].*$/, "");
-		if (cleaned.length > 0 && /^[A-Za-z0-9_./+-]{1,64}$/.test(cleaned)) {
-			return cleaned;
-		}
-		return "command";
-	}
-	return "command";
 }
 
 function truncate(value: string, max: number): string {

@@ -39,10 +39,14 @@ function buildRequest(overrides: Partial<ApprovalRequest> = {}): ApprovalRequest
 			tool: "bash",
 			operation: "bash",
 			target: { kind: "runtime-box", id: "local" },
-			command: "rm ./tmp/output.log",
+			command: "rm [arguments hidden]",
 			redactedParams: {},
 		},
-		risk: { tier: "high", overridable: true, reasons: ["Runs a shell command"] },
+		risk: {
+			tier: "high",
+			overridable: false,
+			reasons: ["Runs a shell command whose full effect is hidden for security"],
+		},
 		state: "pending",
 		revision: 1,
 		createdAt: "2024-05-01T10:00:00.000Z",
@@ -60,6 +64,21 @@ function buildPolicy(overrides: Partial<SessionApprovalPolicy> = {}): SessionApp
 		updatedAt: "2024-05-01T09:59:00.000Z",
 		...overrides,
 	};
+}
+
+function buildOverridableRequest(overrides: Partial<ApprovalRequest> = {}): ApprovalRequest {
+	// Only non-shell, overridable Actions (e.g. a file write) can offer Allow all.
+	return buildRequest({
+		action: {
+			tool: "write",
+			operation: "write",
+			target: { kind: "runtime-box", id: "local" },
+			path: "/workspace/output.log",
+			redactedParams: {},
+		},
+		risk: { tier: "medium", overridable: true, reasons: ["Writes a file"] },
+		...overrides,
+	});
 }
 
 function renderCard(request: ApprovalRequest, policy: SessionApprovalPolicy | undefined) {
@@ -80,11 +99,18 @@ describe("ApprovalCard", () => {
 	test("renders tool, command, risk reason, and actions", () => {
 		renderCard(buildRequest(), buildPolicy());
 		expect(screen.getByRole("heading", { name: "bash" })).toBeInTheDocument();
-		expect(screen.getByText("rm ./tmp/output.log")).toBeInTheDocument();
-		expect(screen.getByText("Runs a shell command")).toBeInTheDocument();
+		expect(screen.getByText("rm [arguments hidden]")).toBeInTheDocument();
+		expect(
+			screen.getByText("Runs a shell command whose full effect is hidden for security"),
+		).toBeInTheDocument();
 		expect(screen.getByRole("button", { name: "Approve once" })).toBeInTheDocument();
 		expect(screen.getByRole("button", { name: "Reject" })).toBeInTheDocument();
-		expect(screen.getByRole("button", { name: "Allow all for this Session" })).toBeInTheDocument();
+		// A shell Action is never overridable, so Allow all is hidden and the
+		// "always needs explicit approval" badge is shown instead.
+		expect(
+			screen.queryByRole("button", { name: "Allow all for this Session" }),
+		).not.toBeInTheDocument();
+		expect(screen.getByText("Always needs explicit approval")).toBeInTheDocument();
 	});
 
 	test("approve once submits an approve_once decision", async () => {
@@ -126,7 +152,7 @@ describe("ApprovalCard", () => {
 
 	test("allow-all toggles the session policy", async () => {
 		setAllowAll.mockResolvedValue();
-		renderCard(buildRequest(), buildPolicy());
+		renderCard(buildOverridableRequest(), buildPolicy());
 		fireEvent.click(screen.getByRole("button", { name: "Allow all for this Session" }));
 		await waitFor(() => expect(setAllowAll).toHaveBeenCalledWith(sessionId, true));
 	});

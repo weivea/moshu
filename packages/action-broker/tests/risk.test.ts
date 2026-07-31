@@ -119,50 +119,74 @@ describe("server-authoritative risk classification", () => {
 		}
 	});
 
-	test("command preview masks common and unknown secret shapes fail-closed", () => {
-		const secrets: { command: string; secret: string }[] = [
-			{ command: "deploy --password hunter2", secret: "hunter2" },
-			{ command: "deploy --password=hunter2", secret: "hunter2" },
-			{ command: "API_TOKEN=abc123XYZ run", secret: "abc123XYZ" },
-			{ command: "curl -u alice:supersecret https://x", secret: "supersecret" },
-			{
-				command: 'curl -H "Authorization: Bearer sk-abcdef0123456789abcd" https://x',
-				secret: "sk-abcdef0123456789abcd",
-			},
-			{
-				command: 'curl -H "X-Api-Key: my-unknown-secret-value-1234" https://x',
-				secret: "my-unknown-secret-value-1234",
-			},
-			{
-				command: "gh auth login --with-token ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345",
-				secret: "ghp_ABCDEFGHIJKLMNOPQRSTUVWXYZ012345",
-			},
-			{ command: "aws configure set x AKIAIOSFODNN7EXAMPLE", secret: "AKIAIOSFODNN7EXAMPLE" },
-			{ command: "curl https://alice:s3cr3tpw@example.com/api", secret: "s3cr3tpw" },
-			{ command: "curl 'https://x/api?api_key=zzztopsecret999&q=1'", secret: "zzztopsecret999" },
-			{ command: "run --secret Xy9UnknownHighEntropyValue", secret: "Xy9UnknownHighEntropyValue" },
-			{ command: "MYAPP_CREDENTIAL=zzsecretzz start", secret: "zzsecretzz" },
+	test("shell command preview discloses only the executable basename", () => {
+		const cases: { command: string; label: string }[] = [
+			{ command: "curl -u alice:supersecret https://x", label: "curl" },
+			{ command: "/bin/bash -c 'echo hi'", label: "bash" },
+			{ command: "/usr/bin/env python3 deploy.py", label: "env" },
+			{ command: "TOKEN=abc bash script.sh", label: "bash" },
+			{ command: "./run.sh --secret v", label: "run.sh" },
+			{ command: "   git   push --force  ", label: "git" },
+			// A substitution / metacharacter program word cannot be proven safe.
+			{ command: "$(cat evil) arg", label: "shell" },
+			{ command: "`evil` arg", label: "shell" },
+			{ command: "'quoted prog' arg", label: "shell" },
+			{ command: "", label: "shell" },
 		];
-		for (const { command, secret } of secrets) {
-			const preview = buildSafeCommandPreview(command);
-			expect(preview).not.toContain(secret);
-			expect(preview).toContain("[redacted]");
+		for (const { command, label } of cases) {
+			expect(buildSafeCommandPreview(command)).toBe(`${label} [arguments hidden]`);
 		}
 	});
 
-	test("command preview hides all arguments when it cannot be safely parsed", () => {
-		// Command substitution / backticks could hide a secret we cannot resolve.
+	test("no secret sentinel leaks into the shell preview or serialized Approval summary", () => {
+		// Attached/separate credential flags, arbitrary/unknown flags, URL
+		// userinfo/query, env assignments, quotes, pipes, and substitution must all
+		// keep their secret out of every public projection. A denylist is not
+		// trusted: only the executable basename is ever shown.
+		const cases: { command: string; secret: string }[] = [
+			{ command: "curl -uuser:RawSecret123 https://x", secret: "RawSecret123" },
+			{ command: "curl --oauth2-bearer UnmaskedValueABC https://x", secret: "UnmaskedValueABC" },
+			{ command: "sshpass -pUnmaskedValueDEF ssh host", secret: "UnmaskedValueDEF" },
+			{ command: "curl -u alice:supersecret https://x", secret: "supersecret" },
+			{ command: "deploy --password hunter2", secret: "hunter2" },
+			{ command: "deploy --password=hunter2", secret: "hunter2" },
+			{
+				command: "deploy --totally-unknown-flag zzUnknownFlagSecret",
+				secret: "zzUnknownFlagSecret",
+			},
+			{ command: "deploy --totally-unknown-flag=zzAttachedUnknown", secret: "zzAttachedUnknown" },
+			{ command: "curl https://alice:urlUserSecret@example.com", secret: "urlUserSecret" },
+			{ command: 'curl "https://x/api?token=urlQuerySecret&q=1"', secret: "urlQuerySecret" },
+			{ command: "API_TOKEN=envSecretValue run", secret: "envSecretValue" },
+			{ command: "MYAPP_WHATEVER=unknownEnvSecret run", secret: "unknownEnvSecret" },
+			{ command: 'echo "quotedSecretVal" | curl -d @- https://x', secret: "quotedSecretVal" },
+			{ command: "curl $(printf subShellSecret) https://x", secret: "subShellSecret" },
+			{ command: "curl `printf backtickSecret` https://x", secret: "backtickSecret" },
+			{ command: "bash <(echo procSubSecret)", secret: "procSubSecret" },
+			{ command: "run --password 'unbalQuoteSecret", secret: "unbalQuoteSecret" },
+		];
+		for (const { command, secret } of cases) {
+			const preview = buildSafeCommandPreview(command);
+			expect(preview).not.toContain(secret);
+			expect(preview.endsWith("[arguments hidden]")).toBe(true);
+			// The full server-authoritative summary/risk that is persisted and
+			// broadcast must likewise never carry the secret.
+			const classification = classifyExecutorAction({ tool: "bash", arguments: { command } });
+			expect(JSON.stringify(classification.summary)).not.toContain(secret);
+			expect(JSON.stringify(classification.risk)).not.toContain(secret);
+		}
+	});
+
+	test("command preview reduces unparseable commands to a safe label", () => {
 		expect(buildSafeCommandPreview("curl $(cat /run/secrets/token) https://x")).toBe(
 			"curl [arguments hidden]",
 		);
 		expect(buildSafeCommandPreview("deploy `cat secret`")).toBe("deploy [arguments hidden]");
-		// Unbalanced quotes → fail closed, never leak the trailing literal.
-		expect(buildSafeCommandPreview('run --password "unterminated hunter2')).not.toContain(
-			"hunter2",
+		// Unbalanced quotes → fail closed to "shell", never leak the trailing literal.
+		expect(buildSafeCommandPreview('run --password "unterminated hunter2')).toBe(
+			"shell [arguments hidden]",
 		);
 		// A leading secret env assignment must not leak through the fallback label.
-		const fallback = buildSafeCommandPreview("SECRET_TOKEN=leakme $(do)");
-		expect(fallback).not.toContain("leakme");
-		expect(fallback).toContain("[arguments hidden]");
+		expect(buildSafeCommandPreview("SECRET_TOKEN=leakme $(do)")).toBe("shell [arguments hidden]");
 	});
 });
