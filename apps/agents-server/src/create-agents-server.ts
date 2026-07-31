@@ -202,6 +202,11 @@ export async function createAgentsServer(
 				`Expired ${approvalRecovery.expired} pending Tool approvals that could not resume after restart.`,
 			);
 		}
+		if (approvalRecovery.policiesReset > 0) {
+			reportDiagnostic(
+				`Reset ${approvalRecovery.policiesReset} Session Allow-all policies to off after restart (SEC-003).`,
+			);
+		}
 		const actionAuthorizer = new DurableActionAuthorizationService(
 			database.actions,
 			database.runs,

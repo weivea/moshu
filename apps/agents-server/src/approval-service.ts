@@ -247,7 +247,7 @@ export class ApprovalService implements ActionApprovalGate {
 		return expired.length;
 	}
 
-	recoverOnStartup(nowMs?: number): { expired: number } {
+	recoverOnStartup(nowMs?: number): { expired: number; policiesReset: number } {
 		return this.#approvals.recoverOnStartup(nowMs ?? this.#clock.now());
 	}
 

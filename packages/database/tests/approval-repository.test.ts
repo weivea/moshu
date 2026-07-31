@@ -265,8 +265,39 @@ describe("ApprovalRepository", () => {
 			const second = createPending(database, sessionId, runId);
 			const result = database.approvals.recoverOnStartup();
 			expect(result.expired).toBe(2);
+			expect(result.policiesReset).toBe(0);
 			expect(database.approvals.getOrThrow(first.id).state).toBe("expired");
 			expect(database.approvals.getOrThrow(second.id).state).toBe("expired");
+		} finally {
+			database.close();
+		}
+	});
+
+	test("recoverOnStartup resets enabled Session Allow-all policies and is idempotent", () => {
+		const { database, sessionId } = setup();
+		try {
+			const enabled = database.approvals.updatePolicy({
+				sessionId,
+				allowAll: true,
+				expectedRevision: 0,
+				idempotencyKey: crypto.randomUUID(),
+				updatedBy: clientSource,
+			});
+			expect(enabled.policy.allowAll).toBe(true);
+			expect(enabled.policy.revision).toBe(1);
+
+			const first = database.approvals.recoverOnStartup();
+			expect(first.policiesReset).toBe(1);
+
+			const afterReset = database.approvals.getPolicy(sessionId);
+			expect(afterReset.allowAll).toBe(false);
+			expect(afterReset.revision).toBe(2);
+			expect(afterReset.updatedBy?.kind).toBe("system");
+
+			// A second recovery must not reset an already-disabled policy again.
+			const second = database.approvals.recoverOnStartup();
+			expect(second.policiesReset).toBe(0);
+			expect(database.approvals.getPolicy(sessionId).revision).toBe(2);
 		} finally {
 			database.close();
 		}
@@ -380,6 +411,38 @@ describe("ApprovalRepository", () => {
 			expect(pendingOnly.items.map((item) => item.id)).toEqual([second.id]);
 			expect(pendingOnly.policies).toHaveLength(1);
 			expect(pendingOnly.policies[0]?.sessionId).toBe(sessionId);
+		} finally {
+			database.close();
+		}
+	});
+
+	test("unscoped list only returns policies for sessions present in the item page", () => {
+		const { database, sessionId: sessionA, runId: runA } = setup();
+		try {
+			// Session B has a policy but no pending approval, so it must not appear
+			// in an unscoped listing's policy set (which is bounded to item sessions).
+			const sessionB = database.sessions.create({ title: "Policy-only session" }).session;
+			database.approvals.updatePolicy({
+				sessionId: sessionB.id,
+				allowAll: true,
+				expectedRevision: 0,
+				idempotencyKey: crypto.randomUUID(),
+				updatedBy: clientSource,
+			});
+			database.approvals.updatePolicy({
+				sessionId: sessionA,
+				allowAll: true,
+				expectedRevision: 0,
+				idempotencyKey: crypto.randomUUID(),
+				updatedBy: clientSource,
+			});
+			createPending(database, sessionA, runA);
+
+			const listed = database.approvals.list({ states: ["pending"] });
+			const listedSessions = new Set(listed.policies.map((policy) => policy.sessionId));
+			expect(listedSessions.has(sessionA)).toBe(true);
+			expect(listedSessions.has(sessionB.id)).toBe(false);
+			expect(listed.policies.length).toBeLessThanOrEqual(listed.items.length);
 		} finally {
 			database.close();
 		}

@@ -39,10 +39,13 @@ export interface ActionClassification {
 const maxCommandSummaryLength = 2_048;
 const maxPathSummaryLength = 1_024;
 
-// Patterns that mark a bash command as critical / non-overridable: destructive,
-// privilege-escalating, or remote-code-execution shapes. A "Session Allow all"
-// policy must never auto-approve these.
-const nonOverridableBashPatterns: { pattern: RegExp; reason: string }[] = [
+// Patterns that additionally raise a shell command from high to *critical*:
+// destructive, privilege-escalating, or remote-code-execution shapes. This list
+// is only a high-signal annotation for the operator — it is NEVER the security
+// boundary. Every shell command is already non-overridable (see classifyBash), so
+// obfuscation that evades these patterns still cannot be auto-approved by a
+// "Session Allow all" policy; it only downgrades the displayed tier to high.
+const criticalBashPatterns: { pattern: RegExp; reason: string }[] = [
 	{ pattern: /(^|[\s;&|])sudo(\s|$)/, reason: "Runs a command with elevated privileges (sudo)." },
 	{
 		pattern: /\brm\s+(-[a-z]*r[a-z]*f|-[a-z]*f[a-z]*r|-r\s+-f|-f\s+-r)\b/i,
@@ -69,21 +72,250 @@ const nonOverridableBashPatterns: { pattern: RegExp; reason: string }[] = [
 	},
 ];
 
-const secretRedactionPatterns: RegExp[] = [
-	// key=value style secrets: TOKEN=..., --password=..., api_key=...
-	/((?:^|[\s;&|])(?:[A-Za-z0-9_]*(?:secret|token|password|passwd|api[_-]?key|access[_-]?key|auth)[A-Za-z0-9_]*)\s*=\s*)(\S+)/gi,
-	// --password value / --token value
-	/(--(?:password|token|secret|api[_-]?key|access[_-]?key)\s+)(\S+)/gi,
-	// Authorization: Bearer <token>
-	/(Authorization:\s*Bearer\s+)(\S+)/gi,
+// --- Fail-closed command preview ------------------------------------------
+//
+// The command preview stored in the (persisted, broadcast) Approval summary must
+// never contain a raw credential. It is generated fail-closed:
+//   * recognised secret-bearing positions are masked (auth/api-key/cookie/user/
+//     password/token flags + headers, URL credentials + secret query params,
+//     secret env assignments, and known secret literals anywhere), and
+//   * any command we cannot safely tokenise (command substitution, backticks,
+//     process substitution, or unbalanced quotes) is reduced to
+//     "<executable> [arguments hidden]".
+// The raw validated command stays on the server-only execution path (the Action
+// intent) — only this preview reaches the Approval contract, events, UI, and logs.
+
+const redactedPlaceholder = "[redacted]";
+const hiddenArgumentsLabel = "[arguments hidden]";
+
+// Flags whose *following* argument is a credential (curl/http clients, ssh, …).
+const credentialValueFlags = new Set([
+	"-u",
+	"--user",
+	"-p",
+	"--password",
+	"--passwd",
+	"--pass",
+	"--token",
+	"--api-key",
+	"--apikey",
+	"--access-key",
+	"--secret",
+	"--auth",
+	"--authorization",
+	"--bearer",
+	"--cookie",
+	"--proxy-user",
+	"--tlspassword",
+	"--key-password",
+]);
+
+// Flags whose following argument is an HTTP header (value masked when sensitive).
+const headerValueFlags = new Set(["-H", "--header"]);
+
+// Inline "--flag=value" credential forms.
+const sensitiveInlineFlag =
+	/^(--?(?:user|password|passwd|pass|token|api[-_]?key|access[-_]?key|secret|auth|authorization|bearer|cookie|proxy-user|tlspassword|key-password))=/i;
+
+// Header names whose value must never be shown.
+const sensitiveHeaderName =
+	/^(?:authorization|proxy-authorization|cookie|set-cookie|x-api-key|api-key|x-auth-token|x-access-token|x-amz-security-token|x-goog-api-key)$/i;
+
+// Environment-assignment names that carry secrets.
+const sensitiveEnvName =
+	/(?:secret|token|password|passwd|api[-_]?key|access[-_]?key|auth|credential|private[-_]?key|session[-_]?key|passphrase)/i;
+
+// Query-string parameter names whose value must never be shown.
+const sensitiveQueryParam =
+	/(?:token|secret|password|passwd|api[-_]?key|access[-_]?key|auth|signature|sig|credential|session)/i;
+
+// High-signal standalone secret literals (masked wherever they appear).
+const secretLiteralPatterns: RegExp[] = [
+	/A(?:KIA|SIA|GPA|IDA|ROA|IPA|NPA|NVA|CCA)[0-9A-Z]{12,}/, // AWS keys
+	/gh[posur]_[A-Za-z0-9]{20,}/, // GitHub tokens
+	/github_pat_[A-Za-z0-9_]{20,}/,
+	/xox[baprs]-[A-Za-z0-9-]{10,}/, // Slack
+	/sk-[A-Za-z0-9_-]{16,}/, // OpenAI-style keys
+	/AIza[0-9A-Za-z_-]{20,}/, // Google API key
+	/ya29\.[0-9A-Za-z_-]{20,}/, // Google OAuth token
+	/eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{4,}/, // JWT
+	/-----BEGIN[A-Z0-9 ]*PRIVATE KEY-----/, // PEM private key
 ];
 
-export function redactCommand(command: string): string {
-	let redacted = command;
-	for (const pattern of secretRedactionPatterns) {
-		redacted = redacted.replace(pattern, (_match, prefix: string) => `${prefix}[redacted]`);
+// Constructs whose contents we cannot statically reason about → hide all args.
+const unsafeSubstitution = /\$\(|`|<\(|>\(/;
+
+export function buildSafeCommandPreview(command: string): string {
+	if (unsafeSubstitution.test(command)) {
+		return truncate(fallbackPreview(command), maxCommandSummaryLength);
 	}
-	return truncate(redacted, maxCommandSummaryLength);
+	const tokens = tokenizeCommand(command);
+	if (tokens === null) {
+		return truncate(fallbackPreview(command), maxCommandSummaryLength);
+	}
+	const masked: string[] = [];
+	let pending: "credential" | "header" | null = null;
+	for (const token of tokens) {
+		if (pending === "credential") {
+			masked.push(redactedPlaceholder);
+			pending = null;
+			continue;
+		}
+		if (pending === "header") {
+			masked.push(maskHeaderValue(token));
+			pending = null;
+			continue;
+		}
+		const lower = token.toLowerCase();
+		if (credentialValueFlags.has(lower)) {
+			masked.push(token);
+			pending = "credential";
+			continue;
+		}
+		// `-H` (curl header) is case-sensitive; `--header` is not.
+		if (headerValueFlags.has(token) || headerValueFlags.has(lower)) {
+			masked.push(token);
+			pending = "header";
+			continue;
+		}
+		masked.push(maskToken(token));
+	}
+	return truncate(masked.join(" "), maxCommandSummaryLength);
+}
+
+function maskToken(token: string): string {
+	const inline = token.match(sensitiveInlineFlag);
+	if (inline !== null) {
+		return `${inline[1]}=${redactedPlaceholder}`;
+	}
+	const env = token.match(/^([A-Za-z_][A-Za-z0-9_]*)=([\s\S]*)$/);
+	if (env !== null) {
+		const name = env[1] ?? "";
+		const value = env[2] ?? "";
+		if (sensitiveEnvName.test(name) || containsSecretLiteral(value) || hasUrlCredentials(value)) {
+			return `${name}=${redactedPlaceholder}`;
+		}
+	}
+	return maskSecretLiterals(maskUrl(token));
+}
+
+function maskHeaderValue(token: string): string {
+	const colon = token.indexOf(":");
+	if (colon > 0) {
+		const name = token.slice(0, colon).trim();
+		if (sensitiveHeaderName.test(name)) {
+			return `${name}: ${redactedPlaceholder}`;
+		}
+	}
+	return maskToken(token);
+}
+
+function maskUrl(token: string): string {
+	if (!token.includes("://")) {
+		return token;
+	}
+	let out = token.replace(
+		/([a-z][a-z0-9+.-]*:\/\/)([^/@\s]+)@/i,
+		(_match, scheme: string) => `${scheme}${redactedPlaceholder}@`,
+	);
+	out = out.replace(/([?&]([^=&\s]+)=)([^&\s]+)/g, (match, prefix: string, key: string) =>
+		sensitiveQueryParam.test(key) ? `${prefix}${redactedPlaceholder}` : match,
+	);
+	return out;
+}
+
+function maskSecretLiterals(token: string): string {
+	let out = token;
+	for (const pattern of secretLiteralPatterns) {
+		out = out.replace(new RegExp(pattern.source, "g"), () => redactedPlaceholder);
+	}
+	return out;
+}
+
+function containsSecretLiteral(value: string): boolean {
+	return secretLiteralPatterns.some((pattern) => pattern.test(value));
+}
+
+function hasUrlCredentials(value: string): boolean {
+	return /[a-z][a-z0-9+.-]*:\/\/[^/@\s]+@/i.test(value);
+}
+
+// Conservative POSIX-ish tokenizer. Returns null on unbalanced quotes so the
+// caller fails closed instead of guessing.
+function tokenizeCommand(command: string): string[] | null {
+	const tokens: string[] = [];
+	let current = "";
+	let has = false;
+	let quote: '"' | "'" | null = null;
+	for (let i = 0; i < command.length; i += 1) {
+		const ch = command[i] ?? "";
+		if (quote === "'") {
+			if (ch === "'") {
+				quote = null;
+			} else {
+				current += ch;
+			}
+			continue;
+		}
+		if (quote === '"') {
+			if (ch === "\\" && i + 1 < command.length) {
+				i += 1;
+				current += command[i] ?? "";
+			} else if (ch === '"') {
+				quote = null;
+			} else {
+				current += ch;
+			}
+			continue;
+		}
+		if (ch === "'" || ch === '"') {
+			quote = ch;
+			has = true;
+			continue;
+		}
+		if (ch === "\\" && i + 1 < command.length) {
+			i += 1;
+			current += command[i] ?? "";
+			has = true;
+			continue;
+		}
+		if (/\s/.test(ch)) {
+			if (has) {
+				tokens.push(current);
+				current = "";
+				has = false;
+			}
+			continue;
+		}
+		current += ch;
+		has = true;
+	}
+	if (quote !== null) {
+		return null;
+	}
+	if (has) {
+		tokens.push(current);
+	}
+	return tokens;
+}
+
+function fallbackPreview(command: string): string {
+	return `${safeExecutableLabel(command)} ${hiddenArgumentsLabel}`;
+}
+
+function safeExecutableLabel(command: string): string {
+	for (const token of command.trim().split(/\s+/)) {
+		// Skip leading environment assignments (their value may be a secret).
+		if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(token)) {
+			continue;
+		}
+		const cleaned = token.replace(/[;&|<>()`'"$].*$/, "");
+		if (cleaned.length > 0 && /^[A-Za-z0-9_./+-]{1,64}$/.test(cleaned)) {
+			return cleaned;
+		}
+		return "command";
+	}
+	return "command";
 }
 
 function truncate(value: string, max: number): string {
@@ -174,24 +406,35 @@ export function classifyExecutorAction(call: ExecutorToolCall): ActionClassifica
 }
 
 function classifyBash(command: string): ActionClassification {
-	const reasons: string[] = [];
-	for (const { pattern, reason } of nonOverridableBashPatterns) {
+	const dangerReasons: string[] = [];
+	for (const { pattern, reason } of criticalBashPatterns) {
 		if (pattern.test(command)) {
-			reasons.push(reason);
+			dangerReasons.push(reason);
 		}
 	}
-	const overridable = reasons.length === 0;
+	const critical = dangerReasons.length > 0;
+	// Fail closed: a shell command's true effect can never be proven safe by
+	// static pattern matching (interpreter paths, env wrappers, quoting, command
+	// substitution, and obfuscation all defeat a denylist). Every bash Action is
+	// therefore NON-overridable — a Session "Allow all" policy can never
+	// auto-approve it. Known-dangerous shapes only raise the tier from high to
+	// critical and attach explanatory reasons.
+	const reasons = critical
+		? dangerReasons
+		: [
+				"Runs a shell command whose full effect cannot be verified; it always requires explicit approval.",
+			];
 	return {
 		operation: "bash",
 		risk: {
-			tier: overridable ? "high" : "critical",
-			overridable,
-			reasons: overridable ? ["Runs a shell command that can change Runtime Box state."] : reasons,
+			tier: critical ? "critical" : "high",
+			overridable: false,
+			reasons,
 		},
 		requiresApproval: true,
 		summary: {
 			operation: "bash",
-			command: redactCommand(command),
+			command: buildSafeCommandPreview(command),
 			redactedParams: {},
 		},
 	};

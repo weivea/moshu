@@ -143,7 +143,7 @@ export interface ApprovalRepository {
 	decide(input: DecideApprovalRequestInput): DecideApprovalRequestResult;
 	cancel(approvalId: string, source: DecisionSource, nowMs?: number): ApprovalRequestRecord;
 	expireDue(nowMs?: number): ApprovalRequestRecord[];
-	recoverOnStartup(nowMs?: number): { expired: number };
+	recoverOnStartup(nowMs?: number): { expired: number; policiesReset: number };
 	getPolicy(sessionId: string, nowMs?: number): SessionApprovalPolicyRecord;
 	updatePolicy(input: UpdateSessionApprovalPolicyDbInput): UpdateSessionApprovalPolicyResult;
 	resetForSession(sessionId: string, nowMs?: number): void;
@@ -231,18 +231,32 @@ export class SqliteApprovalRepository implements ApprovalRepository {
 			.limit(limit)
 			.all();
 		const items = rows.map(mapApprovalRow);
-		const policyRows =
-			filter.sessionId === undefined
-				? this.orm.select().from(sessionApprovalPoliciesTable).all()
+		if (filter.sessionId !== undefined) {
+			const policyRows = this.orm
+				.select()
+				.from(sessionApprovalPoliciesTable)
+				.where(eq(sessionApprovalPoliciesTable.sessionId, filter.sessionId))
+				.all();
+			const policies = policyRows.map(mapPolicyRow);
+			if (policies.length === 0) {
+				policies.push(this.#defaultPolicy(filter.sessionId));
+			}
+			return { items, policies };
+		}
+		// Unscoped list: only return policies for the sessions represented in the
+		// bounded item page. The item page is already capped at `limit` (<=200), so
+		// the distinct session set — and therefore the policy list — can never exceed
+		// the wire contract's max regardless of how many sessions have a policy.
+		const sessionIds = [...new Set(items.map((item) => item.sessionId))];
+		const policies =
+			sessionIds.length === 0
+				? []
 				: this.orm
 						.select()
 						.from(sessionApprovalPoliciesTable)
-						.where(eq(sessionApprovalPoliciesTable.sessionId, filter.sessionId))
-						.all();
-		const policies = policyRows.map(mapPolicyRow);
-		if (filter.sessionId !== undefined && policies.length === 0) {
-			policies.push(this.#defaultPolicy(filter.sessionId));
-		}
+						.where(inArray(sessionApprovalPoliciesTable.sessionId, sessionIds))
+						.all()
+						.map(mapPolicyRow);
 		return { items, policies };
 	}
 
@@ -333,7 +347,7 @@ export class SqliteApprovalRepository implements ApprovalRepository {
 		});
 	}
 
-	recoverOnStartup(nowMs?: number): { expired: number } {
+	recoverOnStartup(nowMs?: number): { expired: number; policiesReset: number } {
 		const now = nowMs ?? this.clock.now();
 		return this.orm.transaction((transaction) => {
 			const rows = transaction
@@ -344,7 +358,32 @@ export class SqliteApprovalRepository implements ApprovalRepository {
 			for (const row of rows) {
 				this.#applyTerminal(transaction, row, "expired", now, undefined, undefined);
 			}
-			return { expired: rows.length };
+			// SEC-003: a Session "Allow all" policy must never survive an Agent Server
+			// restart and silently keep auto-approving new Actions. In the same
+			// transaction, reset every enabled policy to allowAll=false with a revision
+			// bump and a system-restart attribution. This is naturally idempotent: a
+			// second recovery finds no enabled policies (and no pending requests) left.
+			const enabledPolicies = transaction
+				.select()
+				.from(sessionApprovalPoliciesTable)
+				.where(eq(sessionApprovalPoliciesTable.allowAll, 1))
+				.all();
+			const updatedByJson = JSON.stringify(systemRestartSource());
+			for (const policy of enabledPolicies) {
+				const nextRevision = policy.revision + 1;
+				transaction
+					.update(sessionApprovalPoliciesTable)
+					.set({
+						allowAll: 0,
+						revision: nextRevision,
+						updatedByJson,
+						lastIdempotencyKey: `system-restart:${policy.sessionId}:${nextRevision}`,
+						updatedAtMs: now,
+					})
+					.where(eq(sessionApprovalPoliciesTable.sessionId, policy.sessionId))
+					.run();
+			}
+			return { expired: rows.length, policiesReset: enabledPolicies.length };
 		});
 	}
 
@@ -509,4 +548,10 @@ function mapPolicyRow(row: PolicyRow): SessionApprovalPolicyRecord {
 			? {}
 			: { updatedBy: JSON.parse(row.updatedByJson) as DecisionSource }),
 	};
+}
+
+// Attribution recorded when an Agent Server restart resets a Session "Allow all"
+// policy. It is a server-owned system decision, never a client identity.
+function systemRestartSource(): DecisionSource {
+	return { kind: "system", clientRole: "restart" };
 }

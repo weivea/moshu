@@ -73,7 +73,7 @@ Runtime Box 在实际执行前验证 grant。Allow all 只改变 server 的审�
 - 有效性绑定当前 client instance/generation；stable `clientId` 不会让 grant 跨重启延续。
 - 状态在输入框和会话头持续可见。
 
-> **Layer 2 实现边界**：Allow-all 策略为 session-scoped、revisioned、server-owned（`session_approval_policies`），随 Session retire（删除/退休）reset，**不跨 Session 泄漏**。它只对 `overridable` 的普通 action 自动 `approve_once` 并记录 policy evidence；server 判定的 **不可覆盖（critical）高危 action 永不被绕过**，仍需单独 approve/reject。Desktop 卡片在开启时展示提示并说明该边界。当前策略在 server 重启后仍从 DB 恢复（尚未实现“重启自动关闭”）；跨设备/instance 的 generation 绑定属后续层。
+> **Layer 2 实现边界**：Allow-all 策略为 session-scoped、revisioned、server-owned（`session_approval_policies`），随 Session retire（删除/退休）reset，**不跨 Session 泄漏**。它只对 `overridable` 的普通 action 自动 `approve_once` 并记录 policy evidence；server 判定的 **不可覆盖 action 永不被绕过**——这包括**全部 shell/bash 动作**（fail-closed：shell 效果无法被静态证明安全，故一律 non-overridable）与其他 critical 高危动作，仍需单独 approve/reject。Desktop 卡片在开启时展示提示并说明该边界。Agent Server 重启恢复会在事务内将所有 allowAll=true 策略 reset 为 false（revision +1、记录 system-restart 归属，SEC-003 已落地且幂等），旧 Allow-all 不会在重启后自动批准新 Action；跨设备/instance 的 generation 绑定属后续层。
 
 ### 5.2 开启确认
 

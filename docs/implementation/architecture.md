@@ -391,19 +391,24 @@ agentDataDirectory/
   只读工具（read/grep/find/ls）自动放行。gate 缺省时保持 Layer 1 legacy 行为，既有测试不变。
 - **权威风险分级**：由 agents-server 基于 Tool identity + 校验后的 normalized 参数用 `@moshu/action-broker`
   重新计算，**从不信任** Runtime Box 或模型自报的 tier。read/search → low（不审批）；edit/write → medium 可覆盖；
-  bash → high 可覆盖，命中危险模式（sudo、`rm -rf`、mkfs、`dd of=`、fork bomb、`curl|sh` 等）→ critical
-  **不可覆盖**；MCP → high 可覆盖。summary 仅含脱敏 command/path/operation 与 redacted 参数键，绝不泄漏
-  edit/write 内容、MCP 参数值或 secret/env。
+  bash/shell → **一律不可覆盖**（fail-closed：shell 的真实效果无法被 denylist 静态证明为安全，故解释器路径、
+  env 包装、引号/命令替换、混淆都不能降级），命中危险模式（sudo、`rm -rf`、mkfs、`dd of=`、fork bomb、
+  `curl|sh` 等）仅将 tier 由 high 抬升到 critical 并附原因；MCP → high 可覆盖。summary 的 command 是
+  **fail-closed 安全预览**：脱敏 authorization/api-key/cookie/user/password/token 等 header 与 flag、URL 凭据/
+  query secret、env 赋值 secret 与已知 secret 字面量；无法安全解析（命令替换/反引号/引号不平衡）时只显示
+  `可执行名 [arguments hidden]`。原始参数只留在 server 侧执行路径，绝不进入 Approval 合同/事件/UI/日志。
 - **持久化与并发**：approval request 与 session allow-all policy 持久到 SQLite，带 monotonic revision/CAS 与
   唯一 decision idempotency key。Action intent 与 Approval 状态转换在事务边界内，不会“决定成功但 action 未持久”。
 - **决策语义**：approve → CAS decision → grant → resume；reject/expire/cancel → 持久终态并让 Tool/Run 得到
   稳定 typed 结果。两个 client 同时决定只有一个 `applied`，loser 得到 `superseded` 的 authoritative final state
   而非重复 side effect；相同 idempotency key 重试返回 `idempotent` 先前结果。
 - **Session Allow all**：session-scoped、revisioned、server-owned。对可覆盖普通 action 自动通过并记录
-  policy evidence（allowAllRevision）；server 判定的 non-overridable 高危 action **永不被绕过**。策略在 session
-  retire 时 reset，不跨 Session 泄漏。
+  policy evidence（allowAllRevision）；server 判定的 non-overridable action（含**全部 shell**与 critical 高危）
+  **永不被绕过**。策略在 session retire 时 reset，不跨 Session 泄漏。
 - **恢复**：agents-server 重启时对 pending request 执行保守 recovery——将其 expire（无法恢复进程内 waiter），
-  避免“批准了却无法执行”；已决定的 action 不重复 grant/执行。
+  避免"批准了却无法执行"；已决定的 action 不重复 grant/执行。同一事务内还会将**所有 allowAll=true 的 Session
+  策略 reset 为 false**（revision +1、记录 system-restart 归属，SEC-003），使旧的 Allow-all 不会在重启后继续
+  自动批准新 Action；该恢复天然幂等（二次恢复不再重置）。
 - **Product RPC / 事件**：新增 client-neutral 合同 `approvals.list/get/decide`、
   `sessionApprovalPolicy.get/update`（均带 expectedRevision + idempotencyKey）。approval.created/updated 与
   sessionApprovalPolicy.changed 只投递给该 Session 的已认证订阅 client；另有无 payload 的
