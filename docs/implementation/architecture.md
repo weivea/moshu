@@ -533,41 +533,57 @@ agentDataDirectory/
 > iOS 生命周期/重连、best-effort 本地通知与发布加固。**硬边界：无云 Push Relay、无 APNs remote/silent push、
 > 无 VoIP/background-processing 伪保活、设备不落业务数据、Desktop 必须在线。** suspended/terminated **不保证通知**。
 
-- **Durable attention feed（server-owned）**：合同/表/repository/RPC 见 data-contracts §9.5。Agent Server 在 approval 进入
-  `pending`、Run 终态时投影出脱敏 `MobileAttentionEvent`（幂等/事务/重启不丢）durably append；每 `mobileClientId` 维护
+- **Durable attention feed（server-owned，transactional outbox）**：合同/表/repository/RPC 见 data-contracts §9.5。
+  approval 进入 `pending`、Run 终态时，在**与业务写同一 SQLite 事务**内向 `mobile_attention_outbox` 追加（`dedupeKey`
+  unique + 最小脱敏 payload），业务 commit 与 outbox 原子；独立幂等 `MobileAttentionOutboxDrainer` 投影到
+  `mobile_attention_events` 并 `markProcessed`，startup 与运行期 drain，失败**保留重试并记录诊断、绝不吞成成功**——因此
+  crash/append 失败不会永久丢未读，`attention.changed` hint 丢失也不影响 reconnect list。每 `mobileClientId` 维护
   server 侧单调 ack cursor。`mobile.attention.list`（cursor 分页 + unreadCount/nextCursor/latestSeq/resyncRequired）与
   `mobile.attention.ack`（CAS/幂等/单调、不回退）加入 mobile-client strict allowlist；**peer identity 由 auth context 决定，
-  禁止伪造 clientId 或回退 cursor**。bounded retention（30 天 + per-feed 上限），cursor 过旧显式 `resyncRequired` 不伪装无未读；
+  禁止伪造 clientId 或回退 cursor**。bounded retention（30 天 + per-client 500）在 startup（强制）、drain 后（throttle + jitter）
+  与有界 periodic 路径执行（避免每 event O(n)），与 cursor gap/resync 语义一致；cursor 过旧显式 `resyncRequired` 不伪装无未读；
   设备 revoke 不可读、unpair 清 cursor 不泄漏旧 feed。live 只发最小 `attention.changed` hint（无业务正文），Desktop Product RPC
-  不暴露 mobile device 未读。
+  不暴露 mobile device 未读。mobile ingress handler 逻辑抽到 pi-free `mobile-ingress-handlers.ts`（`resolveMobileClientId` /
+  `listMobileAttentionForPeer` / `ackMobileAttentionForPeer` / `revokeMobileDevice`），由 `product-rpc.ts` 与 smoke 复用**单一来源**。
 - **iOS 生命周期/重连**：`src/native/lifecycle.ts` 用 `@capacitor/app` `appStateChange`（web `visibilitychange` 回退）。
   foreground → 连接/恢复 + 立即一次重试；background → **暂停**重连（不新建 socket），仅让既有 socket 在系统短窗口存活；
   系统 expiration 关闭 socket。重连用**有界指数退避 + jitter**（`reconnectMaxDelayMs`/`reconnectJitterRatio`），stable `connected`
-  与用户 `retry()` 后 reset；fatal（`AUTH_REVOKED`/`AUTH_FAILED`/`PROTOCOL_MISMATCH`/identity）不重试；background/offline 暂停
-  timer；旧 connection callbacks 不复活。断线仅显示 offline/reconnecting，不展示缓存业务；回连重新 snapshot + attention feed。
-- **原生 background task**：`BackgroundActivityCoordinator`（`MoshuMobileCore`，`AppDelegate` 装配）持有**单一、幂等、有界**的
-  `UIApplication.beginBackgroundTask`，end 或系统 expiration 都保证 cleanup。这是普通有限 task——**不声明任何 `UIBackgroundModes`**、
-  非 remote/silent push、非 VoIP/audio 保活。
+  与用户 `retry()` 后 reset；fatal（`AUTH_REVOKED`/`AUTH_FAILED`/`PROTOCOL_MISMATCH`/`UNSUPPORTED_PROTOCOL`/identity）不重试；
+  background/offline 暂停 timer；旧 connection callbacks 不复活。background 期 socket close **直接转 offline 不排重连**。
+  断线仅显示 offline/reconnecting，不展示缓存业务；回连重新 snapshot + attention feed。
+- **原生 background task**：`BackgroundActivityCoordinator`（`MoshuMobileCore`，纯逻辑、XCTest 覆盖）持有**单一、幂等、有界**的
+  `UIApplication.beginBackgroundTask`。**由 `MoshuMobileTransportPlugin` 独占装配**（与 engine 同一 owner，避免 AppDelegate 跨对象
+  连线）：plugin 在 `load()` 注册 `didEnterBackground`→`begin` / `didBecomeActive`/`willTerminate`→`end`，`deinit` 移除 observer；
+  系统 expiration handler 调 `engine.closeActiveConnection(reason:)` 关闭**当前精确 socket** 并 emit `closed`（JS 转 offline/background），
+  再结束 task。coordinator 的 stale-guard 保证 `end()` 之后到来的迟到 expiration 是 **strict no-op**（不能关掉更新的 connection）。
+  这是普通有限 task——**不声明任何 `UIBackgroundModes`**、非 remote/silent push、非 VoIP/audio 保活。
 - **本地通知（best effort）**：官方 `@capacitor/local-notifications`（lazy import、iOS-only、web/test 降级 no-op）。首次成功配对后
   由用户在 Settings **显式开启**（冷启动不突袭权限），Settings 显示 permission 状态与开关。仅当 App **非 active** 且短后台 socket
   实际收到 `attention.changed` 时 schedule generic 本地通知；active 时只更新 Activity badge。通知文案本地化 generic（无 raw
   prompt/command/path/secret），id 由 attention `seq` 稳定派生（`NotificationContentBuilder`/`notificationIdForSeq`）防重复。
-  tap/deeplink 只携 opaque id，App active 后先认证/重连/snapshot 再导航；未配对/fatal/offline 显示安全状态。**suspended/terminated
-  无通知保证**；重连从 server feed 恢复 missed 未读并显示 badge，但不为历史事件批量补发系统通知。**不注册 APNs token、不请求
-  remote notification entitlement、不加云服务。**
-- **发布加固**：`release.config.json`（单一版本源）+ `scripts/sync-version.ts`（fan-out MARKETING_VERSION/CURRENT_PROJECT_VERSION
-  + package.json，`--check` 校验）；`App/PrivacyInfo.xcprivacy`（无采集/无 tracking，仅 `NSPrivacyAccessedAPICategoryUserDefaults`
-  reason `CA92.1`）；`scripts/release-gate.ts`（fail-closed：无 server.url/remote UI、无 node builtins/Buffer/ws、无 secret 样本、
-  无宽泛 ATS、无 remote-notification/voip/audio/fetch/processing bg mode、无 aps-environment/Local Network/Bonjour、无 hardcoded
-  Team/provisioning、version 一致、contracts↔canonical vectors 同步、dist↔iOS public 一致）。开发 bundle id `dev.moshu.mobile`，
-  发布 build 期 override `PRODUCT_BUNDLE_IDENTIFIER`；export compliance（CryptoKit Ed25519 + TLS）问卷/豁免由发布方确认，工程不
-  武断写 `ITSAppUsesNonExemptEncryption`。详见 quality-release。
-- **验证**：79 Vitest（含 attention 恢复无 replay、badge、ack 单调、resyncRequired、notification 短后台 gating、permission、生命周期
-  退避/暂停）、67 Swift XCTest（含 background task 幂等/有界/expiration cleanup、稳定 notification id、generic 键、opaque route id）、
-  `tsc` strict、`vite build`、`cap copy ios`、release gate 全绿；server 侧 `mobile-attention-projection` + `mobile-ingress-smoke`
-  端到端（pair→approve→connect→create/send/subscribe→approval decide→attention append/list/ack→disconnect→missed→reconnect 恢复
-  未读→revoke fatal）与 `packages/database` attention repository（pagination/retention/ack 单调/幂等/revoke 清 cursor）通过。真机
-  签名、真实 Dev Tunnel probe（opt-in）、App Store review 提交为发布方人工步骤。
+  schedule 只挂**校验过的 opaque route**（`sessionId`/`approvalId`/`attentionEventId`，`parseNotificationRoute` 白名单过滤）。
+  tap 由 `NotificationTapCoordinator` 处理（注册 `localNotificationActionPerformed`、start/dispose 单一 listener 无泄漏）：未配对/fatal
+  显示安全状态**不导航**；否则**等到 authenticated connection + attention snapshot 刷新成功后**才用 opaque id 导航，绝不直接展示 stale
+  payload。**suspended/terminated 无通知保证**；重连从 server feed 恢复 missed 未读并显示 badge，但不为历史事件批量补发系统通知。
+  **不注册 APNs token、不请求 remote notification entitlement、不加云服务。**
+- **发布加固**：`release.config.json`（单一版本源 + `bundleId.development`/`bundleId.release`）+ `scripts/sync-version.ts`（fan-out
+  MARKETING_VERSION/CURRENT_PROJECT_VERSION + package.json，`--check` 校验）；`App/PrivacyInfo.xcprivacy`（无采集/无 tracking，仅
+  `NSPrivacyAccessedAPICategoryUserDefaults` reason `CA92.1`）；`scripts/release-gate.ts`（fail-closed：无 server.url/remote UI、
+  无 node builtins/Buffer/ws、无 secret 样本、无宽泛 ATS、无 remote-notification/voip/audio/fetch/processing bg mode、无
+  aps-environment/Local Network/Bonjour、无 hardcoded Team/provisioning、version 一致、contracts↔canonical vectors 同步、
+  **dist↔iOS public 递归 SHA-256 manifest 完全一致**）。开发 bundle id `dev.moshu.mobile`；**真实发布 gate**（`MOSHU_MOBILE_RELEASE=1`
+  或 `--release`）要求发布方设 `MOSHU_MOBILE_RELEASE_BUNDLE_ID`（或 `release.config.json` `bundleId.release`）为永久非 dev id，
+  拒绝空值/`dev.moshu.mobile`，并用 `xcodebuild -showBuildSettings -configuration Release` 解析的 `PRODUCT_BUNDLE_IDENTIFIER`
+  精确比对；export compliance（CryptoKit Ed25519 + TLS）问卷/豁免由发布方确认，工程不武断写 `ITSAppUsesNonExemptEncryption`。详见 quality-release。
+- **验证（实际运行）**：**102 Vitest**（含 attention 恢复无 replay、badge、ack 单调、resyncRequired、notification 短后台 gating、opaque
+  route 只带白名单 id、notification tap offline→connect→refresh→navigate / unpaired-fatal 安全态 / dispose、`UNSUPPORTED_PROTOCOL`
+  fatal 无重连、background close→offline）、**68 Swift XCTest**（含 background task 幂等/有界/expiration cleanup、**stale expiration
+  no-op**、稳定 notification id、generic 键、opaque route id）、`tsc` strict、`vite build`、`cap sync ios`、release gate 全绿（dev 10 checks；
+  real-release 正确 FAIL 于 dev bundle id）；server 侧 `mobile-attention-drainer`（crash/restart/幂等/retention）+ **真实 production 组合**的
+  `mobile-ingress-smoke`（`openAppDatabase` + Approval/Run 仓储 → 事务 outbox → 真实 drainer 投影 → 共享 list/ack → 真实 revoke）
+  与 `packages/database` attention repository/outbox（pagination/retention/ack 单调/幂等/revoke 清 cursor）通过（合计 contracts+database
+  125、隔离 agents-server mobile 14）。**iOS simulator `xcodebuild build`（iPhone 17 Pro / iOS 26.5，禁签名）BUILD SUCCEEDED**。真机
+  签名、真实发布 bundle id 覆盖、真实 Dev Tunnel probe（opt-in）、App Store review 提交为发布方人工步骤。
 
 
 ### 9.1 请求流程

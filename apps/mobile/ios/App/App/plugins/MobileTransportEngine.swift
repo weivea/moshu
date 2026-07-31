@@ -232,6 +232,18 @@ final class MobileTransportEngine: NSObject {
 		teardown(connectionId: connectionId, code: code, reason: reason)
 	}
 
+	/// Closes the current active connection (if any) with a stable, non-secret reason. Invoked by the
+	/// bounded background-task expiration path so the *exact* live socket is torn down when the OS
+	/// reclaims the short background window. The emitted `closed` state is the reliable native→JS
+	/// signal that drives the web layer offline (it does not depend on a JS timer surviving the
+	/// expiration). A no-op when nothing is connected. Runs on the transport's serial queue.
+	func closeActiveConnection(reason: String) {
+		queue.async { [weak self] in
+			guard let self, let connectionId = self.activeConnectionId else { return }
+			self.teardown(connectionId: connectionId, code: nil, reason: reason)
+		}
+	}
+
 	func unpair() throws {
 		if let connectionId = activeConnectionId {
 			teardown(connectionId: connectionId, code: nil, reason: "unpair")

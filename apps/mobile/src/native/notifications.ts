@@ -17,6 +17,44 @@ import { Capacitor } from "@capacitor/core";
 /** Normalized permission state, independent of the underlying plugin's enum spelling. */
 export type NotificationPermissionState = "granted" | "denied" | "prompt" | "unavailable";
 
+/**
+ * The ONLY payload a notification is allowed to carry across the tap boundary: opaque, server-issued
+ * identifiers. There is never any business content here (no prompt/command/path/secret and no
+ * human-readable text) — just ids the app re-resolves against a freshly authenticated session before
+ * it navigates. Every field is optional; a route with no ids is not actionable and is rejected.
+ */
+export interface NotificationRoute {
+	readonly sessionId?: string;
+	readonly approvalId?: string;
+	readonly attentionEventId?: string;
+}
+
+// The closed set of keys allowed to survive the notification tap boundary. Anything else in the
+// plugin-delivered `extra` bag is dropped, so a malformed or hostile payload can never smuggle
+// business content (or arbitrary keys) into navigation.
+const NOTIFICATION_ROUTE_KEYS = ["sessionId", "approvalId", "attentionEventId"] as const;
+
+/**
+ * Validate and narrow an opaque notification `extra` bag into a {@link NotificationRoute}. Only the
+ * whitelisted keys are kept, and only when their value is a non-empty string. Returns `null` when the
+ * payload is missing, malformed, or carries no actionable id — callers must then show a safe state
+ * instead of navigating.
+ */
+export function parseNotificationRoute(extra: unknown): NotificationRoute | null {
+	if (typeof extra !== "object" || extra === null) {
+		return null;
+	}
+	const source = extra as Record<string, unknown>;
+	const route: { -readonly [K in keyof NotificationRoute]: NotificationRoute[K] } = {};
+	for (const key of NOTIFICATION_ROUTE_KEYS) {
+		const value = source[key];
+		if (typeof value === "string" && value.length > 0) {
+			route[key] = value;
+		}
+	}
+	return Object.keys(route).length > 0 ? route : null;
+}
+
 export interface LocalNotificationRequest {
 	/** Stable 31-bit id derived from the attention sequence; identical ids coalesce in the OS. */
 	readonly id: number;
@@ -25,11 +63,11 @@ export interface LocalNotificationRequest {
 	/** Generic, already-localized body. Must never contain business content. */
 	readonly body: string;
 	/**
-	 * Opaque routing hint delivered on tap (e.g. sessionId/approvalId). The app re-authenticates,
-	 * reconnects and re-snapshots BEFORE navigating, so a stale/opaque id can never surface cached
-	 * business content.
+	 * Opaque routing hint delivered on tap (only sessionId/approvalId/attentionEventId). The app
+	 * re-authenticates, reconnects and re-snapshots BEFORE navigating, so a stale/opaque id can never
+	 * surface cached business content.
 	 */
-	readonly route?: Readonly<Record<string, string>>;
+	readonly route?: NotificationRoute;
 }
 
 /**
@@ -45,6 +83,13 @@ export interface LocalNotificationScheduler {
 	schedule(request: LocalNotificationRequest): Promise<void>;
 	/** Reflect the current unread count on the app icon badge. `0` clears it. */
 	setBadge(count: number): Promise<void>;
+	/**
+	 * Register a handler invoked when the user taps a delivered notification. The handler receives the
+	 * validated opaque {@link NotificationRoute} only (taps carrying no actionable id are dropped).
+	 * Returns a disposer that removes the underlying native listener; callers MUST call it to avoid
+	 * leaking a listener across a re-mount.
+	 */
+	onTap(handler: (route: NotificationRoute) => void): () => void;
 }
 
 // The maximum 32-bit signed integer. Capacitor notification ids must fit in a native int, so the
@@ -72,6 +117,11 @@ export const noopNotificationScheduler: LocalNotificationScheduler = {
 	},
 	async setBadge() {
 		// no-op
+	},
+	onTap() {
+		return () => {
+			// no-op
+		};
 	},
 };
 
@@ -161,5 +211,41 @@ export class CapacitorNotificationScheduler implements LocalNotificationSchedule
 				// best-effort
 			}
 		}
+	}
+
+	onTap(handler: (route: NotificationRoute) => void): () => void {
+		// `addListener` resolves to a native handle asynchronously. We register eagerly and keep the
+		// pending handle so the disposer can remove it even if it is called before registration lands.
+		// The listener only ever forwards a *validated* opaque route; a payload with no actionable id
+		// (or one carrying anything but the whitelisted keys) is dropped here, never surfaced.
+		let disposed = false;
+		let handle: { remove: () => Promise<void> } | null = null;
+
+		void this.#plugin().then((plugin) => {
+			if (!plugin || disposed) {
+				return;
+			}
+			void plugin
+				.addListener("localNotificationActionPerformed", (action) => {
+					if (disposed) {
+						return;
+					}
+					const route = parseNotificationRoute(action.notification?.extra);
+					if (route) {
+						handler(route);
+					}
+				})
+				.then((registered) => {
+					handle = registered;
+					if (disposed) {
+						void handle.remove();
+					}
+				});
+		});
+
+		return () => {
+			disposed = true;
+			void handle?.remove();
+		};
 	}
 }

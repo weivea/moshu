@@ -532,24 +532,49 @@ VoIP/background-processing 伪保活、设备不落业务数据、Desktop 必须
 
 - 开发 bundle id `dev.moshu.mobile`（committed）。发布 build 期 override `PRODUCT_BUNDLE_IDENTIFIER`
   （xcconfig 或 `xcodebuild PRODUCT_BUNDLE_IDENTIFIER=...`），不把 App Store 身份写进源码。
+- 真实发布 gate（`MOSHU_MOBILE_RELEASE=1` 或 `--release`）要求发布方设置
+  `MOSHU_MOBILE_RELEASE_BUNDLE_ID`，或把 `release.config.json` 的 `bundleId.release` 改为永久非 dev
+  reverse-DNS id；gate 会用 Xcode Release `PRODUCT_BUNDLE_IDENTIFIER` 精确比对。
+- `dist` ↔ iOS `public` 同步不只看 `index.html`：gate 递归比较文件集合、大小和 SHA-256，忽略
+  `.DS_Store` / `capacitor.config.json` / `config.xml` / `cordova*.js` 等 Capacitor/native metadata。
 
-### 21.7 验证命令（本层）
+### 21.7 验证命令（本层，实际运行结果）
 
-- `bun run --cwd apps/mobile test`（79 Vitest）、`typecheck`、`build`、`cap:copy`（或 `cap:sync`，best-effort）。
-- `swift test`（`apps/mobile/native/MoshuMobile`，67 XCTest）。
-- server 侧隔离测试：`bun test packages/contracts packages/database` 与
-  `apps/agents-server/src/mobile-attention-projection.test.ts` / `mobile-ingress-smoke.test.ts` /
-  `mobile-ingress-auth.test.ts` / `mobile-ingress-generation-fence.test.ts`。
-- `bun run --cwd apps/mobile release:gate`。
-- iOS simulator `xcodebuild test/build`（禁签名）与真实 Dev Tunnel probe（`scripts/probe-live-dev-tunnel.ts`）为
-  **opt-in**、记录命令、不要求 CI secret。
+- `bun run --cwd apps/mobile test`（**102 Vitest**，含 notification-tap / attention route / release-gate）、
+  `typecheck`（clean）、`build`（vite production）、`cap:sync`（copy dist→`ios/App/App/public`，含
+  `@capacitor/local-notifications`）。
+- `swift test`（`apps/mobile/native/MoshuMobile`，**68 XCTest**，含 `BackgroundActivityCoordinator` 陈旧
+  expiration no-op）。
+- server 侧隔离测试：`bun test packages/contracts packages/database`（**125 pass**，含 mobile attention
+  contracts + `mobile-attention-repository` + `mobile-attention-outbox` DB 测试）与
+  `apps/agents-server/src/mobile-attention-drainer.test.ts` / `mobile-ingress-smoke.test.ts` /
+  `mobile-ingress-auth.test.ts` / `mobile-ingress-generation-fence.test.ts`（**14 pass**）。
+  smoke 通过真实 `openAppDatabase` + Approval/Run 仓储 → 事务 outbox → 真实 drainer 投影 → 共享
+  list/ack handler → 真实 revoke，**不再自建 bespoke handler**（复用 `mobile-ingress-handlers.ts`）。
+  > 环境限制：`@earendil-works/pi-*` 未安装，故无法导入 `@moshu/agent-runtime`（即 `product-rpc.ts` /
+  > `create-agents-server.ts`）跑完整 agents-server 套件；以上隔离测试覆盖 mobile 增量。
+- `bun run --cwd apps/mobile release:gate`（dev 模式 **10 checks 全绿**）。真实发布模式
+  `MOSHU_MOBILE_RELEASE=1 MOSHU_MOBILE_RELEASE_BUNDLE_ID=... release:gate` 已验证会用
+  `xcodebuild -showBuildSettings -configuration Release` 解析 `PRODUCT_BUNDLE_IDENTIFIER` 并精确比对：
+  当前 committed 项目仍是 `dev.moshu.mobile`，故真实模式**正确 FAIL**（发布方必须先把项目 bundle id
+  改为永久 id 并对齐 `MOSHU_MOBILE_RELEASE_BUNDLE_ID`）。
+- iOS simulator `xcodebuild build`（**实际运行**，iPhone 17 Pro / iOS 26.5，Xcode 26.5，
+  `CODE_SIGNING_ALLOWED=NO`）：**BUILD SUCCEEDED**。App 工程只有 `App` target（无 XCTest bundle），故 native
+  单元测试走 SPM `swift test`；App/plugin 层由此 simulator build 编译校验。
+  > 环境限制：Copilot runtime 注入 `GIT_CONFIG_KEY_0=safe.bareRepository=explicit`，会让 xcodebuild 内部
+  > git 无法解析 SwiftPM 缓存。运行 xcodebuild（含 release gate 的 live bundle-id 路径）需清除该注入：
+  > `env -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 -u GIT_CONFIG_KEY_1 -u GIT_CONFIG_VALUE_1 ...`。
+- 真实 Dev Tunnel probe（`scripts/probe-live-dev-tunnel.ts`）保持 **opt-in**、记录命令、不要求 CI secret。
 
 ### 21.8 发布检查表（Mobile Layer 5）
 
 - [ ] `release:version -- --check` 通过（版本一致）。
-- [ ] `release:gate` 全绿（remote UI / node-leak / secret / ATS / background mode / APNs / signing / vectors / bundle sync）。
+- [ ] `release:gate` 全绿（remote UI / node-leak / secret / ATS / background mode / APNs / signing /
+      vectors / bundle id / bundle manifest sync）。
 - [ ] `PrivacyInfo.xcprivacy` 与实际依赖一致；Info.plist 无多余权限/background mode。
 - [ ] Export compliance 问卷由发布方确认；未武断写 `ITSAppUsesNonExemptEncryption`。
 - [ ] reviewer 路径（在线 Desktop + 配对二维码或安全 demo）已备妥；无生产云账号/假成功。
-- [ ] 79 Vitest + 67 Swift XCTest + server attention smoke + database attention repository 通过。
-- [ ] 真机签名、真实 Dev Tunnel probe、App Store 提交为发布方人工步骤（记录在案）。
+- [ ] 102 Vitest + 68 Swift XCTest + 125 contracts/database + 14 隔离 agents-server mobile 测试通过。
+- [ ] iOS simulator `xcodebuild build`（禁签名）BUILD SUCCEEDED。
+- [ ] 真机签名 / `DEVELOPMENT_TEAM`、真实发布 bundle id 覆盖、真实 Dev Tunnel probe、App Store 提交与
+      export-compliance 问卷为发布方人工步骤（记录在案）。

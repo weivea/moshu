@@ -3,6 +3,7 @@ import { generateKeyPairSync, type KeyObject, sign } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { ActionRisk, ApprovalActionSummary } from "@moshu/contracts";
 import {
 	ackMobileAttentionOutputSchema,
 	claimMobilePairingOutputSchema,
@@ -16,7 +17,7 @@ import {
 	mobileDeviceSchema,
 	productRpcMethods,
 } from "@moshu/contracts";
-import { openAppDatabase } from "@moshu/database";
+import { type AppDatabase, createUuidV7, openAppDatabase } from "@moshu/database";
 import {
 	connectRpcClient,
 	createRpcServer,
@@ -25,8 +26,14 @@ import {
 } from "@moshu/process-rpc";
 
 import { AgentServerIdentity } from "./agent-server-identity";
+import { MobileAttentionOutboxDrainer } from "./mobile-attention-drainer";
 import { MobileIngressAuth } from "./mobile-ingress-auth";
 import { MobileIngressGenerationFence } from "./mobile-ingress-generation-fence";
+import {
+	ackMobileAttentionForPeer,
+	listMobileAttentionForPeer,
+	revokeMobileDevice,
+} from "./mobile-ingress-handlers";
 
 const rpcIdentity = {
 	role: "agents" as const,
@@ -45,6 +52,80 @@ const mobileAllowlist: RpcMethodAllowlist = {
 		events: [...mobileClientProductEventMethods],
 	},
 };
+
+const mediumRisk: ActionRisk = { tier: "medium", overridable: true, reasons: ["edit"] };
+
+function makeActionSummary(): ApprovalActionSummary {
+	return {
+		tool: "bash",
+		operation: "bash",
+		target: { kind: "runtime-box", id: "box-1" },
+		command: "echo secret-command",
+		redactedParams: {},
+	};
+}
+
+function makeProviderInput() {
+	return {
+		schemaVersion: 1 as const,
+		providerId: createUuidV7(),
+		name: "OpenAI",
+		source: "custom" as const,
+		api: "openai-responses",
+		model: "gpt-5.4",
+		thinkingLevel: "medium" as const,
+	};
+}
+
+// Drive the real production write path: create a session + Run through the durable repositories so
+// the transactional attention outbox is written atomically by the same code paths the Agent Server
+// uses at runtime — no bespoke append.
+function seedRun(database: AppDatabase): {
+	sessionId: string;
+	runId: string;
+	assistantMessageId: string;
+} {
+	const session = database.sessions.create({ title: "Smoke Session" }).session;
+	const created = database.runs.create({
+		clientRequestId: crypto.randomUUID(),
+		sessionId: session.id,
+		mode: "ask",
+		provider: makeProviderInput(),
+		userMessageId: createUuidV7(),
+		userContent: "Smoke prompt",
+		assistantMessageId: createUuidV7(),
+	});
+	return {
+		sessionId: session.id,
+		runId: created.run.id,
+		assistantMessageId: created.run.assistantMessageId,
+	};
+}
+
+function createPendingApproval(database: AppDatabase, sessionId: string, runId: string): string {
+	const now = Date.now();
+	const id = crypto.randomUUID();
+	database.approvals.create({
+		id,
+		sessionId,
+		runId,
+		actionId: crypto.randomUUID(),
+		toolCallId: `call-${crypto.randomUUID()}`,
+		action: makeActionSummary(),
+		risk: mediumRisk,
+		createdAtMs: now,
+		expiresAtMs: now + 60_000,
+	});
+	return id;
+}
+
+function completeRun(database: AppDatabase, runId: string, assistantMessageId: string): void {
+	database.runs.updateStatus({ runId, status: "running" });
+	database.runs.commitTerminal({
+		runId,
+		message: { messageId: assistantMessageId, status: "complete", content: "done" },
+	});
+}
 
 function createDeviceKey(): { publicKey: string; privateKey: KeyObject } {
 	const pair = generateKeyPairSync("ed25519");
@@ -90,6 +171,16 @@ describe("Mobile ingress transport smoke", () => {
 		const directory = mkdtempSync(join(tmpdir(), "moshu-mobile-smoke-"));
 		const database = openAppDatabase(":memory:");
 		let server: RpcServer | undefined;
+		// The disconnect closure mirrors the production create-agents-server wiring: revoking a device
+		// tears down any live peer for that client id. It is passed to the shared revoke helper so the
+		// smoke exercises the real revoke composition rather than manually closing peers.
+		const disconnectMobileDevice = (mobileClientId: string, reason: string): void => {
+			for (const peer of server?.peers ?? []) {
+				if (peer.remoteIdentity.peerId === mobileClientId && !peer.isClosed) {
+					peer.close(1008, reason);
+				}
+			}
+		};
 		try {
 			const identity = AgentServerIdentity.open(join(directory, "identity.json"));
 			const auth = new MobileIngressAuth({
@@ -101,6 +192,17 @@ describe("Mobile ingress transport smoke", () => {
 				isRemoteAccessEnabled: () => true,
 			});
 			const fence = new MobileIngressGenerationFence(database.mobileDevices);
+			// Real production drainer: it projects the transactional outbox into the durable feed exactly
+			// as the Agent Server does at runtime. `onAppended` is the mobile-only `attention.changed`
+			// live hint; losing it never affects durable recovery.
+			let attentionChangedHints = 0;
+			const drainer = new MobileAttentionOutboxDrainer({
+				attention: database.mobileAttention,
+				outbox: database.mobileAttentionOutbox,
+				onAppended: () => {
+					attentionChangedHints += 1;
+				},
+			});
 			const runtimeGetCalls: string[] = [];
 			server = createRpcServer({
 				identity: rpcIdentity,
@@ -120,25 +222,25 @@ describe("Mobile ingress transport smoke", () => {
 						// A handler exists for a forbidden method, yet the allowlist must still deny it —
 						// proving isolation is enforced by policy, not by the absence of a handler.
 						[productRpcMethods.providersDelete]: () => ({ deleted: true }),
-						// The durable attention feed handlers mirror the Product RPC wiring: the peer's
+						// The durable attention feed handlers reuse the shared production helpers: the peer's
 						// authenticated identity (never request input) selects the per-device unread state,
 						// so a Mobile client can only ever read/advance its own cursor.
-						[productRpcMethods.mobileAttentionList]: (payload, context) => {
-							const input = payload as { cursor?: string; limit?: number } | undefined;
-							return listMobileAttentionOutputSchema.parse(
-								database.mobileAttention.list(context.remoteIdentity.peerId, {
-									cursor: input?.cursor,
-									limit: input?.limit,
-								}),
-							);
-						},
-						[productRpcMethods.mobileAttentionAck]: (payload, context) => {
-							const input = payload as { seq: number };
-							return ackMobileAttentionOutputSchema.parse({
-								schemaVersion: 1,
-								...database.mobileAttention.ack(context.remoteIdentity.peerId, input.seq),
-							});
-						},
+						[productRpcMethods.mobileAttentionList]: (payload, context) =>
+							listMobileAttentionOutputSchema.parse(
+								listMobileAttentionForPeer(
+									database.mobileAttention,
+									context.peer,
+									(payload ?? {}) as { cursor?: string; limit?: number },
+								),
+							),
+						[productRpcMethods.mobileAttentionAck]: (payload, context) =>
+							ackMobileAttentionOutputSchema.parse(
+								ackMobileAttentionForPeer(
+									database.mobileAttention,
+									context.peer,
+									payload as { seq: number },
+								),
+							),
 					},
 				},
 				methodAllowlist: mobileAllowlist,
@@ -205,32 +307,23 @@ describe("Mobile ingress transport smoke", () => {
 			expect(runtimeGetCalls).toEqual([approved.mobileClientId]);
 			await expect(peer.request(productRpcMethods.providersDelete, {})).rejects.toThrow();
 
-			// 4b) Durable attention feed: the Agent Server appends desensitized events (as it would on a
-			// pending approval / Run terminal). The phone lists unread, acks, and — critically — recovers
-			// missed unread after a disconnect from the server-owned feed, never from device storage.
-			database.mobileAttention.append({
-				type: "approval_required",
-				dedupeKey: "approval:attn-1",
-				approvalId: "attn-1",
-				sessionId: "019fb74d-0000-7000-8000-000000000001",
-				titleKey: "attention.approvalRequired.title",
-				bodyKey: "attention.approvalRequired.body",
-			});
-			// Idempotency: the same business event must not append twice.
-			database.mobileAttention.append({
-				type: "approval_required",
-				dedupeKey: "approval:attn-1",
-				approvalId: "attn-1",
-				titleKey: "attention.approvalRequired.title",
-				bodyKey: "attention.approvalRequired.body",
-			});
-			database.mobileAttention.append({
-				type: "run_completed",
-				dedupeKey: "run:attn-run-1",
-				runId: "attn-run-1",
-				titleKey: "attention.runCompleted.title",
-				bodyKey: "attention.runCompleted.body",
-			});
+			// 4b) Durable attention feed via the REAL production composition: a pending approval and a
+			// Run terminal transition each write the transactional outbox atomically with their business
+			// state; the production drainer projects them into the durable feed (desensitized). The phone
+			// lists unread, acks, and — critically — recovers missed unread after a disconnect from the
+			// server-owned feed, never from device storage.
+			const { sessionId, runId, assistantMessageId } = seedRun(database);
+			createPendingApproval(database, sessionId, runId);
+			completeRun(database, runId, assistantMessageId);
+
+			// Nothing is visible on the feed until the drainer projects the committed outbox rows.
+			expect(database.mobileAttention.latestSeq()).toBe(0);
+			expect(database.mobileAttentionOutbox.pendingCount()).toBe(2);
+			const drainResult = drainer.drain();
+			expect(drainResult.appended).toBe(2);
+			expect(database.mobileAttentionOutbox.pendingCount()).toBe(0);
+			// The live `attention.changed` hint fired for the projected batch.
+			expect(attentionChangedHints).toBeGreaterThanOrEqual(1);
 
 			const feed = listMobileAttentionOutputSchema.parse(
 				await peer.request(productRpcMethods.mobileAttentionList, {}),
@@ -246,6 +339,8 @@ describe("Mobile ingress transport smoke", () => {
 				expect(Object.keys(item)).not.toContain("prompt");
 				expect(Object.keys(item)).not.toContain("command");
 			}
+			// Reconfirm nothing raw leaked into the feed payload.
+			expect(JSON.stringify(feed)).not.toContain("secret-command");
 
 			const ack = ackMobileAttentionOutputSchema.parse(
 				await peer.request(productRpcMethods.mobileAttentionAck, { seq: 1 }),
@@ -253,14 +348,10 @@ describe("Mobile ingress transport smoke", () => {
 			expect(ack.ackSeq).toBe(1);
 			expect(ack.unreadCount).toBe(1);
 
-			// A missed event arrives while the phone will be offline between reconnects.
-			database.mobileAttention.append({
-				type: "run_failed",
-				dedupeKey: "run:attn-run-2",
-				runId: "attn-run-2",
-				titleKey: "attention.runFailed.title",
-				bodyKey: "attention.runFailed.body",
-			});
+			// A missed event arrives (another pending approval) while the phone will be offline between
+			// reconnects; it flows through the same outbox → drainer projection path.
+			createPendingApproval(database, sessionId, runId);
+			expect(drainer.drain().appended).toBe(1);
 
 			// 5) A reconnect at a higher generation fences the previous live peer.
 			const reconnectInput: MobileChallengeInput = {
@@ -295,16 +386,17 @@ describe("Mobile ingress transport smoke", () => {
 			expect(recovered.latestSeq).toBe(3);
 			expect(recovered.resyncRequired).toBe(false);
 
-			// 6) Revoking the device closes the live peer and blocks any new challenge/upgrade. The
-			// Product RPC revoke handler also drops the device's server-side unread cursor so a re-paired
-			// client id can never inherit stale read state; mirror that cleanup here.
-			auth.revokeDevice({ mobileClientId: approved.mobileClientId, deviceKeyId: "device-key-1" });
-			database.mobileAttention.deleteAckCursor(approved.mobileClientId);
-			for (const livePeer of server.peers) {
-				if (livePeer.remoteIdentity.peerId === approved.mobileClientId) {
-					livePeer.close(1008, "device revoked");
-				}
-			}
+			// 6) Revoking the device runs the REAL shared revoke composition: it revokes the durable key,
+			// drops the device's server-side unread cursor (so a re-paired client id can never inherit
+			// stale read state), and tears down the live peer.
+			revokeMobileDevice(
+				{
+					mobileAttention: database.mobileAttention,
+					revokeDeviceKey: (input) => auth.revokeDevice(input),
+					disconnectMobileDevice,
+				},
+				{ mobileClientId: approved.mobileClientId, deviceKeyId: "device-key-1" },
+			);
 			await secondPeer.closed;
 
 			const revokedInput: MobileChallengeInput = {

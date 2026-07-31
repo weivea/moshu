@@ -2,6 +2,7 @@ import type { AckMobileAttentionOutput, ListMobileAttentionOutput } from "@moshu
 import type { MobileEventBus } from "./events";
 import {
 	type LocalNotificationScheduler,
+	type NotificationRoute,
 	noopNotificationScheduler,
 	notificationIdForSeq,
 } from "../native/notifications";
@@ -167,7 +168,7 @@ export class AttentionController {
 		this.#resyncRequired = page.resyncRequired;
 
 		if (notify && page.latestSeq > this.#seenSeq) {
-			await this.#maybeNotify(page.latestSeq);
+			await this.#maybeNotify(page.latestSeq, page.items);
 		}
 		// Whether or not we notified, everything up to latestSeq is now "seen": a later reconnect
 		// snapshot must not resurface these as notifications.
@@ -177,7 +178,7 @@ export class AttentionController {
 		this.#emit();
 	}
 
-	async #maybeNotify(latestSeq: number): Promise<void> {
+	async #maybeNotify(latestSeq: number, items: ListMobileAttentionOutput["items"]): Promise<void> {
 		// Active app → Activity badge only, no lock-screen banner.
 		if (this.#isAppActive() || !this.#isNotificationsEnabled()) {
 			return;
@@ -187,7 +188,33 @@ export class AttentionController {
 			id: notificationIdForSeq(latestSeq),
 			title: text.title,
 			body: text.body,
+			route: this.#routeForSeq(latestSeq, items),
 		});
+	}
+
+	/**
+	 * Build the opaque tap route for the newest event. Only server-issued ids are carried
+	 * (sessionId/approvalId + the stable attention eventId); never any business content. Returns
+	 * `undefined` when the newest event isn't present in the page so we never fabricate a route.
+	 */
+	#routeForSeq(
+		latestSeq: number,
+		items: ListMobileAttentionOutput["items"],
+	): NotificationRoute | undefined {
+		const event = items.find((item) => item.seq === latestSeq);
+		if (!event) {
+			return undefined;
+		}
+		const route: { -readonly [K in keyof NotificationRoute]: NotificationRoute[K] } = {
+			attentionEventId: event.eventId,
+		};
+		if (event.sessionId) {
+			route.sessionId = event.sessionId;
+		}
+		if (event.approvalId) {
+			route.approvalId = event.approvalId;
+		}
+		return route;
 	}
 
 	async #applyBadge(): Promise<void> {

@@ -29,6 +29,10 @@ import {
 	SqliteMobileAttentionRepository,
 } from "./mobile-attention-repository";
 import {
+	type MobileAttentionOutboxRepository,
+	SqliteMobileAttentionOutboxRepository,
+} from "./mobile-attention-outbox-repository";
+import {
 	type MobileDeviceRepository,
 	SqliteMobileDeviceRepository,
 } from "./mobile-device-repository";
@@ -73,6 +77,7 @@ export interface AppDatabase {
 	mobilePairings: MobilePairingRepository;
 	mobileDevices: MobileDeviceRepository;
 	mobileAttention: MobileAttentionRepository;
+	mobileAttentionOutbox: MobileAttentionOutboxRepository;
 	remoteAccess: RemoteAccessRepository;
 	runtimeBoxInventory: RuntimeBoxInventoryRepository;
 	runtimeProfiles: RuntimeProfileRepository;
@@ -177,6 +182,9 @@ export function openAppDatabase(
 		arch: process.arch,
 		capabilities: [],
 	});
+	// One outbox instance shared by the approval and Run repositories so their business writes and the
+	// Mobile attention enqueue land in the same SQLite transaction (single synchronous connection).
+	const mobileAttentionOutbox = new SqliteMobileAttentionOutboxRepository(orm);
 	return {
 		client,
 		orm,
@@ -196,11 +204,12 @@ export function openAppDatabase(
 		mobilePairings: new SqliteMobilePairingRepository(orm),
 		mobileDevices: new SqliteMobileDeviceRepository(orm),
 		mobileAttention: new SqliteMobileAttentionRepository(orm),
+		mobileAttentionOutbox,
 		remoteAccess: new SqliteRemoteAccessRepository(orm),
 		sessions: createSessionRepository({ orm, runtimeBoxes, projects }),
-		runs: createRunJournalRepository({ client, orm }),
+		runs: createRunJournalRepository({ client, orm, attentionOutbox: mobileAttentionOutbox }),
 		actions: new SqliteActionRepository(orm),
-		approvals: new SqliteApprovalRepository(orm),
+		approvals: new SqliteApprovalRepository(orm, { now: Date.now }, mobileAttentionOutbox),
 		close: () => client.close(),
 	};
 }

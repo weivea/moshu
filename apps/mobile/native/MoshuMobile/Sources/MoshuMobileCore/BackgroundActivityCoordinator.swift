@@ -79,14 +79,18 @@ public final class BackgroundActivityCoordinator {
 	}
 
 	/// OS expiration path: clean up exactly once — run `onExpire` (close the socket) then end the task.
+	/// If the task was already ended (e.g. the App returned to the foreground and called `end()`),
+	/// a late/stale expiration callback is a strict no-op: it must NOT run `onExpire`, so an expired
+	/// task can never tear down a *newer* connection opened by a subsequent foreground session.
 	private func handleExpiration() {
 		lock.lock()
-		let id = taskId
+		guard let id = taskId else {
+			lock.unlock()
+			return
+		}
 		taskId = nil
 		lock.unlock()
 		onExpire()
-		if let id {
-			host.endTask(id)
-		}
+		host.endTask(id)
 	}
 }

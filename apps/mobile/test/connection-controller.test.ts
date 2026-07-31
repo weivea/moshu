@@ -1,4 +1,5 @@
 import type { RpcPeer } from "@moshu/process-rpc-core";
+import { RpcHandshakeError } from "@moshu/process-rpc-core";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ConnectionController } from "../src/rpc/connection-controller";
 import { FakeTransport, makeBinding, makeConnectResult } from "./helpers";
@@ -116,6 +117,41 @@ describe("ConnectionController", () => {
 		const state = controller.getState();
 		expect(state.kind).toBe("error");
 		expect(state.kind === "error" && state.code).toBe("protocol-mismatch");
+	});
+
+	it("treats a real handshake UNSUPPORTED_PROTOCOL error as fatal and never reconnects", async () => {
+		vi.useFakeTimers();
+		const transport = new FakeTransport();
+		transport.status = { state: "paired", binding: makeBinding() };
+		// The native socket upgrades fine, but the JS process-rpc handshake rejects because the server
+		// negotiated an incompatible protocol version — exactly what completeMobileHandshake throws.
+		const handshake = async (): Promise<RpcPeer> => {
+			throw new RpcHandshakeError(
+				"UNSUPPORTED_PROTOCOL",
+				"Server selected an incompatible protocol version.",
+			);
+		};
+		const controller = new ConnectionController({
+			transport,
+			handshake: handshake as never,
+			reconnectDelayMs: 100,
+			reconnectJitterRatio: 0,
+			random: () => 0,
+			pollIntervalMs: 1_000_000,
+		});
+		controllers.push(controller);
+
+		await controller.init();
+		const state = controller.getState();
+		expect(state.kind).toBe("error");
+		expect(state.kind === "error" && state.code).toBe("protocol-mismatch");
+
+		// A protocol mismatch is permanent: no bounded-backoff reconnect may be scheduled, even after
+		// the reconnect delay elapses many times over.
+		const connectSpy = vi.spyOn(transport, "connect");
+		await vi.advanceTimersByTimeAsync(5_000);
+		expect(connectSpy).not.toHaveBeenCalled();
+		expect(controller.getState().kind).toBe("error");
 	});
 
 	it("goes offline (not fatal) on a transient connect failure", async () => {
@@ -273,6 +309,34 @@ describe("ConnectionController", () => {
 
 		expect(connectSpy).not.toHaveBeenCalled();
 		expect(controller.getState().kind).not.toBe("connected");
+	});
+
+	it("goes offline (no reconnect) when the socket closes while backgrounded, then reconnects on foreground", async () => {
+		const transport = new FakeTransport();
+		transport.status = { state: "paired", binding: makeBinding() };
+		const { handshake, captured } = fakeHandshake();
+		const controller = makeController(transport, handshake);
+		await controller.init();
+		expect(controller.getState().kind).toBe("connected");
+
+		// The App is backgrounded; the OS then reclaims the short window and the NATIVE engine closes
+		// the exact active socket (surfacing to JS as a plain, non-fatal close). We must transition to
+		// offline WITHOUT arming a reconnect — never a misleading "reconnecting" while off-foreground.
+		const connectSpy = vi.spyOn(transport, "connect");
+		controller.onAppBackground();
+		captured.onClose?.({ code: 1001, reason: "background-expired" });
+		await Promise.resolve();
+		await Promise.resolve();
+		await Promise.resolve();
+
+		expect(controller.getState().kind).toBe("offline");
+		expect(connectSpy).not.toHaveBeenCalled();
+
+		// Foreground re-entry makes exactly one immediate attempt and reconnects (which re-snapshots the
+		// durable attention feed at the layer above).
+		await controller.onAppActive();
+		expect(connectSpy).toHaveBeenCalledTimes(1);
+		expect(controller.getState().kind).toBe("connected");
 	});
 
 	it("reconnects with bounded exponential backoff and resets after a stable connection", async () => {

@@ -48,10 +48,7 @@ import { FileProviderRegistryStore } from "./file-provider-registry-store";
 import { McpActionDispatcher } from "./mcp-action-dispatcher";
 import { MobileIngressAuth } from "./mobile-ingress-auth";
 import { MobileIngressGenerationFence } from "./mobile-ingress-generation-fence";
-import {
-	projectApprovalAttention,
-	projectRunTerminalAttention,
-} from "./mobile-attention-projection";
+import { MobileAttentionOutboxDrainer } from "./mobile-attention-drainer";
 import {
 	agentsServerClientMethodAllowlist,
 	agentsServerMobileMethodAllowlist,
@@ -178,6 +175,7 @@ export async function createAgentsServer(
 	let unsubscribe: (() => void) | undefined;
 	let unsubscribeApprovals: (() => void) | undefined;
 	let approvalSweepTimer: ReturnType<typeof setInterval> | undefined;
+	let attentionDrainerHandle: { stop: () => void } | undefined;
 	let authController: HeadlessAuthController | undefined;
 	let agentServerMcpLifecycle: McpLifecycleManager | undefined;
 	try {
@@ -693,31 +691,26 @@ export async function createAgentsServer(
 			reportDiagnostic(error instanceof Error ? error.message : "Dev Tunnel startup failed.");
 		});
 		const service = chatService;
-		// Durably append a desensitized Mobile attention event and, only if a new row was actually
-		// written, push the mobile-only `attention.changed` live hint. Append is transactional and
-		// idempotent (dedupe key), so a duplicate business event neither double-appends nor re-notifies,
-		// and a server restart never loses or replays an event. Failures here never break the primary
-		// event fan-out — the phone still recovers missed unread from the durable feed on reconnect.
-		const appendMobileAttention = (
-			input: Parameters<typeof database.mobileAttention.append>[0],
-		): void => {
-			try {
-				const result = database.mobileAttention.append(input);
-				if (result.appended) {
-					broadcastMobileAttentionChanged(productEventPeers());
-				}
-			} catch (error) {
-				const message = error instanceof Error ? error.message.slice(0, 256) : "Unknown failure.";
-				reportDiagnostic(
-					`Mobile attention append failed; reconnect recovery still applies: ${message}`,
-				);
-			}
-		};
+		// The durable Mobile attention feed is fed by a transactional outbox: the approval and Run
+		// repositories write a desensitized outbox row in the SAME transaction as the business write, so
+		// a crash between the business commit and the feed projection can never permanently lose unread.
+		// This independent, idempotent drainer projects committed outbox rows into the feed and enforces
+		// retention. It drains once at startup (replaying anything a crash left behind), on each relevant
+		// live event, and on a bounded periodic backstop. `onAppended` pushes the mobile-only
+		// `attention.changed` hint only when a NEW row was projected; losing that hint never affects
+		// durable recovery because the phone re-reads the feed on reconnect.
+		const attentionDrainer = new MobileAttentionOutboxDrainer({
+			attention: database.mobileAttention,
+			outbox: database.mobileAttentionOutbox,
+			onAppended: () => broadcastMobileAttentionChanged(productEventPeers()),
+			reportDiagnostic,
+		});
+		attentionDrainerHandle = attentionDrainer.start();
 		unsubscribe = service.subscribe((event) => {
 			eventRouter.publish(productEventPeers(), event, service.getClientRequestId(event.runId));
-			const attention = projectRunTerminalAttention(event);
-			if (attention !== undefined) {
-				appendMobileAttention(attention);
+			// A Run terminal transition committed its attention outbox row atomically; project it now.
+			if (event.type === "run.status") {
+				attentionDrainer.drain();
 			}
 		});
 		// Fan approval state changes out to the multi-client event hub: Session-scoped events reach
@@ -736,9 +729,10 @@ export async function createAgentsServer(
 					kind: event.type === "approval.created" ? "created" : "updated",
 					request: event.request,
 				});
-				const attention = projectApprovalAttention(event);
-				if (attention !== undefined) {
-					appendMobileAttention(attention);
+				// A newly-created approval that entered "pending" committed its attention outbox row
+				// atomically with the approval insert; project it now.
+				if (event.type === "approval.created") {
+					attentionDrainer.drain();
 				}
 			}
 			broadcastApprovalActivityChanged(peers);
@@ -771,6 +765,7 @@ export async function createAgentsServer(
 				const execution = (async () => {
 					unsubscribe?.();
 					unsubscribeApprovals?.();
+					attentionDrainerHandle?.stop();
 					if (approvalSweepTimer !== undefined) {
 						clearInterval(approvalSweepTimer);
 					}
@@ -796,6 +791,8 @@ export async function createAgentsServer(
 		};
 	} catch (error) {
 		unsubscribe?.();
+		unsubscribeApprovals?.();
+		attentionDrainerHandle?.stop();
 		await devTunnelService?.shutdown();
 		productRpcServer?.stop();
 		runtimeRpcServer?.stop();

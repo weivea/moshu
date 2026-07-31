@@ -29,6 +29,8 @@ import { and, asc, desc, eq, gt, inArray, sql } from "drizzle-orm";
 
 import type { AppDrizzleDatabase } from "./database";
 import { createUuidV7 } from "./ids";
+import { buildRunTerminalAttentionInput } from "./mobile-attention-copy";
+import type { MobileAttentionOutboxWriter } from "./mobile-attention-outbox-repository";
 import {
 	agentSessionCleanupOutboxTable,
 	chatRunEventsTable,
@@ -405,6 +407,10 @@ export class SqliteRunJournalRepository implements RunJournalRepository {
 		private readonly orm: AppDrizzleDatabase,
 		private readonly idGenerator: RepositoryIdGenerator = { create: createUuidV7 },
 		private readonly clock: RepositoryClock = { now: () => Date.now() },
+		// Optional transactional outbox. When present, a Run's single terminal transition enqueues a
+		// desensitized Mobile attention row in the SAME transaction as the status write, so a crash
+		// between the two can never permanently lose the phone's unread signal.
+		private readonly attentionOutbox?: MobileAttentionOutboxWriter,
 	) {}
 
 	create(input: CreateRunInput): CreateRunResult {
@@ -758,6 +764,7 @@ export class SqliteRunJournalRepository implements RunJournalRepository {
 				),
 			);
 			this.touchSession(row.sessionId, nowMs, false);
+			this.enqueueTerminalAttention("failed", runId, row.sessionId, nowMs);
 			return {
 				run: buildRun({
 					...row,
@@ -883,6 +890,7 @@ export class SqliteRunJournalRepository implements RunJournalRepository {
 					updatedAtMs: nowMs,
 					completedAtMs: nowMs,
 				};
+				this.enqueueTerminalAttention(terminalStatus, runId, row.sessionId, nowMs);
 			} else if (row.assistantContent !== message.content) {
 				this.orm
 					.update(chatRunsTable)
@@ -1154,6 +1162,24 @@ export class SqliteRunJournalRepository implements RunJournalRepository {
 			.run();
 	}
 
+	// Enqueue the desensitized Mobile attention outbox row for a Run's single terminal transition,
+	// inside the caller's transaction so it is atomic with the status write. `buildRunTerminalAttentionInput`
+	// only returns undefined for non-terminal statuses, which never reach this helper.
+	private enqueueTerminalAttention(
+		status: ChatRunStatus,
+		runId: string,
+		sessionId: string,
+		nowMs: number,
+	): void {
+		if (this.attentionOutbox === undefined) {
+			return;
+		}
+		const attention = buildRunTerminalAttentionInput({ status, runId, sessionId, createdAtMs: nowMs });
+		if (attention !== undefined) {
+			this.attentionOutbox.enqueue(attention);
+		}
+	}
+
 	private inTransaction<TResult>(callback: () => TResult): TResult {
 		this.client.exec("BEGIN IMMEDIATE");
 		try {
@@ -1282,6 +1308,13 @@ export class SqliteRunJournalRepository implements RunJournalRepository {
 export function createRunJournalRepository(database: {
 	client: Database;
 	orm: AppDrizzleDatabase;
+	attentionOutbox?: MobileAttentionOutboxWriter;
 }): RunJournalRepository {
-	return new SqliteRunJournalRepository(database.client, database.orm);
+	return new SqliteRunJournalRepository(
+		database.client,
+		database.orm,
+		undefined,
+		undefined,
+		database.attentionOutbox,
+	);
 }

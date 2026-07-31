@@ -1,7 +1,7 @@
 import type { AckMobileAttentionOutput, ListMobileAttentionOutput } from "@moshu/contracts";
 import { beforeEach, describe, expect, it } from "vitest";
 import { AttentionController, type AttentionFeedClient } from "../src/rpc/attention-controller";
-import type { LocalNotificationScheduler } from "../src/native/notifications";
+import type { LocalNotificationScheduler, NotificationRoute } from "../src/native/notifications";
 import { MobileEventBus } from "../src/rpc/events";
 
 function listOutput(overrides: Partial<ListMobileAttentionOutput> = {}): ListMobileAttentionOutput {
@@ -51,8 +51,15 @@ function makeFeedClient() {
 }
 
 function makeScheduler() {
-	const scheduled: { id: number; title: string; body: string }[] = [];
+	const scheduled: {
+		id: number;
+		title: string;
+		body: string;
+		route?: NotificationRoute;
+	}[] = [];
 	const badges: number[] = [];
+	const tapHandlers: ((route: NotificationRoute) => void)[] = [];
+	let disposeCount = 0;
 	const scheduler: LocalNotificationScheduler = {
 		async getPermission() {
 			return "granted";
@@ -61,16 +68,51 @@ function makeScheduler() {
 			return "granted";
 		},
 		async schedule(request) {
-			scheduled.push({ id: request.id, title: request.title, body: request.body });
+			scheduled.push({
+				id: request.id,
+				title: request.title,
+				body: request.body,
+				route: request.route,
+			});
 		},
 		async setBadge(count) {
 			badges.push(count);
 		},
+		onTap(handler) {
+			tapHandlers.push(handler);
+			return () => {
+				disposeCount += 1;
+			};
+		},
 	};
-	return { scheduler, scheduled, badges };
+	return {
+		scheduler,
+		scheduled,
+		badges,
+		tapHandlers,
+		disposeCount: () => disposeCount,
+	};
 }
 
 const TEXT = { title: "Moshu", body: "New activity" };
+
+/** Build a minimal, valid desensitized attention event for a given sequence. */
+function makeEvent(
+	seq: number,
+	overrides: Partial<ListMobileAttentionOutput["items"][number]> = {},
+): ListMobileAttentionOutput["items"][number] {
+	return {
+		schemaVersion: 1,
+		eventId: `00000000-0000-4000-8000-${String(seq).padStart(12, "0")}`,
+		seq,
+		type: "approval_required",
+		visibility: "mobile-clients",
+		createdAt: "2024-01-01T00:00:00.000Z",
+		titleKey: "attention.approval_required.title",
+		bodyKey: "attention.approval_required.body",
+		...overrides,
+	};
+}
 
 describe("AttentionController", () => {
 	let bus: MobileEventBus;
@@ -121,6 +163,58 @@ describe("AttentionController", () => {
 		expect(scheduled[0]?.body).toBe(TEXT.body);
 		// The body/title carry no business content — only the generic localized copy.
 		expect(scheduled[0]?.body).not.toContain("shell");
+	});
+
+	it("attaches ONLY the opaque route ids from the newest event to the notification", async () => {
+		const feed = makeFeedClient();
+		const { scheduler, scheduled } = makeScheduler();
+		feed.enqueue(listOutput({ unreadCount: 0, latestSeq: 0 }));
+		const controller = new AttentionController({
+			scheduler,
+			isAppActive: () => false,
+			notificationText: () => TEXT,
+		});
+		controller.attach(feed.client, bus);
+		await controller.whenSettled();
+
+		const event = makeEvent(1, {
+			sessionId: "session-abc",
+			approvalId: "approval-xyz",
+			runId: "run-should-not-leak",
+		});
+		feed.enqueue(listOutput({ unreadCount: 1, latestSeq: 1, items: [event] }));
+		bus.emit("mobileAttentionChanged", { schemaVersion: 1 });
+		await controller.whenSettled();
+
+		expect(scheduled).toHaveLength(1);
+		// Route carries only sessionId/approvalId + the stable attention eventId — nothing else, and no
+		// business content (runId and any other field are not forwarded across the tap boundary).
+		expect(scheduled[0]?.route).toEqual({
+			attentionEventId: event.eventId,
+			sessionId: "session-abc",
+			approvalId: "approval-xyz",
+		});
+	});
+
+	it("omits a route when the newest event is not present in the page", async () => {
+		const feed = makeFeedClient();
+		const { scheduler, scheduled } = makeScheduler();
+		feed.enqueue(listOutput({ unreadCount: 0, latestSeq: 0 }));
+		const controller = new AttentionController({
+			scheduler,
+			isAppActive: () => false,
+			notificationText: () => TEXT,
+		});
+		controller.attach(feed.client, bus);
+		await controller.whenSettled();
+
+		// latestSeq advances but the page carries no matching item → never fabricate a route.
+		feed.enqueue(listOutput({ unreadCount: 1, latestSeq: 5, items: [] }));
+		bus.emit("mobileAttentionChanged", { schemaVersion: 1 });
+		await controller.whenSettled();
+
+		expect(scheduled).toHaveLength(1);
+		expect(scheduled[0]?.route).toBeUndefined();
 	});
 
 	it("does NOT notify for a live hint while the app is active (badge only)", async () => {

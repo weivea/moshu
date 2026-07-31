@@ -1,6 +1,6 @@
 import type Database from "bun:sqlite";
 
-export const currentAppDatabaseVersion = 25;
+export const currentAppDatabaseVersion = 26;
 
 export class AppDatabaseResetRequiredError extends Error {
 	readonly currentVersion: number;
@@ -84,6 +84,7 @@ export function applyAppMigrations(client: Database): void {
 			DROP TABLE IF EXISTS mobile_attention_ack_cursors;
 			DROP TABLE IF EXISTS mobile_attention_events;
 			DROP TABLE IF EXISTS mobile_attention_feed_meta;
+			DROP TABLE IF EXISTS mobile_attention_outbox;
 			DROP TABLE IF EXISTS mobile_device_generation_fences;
 			DROP TABLE IF EXISTS mobile_device_keys;
 			DROP TABLE IF EXISTS mobile_pairing_sessions;
@@ -393,6 +394,29 @@ export function applyAppMigrations(client: Database): void {
 
 			INSERT INTO mobile_attention_feed_meta (id, next_seq, pruned_through_seq)
 				VALUES (1, 1, 0);
+
+			-- Transactional outbox that makes the durable attention feed crash-consistent: an approval
+			-- reaching "pending" or a Run reaching a terminal status writes a desensitized row here in
+			-- the SAME transaction as the business write. An idempotent drainer projects each row into
+			-- mobile_attention_events and marks it processed; a crash between business commit and
+			-- projection replays from the outbox on startup rather than losing unread.
+			CREATE TABLE mobile_attention_outbox (
+				id INTEGER PRIMARY KEY NOT NULL,
+				dedupe_key TEXT NOT NULL UNIQUE,
+				type TEXT NOT NULL,
+				session_id TEXT,
+				run_id TEXT,
+				approval_id TEXT,
+				title_key TEXT NOT NULL,
+				body_key TEXT NOT NULL,
+				created_at_ms INTEGER NOT NULL,
+				enqueued_at_ms INTEGER NOT NULL,
+				processed_at_ms INTEGER,
+				attempts INTEGER NOT NULL DEFAULT 0,
+				last_error TEXT
+			);
+			CREATE INDEX mobile_attention_outbox_pending_idx
+				ON mobile_attention_outbox(processed_at_ms, id);
 
 			CREATE TABLE projects (
 				id TEXT PRIMARY KEY NOT NULL,

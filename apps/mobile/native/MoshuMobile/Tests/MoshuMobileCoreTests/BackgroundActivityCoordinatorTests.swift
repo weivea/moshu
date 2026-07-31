@@ -80,6 +80,23 @@ final class BackgroundActivityCoordinatorTests: XCTestCase {
 		XCTAssertEqual(host.beginCount, 2, "A new foreground→background cycle may begin a new task")
 		XCTAssertTrue(coordinator.isActive)
 	}
+
+	func testStaleExpirationAfterEndIsANoOpAndCannotCloseANewerConnection() {
+		let host = FakeBackgroundTaskHost()
+		var expireCount = 0
+		let coordinator = BackgroundActivityCoordinator(host: host, onExpire: { expireCount += 1 })
+
+		// Foreground returned and ended the task BEFORE the OS fired the (now stale) expiration handler.
+		coordinator.begin()
+		coordinator.end()
+		host.fireExpiration()
+
+		// The stale expiration must not run cleanup: otherwise it would tear down whatever socket the
+		// next foreground session opens.
+		XCTAssertEqual(expireCount, 0, "A stale expiration after end() must not run onExpire")
+		XCTAssertEqual(host.endedIds.count, 1, "end() already released the task; no double-end")
+		XCTAssertFalse(coordinator.isActive)
+	}
 }
 
 final class NotificationContentBuilderTests: XCTestCase {

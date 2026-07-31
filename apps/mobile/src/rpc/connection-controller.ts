@@ -69,6 +69,10 @@ const fatalCodeMap: Record<string, FatalConnectionCode> = {
 	AUTH_REVOKED: "auth-revoked",
 	AUTH_FAILED: "auth-failed",
 	PROTOCOL_MISMATCH: "protocol-mismatch",
+	// The JS handshake rejects with `UNSUPPORTED_PROTOCOL` when the server negotiates an incompatible
+	// process-rpc protocol version; that is a permanent negotiation failure, never a transient network
+	// fault, so it must be fatal (no reconnect) rather than retried forever.
+	UNSUPPORTED_PROTOCOL: "protocol-mismatch",
 	IDENTITY_MISMATCH: "identity-mismatch",
 	URL_INVALID: "url-invalid",
 	PAIRING_REJECTED: "pairing-rejected",
@@ -82,6 +86,7 @@ const fatalReasonMap: Record<string, FatalConnectionCode> = {
 	AUTH_REVOKED: "auth-revoked",
 	AUTH_FAILED: "auth-failed",
 	PROTOCOL_MISMATCH: "protocol-mismatch",
+	UNSUPPORTED_PROTOCOL: "protocol-mismatch",
 };
 
 const rpcLimits = resolveRpcLimits({
@@ -325,6 +330,15 @@ export class ConnectionController {
 		if (fatalReason && fatalReasonMap[fatalReason]) {
 			void this.#teardownConnection();
 			this.#setState({ kind: "error", code: fatalReasonMap[fatalReason], binding });
+			return;
+		}
+		// Backgrounded: the OS reclaimed the short background window and the native engine closed the
+		// exact active socket (or the socket simply dropped off-foreground). Go offline WITHOUT arming a
+		// reconnect — we never open a new connection off-foreground. Foreground re-entry (onAppActive)
+		// makes one immediate attempt and re-snapshots the durable attention feed.
+		if (this.#backgrounded) {
+			void this.#teardownConnection();
+			this.#setState({ kind: "offline", binding });
 			return;
 		}
 		// Otherwise re-check the binding: a close could still be a server-side revocation that only

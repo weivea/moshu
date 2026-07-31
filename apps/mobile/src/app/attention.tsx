@@ -12,8 +12,11 @@ import {
 	CapacitorNotificationScheduler,
 	type LocalNotificationScheduler,
 	type NotificationPermissionState,
+	type NotificationRoute,
 } from "../native/notifications";
 import { AttentionController, type AttentionSnapshot } from "../rpc/attention-controller";
+import type { ConnectionController, ConnectionState } from "../rpc/connection-controller";
+import { NotificationTapCoordinator, type NotificationTapReadiness } from "../rpc/notification-tap";
 import { useConnection } from "./connection";
 import { useI18n } from "./i18n";
 import { readNotificationsEnabled, writeNotificationsEnabled } from "./preferences";
@@ -39,13 +42,92 @@ const EMPTY_SNAPSHOT: AttentionSnapshot = {
 	resyncRequired: false,
 };
 
+// Upper bound on how long a notification tap waits for an authenticated connection + fresh snapshot
+// before falling back to a safe state. Tapping foregrounds the app (which triggers reconnect), so a
+// healthy session resolves well under this; the cap just guarantees we never hang on a dead network.
+const NOTIFICATION_READY_TIMEOUT_MS = 15_000;
+
+/** Map the connection state machine to the coarse readiness the tap coordinator gates on. */
+function mapReadiness(state: ConnectionState): NotificationTapReadiness {
+	switch (state.kind) {
+		case "connected":
+			return "ready";
+		case "unpaired":
+			return "unpaired";
+		case "error":
+			return "fatal";
+		default:
+			return "connecting";
+	}
+}
+
+/**
+ * Resolve once the connection is authenticated AND a fresh attention snapshot has been taken, so a
+ * notification tap never navigates into stale content. Resolves `false` if the session drops to
+ * unpaired/fatal or the wait times out.
+ */
+function waitUntilReady(
+	connection: ConnectionController,
+	attention: AttentionController,
+): Promise<boolean> {
+	return new Promise<boolean>((resolve) => {
+		let settled = false;
+		let unsubscribe = () => {};
+		const timer = setTimeout(() => finish(false), NOTIFICATION_READY_TIMEOUT_MS);
+
+		function cleanup() {
+			clearTimeout(timer);
+			unsubscribe();
+		}
+		function finish(ready: boolean) {
+			if (settled) {
+				return;
+			}
+			settled = true;
+			cleanup();
+			resolve(ready);
+		}
+		function evaluate(state: ConnectionState) {
+			if (settled) {
+				return;
+			}
+			const readiness = mapReadiness(state);
+			if (readiness === "unpaired" || readiness === "fatal") {
+				finish(false);
+				return;
+			}
+			if (readiness === "ready") {
+				settled = true;
+				cleanup();
+				// A fresh snapshot MUST land before navigation so we never surface cached business data.
+				attention.refresh().then(
+					() => resolve(true),
+					() => resolve(false),
+				);
+			}
+		}
+
+		unsubscribe = connection.subscribe(evaluate);
+		evaluate(connection.getState());
+	});
+}
+
 export interface AttentionProviderProps {
 	readonly scheduler?: LocalNotificationScheduler;
+	/** Navigate to an opaque route after a notification tap resolves to a ready, refreshed session. */
+	readonly onNotificationNavigate?: (route: NotificationRoute) => void;
+	/** Surface a safe (non-navigating) state when a tap lands while unpaired/fatal or before ready. */
+	readonly onNotificationSafeState?: (route: NotificationRoute) => void;
 	readonly children: ReactNode;
 }
 
-export function AttentionProvider({ scheduler, children }: AttentionProviderProps) {
-	const { state } = useConnection();
+export function AttentionProvider({
+	scheduler,
+	onNotificationNavigate,
+	onNotificationSafeState,
+	children,
+}: AttentionProviderProps) {
+	const { state, controller: connectionController } = useConnection();
 	const { t } = useI18n();
 
 	const [snapshot, setSnapshot] = useState<AttentionSnapshot>(EMPTY_SNAPSHOT);
@@ -61,6 +143,17 @@ export function AttentionProvider({ scheduler, children }: AttentionProviderProp
 	enabledRef.current = notificationsEnabled;
 	permissionRef.current = permission;
 	translateRef.current = t;
+
+	// Notification-tap callbacks are read through refs so the coordinator (created once) always calls
+	// the latest handler without being torn down and re-registered on every render.
+	const navigateRef = useRef<((route: NotificationRoute) => void) | undefined>(
+		onNotificationNavigate,
+	);
+	const safeStateRef = useRef<((route: NotificationRoute) => void) | undefined>(
+		onNotificationSafeState,
+	);
+	navigateRef.current = onNotificationNavigate;
+	safeStateRef.current = onNotificationSafeState;
 
 	const schedulerRef = useRef<LocalNotificationScheduler | null>(scheduler ?? null);
 	if (schedulerRef.current === null) {
@@ -111,6 +204,24 @@ export function AttentionProvider({ scheduler, children }: AttentionProviderProp
 		controller.detach();
 		return undefined;
 	}, [controller, state]);
+
+	// Register (and dispose) the single notification-tap listener. A tap only navigates after the
+	// session is authenticated and a fresh attention snapshot has landed; unpaired/fatal taps show a
+	// safe state instead of stale content. The coordinator is recreated only if a controller identity
+	// changes (never on normal renders), so there is exactly one live native listener.
+	useEffect(() => {
+		const coordinator = new NotificationTapCoordinator({
+			scheduler: activeScheduler,
+			readiness: () => mapReadiness(connectionController.getState()),
+			waitUntilReady: () => waitUntilReady(connectionController, controller),
+			navigate: (route) => navigateRef.current?.(route),
+			showSafeState: (route) => safeStateRef.current?.(route),
+		});
+		coordinator.start();
+		return () => {
+			coordinator.dispose();
+		};
+	}, [activeScheduler, connectionController, controller]);
 
 	const enableNotifications = useCallback(async () => {
 		const result = await activeScheduler.requestPermission();

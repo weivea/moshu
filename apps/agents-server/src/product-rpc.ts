@@ -96,6 +96,11 @@ import type { ChatApplicationService } from "./chat-application-service";
 import type { DevTunnelService } from "./dev-tunnel-service";
 import type { MobileIngressAuth } from "./mobile-ingress-auth";
 import {
+	ackMobileAttentionForPeer,
+	listMobileAttentionForPeer,
+	revokeMobileDevice,
+} from "./mobile-ingress-handlers";
+import {
 	broadcastApprovalActivityChanged,
 	broadcastMobileAttentionChanged,
 	ProductEventRouter,
@@ -411,32 +416,30 @@ export function createProductRpcHandlers(dependencies: ProductRpcDependencies): 
 			),
 			[productRpcMethods.mobileDeviceRevoke]: createRequestHandler(
 				productRpcRequestSchemas[productRpcMethods.mobileDeviceRevoke],
-				(input) => {
-					const output = requireMobileIngressAuth().revokeDevice(input);
-					// Drop the device's server-side unread cursor so a revoked (and later re-paired)
-					// client id can never inherit stale read state, and no feed is retained for it.
-					mobileAttention?.deleteAckCursor(input.mobileClientId);
-					disconnectMobileDevice?.(input.mobileClientId, "Mobile device revoked.");
-					return output;
-				},
+				// Shared revoke logic (single source of truth, also exercised by the ingress smoke): revoke
+				// the durable key, drop the device's server-side unread cursor so a re-paired client id can
+				// never inherit stale read state, and tear down any live peer.
+				(input) =>
+					revokeMobileDevice(
+						{
+							mobileAttention: requireMobileAttention(),
+							revokeDeviceKey: (revokeInput) =>
+								requireMobileIngressAuth().revokeDevice(revokeInput),
+							disconnectMobileDevice,
+						},
+						input,
+					),
 			),
 			[productRpcMethods.mobileAttentionList]: createRequestHandler(
 				productRpcRequestSchemas[productRpcMethods.mobileAttentionList],
 				// Peer identity is server-derived from the authenticated Mobile ingress session, never
 				// from request input, so a caller can neither forge another device's clientId nor read a
 				// Desktop feed. Desktop product clients are rejected outright.
-				(input, peer) =>
-					requireMobileAttention().list(resolveMobileClientId(peer), {
-						cursor: input.cursor,
-						limit: input.limit,
-					}),
+				(input, peer) => listMobileAttentionForPeer(requireMobileAttention(), peer, input),
 			),
 			[productRpcMethods.mobileAttentionAck]: createRequestHandler(
 				productRpcRequestSchemas[productRpcMethods.mobileAttentionAck],
-				(input, peer) => {
-					const result = requireMobileAttention().ack(resolveMobileClientId(peer), input.seq);
-					return { schemaVersion: 1 as const, ...result };
-				},
+				(input, peer) => ackMobileAttentionForPeer(requireMobileAttention(), peer, input),
 			),
 			[productRpcMethods.remoteAccessStatus]: createRequestHandler(
 				productRpcRequestSchemas[productRpcMethods.remoteAccessStatus],
@@ -1267,16 +1270,6 @@ function resolveProductClientId(peer: RpcPeer): string {
 // The Mobile attention feed is per-device unread state, so its handlers must bind strictly to an
 // authenticated Mobile client. Desktop product clients are rejected — a Desktop peer must never be
 // able to read or advance a phone's unread cursor, and a Mobile caller can only address its own feed.
-function resolveMobileClientId(peer: RpcPeer): string {
-	if (peer.remoteIdentity.role !== "mobile-client") {
-		throw new RpcHandlerError(
-			"CLIENT_IDENTITY_REQUIRED",
-			"The Mobile attention feed is only available to authenticated Mobile clients.",
-		);
-	}
-	return peer.remoteIdentity.peerId;
-}
-
 function createRequestHandler<TInputSchema extends ZodType, TOutputSchema extends ZodType>(
 	contract: { input: TInputSchema; output: TOutputSchema },
 	execute: (

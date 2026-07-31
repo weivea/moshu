@@ -11,6 +11,8 @@ import {
 } from "@moshu/contracts";
 import { and, desc, eq, inArray, lte } from "drizzle-orm";
 import type { AppDrizzleDatabase } from "./database";
+import { buildApprovalPendingAttentionInput } from "./mobile-attention-copy";
+import type { MobileAttentionOutboxWriter } from "./mobile-attention-outbox-repository";
 import { actionApprovalRequestsTable, sessionApprovalPoliciesTable } from "./schema";
 
 // ---------------------------------------------------------------------------
@@ -153,6 +155,10 @@ export class SqliteApprovalRepository implements ApprovalRepository {
 	constructor(
 		private readonly orm: AppDrizzleDatabase,
 		private readonly clock: { now(): number } = { now: Date.now },
+		// Optional transactional outbox. When present, a newly-pending approval enqueues a desensitized
+		// Mobile attention row in the SAME transaction as the approval insert, so a crash between the
+		// two can never permanently lose the phone's unread signal.
+		private readonly attentionOutbox?: MobileAttentionOutboxWriter,
 	) {}
 
 	create(input: CreateApprovalRequestInput): ApprovalRequestRecord {
@@ -169,32 +175,44 @@ export class SqliteApprovalRepository implements ApprovalRepository {
 					decidedAt: new Date(input.createdAtMs).toISOString(),
 				}
 			: undefined;
-		this.orm
-			.insert(actionApprovalRequestsTable)
-			.values({
-				id: input.id,
-				sessionId: input.sessionId,
-				runId: input.runId,
-				actionId: input.actionId,
-				toolCallId: input.toolCallId,
-				tool: action.tool,
-				operation: action.operation,
-				actionSummaryJson: JSON.stringify(action),
-				riskTier: risk.tier,
-				riskOverridable: risk.overridable ? 1 : 0,
-				riskJson: JSON.stringify(risk),
-				state: approved ? "approved" : "pending",
-				revision: 1,
-				decisionIdempotencyKey: null,
-				decisionJson: decision === undefined ? null : JSON.stringify(decision),
-				policyEvidenceJson:
-					input.policyApproval === undefined ? null : JSON.stringify(input.policyApproval),
-				createdAtMs: input.createdAtMs,
-				expiresAtMs: input.expiresAtMs,
-				decidedAtMs: approved ? input.createdAtMs : null,
-			})
-			.run();
-		return this.getOrThrow(input.id);
+		return this.orm.transaction((transaction) => {
+			transaction
+				.insert(actionApprovalRequestsTable)
+				.values({
+					id: input.id,
+					sessionId: input.sessionId,
+					runId: input.runId,
+					actionId: input.actionId,
+					toolCallId: input.toolCallId,
+					tool: action.tool,
+					operation: action.operation,
+					actionSummaryJson: JSON.stringify(action),
+					riskTier: risk.tier,
+					riskOverridable: risk.overridable ? 1 : 0,
+					riskJson: JSON.stringify(risk),
+					state: approved ? "approved" : "pending",
+					revision: 1,
+					decisionIdempotencyKey: null,
+					decisionJson: decision === undefined ? null : JSON.stringify(decision),
+					policyEvidenceJson:
+						input.policyApproval === undefined ? null : JSON.stringify(input.policyApproval),
+					createdAtMs: input.createdAtMs,
+					expiresAtMs: input.expiresAtMs,
+					decidedAtMs: approved ? input.createdAtMs : null,
+				})
+				.run();
+			if (!approved) {
+				this.attentionOutbox?.enqueue(
+					buildApprovalPendingAttentionInput({
+						approvalId: input.id,
+						sessionId: input.sessionId,
+						runId: input.runId,
+						createdAtMs: input.createdAtMs,
+					}),
+				);
+			}
+			return this.getOrThrow(input.id);
+		});
 	}
 
 	get(approvalId: string): ApprovalRequestRecord | undefined {

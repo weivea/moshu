@@ -4,6 +4,7 @@
 	"buildNumber": "1",
 	"bundleId": {
 		"development": "dev.moshu.mobile",
-		"$release": "Release builds override PRODUCT_BUNDLE_IDENTIFIER at build time (e.g. via an xcconfig or `xcodebuild PRODUCT_BUNDLE_IDENTIFIER=...`). The committed project keeps the development id so no App Store identity is baked into source. See docs/implementation/quality-release.md."
+		"release": null,
+		"$release": "Publishers MUST supply a permanent non-dev reverse-DNS bundle id via MOSHU_MOBILE_RELEASE_BUNDLE_ID for real release gates, or set bundleId.release here to that permanent id. The committed project keeps the development id so no App Store identity is baked into source; dev.moshu.mobile is forbidden for release builds."
 	}
 }

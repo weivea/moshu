@@ -2,6 +2,26 @@ import AVFoundation
 import Capacitor
 import Foundation
 import MoshuMobileCore
+import UIKit
+
+/// Bridges `UIApplication`'s background-task API to the pure-logic ``BackgroundActivityCoordinator``.
+/// This is a plain, finite background task — NOT a declared `UIBackgroundMode`, remote/silent push,
+/// or VoIP keep-alive. It only extends the App's runtime briefly after backgrounding so an already
+/// open socket can still receive a live attention event; when it ends (or the OS expires it) the
+/// engine closes the socket and the web layer goes offline.
+final class UIApplicationBackgroundTaskHost: BackgroundTaskHost {
+	func beginTask(expirationHandler: @escaping () -> Void) -> Int {
+		let identifier = UIApplication.shared.beginBackgroundTask(
+			withName: "dev.moshu.mobile.attention-window",
+			expirationHandler: expirationHandler
+		)
+		return Int(identifier.rawValue)
+	}
+
+	func endTask(_ id: Int) {
+		UIApplication.shared.endBackgroundTask(UIBackgroundTaskIdentifier(rawValue: id))
+	}
+}
 
 /// The `MoshuMobileTransport` Capacitor plugin — the sole bridge between the Web layer and the
 /// device's secret material. It is a thin dispatcher: every method forwards to `MobileTransportEngine`
@@ -33,6 +53,61 @@ public class MoshuMobileTransportPlugin: CAPPlugin, CAPBridgedPlugin, MobileTran
 		engine.delegate = self
 		return engine
 	}()
+
+	/// Owns the single bounded background task. Its expiration handler closes the *exact* active socket
+	/// via the engine so the OS reclaiming the short background window reliably tears the connection
+	/// down (the web layer then observes the emitted `closed` state and goes offline). This co-owns the
+	/// task with the engine so there is no cross-object wiring between the AppDelegate and the plugin.
+	private lazy var backgroundActivity = BackgroundActivityCoordinator(
+		host: UIApplicationBackgroundTaskHost(),
+		onExpire: { [weak self] in
+			self?.engine.closeActiveConnection(reason: "background-expired")
+		}
+	)
+
+	/// Registers lifecycle observers so the bounded background task begins when the App backgrounds and
+	/// ends when it returns to the foreground (or terminates). Idempotent via the coordinator.
+	override public func load() {
+		let center = NotificationCenter.default
+		center.addObserver(
+			self,
+			selector: #selector(handleDidEnterBackground),
+			name: UIApplication.didEnterBackgroundNotification,
+			object: nil
+		)
+		center.addObserver(
+			self,
+			selector: #selector(handleDidBecomeActive),
+			name: UIApplication.didBecomeActiveNotification,
+			object: nil
+		)
+		center.addObserver(
+			self,
+			selector: #selector(handleWillTerminate),
+			name: UIApplication.willTerminateNotification,
+			object: nil
+		)
+	}
+
+	deinit {
+		NotificationCenter.default.removeObserver(self)
+	}
+
+	@objc private func handleDidEnterBackground() {
+		// Begin the single, bounded background task so an already-open socket can survive the OS's short
+		// background window and still receive a live attention event. Idempotent.
+		backgroundActivity.begin()
+	}
+
+	@objc private func handleDidBecomeActive() {
+		// Back in the foreground: end the task promptly (idempotent). The web layer reconnects and
+		// re-snapshots the durable attention feed.
+		backgroundActivity.end()
+	}
+
+	@objc private func handleWillTerminate() {
+		backgroundActivity.end()
+	}
 
 	// MARK: Status / lifecycle
 

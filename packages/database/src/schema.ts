@@ -696,6 +696,36 @@ export const mobileAttentionAckCursorsTable = sqliteTable("mobile_attention_ack_
 	updatedAtMs: integer("updated_at_ms").notNull(),
 });
 
+// Transactional outbox for the durable Mobile attention feed. A desensitized attention row is written
+// here in the SAME SQLite transaction as the business write (approval → pending, Run → terminal), so a
+// crash between the business commit and the feed projection can never permanently lose unread. An
+// independent, idempotent drainer projects each row into `mobile_attention_events` and marks it
+// processed; failures are retained (attempts/last_error) and retried, never swallowed as success.
+export const mobileAttentionOutboxTable = sqliteTable(
+	"mobile_attention_outbox",
+	{
+		id: integer("id").primaryKey(),
+		dedupeKey: text("dedupe_key").notNull(),
+		type: text("type", {
+			enum: ["approval_required", "run_completed", "run_failed", "run_cancelled"],
+		}).notNull(),
+		sessionId: text("session_id"),
+		runId: text("run_id"),
+		approvalId: text("approval_id"),
+		titleKey: text("title_key").notNull(),
+		bodyKey: text("body_key").notNull(),
+		createdAtMs: integer("created_at_ms").notNull(),
+		enqueuedAtMs: integer("enqueued_at_ms").notNull(),
+		processedAtMs: integer("processed_at_ms"),
+		attempts: integer("attempts").notNull().default(0),
+		lastError: text("last_error"),
+	},
+	(table) => [
+		uniqueIndex("mobile_attention_outbox_dedupe_key_unique").on(table.dedupeKey),
+		index("mobile_attention_outbox_pending_idx").on(table.processedAtMs, table.id),
+	],
+);
+
 export const appSchema = {
 	agentGlobalProfilesTable,
 	agentRuntimeProfilesTable,
@@ -735,4 +765,5 @@ export const appSchema = {
 	mobileAttentionFeedMetaTable,
 	mobileAttentionEventsTable,
 	mobileAttentionAckCursorsTable,
+	mobileAttentionOutboxTable,
 };
