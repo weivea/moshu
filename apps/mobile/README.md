@@ -193,7 +193,12 @@ rather than using a stale opaque id. Because that route walk is async, the contr
 the connection **generation** at notify time and re-checks — app still backgrounded,
 notifications still enabled, same generation/client — **after** the walk and **before**
 scheduling, so a lookup that finishes once the app has foregrounded (or on a superseded socket)
-never fires a stale notification.
+never fires a stale notification. Every attention hint task also **binds its owning
+connection (client + generation) at enqueue time**, not at execution time, and re-validates at
+task start and after each `await` (including after the async route walk, before advancing the
+`#seenSeq` baseline): a hint queued on connection A can never run against a later-attached
+connection B — it is dropped instead of consuming B's feed or scheduling before B's own
+non-notifying baseline is established.
 
 ## Lifecycle & reconnect (Layer 5)
 

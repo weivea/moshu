@@ -515,4 +515,104 @@ describe("AttentionController", () => {
 		// The old lookup completed on a superseded connection: its notification must never fire.
 		expect(scheduled).toHaveLength(0);
 	});
+
+	it("drops queued hints from a superseded connection: an old A queue never consumes B's feed/baseline", async () => {
+		const { scheduler, scheduled } = makeScheduler();
+
+		// --- Connection A: a busy feed whose newest event (seq 150) is behind a DEFERRED second page. ---
+		const reachedA = deferred();
+		const releaseA = deferred();
+		const aNoCursor: ListMobileAttentionOutput[] = [
+			listOutput({ latestSeq: 0 }), // A baseline snapshot
+			listOutput({
+				unreadCount: 100,
+				latestSeq: 150,
+				items: [makeEvent(1)],
+				nextCursor: "A-cursor-2",
+			}), // A hint #1 first page
+		];
+		const aListCursors: (string | undefined)[] = [];
+		const clientA: AttentionFeedClient = {
+			async listAttention(input) {
+				aListCursors.push(input?.cursor);
+				if (input?.cursor === "A-cursor-2") {
+					reachedA.resolve();
+					await releaseA.promise; // pause the A route walk deep in the page crawl
+					return listOutput({ latestSeq: 150, items: [makeEvent(149), makeEvent(150)] });
+				}
+				return aNoCursor.shift() ?? listOutput();
+			},
+			async ackAttention() {
+				return { schemaVersion: 1, ackSeq: 0, unreadCount: 0, latestSeq: 0 };
+			},
+		};
+
+		// --- Connection B: a DIFFERENT server with a LOWER seq space. If a superseded A task leaked its
+		//     baseline (seenSeq=150) onto B, B's later hint (seq 120) would be wrongly suppressed. ---
+		const bNoCursor: ListMobileAttentionOutput[] = [
+			listOutput({ unreadCount: 2, latestSeq: 100, items: [makeEvent(100)] }), // B baseline
+			listOutput({
+				unreadCount: 3,
+				latestSeq: 120,
+				items: [makeEvent(120, { sessionId: "session-B", approvalId: "approval-B" })],
+			}), // B hint
+		];
+		const bListCursors: (string | undefined)[] = [];
+		const clientB: AttentionFeedClient = {
+			async listAttention(input) {
+				bListCursors.push(input?.cursor);
+				return bNoCursor.shift() ?? listOutput();
+			},
+			async ackAttention() {
+				return { schemaVersion: 1, ackSeq: 0, unreadCount: 0, latestSeq: 0 };
+			},
+		};
+
+		const controller = new AttentionController({
+			scheduler,
+			isAppActive: () => false,
+			notificationText: () => TEXT,
+		});
+		const busA = new MobileEventBus();
+		const busB = new MobileEventBus();
+
+		controller.attach(clientA, busA);
+		await controller.whenSettled(); // A baseline: seenSeq = 0
+
+		// A hint #1 → its task starts and blocks deep in the deferred page walk.
+		busA.emit("mobileAttentionChanged", { schemaVersion: 1 });
+		await reachedA.promise; // A hint #1 is now parked at page 2
+
+		// A hint #2 → queued BEHIND the still-running A hint #1. Its owning client/generation is captured
+		// as A at enqueue time (the whole point: it must NOT bind to B when it later runs).
+		busA.emit("mobileAttentionChanged", { schemaVersion: 1 });
+
+		// Connection A is replaced by B while BOTH A hints are still outstanding in the queue.
+		controller.attach(clientB, busB);
+
+		// Release A's deferred walk: both A tasks must now unwind WITHOUT ever touching B.
+		releaseA.resolve();
+		await controller.whenSettled();
+
+		// B was listed exactly once — by its OWN baseline. Neither A task consumed B's feed.
+		expect(bListCursors).toEqual([undefined]);
+		// A hint #1 walked A's own cursor (never B's), proving it stayed bound to A.
+		expect(aListCursors).toContain("A-cursor-2");
+		// A hint #1 dropped its (stale) schedule; A hint #2 dropped at task start; B baseline is
+		// non-notifying. Nothing was scheduled.
+		expect(scheduled).toHaveLength(0);
+
+		// The B baseline established seenSeq from B's OWN feed (100), NOT from the superseded A feed
+		// (150). A brand-new B hint (seq 120) is therefore above B's baseline and DOES notify.
+		busB.emit("mobileAttentionChanged", { schemaVersion: 1 });
+		await controller.whenSettled();
+
+		expect(scheduled).toHaveLength(1);
+		expect(scheduled[0]?.id).toBe(120);
+		expect(scheduled[0]?.route).toEqual({
+			attentionEventId: makeEvent(120).eventId,
+			sessionId: "session-B",
+			approvalId: "approval-B",
+		});
+	});
 });

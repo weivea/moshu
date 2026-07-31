@@ -122,10 +122,15 @@ export class AttentionController {
 		this.detach();
 		this.#client = client;
 		this.#generation += 1;
+		// Bind THIS connection's identity to every task it enqueues. Capturing `client`/`generation`
+		// here (at enqueue time) — not when the queued task later runs — is what prevents a hint for
+		// connection A that is still sitting in the serial queue from being serviced against a newer
+		// connection B (which would otherwise notify against B's feed before B's own baseline ran).
+		const generation = this.#generation;
 		this.#unsubscribe = bus.on("mobileAttentionChanged", () => {
-			this.#enqueue(() => this.#refresh({ notify: true }));
+			this.#enqueue(() => this.#refresh({ notify: true, client, generation }));
 		});
-		this.#enqueue(() => this.#refresh({ notify: false }));
+		this.#enqueue(() => this.#refresh({ notify: false, client, generation }));
 	}
 
 	/** Unbind from the current session (on disconnect). Keeps the last known unread for the badge. */
@@ -161,7 +166,12 @@ export class AttentionController {
 
 	/** Force a fresh snapshot without notifying (e.g. when opening the Activity screen). */
 	async refresh(): Promise<void> {
-		await this.#enqueue(() => this.#refresh({ notify: false }));
+		const client = this.#client;
+		if (!client) {
+			return;
+		}
+		const generation = this.#generation;
+		await this.#enqueue(() => this.#refresh({ notify: false, client, generation }));
 	}
 
 	/** Resolves when all currently-queued refresh/ack work has settled. Primarily for tests. */
@@ -174,16 +184,23 @@ export class AttentionController {
 		return this.#queue;
 	}
 
-	async #refresh({ notify }: { notify: boolean }): Promise<void> {
-		const client = this.#client;
-		if (!client) {
+	async #refresh({
+		notify,
+		client,
+		generation,
+	}: {
+		notify: boolean;
+		client: AttentionFeedClient;
+		generation: number;
+	}): Promise<void> {
+		// Validate the captured connection at task start: a hint whose connection was replaced while it
+		// waited in the serial queue must never touch the current connection's feed or baseline.
+		if (this.#client !== client || this.#generation !== generation) {
 			return;
 		}
-		// Capture the connection identity that owns this refresh. If it is replaced (detach/re-attach)
-		// while we await the network, we must abandon rather than write another connection's state.
-		const generation = this.#generation;
 		const page = await client.listAttention();
-		if (this.#generation !== generation || this.#client !== client) {
+		// The connection can be replaced across the await, too — re-validate before mutating any state.
+		if (this.#client !== client || this.#generation !== generation) {
 			return;
 		}
 		this.#unreadCount = page.unreadCount;
@@ -193,6 +210,12 @@ export class AttentionController {
 
 		if (notify && page.latestSeq > this.#seenSeq) {
 			await this.#maybeNotify(page, generation, client);
+			// #maybeNotify runs its OWN async (multi-page) route walk, during which the connection may be
+			// replaced. Re-validate before committing the seenSeq baseline / badge, so a superseded A task
+			// can never advance a newly-attached B's baseline (which would wrongly suppress B's hints).
+			if (this.#client !== client || this.#generation !== generation) {
+				return;
+			}
 		}
 		// Whether or not we notified, everything up to latestSeq is now "seen": a later reconnect
 		// snapshot must not resurface these as notifications.

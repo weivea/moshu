@@ -585,8 +585,8 @@ agentDataDirectory/
   或 `--release`）要求发布方设 `MOSHU_MOBILE_RELEASE_BUNDLE_ID`（或 `release.config.json` `bundleId.release`）为永久非 dev id，
   拒绝空值/`dev.moshu.mobile`，并用 `xcodebuild -showBuildSettings -configuration Release` 解析的 `PRODUCT_BUNDLE_IDENTIFIER`
   精确比对；export compliance（CryptoKit Ed25519 + TLS）问卷/豁免由发布方确认，工程不武断写 `ITSAppUsesNonExemptEncryption`。详见 quality-release。
-- **验证（实际运行）**：**116 Vitest**（含 attention 恢复无 replay、badge、ack 单调、resyncRequired、notification 短后台 gating、opaque
-  route 只带白名单 id、**gap/走查耗尽→ `safeActivity` 安全路由 + 异步走查后 re-validate（前台化/换连接不补发通知）**、notification tap
+- **验证（实际运行）**：**117 Vitest**（含 attention 恢复无 replay、badge、ack 单调、resyncRequired、notification 短后台 gating、opaque
+  route 只带白名单 id、**gap/走查耗尽→ `safeActivity` 安全路由 + 异步走查后 re-validate（前台化/换连接不补发通知）**、**attention hint 任务入队瞬间绑定 owning client/generation，start 及每个 await 后校验，旧 A 队列绝不消费 B feed 或在 B baseline 前 schedule**、notification tap
   offline→connect→refresh→navigate / unpaired-fatal 安全态 / **safe-activity gap tap→Activity** / dispose、production root
   tap→navigate + surviving-socket foreground resnapshot、`UNSUPPORTED_PROTOCOL` fatal 无重连、background close→offline）、**70 Swift XCTest**
   （含 background task 幂等/有界/expiration cleanup、**stale/late-A vs B/synchronous expiration no-op**、稳定 notification id、generic 键、
