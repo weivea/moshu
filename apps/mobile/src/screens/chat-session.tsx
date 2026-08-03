@@ -61,6 +61,7 @@ export function ChatSessionScreen() {
 
 	const view = controllerRef.current?.getView();
 
+	// biome-ignore lint/correctness/useExhaustiveDependencies: Message activity intentionally triggers auto-scroll.
 	useEffect(() => {
 		const node = listRef.current;
 		if (node) {
@@ -84,8 +85,7 @@ export function ChatSessionScreen() {
 		}
 		return models.find(
 			(entry) =>
-				entry.providerId === selectedModel.providerId &&
-				entry.model.id === selectedModel.modelId,
+				entry.providerId === selectedModel.providerId && entry.model.id === selectedModel.modelId,
 		);
 	}, [models, selectedModel]);
 

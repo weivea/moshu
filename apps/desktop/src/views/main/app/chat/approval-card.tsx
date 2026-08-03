@@ -56,9 +56,15 @@ interface ApprovalCardProps {
 	request: ApprovalRequest;
 	policy: SessionApprovalPolicy | undefined;
 	disabled?: boolean;
+	embedded?: boolean;
 }
 
-export function ApprovalCard({ request, policy, disabled = false }: ApprovalCardProps) {
+export function ApprovalCard({
+	request,
+	policy,
+	disabled = false,
+	embedded = false,
+}: ApprovalCardProps) {
 	const { t } = useI18n();
 	const { decide, setAllowAll } = useApprovals();
 	const [submitting, setSubmitting] = useState<"approve" | "reject" | "allowAll" | undefined>();
@@ -89,13 +95,14 @@ export function ApprovalCard({ request, policy, disabled = false }: ApprovalCard
 		setFeedback(undefined);
 		setSubmitting("allowAll");
 		try {
-			await setAllowAll(request.sessionId, !(policy?.allowAll ?? false));
+			const enable = !(policy?.allowAll ?? false);
+			await setAllowAll(request.sessionId, enable, enable ? request : undefined);
 		} catch {
 			setFeedback("generic");
 		} finally {
 			setSubmitting(undefined);
 		}
-	}, [policy?.allowAll, request.sessionId, setAllowAll]);
+	}, [policy?.allowAll, request, setAllowAll]);
 
 	const feedbackMessage = useMemo(() => {
 		switch (feedback) {
@@ -117,7 +124,7 @@ export function ApprovalCard({ request, policy, disabled = false }: ApprovalCard
 
 	return (
 		<article
-			className="chat-card approval-card"
+			className={embedded ? "approval-card approval-card--embedded" : "chat-card approval-card"}
 			data-risk={request.risk.tier}
 			data-state={request.state}
 			aria-label={t("approval.card.title")}
@@ -205,7 +212,6 @@ export function ApprovalCard({ request, policy, disabled = false }: ApprovalCard
 				<Button
 					className="chat-button chat-button--primary"
 					isDisabled={!isInteractive || isBusy}
-					isLoading={submitting === "approve"}
 					onPress={() => void submitDecision("approve_once")}
 				>
 					{t("approval.action.approve")}
@@ -213,7 +219,6 @@ export function ApprovalCard({ request, policy, disabled = false }: ApprovalCard
 				<Button
 					className="chat-button chat-button--danger"
 					isDisabled={!isInteractive || isBusy}
-					isLoading={submitting === "reject"}
 					onPress={() => void submitDecision("reject")}
 				>
 					{t("approval.action.reject")}
@@ -222,7 +227,6 @@ export function ApprovalCard({ request, policy, disabled = false }: ApprovalCard
 					<Button
 						className="chat-button chat-button--inline"
 						isDisabled={disabled || isBusy}
-						isLoading={submitting === "allowAll"}
 						onPress={() => void toggleAllowAll()}
 					>
 						{allowAllEnabled ? t("approval.action.allowAllOff") : t("approval.action.allowAll")}

@@ -5,9 +5,11 @@ import {
 	DefaultActionPolicy,
 	getExecutorToolMetadata,
 } from "@moshu/action-broker";
+import { projectToolOutput } from "@moshu/agent-runtime";
 import {
 	type ActionRisk,
 	type ApprovalActionSummary,
+	type ChatRunEvent,
 	createExecutorToolParameterPayload,
 	createMcpToolParameterPayload,
 	type ExecutorExecutionContext,
@@ -42,10 +44,14 @@ export class DurableActionAuthorizationService implements RuntimeBoxActionAuthor
 	readonly #policy: DefaultActionPolicy;
 	readonly #allowMcpTools: boolean;
 	readonly #approvalGate: ActionApprovalGate | undefined;
+	readonly #timelineListeners = new Set<(events: readonly ChatRunEvent[]) => void>();
 
 	constructor(
 		private readonly actions: ActionRepository,
-		private readonly runs: Pick<RunJournalRepository, "get">,
+		private readonly runs: Pick<
+			RunJournalRepository,
+			"get" | "drainTimelineOutbox" | "hasPendingTimelineOutbox"
+		>,
 		private readonly authority: ProcessPeerIdentity,
 		options: { allowSideEffects: boolean; approvalGate?: ActionApprovalGate } = {
 			allowSideEffects: true,
@@ -54,6 +60,13 @@ export class DurableActionAuthorizationService implements RuntimeBoxActionAuthor
 		this.#policy = new DefaultActionPolicy(options.allowSideEffects);
 		this.#allowMcpTools = options.allowSideEffects;
 		this.#approvalGate = options.approvalGate;
+	}
+
+	subscribeTimeline(listener: (events: readonly ChatRunEvent[]) => void): () => void {
+		this.#timelineListeners.add(listener);
+		return () => {
+			this.#timelineListeners.delete(listener);
+		};
 	}
 
 	async authorize(
@@ -152,6 +165,7 @@ export class DurableActionAuthorizationService implements RuntimeBoxActionAuthor
 			expiresAtMs,
 		});
 		this.actions.consumeGrant(actionId, grantId, sha256(grantToken));
+		this.#flushTimeline();
 		return authorizedInput;
 	}
 
@@ -301,6 +315,7 @@ export class DurableActionAuthorizationService implements RuntimeBoxActionAuthor
 			expiresAtMs,
 		});
 		this.actions.consumeGrant(actionId, grantId, sha256(grantToken));
+		this.#flushTimeline();
 		return authorizedInput;
 	}
 
@@ -353,6 +368,7 @@ export class DurableActionAuthorizationService implements RuntimeBoxActionAuthor
 			expiresAtMs,
 		});
 		this.actions.consumeGrant(actionId, grantId, sha256(grantToken));
+		this.#flushTimeline();
 		return input;
 	}
 
@@ -361,7 +377,13 @@ export class DurableActionAuthorizationService implements RuntimeBoxActionAuthor
 		input: RuntimeBoxMcpToolInvokeInput,
 		result: RuntimeBoxMcpToolInvokeOutput,
 	): void {
-		this.actions.completeLocal(agentServerId, input.invocationId, result);
+		this.actions.completeLocal(
+			agentServerId,
+			input.invocationId,
+			result,
+			projectActionOutput(result),
+		);
+		this.#flushTimeline();
 	}
 
 	complete(
@@ -369,15 +391,22 @@ export class DurableActionAuthorizationService implements RuntimeBoxActionAuthor
 		input: ExecutorToolInvokeInput | RuntimeBoxMcpToolInvokeInput,
 		result: ExecutorToolInvokeOutput | RuntimeBoxMcpToolInvokeOutput,
 	): void {
-		this.actions.complete(runtimeBoxId, createEvidence(input, "succeeded", { result }));
+		this.actions.complete(
+			runtimeBoxId,
+			createEvidence(input, "succeeded", { result }),
+			projectActionOutput(result),
+		);
+		this.#flushTimeline();
 	}
 
 	fail(input: ExecutorToolInvokeInput | RuntimeBoxMcpToolInvokeInput, safeError: string): void {
 		this.actions.markFailed(input.invocationId, safeError);
+		this.#flushTimeline();
 	}
 
 	cancel(input: ExecutorToolInvokeInput | RuntimeBoxMcpToolInvokeInput, safeError: string): void {
 		this.actions.markCancelled(input.invocationId, safeError);
+		this.#flushTimeline();
 	}
 
 	cancelUndispatched(
@@ -385,6 +414,7 @@ export class DurableActionAuthorizationService implements RuntimeBoxActionAuthor
 		safeError: string,
 	): void {
 		this.actions.cancelUndispatched(input.invocationId, safeError);
+		this.#flushTimeline();
 	}
 
 	markOutcomeUnknown(
@@ -392,6 +422,7 @@ export class DurableActionAuthorizationService implements RuntimeBoxActionAuthor
 		safeError: string,
 	): void {
 		this.actions.markOutcomeUnknown(input.invocationId, safeError);
+		this.#flushTimeline();
 	}
 
 	reconcile(
@@ -400,8 +431,13 @@ export class DurableActionAuthorizationService implements RuntimeBoxActionAuthor
 		acknowledgedInvocationIds: readonly string[],
 	): ReconcileRuntimeBoxInvocationsOutput {
 		for (const evidence of items) {
-			this.actions.complete(runtimeBoxId, evidence);
+			this.actions.complete(
+				runtimeBoxId,
+				evidence,
+				evidence.result === undefined ? undefined : projectActionOutput(evidence.result),
+			);
 		}
+		this.#flushTimeline();
 		const ackedInvocationIds = items.map((item) => item.invocationId);
 		const confirmedAcknowledgementIds = [...new Set(acknowledgedInvocationIds)];
 		this.actions.markServerAcked(ackedInvocationIds);
@@ -419,6 +455,33 @@ export class DurableActionAuthorizationService implements RuntimeBoxActionAuthor
 	markReceiptConfirmed(runtimeBoxId: string, invocationIds: readonly string[]): void {
 		this.actions.markReceiptConfirmed(runtimeBoxId, invocationIds);
 	}
+
+	#flushTimeline(): void {
+		for (;;) {
+			const events = this.runs.drainTimelineOutbox();
+			for (const listener of this.#timelineListeners) {
+				listener(events);
+			}
+			if (!this.runs.hasPendingTimelineOutbox()) {
+				return;
+			}
+		}
+	}
+}
+
+function projectActionOutput(result: RuntimeBoxActionResult) {
+	if ("tool" in result) {
+		return projectToolOutput({ kind: "builtin", name: result.tool }, result);
+	}
+	return projectToolOutput(
+		{
+			kind: "mcp",
+			name: result.stableToolId,
+			mcpServerId: result.mcpServerId,
+			stableToolId: result.stableToolId,
+		},
+		result.result,
+	);
 }
 
 function createEvidence(

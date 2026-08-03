@@ -1,6 +1,6 @@
 import { z } from "zod";
 
-import { uuidV7Schema } from "./chat";
+import { toolCallIdSchema, uuidV7Schema } from "./contract-primitives";
 import { runtimeResourceIdSchema } from "./runtime-resources";
 import {
 	runtimeResourceContentHashSchema,
@@ -20,7 +20,6 @@ export const maxExecutorToolResultPayloadBytes = 7 * 512 * 1024;
 
 const maxPathBytes = 32 * 1024;
 const maxToolStringBytes = 512 * 1024;
-const maxToolCallIdBytes = 512;
 const textEncoder = new TextEncoder();
 
 export const actionIdSchema = z.string().uuid();
@@ -173,7 +172,7 @@ export const runtimeBoxToolInvokeInputSchema = z
 		schemaVersion: z.literal(1),
 		invocationId: z.string().uuid(),
 		runId: uuidV7Schema,
-		toolCallId: boundedUtf8String(maxToolCallIdBytes, "Tool call ID", 1),
+		toolCallId: toolCallIdSchema,
 		cwd: pathSchema,
 		call: executorToolCallSchema,
 		authorization: runtimeBoxToolAuthorizationSchema.optional(),
@@ -193,7 +192,7 @@ export const runtimeBoxMcpToolInvokeInputSchema = z
 		schemaVersion: z.literal(1),
 		invocationId: z.string().uuid(),
 		runId: uuidV7Schema,
-		toolCallId: boundedUtf8String(maxToolCallIdBytes, "Tool call ID", 1),
+		toolCallId: toolCallIdSchema,
 		mcpServerId: runtimeResourceIdSchema,
 		mcpServerVersion: runtimeResourceVersionSchema,
 		mcpServerContentHash: runtimeResourceContentHashSchema,

@@ -1,9 +1,39 @@
 import { describe, expect, test } from "bun:test";
+import { statSync } from "node:fs";
+import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
+
 import {
 	companionSourceWatchPaths,
 	createElectrobunConfig,
 	electrobunWatchIgnorePatterns,
 } from "../electrobun.config";
+import { stagedThirdPartyNoticesSource } from "./stage-package-resources";
+
+const desktopRoot = resolve(import.meta.dir, "..");
+const repositoryRoot = resolve(desktopRoot, "../..");
+
+function isWithin(path: string, directory: string): boolean {
+	const relativePath = relative(directory, path);
+	return (
+		relativePath === "" ||
+		(!relativePath.startsWith(`..${sep}`) && relativePath !== ".." && !isAbsolute(relativePath))
+	);
+}
+
+function resolveConfiguredWatchDirectories(
+	config: ReturnType<typeof createElectrobunConfig>,
+): string[] {
+	const copyDirectories = Object.keys(config.build.copy ?? {}).map((source) => {
+		const sourcePath = resolve(desktopRoot, source);
+		try {
+			return statSync(sourcePath).isDirectory() ? sourcePath : dirname(sourcePath);
+		} catch {
+			return dirname(sourcePath);
+		}
+	});
+	const explicitDirectories = (config.build.watch ?? []).map((path) => resolve(desktopRoot, path));
+	return [...copyDirectories, ...explicitDirectories];
+}
 
 describe("Electrobun config", () => {
 	test("disables Electrobun's timestamped signer for default ad-hoc packages", () => {
@@ -30,7 +60,27 @@ describe("Electrobun config", () => {
 		]);
 	});
 
-	test("ignores repository metadata and generated directories outside the desktop root", () => {
+	test("does not watch unrelated repository files through package copy sources", () => {
+		const config = createElectrobunConfig({}, "darwin");
+		expect(config.build.copy).toMatchObject({
+			[stagedThirdPartyNoticesSource]: "licenses/THIRD_PARTY_NOTICES.txt",
+		});
+		expect(config.build.copy).not.toHaveProperty("../../THIRD_PARTY_NOTICES.txt");
+
+		const watchDirectories = resolveConfiguredWatchDirectories(config);
+		expect(
+			watchDirectories.some((directory) =>
+				isWithin(resolve(repositoryRoot, "README.md"), directory),
+			),
+		).toBe(false);
+		expect(
+			watchDirectories.some((directory) =>
+				isWithin(resolve(repositoryRoot, "packages/contracts/src/index.ts"), directory),
+			),
+		).toBe(true);
+	});
+
+	test("ignores generated directories within configured watch roots", () => {
 		const config = createElectrobunConfig({}, "darwin");
 		expect(config.build.watchIgnore).toEqual(electrobunWatchIgnorePatterns);
 		const ignores = electrobunWatchIgnorePatterns.map((pattern) => new Bun.Glob(pattern));

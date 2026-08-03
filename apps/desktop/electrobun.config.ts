@@ -2,6 +2,7 @@ import type { ElectrobunConfig } from "electrobun";
 
 import { moshuReleaseVersion } from "../../packages/contracts/src/companion-bootstrap";
 import { resolveCompanionCodesignIdentity } from "./scripts/companion-signing";
+import { stagedThirdPartyNoticesSource } from "./scripts/stage-package-resources";
 import { createElectrobunCompanionCopyEntries } from "./src/shared/companion-executable-names";
 
 export const companionSourceWatchPaths = [
@@ -46,7 +47,7 @@ export function createElectrobunConfig(
 				"dist/mainview/index.html": "views/mainview/index.html",
 				"dist/mainview/assets": "views/mainview/assets",
 				"src/views/canvas/index.html": "views/canvas/index.html",
-				"../../THIRD_PARTY_NOTICES.txt": "licenses/THIRD_PARTY_NOTICES.txt",
+				[stagedThirdPartyNoticesSource]: "licenses/THIRD_PARTY_NOTICES.txt",
 				"../../third_party/licenses": "licenses/third_party",
 				"../runtime-box/node_modules/@silvia-odwyer/photon-node/LICENSE.md":
 					"licenses/third_party/photon-node-LICENSE.md",
@@ -56,7 +57,6 @@ export function createElectrobunConfig(
 			targets: "current",
 			useAsar: false,
 			watch: companionSourceWatchPaths,
-			// Root-level copy sources make Electrobun watch the repository root.
 			watchIgnore: electrobunWatchIgnorePatterns,
 			mac: {
 				bundleCEF: false,

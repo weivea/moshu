@@ -24,7 +24,6 @@ function setup() {
 		provider: makeProviderInput(),
 		userMessageId: createUuidV7(),
 		userContent: "Test prompt",
-		assistantMessageId: createUuidV7(),
 	}).run;
 	return { database, sessionId: session.id, runId: run.id };
 }
@@ -344,6 +343,97 @@ describe("ApprovalRepository", () => {
 					updatedBy: clientSource,
 				}),
 			).toThrow(/revision conflict/i);
+		} finally {
+			database.close();
+		}
+	});
+
+	test("enables Allow all and approves the current request atomically", () => {
+		const { database, sessionId, runId } = setup();
+		try {
+			const pending = createPending(database, sessionId, runId);
+			const idempotencyKey = crypto.randomUUID();
+			const input = {
+				sessionId,
+				allowAll: true,
+				expectedRevision: 0,
+				idempotencyKey,
+				updatedBy: clientSource,
+				approveRequest: {
+					approvalId: pending.id,
+					expectedRevision: pending.revision,
+				},
+			};
+			const updated = database.approvals.updatePolicy(input);
+
+			expect(updated.outcome).toBe("applied");
+			expect(updated.policy).toMatchObject({ allowAll: true, revision: 1 });
+			expect(updated.requestOutcome).toBe("applied");
+			expect(updated.request).toMatchObject({
+				id: pending.id,
+				state: "approved",
+				revision: 2,
+				policyEvidence: { allowAllRevision: 1 },
+			});
+			expect(updated.request?.decision?.source.kind).toBe("policy");
+			expect(database.approvals.getPolicy(sessionId).allowAll).toBe(true);
+			expect(database.approvals.getOrThrow(pending.id).state).toBe("approved");
+
+			const retry = database.approvals.updatePolicy(input);
+			expect(retry.outcome).toBe("idempotent");
+			expect(retry.requestOutcome).toBe("idempotent");
+			expect(retry.request?.state).toBe("approved");
+		} finally {
+			database.close();
+		}
+	});
+
+	test("rolls back Allow all when the current approval revision is stale", () => {
+		const { database, sessionId, runId } = setup();
+		try {
+			const pending = createPending(database, sessionId, runId);
+			expect(() =>
+				database.approvals.updatePolicy({
+					sessionId,
+					allowAll: true,
+					expectedRevision: 0,
+					idempotencyKey: crypto.randomUUID(),
+					updatedBy: clientSource,
+					approveRequest: {
+						approvalId: pending.id,
+						expectedRevision: pending.revision + 1,
+					},
+				}),
+			).toThrow(/revision conflict/i);
+			expect(database.approvals.getPolicy(sessionId)).toMatchObject({
+				allowAll: false,
+				revision: 0,
+			});
+			expect(database.approvals.getOrThrow(pending.id).state).toBe("pending");
+		} finally {
+			database.close();
+		}
+	});
+
+	test("never enables Allow all through a non-overridable current request", () => {
+		const { database, sessionId, runId } = setup();
+		try {
+			const pending = createPending(database, sessionId, runId, criticalRisk);
+			expect(() =>
+				database.approvals.updatePolicy({
+					sessionId,
+					allowAll: true,
+					expectedRevision: 0,
+					idempotencyKey: crypto.randomUUID(),
+					updatedBy: clientSource,
+					approveRequest: {
+						approvalId: pending.id,
+						expectedRevision: pending.revision,
+					},
+				}),
+			).toThrow("Allow all cannot approve this request.");
+			expect(database.approvals.getPolicy(sessionId).allowAll).toBe(false);
+			expect(database.approvals.getOrThrow(pending.id).state).toBe("pending");
 		} finally {
 			database.close();
 		}

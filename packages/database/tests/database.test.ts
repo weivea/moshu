@@ -7,6 +7,7 @@ import { join } from "node:path";
 
 import {
 	type AppError,
+	type ChatRunTextPart,
 	defaultLocalRuntimeBoxId,
 	type McpSecretInput,
 	retiredSessionTombstoneTtlMs,
@@ -99,15 +100,57 @@ function createRun(database: ReturnType<typeof openAppDatabase>, sessionId: stri
 		provider: makeProviderInput(),
 		userMessageId: createUuidV7(),
 		userContent: "Test prompt",
-		assistantMessageId: createUuidV7(),
 	});
 }
 
-function getAssistantMessageId(run: ReturnType<typeof createRun>["run"]): string {
-	if (run.assistantMessageId === undefined) {
-		throw new Error("Expected the run journal to assign an assistant message ID.");
-	}
-	return run.assistantMessageId;
+function createTextPart(
+	database: ReturnType<typeof openAppDatabase>,
+	runId: string,
+	content = "",
+): ChatRunTextPart {
+	const now = new Date().toISOString();
+	const part: ChatRunTextPart = {
+		schemaVersion: 1,
+		id: createUuidV7(),
+		runId,
+		position: 1,
+		assistantTurnId: createUuidV7(),
+		revision: 1,
+		kind: "text",
+		status: "streaming",
+		content,
+		createdAt: now,
+		updatedAt: now,
+	};
+	database.runs.appendEvent({
+		runId,
+		type: "timeline.part.created",
+		source: { kind: "assistant" },
+		payload: { part },
+	});
+	return part;
+}
+
+function completeTextPart(
+	database: ReturnType<typeof openAppDatabase>,
+	part: ChatRunTextPart,
+	status: Extract<ChatRunTextPart["status"], "completed" | "interrupted">,
+	content = part.content,
+): ChatRunTextPart {
+	const completed = {
+		...part,
+		status,
+		content,
+		revision: part.revision + 1,
+		updatedAt: new Date().toISOString(),
+	};
+	database.runs.appendEvent({
+		runId: part.runId,
+		type: "timeline.text.completed",
+		source: { kind: "assistant" },
+		payload: { part: completed },
+	});
+	return completed;
 }
 
 describe("application database", () => {
@@ -579,7 +622,6 @@ describe("application database", () => {
 						provider: makeProviderInput(),
 						userMessageId: createUuidV7(),
 						userContent: "Project prompt",
-						assistantMessageId: createUuidV7(),
 						projectContext: context,
 					}).run;
 					expect(run.projectContext).toEqual(context);
@@ -598,7 +640,6 @@ describe("application database", () => {
 							provider: makeProviderInput(),
 							userMessageId: createUuidV7(),
 							userContent: "Wrong context",
-							assistantMessageId: createUuidV7(),
 							projectContext: context,
 						}),
 					).toThrow("Global Sessions");
@@ -893,6 +934,7 @@ describe("application database", () => {
 					.map((row) => row.name);
 				expect(tableNames).toEqual([
 					"chat_run_events",
+					"chat_run_parts",
 					"chat_runs",
 					"chat_session_create_requests",
 					"chat_sessions",
@@ -1045,8 +1087,6 @@ describe("application database", () => {
 							providerJson: JSON.stringify(makeProviderState()),
 							userMessageId: createUuidV7(),
 							userContent: "Foreign key prompt",
-							assistantMessageId: createUuidV7(),
-							assistantContent: null,
 							lastErrorJson: null,
 							createdAtMs: Date.now(),
 							updatedAtMs: Date.now(),
@@ -1219,38 +1259,35 @@ describe("application database", () => {
 			try {
 				const session = database.sessions.create({ title: "Run journal" }).session;
 				const created = createRun(database, session.id);
-				const assistantMessageId = getAssistantMessageId(created.run);
 				const running = database.runs.updateStatus({ runId: created.run.id, status: "running" });
+				const textPart = createTextPart(database, created.run.id);
 				const started = database.runs
 					.listEvents({ runId: created.run.id })
-					.find((event) => event.type === "message.started");
+					.find((event) => event.type === "timeline.part.created");
 				const delta = database.runs.appendEvent({
 					runId: created.run.id,
-					type: "message.delta",
+					type: "timeline.text.delta",
 					source: { kind: "assistant" },
-					payload: { messageId: assistantMessageId, delta: "Hello" },
+					payload: { partId: textPart.id, revision: 2, delta: "Hello" },
 				});
+				completeTextPart(database, { ...textPart, revision: 2, content: "Hello" }, "completed");
 				const completed = database.runs.commitTerminal({
 					runId: created.run.id,
-					message: {
-						messageId: assistantMessageId,
-						status: "complete",
-						content: "Hello",
-					},
+					status: "completed",
 				});
 
 				const events = database.runs.listEvents({ runId: created.run.id });
 				expect(events.map((event) => event.seq)).toEqual([1, 2, 3, 4, 5, 6]);
 				expect(events.map((event) => event.type)).toEqual([
 					"run.status",
-					"message.started",
 					"run.status",
-					"message.delta",
-					"message.completed",
+					"timeline.part.created",
+					"timeline.text.delta",
+					"timeline.text.completed",
 					"run.status",
 				]);
 				expect(running.run.status).toBe("running");
-				expect(started?.seq).toBe(2);
+				expect(started?.seq).toBe(3);
 				expect(delta.seq).toBe(4);
 				expect(completed.run.status).toBe("completed");
 				expect(database.runs.listBySession(session.id)).toHaveLength(1);
@@ -1259,8 +1296,11 @@ describe("application database", () => {
 					sessionId: session.id,
 					limit: 1,
 				}).items[0];
-				expect(pageItem?.events).toEqual([]);
-				expect(pageItem?.assistantContent).toBe("Hello");
+				expect(pageItem?.timeline[0]).toMatchObject({
+					kind: "text",
+					status: "completed",
+					content: "Hello",
+				});
 				expect(pageItem?.lastEventSeq).toBe(6);
 			} finally {
 				database.close();
@@ -1281,7 +1321,6 @@ describe("application database", () => {
 						provider: makeProviderInput(),
 						userMessageId: createUuidV7(),
 						userContent: `prompt-${index}`,
-						assistantMessageId: createUuidV7(),
 					});
 				}
 				const ids: string[] = [];
@@ -1299,8 +1338,8 @@ describe("application database", () => {
 						limit: 2,
 					});
 					ids.push(...page.items.map((item) => item.run.id));
-					prompts.push(...page.items.map((item) => item.userContent));
-					expect(page.items.every((item) => item.events.length === 2)).toBe(true);
+					prompts.push(...page.items.map((item) => item.userMessage.content));
+					expect(page.items.every((item) => item.timeline.length === 0)).toBe(true);
 					after = page.nextCursor;
 				} while (after !== undefined);
 
@@ -1339,8 +1378,8 @@ describe("application database", () => {
 			try {
 				const session = database.sessions.create({ title: "Large event journal" }).session;
 				const created = createRun(database, session.id);
-				const assistantMessageId = getAssistantMessageId(created.run);
 				database.runs.updateStatus({ runId: created.run.id, status: "running" });
+				const textPart = createTextPart(database, created.run.id);
 				const eventCount = 100_000;
 				const firstSeq = 4;
 				const lastSeq = firstSeq + eventCount - 1;
@@ -1360,11 +1399,15 @@ describe("application database", () => {
 							$runId,
 							$sessionId,
 							seq,
-							'message.delta',
+							'timeline.text.delta',
 							'assistant',
 							NULL,
 							'user',
-							$payloadJson,
+							json_object(
+								'partId', $partId,
+								'revision', seq - 2,
+								'delta', 'x'
+							),
 							$createdAtMs
 						FROM fixture`,
 					)
@@ -1373,7 +1416,7 @@ describe("application database", () => {
 						lastSeq,
 						runId: created.run.id,
 						sessionId: session.id,
-						payloadJson: JSON.stringify({ messageId: assistantMessageId, delta: "x" }),
+						partId: textPart.id,
 						createdAtMs: Date.now(),
 					});
 
@@ -1434,27 +1477,23 @@ describe("application database", () => {
 			try {
 				const session = database.sessions.create({ title: "Terminal runs" }).session;
 				const failed = createRun(database, session.id);
-				const failedAssistantMessageId = getAssistantMessageId(failed.run);
 				database.runs.updateStatus({ runId: failed.run.id, status: "running" });
+				const failedTextPart = createTextPart(database, failed.run.id, "Partial");
+				completeTextPart(database, failedTextPart, "interrupted");
 				const failure = database.runs.fail({
 					runId: failed.run.id,
 					error: makeAppError("PROVIDER_DOWN"),
-					messageEvent: {
-						messageId: failedAssistantMessageId,
-						content: "Partial",
-					},
 				});
 				expect(failure.run.status).toBe("failed");
-				expect(failure.events.map((event) => event.type)).toEqual([
-					"message.completed",
-					"run.error",
-					"run.status",
-				]);
+				expect(failure.events.map((event) => event.type)).toEqual(["run.error", "run.status"]);
 				const failedPageItem = database.runs
 					.listPageBySession({ sessionId: session.id, limit: 1 })
 					.items.find((item) => item.run.id === failed.run.id);
-				expect(failedPageItem?.assistantContent).toBe("Partial");
-				expect(failedPageItem?.events).toEqual([]);
+				expect(failedPageItem?.timeline[0]).toMatchObject({
+					kind: "text",
+					status: "interrupted",
+					content: "Partial",
+				});
 
 				const cancelled = createRun(database, session.id);
 				database.runs.updateStatus({ runId: cancelled.run.id, status: "running" });
@@ -1462,11 +1501,7 @@ describe("application database", () => {
 				expect(
 					database.runs.commitTerminal({
 						runId: cancelled.run.id,
-						message: {
-							messageId: getAssistantMessageId(cancelled.run),
-							status: "cancelled",
-							content: "",
-						},
+						status: "cancelled",
 					}).run.status,
 				).toBe("cancelled");
 			} finally {
@@ -1475,54 +1510,45 @@ describe("application database", () => {
 		});
 	});
 
-	test("atomically aligns and idempotently commits every terminal message status", () => {
+	test("atomically and idempotently commits every terminal Run status", () => {
 		withTempDatabase((databasePath) => {
 			const database = openAppDatabase(databasePath);
 			try {
 				const session = database.sessions.create({ title: "Terminal commit recovery" }).session;
 				for (const scenario of [
-					{ messageStatus: "complete" as const, runStatus: "completed" as const },
-					{ messageStatus: "cancelled" as const, runStatus: "cancelled" as const },
-					{ messageStatus: "failed" as const, runStatus: "failed" as const },
+					{ runStatus: "completed" as const },
+					{ runStatus: "cancelled" as const },
+					{ runStatus: "failed" as const },
 				]) {
 					const created = createRun(database, session.id);
-					const messageId = getAssistantMessageId(created.run);
 					database.runs.updateStatus({ runId: created.run.id, status: "running" });
-					const error =
-						scenario.messageStatus === "failed" ? makeAppError("CRASH_WINDOW") : undefined;
-					database.runs.appendEvent({
-						runId: created.run.id,
-						type: "message.completed",
-						source: { kind: "assistant" },
-						payload:
-							scenario.messageStatus === "failed"
-								? {
-										messageId,
-										status: "failed",
-										content: "partial",
-										error: error ?? makeAppError("CRASH_WINDOW"),
-									}
-								: {
-										messageId,
-										status: scenario.messageStatus,
-										content: scenario.messageStatus === "complete" ? "answer" : "partial",
-									},
-					});
+					const textPart = createTextPart(
+						database,
+						created.run.id,
+						scenario.runStatus === "completed" ? "answer" : "partial",
+					);
+					completeTextPart(
+						database,
+						textPart,
+						scenario.runStatus === "completed" ? "completed" : "interrupted",
+					);
 
 					const committed = database.runs.commitTerminal({
 						runId: created.run.id,
-						message: { messageId, status: "cancelled", content: "fallback" },
+						status: scenario.runStatus,
+						...(scenario.runStatus === "failed" ? { error: makeAppError("CRASH_WINDOW") } : {}),
 					});
 					expect(committed.run.status).toBe(scenario.runStatus);
 					expect(
 						database.runs
 							.listEvents({ runId: created.run.id })
-							.filter((event) => event.type === "message.completed"),
+							.filter((event) => event.type === "timeline.text.completed"),
 					).toHaveLength(1);
 					const eventCount = database.runs.listEvents({ runId: created.run.id }).length;
 					const repeated = database.runs.commitTerminal({
 						runId: created.run.id,
-						message: { messageId, status: "cancelled", content: "fallback" },
+						status: scenario.runStatus,
+						...(scenario.runStatus === "failed" ? { error: makeAppError("CRASH_WINDOW") } : {}),
 					});
 					expect(repeated.committed).toBe(false);
 					expect(repeated.events).toEqual([]);
@@ -1547,7 +1573,6 @@ describe("application database", () => {
 					provider: makeProviderInput(secret),
 					userMessageId: createUuidV7(),
 					userContent: "Secret safety prompt",
-					assistantMessageId: createUuidV7(),
 				});
 				expect("apiKey" in created.run.provider).toBe(false);
 			} finally {
@@ -1575,7 +1600,6 @@ describe("application database", () => {
 					provider: makeProviderInput(),
 					userMessageId: createUuidV7(),
 					userContent: "Header safety prompt",
-					assistantMessageId: createUuidV7(),
 				});
 				expect("customHeaders" in created.run.provider).toBe(false);
 				expect(created.run.provider.source).toBe("custom");
@@ -1660,8 +1684,8 @@ describe("application database", () => {
 					)
 					INSERT INTO chat_runs (
 						id, runtime_box_id, client_request_id, session_id, mode, status, provider_json,
-						user_message_id, user_content, assistant_message_id, assistant_content,
-						last_error_json, created_at_ms, updated_at_ms, completed_at_ms
+						user_message_id, user_content, last_error_json,
+						created_at_ms, updated_at_ms, completed_at_ms
 					)
 					SELECT
 						printf('00000000-0000-7000-8000-%012x', value),
@@ -1673,8 +1697,6 @@ describe("application database", () => {
 						'{}',
 						printf('10000000-0000-7000-8000-%012x', value),
 						'prompt',
-						printf('20000000-0000-7000-8000-%012x', value),
-						'answer',
 						NULL,
 						value,
 						value,

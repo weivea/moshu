@@ -24,8 +24,9 @@ interface ApprovalsContextValue {
 	approvalsForSession(sessionId: string): ApprovalRequest[];
 	policyForSession(sessionId: string): SessionApprovalPolicy | undefined;
 	refresh(): Promise<void>;
+	ensureApproval(approvalId: string): Promise<void>;
 	decide(request: ApprovalRequest, decision: ApprovalDecisionKind): Promise<DecideApprovalOutput>;
-	setAllowAll(sessionId: string, allowAll: boolean): Promise<void>;
+	setAllowAll(sessionId: string, allowAll: boolean, request?: ApprovalRequest): Promise<void>;
 }
 
 const emptyContext: ApprovalsContextValue = {
@@ -35,6 +36,7 @@ const emptyContext: ApprovalsContextValue = {
 	approvalsForSession: () => [],
 	policyForSession: () => undefined,
 	refresh: () => Promise.resolve(),
+	ensureApproval: () => Promise.resolve(),
 	decide: () => Promise.reject(new Error("Approvals are unavailable outside the desktop runtime.")),
 	setAllowAll: () => Promise.resolve(),
 };
@@ -59,8 +61,12 @@ export function ApprovalsProvider({ children }: { children: ReactNode }) {
 	const [isLoading, setIsLoading] = useState(desktopRuntime);
 	const [errorMessage, setErrorMessage] = useState<string>();
 	const mountedRef = useRef(true);
+	const refreshGenerationRef = useRef(0);
+	const requestMutationVersionRef = useRef(0);
+	const approvalLookupsRef = useRef(new Map<string, Promise<void>>());
 
 	const upsertRequest = useCallback((next: ApprovalRequest) => {
+		requestMutationVersionRef.current += 1;
 		setRequests((current) => {
 			if (!newerRequest(current.get(next.id), next)) {
 				return current;
@@ -86,20 +92,27 @@ export function ApprovalsProvider({ children }: { children: ReactNode }) {
 		if (!desktopRuntime) {
 			return;
 		}
+		const generation = ++refreshGenerationRef.current;
+		const mutationVersionAtStart = requestMutationVersionRef.current;
 		setIsLoading(true);
 		setErrorMessage(undefined);
 		try {
 			const snapshot = await desktopClient.listApprovals({ states: ["pending"] });
-			if (!mountedRef.current) {
+			if (!mountedRef.current || generation !== refreshGenerationRef.current) {
 				return;
 			}
 			setRequests((current) => {
+				if (generation !== refreshGenerationRef.current) {
+					return current;
+				}
 				const updated = new Map(current);
-				// Drop stale pending rows that the server no longer reports.
-				const seen = new Set(snapshot.items.map((item) => item.id));
-				for (const [id, request] of current) {
-					if (request.state === "pending" && !seen.has(id)) {
-						updated.delete(id);
+				if (mutationVersionAtStart === requestMutationVersionRef.current) {
+					// Only a snapshot that did not race a newer live/local mutation may remove rows.
+					const seen = new Set(snapshot.items.map((item) => item.id));
+					for (const [id, request] of current) {
+						if (request.state === "pending" && !seen.has(id)) {
+							updated.delete(id);
+						}
 					}
 				}
 				for (const item of snapshot.items) {
@@ -113,15 +126,54 @@ export function ApprovalsProvider({ children }: { children: ReactNode }) {
 				upsertPolicy(policy);
 			}
 		} catch (error) {
-			if (mountedRef.current) {
+			if (mountedRef.current && generation === refreshGenerationRef.current) {
 				setErrorMessage(error instanceof Error ? error.message : "Unable to load approvals.");
 			}
 		} finally {
-			if (mountedRef.current) {
+			if (mountedRef.current && generation === refreshGenerationRef.current) {
 				setIsLoading(false);
 			}
 		}
 	}, [desktopRuntime, upsertPolicy]);
+
+	const ensureApproval = useCallback(
+		async (approvalId: string): Promise<void> => {
+			if (!desktopRuntime) {
+				return;
+			}
+			const existing = approvalLookupsRef.current.get(approvalId);
+			if (existing !== undefined) {
+				await existing;
+				return;
+			}
+			setErrorMessage(undefined);
+			const lookup = (async () => {
+				try {
+					const output = await desktopClient.getApproval({ approvalId });
+					if (!mountedRef.current) {
+						return;
+					}
+					upsertRequest(output.request);
+					upsertPolicy(output.policy);
+				} catch (error) {
+					if (mountedRef.current) {
+						setErrorMessage(
+							error instanceof Error ? error.message : "Unable to load approval actions.",
+						);
+					}
+				}
+			})();
+			approvalLookupsRef.current.set(approvalId, lookup);
+			try {
+				await lookup;
+			} finally {
+				if (approvalLookupsRef.current.get(approvalId) === lookup) {
+					approvalLookupsRef.current.delete(approvalId);
+				}
+			}
+		},
+		[desktopRuntime, upsertPolicy, upsertRequest],
+	);
 
 	useEffect(() => {
 		mountedRef.current = true;
@@ -167,19 +219,30 @@ export function ApprovalsProvider({ children }: { children: ReactNode }) {
 	);
 
 	const setAllowAll = useCallback(
-		async (sessionId: string, allowAll: boolean) => {
+		async (sessionId: string, allowAll: boolean, request?: ApprovalRequest) => {
 			const current = policies.get(sessionId);
 			const output = await desktopClient.updateSessionApprovalPolicy({
 				sessionId,
 				allowAll,
 				expectedRevision: current?.revision ?? 0,
 				idempotencyKey: crypto.randomUUID(),
+				...(allowAll && request !== undefined
+					? {
+							approveRequest: {
+								approvalId: request.id,
+								expectedRevision: request.revision,
+							},
+						}
+					: {}),
 			});
 			if (mountedRef.current) {
 				upsertPolicy(output.policy);
+				if (output.request !== undefined) {
+					upsertRequest(output.request);
+				}
 			}
 		},
-		[policies, upsertPolicy],
+		[policies, upsertPolicy, upsertRequest],
 	);
 
 	const value = useMemo<ApprovalsContextValue>(() => {
@@ -194,10 +257,11 @@ export function ApprovalsProvider({ children }: { children: ReactNode }) {
 				pending.filter((request) => request.sessionId === sessionId),
 			policyForSession: (sessionId) => policies.get(sessionId),
 			refresh,
+			ensureApproval,
 			decide,
 			setAllowAll,
 		};
-	}, [decide, errorMessage, isLoading, policies, refresh, requests, setAllowAll]);
+	}, [decide, ensureApproval, errorMessage, isLoading, policies, refresh, requests, setAllowAll]);
 
 	return <ApprovalsContext.Provider value={value}>{children}</ApprovalsContext.Provider>;
 }

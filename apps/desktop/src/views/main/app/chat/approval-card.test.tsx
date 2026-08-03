@@ -150,11 +150,12 @@ describe("ApprovalCard", () => {
 		);
 	});
 
-	test("allow-all toggles the session policy", async () => {
+	test("allow-all enables the policy and approves the current request together", async () => {
 		setAllowAll.mockResolvedValue();
-		renderCard(buildOverridableRequest(), buildPolicy());
+		const request = buildOverridableRequest();
+		renderCard(request, buildPolicy());
 		fireEvent.click(screen.getByRole("button", { name: "Allow all for this Session" }));
-		await waitFor(() => expect(setAllowAll).toHaveBeenCalledWith(sessionId, true));
+		await waitFor(() => expect(setAllowAll).toHaveBeenCalledWith(sessionId, true, request));
 	});
 
 	test("critical actions hide allow-all and show a non-overridable badge", () => {

@@ -1,12 +1,10 @@
-import type { AppError, ChatMessage, ChatRun, ChatRunEvent, ChatRunStatus } from "@moshu/contracts";
-
-/**
- * Browser-safe projection of chat run events onto an in-memory conversation. It intentionally does
- * NOT reuse the strict contract message schemas for the streaming projection (those require fields
- * an event stream doesn't carry mid-stream); instead it keeps a lightweight view keyed by message
- * id with a stable display order. All of this lives only in memory for the life of a connection —
- * nothing here is persisted.
- */
+import type {
+	AppError,
+	ChatRunEvent,
+	ChatRunPart,
+	ChatRunSnapshot,
+	ChatRunStatus,
+} from "@moshu/contracts";
 
 export type ChatMessageViewStatus = "streaming" | "complete" | "failed" | "cancelled";
 
@@ -21,130 +19,43 @@ export interface ChatMessageView {
 
 export interface ChatConversationState {
 	readonly sessionId: string;
-	order: Map<string, number>;
+	runs: Map<string, ChatRunSnapshot>;
 	messages: Map<string, ChatMessageView>;
-	runStatus: Map<string, ChatRunStatus>;
-	nextOrder: number;
 	revision: number;
 }
 
 export function createChatConversationState(sessionId: string): ChatConversationState {
 	return {
 		sessionId,
-		order: new Map(),
+		runs: new Map(),
 		messages: new Map(),
-		runStatus: new Map(),
-		nextOrder: 0,
 		revision: 0,
 	};
 }
 
-function assignOrder(state: ChatConversationState, id: string): number {
-	const existing = state.order.get(id);
-	if (existing !== undefined) {
-		return existing;
-	}
-	const next = state.nextOrder;
-	state.nextOrder += 1;
-	state.order.set(id, next);
-	return next;
-}
-
-function upsert(state: ChatConversationState, view: ChatMessageView): void {
-	state.messages.set(view.id, view);
-	state.revision += 1;
-}
-
-/** Seeds the conversation from a session-page snapshot (already validated by the product client). */
-export function ingestSnapshotMessages(
-	state: ChatConversationState,
-	messages: readonly ChatMessage[],
-): void {
-	const sorted = [...messages].sort((left, right) => left.sequence - right.sequence);
-	for (const message of sorted) {
-		const order = assignOrder(state, message.id);
-		const status: ChatMessageViewStatus = message.status;
-		upsert(state, {
-			id: message.id,
-			role: message.role,
-			status,
-			content: message.content,
-			order,
-			...("error" in message && message.error ? { error: message.error } : {}),
-		});
-	}
-}
-
 export function ingestSnapshotRuns(
 	state: ChatConversationState,
-	runs: readonly ChatRun[],
+	runs: readonly ChatRunSnapshot[],
 ): void {
 	for (const run of runs) {
-		state.runStatus.set(run.id, run.status);
+		state.runs.set(run.id, {
+			...structuredClone(run),
+			timeline: run.timeline
+				.filter((part) => part.kind === "text")
+				.map((part) => structuredClone(part)),
+		});
 	}
-	state.revision += 1;
+	rebuildMessages(state);
 }
 
-/**
- * Applies one chat run event. Returns true when it changed the conversation. Callers are
- * responsible for per-run sequence dedupe (see the recovery drain); this function assumes the event
- * is in-order for its run.
- */
 export function applyChatRunEvent(state: ChatConversationState, event: ChatRunEvent): boolean {
-	switch (event.type) {
-		case "run.status": {
-			state.runStatus.set(event.runId, event.payload.status);
-			state.revision += 1;
-			return true;
-		}
-		case "message.started": {
-			const id = event.payload.messageId;
-			if (state.messages.has(id)) {
-				return false;
-			}
-			const order = assignOrder(state, id);
-			upsert(state, { id, role: "assistant", status: "streaming", content: "", order });
-			return true;
-		}
-		case "message.delta": {
-			const id = event.payload.messageId;
-			const current = state.messages.get(id);
-			const order = current?.order ?? assignOrder(state, id);
-			upsert(state, {
-				id,
-				role: "assistant",
-				status: "streaming",
-				content: (current?.content ?? "") + event.payload.delta,
-				order,
-			});
-			return true;
-		}
-		case "message.completed": {
-			const id = event.payload.messageId;
-			const current = state.messages.get(id);
-			const order = current?.order ?? assignOrder(state, id);
-			upsert(state, {
-				id,
-				role: "assistant",
-				status: event.payload.status,
-				content: event.payload.content,
-				order,
-				...(event.payload.status === "failed" ? { error: event.payload.error } : {}),
-			});
-			return true;
-		}
-		case "run.error": {
-			state.runStatus.set(event.runId, "failed");
-			state.revision += 1;
-			return true;
-		}
-		case "run.warning": {
-			return false;
-		}
-		default: {
-			return false;
-		}
+	const current = state.runs.get(event.runId);
+	if (current === undefined || event.seq <= current.lastEventSeq) {
+		return false;
 	}
+	state.runs.set(event.runId, reduceRun(current, event));
+	rebuildMessages(state);
+	return true;
 }
 
 export function selectChatMessages(state: ChatConversationState): ChatMessageView[] {
@@ -154,29 +65,115 @@ export function selectChatMessages(state: ChatConversationState): ChatMessageVie
 const activeRunStatuses = new Set<ChatRunStatus>(["queued", "running", "cancelling"]);
 
 export function isConversationResponding(state: ChatConversationState): boolean {
-	for (const status of state.runStatus.values()) {
-		if (activeRunStatuses.has(status)) {
-			return true;
-		}
-	}
-	return false;
+	return [...state.runs.values()].some((run) => activeRunStatuses.has(run.status));
 }
 
 export function isConversationStopping(state: ChatConversationState): boolean {
-	for (const status of state.runStatus.values()) {
-		if (status === "cancelling") {
-			return true;
-		}
-	}
-	return false;
+	return [...state.runs.values()].some((run) => run.status === "cancelling");
 }
 
 export function latestRunId(state: ChatConversationState): string | undefined {
-	let latest: string | undefined;
-	for (const [runId, status] of state.runStatus) {
-		if (activeRunStatuses.has(status)) {
-			latest = runId;
+	return [...state.runs.values()]
+		.filter((run) => activeRunStatuses.has(run.status))
+		.sort(compareRuns)
+		.at(-1)?.id;
+}
+
+function reduceRun(run: ChatRunSnapshot, event: ChatRunEvent): ChatRunSnapshot {
+	let next: ChatRunSnapshot = { ...run, lastEventSeq: event.seq };
+	switch (event.type) {
+		case "run.status":
+			next = {
+				...next,
+				status: event.payload.status,
+				updatedAt: event.createdAt,
+				...(isTerminalRunStatus(event.payload.status) ? { completedAt: event.createdAt } : {}),
+			};
+			break;
+		case "run.error":
+			next = { ...next, lastError: event.payload.error, updatedAt: event.createdAt };
+			break;
+		case "timeline.part.created":
+			if (event.payload.part.kind === "text") {
+				next = { ...next, timeline: upsertPart(next.timeline, event.payload.part) };
+			}
+			break;
+		case "timeline.text.delta":
+			next = {
+				...next,
+				timeline: next.timeline.map((part) =>
+					part.id === event.payload.partId && part.kind === "text"
+						? {
+								...part,
+								content: `${part.content}${event.payload.delta}`,
+								revision: event.payload.revision,
+								updatedAt: event.createdAt,
+							}
+						: part,
+				),
+			};
+			break;
+		case "timeline.text.completed":
+			next = { ...next, timeline: upsertPart(next.timeline, event.payload.part) };
+			break;
+		case "timeline.tool.updated":
+		case "timeline.tool.progress":
+			break;
+		case "run.warning":
+			break;
+	}
+	return next;
+}
+
+function rebuildMessages(state: ChatConversationState): void {
+	const messages = new Map<string, ChatMessageView>();
+	let order = 0;
+	for (const run of [...state.runs.values()].sort(compareRuns)) {
+		messages.set(run.userMessage.id, {
+			id: run.userMessage.id,
+			role: "user",
+			status: "complete",
+			content: run.userMessage.content,
+			order: order++,
+		});
+		for (const part of [...run.timeline].sort((left, right) => left.position - right.position)) {
+			if (part.kind !== "text") {
+				continue;
+			}
+			messages.set(part.id, {
+				id: part.id,
+				role: "assistant",
+				status: part.status === "streaming" ? "streaming" : "complete",
+				content: part.content,
+				order: order++,
+			});
+		}
+		if (run.lastError !== undefined) {
+			const id = `${run.id}:error`;
+			messages.set(id, {
+				id,
+				role: "assistant",
+				status: "failed",
+				content: "",
+				order: order++,
+				error: run.lastError,
+			});
 		}
 	}
-	return latest;
+	state.messages = messages;
+	state.revision += 1;
+}
+
+function upsertPart(timeline: readonly ChatRunPart[], next: ChatRunPart): ChatRunPart[] {
+	return [...timeline.filter((part) => part.id !== next.id), next].sort(
+		(left, right) => left.position - right.position,
+	);
+}
+
+function compareRuns(left: ChatRunSnapshot, right: ChatRunSnapshot): number {
+	return left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id);
+}
+
+function isTerminalRunStatus(status: ChatRunStatus): boolean {
+	return status === "completed" || status === "failed" || status === "cancelled";
 }

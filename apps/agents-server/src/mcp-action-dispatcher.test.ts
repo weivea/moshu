@@ -5,6 +5,39 @@ import { McpDefinitiveResponseError, McpToolNotReadyError } from "@moshu/mcp-run
 import { DurableActionAuthorizationService } from "./action-authorization-service";
 import { McpActionDispatcher } from "./mcp-action-dispatcher";
 
+type TestDatabase = ReturnType<typeof openAppDatabase>;
+
+function appendMcpToolPart(database: TestDatabase, runId: string, toolCallId: string): void {
+	const now = new Date().toISOString();
+	database.runs.appendEvent({
+		runId,
+		type: "timeline.part.created",
+		source: { kind: "assistant" },
+		payload: {
+			part: {
+				schemaVersion: 1,
+				id: createUuidV7(),
+				runId,
+				position: database.runs.listParts(runId).length + 1,
+				assistantTurnId: createUuidV7(),
+				revision: 1,
+				createdAt: now,
+				updatedAt: now,
+				kind: "tool",
+				toolCallId,
+				tool: {
+					kind: "mcp",
+					name: "tool-query",
+					mcpServerId: "global-database",
+					stableToolId: "tool-query",
+				},
+				status: "queued",
+				summary: "Query database",
+			},
+		},
+	});
+}
+
 describe("McpActionDispatcher", () => {
 	test("executes Agent Server-owned MCP Tools under an Agent Server Action target", async () => {
 		const database = openAppDatabase(":memory:");
@@ -24,8 +57,8 @@ describe("McpActionDispatcher", () => {
 				},
 				userMessageId: createUuidV7(),
 				userContent: "Use the global MCP.",
-				assistantMessageId: createUuidV7(),
 			}).run;
+			appendMcpToolPart(database, run.id, "tool-call");
 			const serverIdentity = {
 				role: "agents" as const,
 				peerId: "moshu-agents-server",
@@ -110,8 +143,8 @@ describe("McpActionDispatcher", () => {
 				},
 				userMessageId: createUuidV7(),
 				userContent: "Call the MCP.",
-				assistantMessageId: createUuidV7(),
 			}).run;
+			appendMcpToolPart(database, run.id, "tool-call");
 			const authorizer = new DurableActionAuthorizationService(database.actions, database.runs, {
 				role: "agents",
 				peerId: "moshu-agents-server",
@@ -182,8 +215,8 @@ describe("McpActionDispatcher", () => {
 				},
 				userMessageId: createUuidV7(),
 				userContent: "Call the MCP.",
-				assistantMessageId: createUuidV7(),
 			}).run;
+			appendMcpToolPart(database, run.id, "tool-call");
 			const authorizer = new DurableActionAuthorizationService(database.actions, database.runs, {
 				role: "agents",
 				peerId: "moshu-agents-server",

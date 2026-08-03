@@ -125,7 +125,7 @@ export class SqliteMobileAttentionOutboxRepository implements MobileAttentionOut
 	}
 
 	deleteProcessedBefore(cutoffMs: number): number {
-		const result = this.orm
+		const deleted = this.orm
 			.delete(mobileAttentionOutboxTable)
 			.where(
 				and(
@@ -133,8 +133,9 @@ export class SqliteMobileAttentionOutboxRepository implements MobileAttentionOut
 					lt(mobileAttentionOutboxTable.processedAtMs, cutoffMs),
 				),
 			)
-			.run();
-		return Number(result.changes ?? 0);
+			.returning({ id: mobileAttentionOutboxTable.id })
+			.all();
+		return deleted.length;
 	}
 }
 

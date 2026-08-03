@@ -4,6 +4,7 @@ import {
 	type AskChatExecutionContext,
 	type AskChatMessage,
 	type AskChatRuntime,
+	type AskChatRuntimeEvent,
 	AskChatRuntimeError,
 	type AskChatSkillResource,
 	ProviderModelNotFoundError,
@@ -19,14 +20,20 @@ import {
 	appErrorSchema,
 	type CancelChatRunInput,
 	type CancelChatRunOutput,
-	type ChatMessage,
 	type ChatRun,
 	type ChatRunEvent,
+	type ChatRunSnapshot,
+	type ChatRunTextPart,
+	type ChatRunToolPart,
 	type ChatSendAcceptedOutput,
+	type ChatUserMessage,
 	type CreateChatSessionOutput,
 	type CreateProcessChatSessionInput,
 	type CreateProviderInput,
-	chatMessageSchema,
+	chatRunSnapshotSchema,
+	chatRunTextPartSchema,
+	chatRunToolPartSchema,
+	chatUserMessageSchema,
 	chatSendAcceptedOutputSchema,
 	createProviderInputSchema,
 	type DefaultModelSelection,
@@ -64,11 +71,12 @@ import {
 	listProvidersOutputSchema,
 	listRetiredChatSessionsInputSchema,
 	listRetiredChatSessionsOutputSchema,
-	maxAssistantMessageContentCharacters,
+	maxChatTextPartContentCharacters,
 	maxChatDeltaCharacters,
 	maxReplayEventBytesPerPage,
 	maxReplayEventsPerPage,
 	normalizeAppErrorSafeMessage,
+	productRpcMaxFrameBytes,
 	type ProcessPeerIdentity,
 	type ProjectRootAgentsIssueCode,
 	type ProjectRunContext,
@@ -110,7 +118,6 @@ import {
 	createUuidV7,
 	type ListRunPageOutput,
 	maxAgentSessionCleanupBatchSize,
-	maxRunEventPageSize,
 	ProjectNotFoundError,
 	type RunJournalPageItem,
 	type RunJournalRepository,
@@ -118,8 +125,8 @@ import {
 	type SessionRepository,
 } from "@moshu/database";
 
-const STREAMED_DELTA_FLUSH_LATENCY_MS = 20;
 const replayTextEncoder = new TextEncoder();
+const sessionPagePayloadBudgetBytes = productRpcMaxFrameBytes - 64 * 1024;
 
 type ChatEventListener = (event: ChatRunEvent) => void | PromiseLike<void>;
 type ChatTaskScheduler = (task: () => void) => void;
@@ -216,12 +223,12 @@ interface ActiveChatRun {
 	sessionId: string;
 	agentSessionId: string;
 	runtimeBoxId: string;
-	assistantMessageId: string;
 	provider: ResolvedProviderConfiguration;
 	messages: AskChatMessage[];
-	durableAssistantContent: string;
-	pendingAssistantDelta: string;
-	pendingDeltaFlushTimer: ReturnType<typeof setTimeout> | undefined;
+	nextPartPosition: number;
+	assistantTurnIds: Map<number, string>;
+	textParts: Map<string, ChatRunTextPart>;
+	toolParts: Map<string, ChatRunToolPart>;
 	abortController: AbortController;
 	cancelRequested: boolean;
 	executionStarted: boolean;
@@ -679,8 +686,7 @@ export class ChatApplicationService {
 		const items = this.#readAllRunItems(parsedInput.sessionId);
 		return {
 			session,
-			messages: this.#buildJournalMessages(items),
-			runs: items.map((item) => item.run).reverse(),
+			runs: items.map(toChatRunSnapshot),
 		};
 	}
 
@@ -691,12 +697,7 @@ export class ChatApplicationService {
 		const items = this.#readAllRunItems(parsedInput.sessionId);
 		return getChatSessionSnapshotOutputSchema.parse({
 			session,
-			messages: this.#buildJournalMessages(items),
-			runs: items.map((item) => item.run).reverse(),
-			eventCursors: items.map((item) => ({
-				runId: item.run.id,
-				lastSeq: item.lastEventSeq,
-			})),
+			runs: items.map(toChatRunSnapshot),
 		});
 	}
 
@@ -712,17 +713,28 @@ export class ChatApplicationService {
 				: { after: decodeRunPageCursor(parsedInput.cursor) }),
 			limit: parsedInput.limit,
 		});
+		const runs: ChatRunSnapshot[] = [];
+		let nextCursor = page.nextCursor;
+		for (const item of page.items) {
+			const run = toChatRunSnapshot(item);
+			const candidate = { session, runs: [...runs, run] };
+			if (encodedJsonBytes(candidate) > sessionPagePayloadBudgetBytes) {
+				if (runs.length === 0) {
+					throw new RangeError("A single Run snapshot exceeds the Product RPC frame budget.");
+				}
+				const lastIncluded = page.items.at(runs.length - 1);
+				if (lastIncluded === undefined) {
+					throw new Error("Session page truncation lost its last included Run.");
+				}
+				nextCursor = runPageCursorForItem(lastIncluded);
+				break;
+			}
+			runs.push(run);
+		}
 		return getChatSessionPageOutputSchema.parse({
 			session,
-			messages: this.#buildJournalMessages(page.items),
-			runs: page.items.map((item) => item.run),
-			eventCursors: page.items.map((item) => ({
-				runId: item.run.id,
-				lastSeq: item.lastEventSeq,
-			})),
-			...(page.nextCursor === undefined
-				? {}
-				: { nextCursor: encodeRunPageCursor(page.nextCursor) }),
+			runs,
+			...(nextCursor === undefined ? {} : { nextCursor: encodeRunPageCursor(nextCursor) }),
 		});
 	}
 
@@ -827,7 +839,6 @@ export class ChatApplicationService {
 
 			this.#revalidateSessionStart(input.sessionId, reservation);
 			const userMessageId = createUuidV7();
-			const assistantMessageId = createUuidV7();
 			const created = this.#runs.create({
 				clientRequestId,
 				sessionId: input.sessionId,
@@ -845,7 +856,6 @@ export class ChatApplicationService {
 				},
 				userMessageId,
 				userContent: input.content,
-				assistantMessageId,
 				...(projectPreflight === undefined
 					? {}
 					: {
@@ -884,11 +894,11 @@ export class ChatApplicationService {
 				sessionId: input.sessionId,
 				agentSessionId: currentSession.agentSessionId,
 				runtimeBoxId: currentSession.runtimeBoxId,
-				assistantMessageId,
 				messages: [{ role: "user", content: input.content, id: userMessageId }],
-				durableAssistantContent: "",
-				pendingAssistantDelta: "",
-				pendingDeltaFlushTimer: undefined,
+				nextPartPosition: 0,
+				assistantTurnIds: new Map(),
+				textParts: new Map(),
+				toolParts: new Map(),
 				provider,
 				abortController: new AbortController(),
 				cancelRequested: false,
@@ -924,11 +934,13 @@ export class ChatApplicationService {
 					});
 			});
 
-			const sequence = existingRuns.length * 2 + 1;
 			return chatSendAcceptedOutputSchema.parse({
-				run: created.run,
-				userMessage: createUserMessage(created.run, input.content, sequence),
-				assistantMessage: createAssistantMessage(created.run, "streaming", "", sequence + 1),
+				run: {
+					...created.run,
+					userMessage: createUserMessage(created.run, input.content),
+					timeline: [],
+					lastEventSeq: created.events.at(-1)?.seq ?? 0,
+				},
 			});
 		} finally {
 			if (!convertedReservation) {
@@ -945,7 +957,10 @@ export class ChatApplicationService {
 		if (existing === undefined) {
 			return undefined;
 		}
-		if (existing.run.sessionId !== input.sessionId || existing.userContent !== input.content) {
+		if (
+			existing.run.sessionId !== input.sessionId ||
+			existing.userMessage.content !== input.content
+		) {
 			throw new AskChatRuntimeError({
 				kind: "duplicate_run_id",
 				message: "Chat send request ID was already used for different content.",
@@ -961,16 +976,8 @@ export class ChatApplicationService {
 			const restored =
 				this.#runs.getByClientRequestId(clientRequestId) ??
 				fail(`Run for request ${clientRequestId} disappeared during recovery.`);
-			const chronologicalRuns = this.#runs.listBySession(input.sessionId).reverse();
-			const runIndex = chronologicalRuns.findIndex((run) => run.id === restored.run.id);
-			const sequence = Math.max(0, runIndex) * 2 + 1;
-			const assistantMessage =
-				this.#buildJournalMessages([restored]).find((message) => message.role === "assistant") ??
-				fail(`Run ${restored.run.id} has no assistant projection.`);
 			return chatSendAcceptedOutputSchema.parse({
-				run: restored.run,
-				userMessage: createUserMessage(restored.run, restored.userContent, sequence),
-				assistantMessage: { ...assistantMessage, sequence: sequence + 1 },
+				run: toChatRunSnapshot(restored),
 			});
 		} finally {
 			if (reservation !== undefined) {
@@ -994,41 +1001,19 @@ export class ChatApplicationService {
 				activeRun.abortController.abort(new AskChatCancelledError(input.runId, input.reason));
 				this.#runtime.cancel(input.runId, input.reason);
 				try {
-					this.#flushPendingAssistantDelta(activeRun);
+					this.#interruptActiveParts(activeRun, "cancelled");
 				} catch (error) {
-					this.#handleFailedRun(activeRun, error);
-					if (activeRun.terminalCommitted) {
-						return { run: this.#runs.get(activeRun.runId) };
-					}
-					this.#assertDataPlaneAvailable();
+					this.#markDataPlaneFatal(activeRun, error);
+					throw this.#createDataPlaneUnavailableError();
 				}
+			} else {
+				this.#interruptPersistedParts(run.id, "cancelled");
 			}
-			const partial =
-				activeRun === undefined
-					? this.#readPartialAssistantContent(run.id)
-					: { content: activeRun.durableAssistantContent, exceeded: false };
-			const outputLimitError = partial.exceeded ? createOutputLimitAppError(run.id) : undefined;
 			let terminal: ReturnType<RunJournalRepository["commitTerminal"]>;
 			try {
 				terminal = this.#runs.commitTerminal({
 					runId: run.id,
-					message:
-						outputLimitError === undefined
-							? {
-									messageId:
-										run.assistantMessageId ??
-										fail(`Run ${run.id} is missing its assistant message ID.`),
-									status: "cancelled",
-									content: partial.content,
-								}
-							: {
-									messageId:
-										run.assistantMessageId ??
-										fail(`Run ${run.id} is missing its assistant message ID.`),
-									status: "failed",
-									content: partial.content,
-									error: outputLimitError,
-								},
+					status: "cancelled",
 					source: { kind: "user" },
 				});
 			} catch (error) {
@@ -1635,38 +1620,8 @@ export class ChatApplicationService {
 				signal: activeRun.abortController.signal,
 				onEvent: async (event) => {
 					this.#throwIfRunFenced(activeRun);
-					const remaining =
-						maxAssistantMessageContentCharacters -
-						activeRun.durableAssistantContent.length -
-						activeRun.pendingAssistantDelta.length;
-					const acceptedDelta = event.delta.slice(0, Math.max(0, remaining));
-					if (acceptedDelta.length > 0) {
-						let offset = 0;
-						while (offset < acceptedDelta.length) {
-							this.#throwIfRunFenced(activeRun);
-							const availableCharacters =
-								maxChatDeltaCharacters - activeRun.pendingAssistantDelta.length;
-							const chunk = acceptedDelta.slice(offset, offset + availableCharacters);
-							activeRun.pendingAssistantDelta += chunk;
-							offset += chunk.length;
-							if (activeRun.pendingAssistantDelta.length === maxChatDeltaCharacters) {
-								this.#persistPendingAssistantDeltaChunk(activeRun, maxChatDeltaCharacters);
-							}
-						}
-						this.#schedulePendingAssistantDeltaFlush(activeRun);
-					}
+					this.#handleRuntimeEvent(activeRun, event);
 					this.#throwIfRunFenced(activeRun);
-					if (acceptedDelta.length < event.delta.length) {
-						this.#flushPendingAssistantDelta(activeRun);
-						this.#fenceExecution(activeRun, "Assistant output exceeded the supported limit.");
-						this.#commitOutputLimitFailure(activeRun);
-						throw new AskChatRuntimeError({
-							kind: "provider_failure",
-							message: "Assistant output exceeded the supported limit.",
-							retryable: true,
-							runId: activeRun.runId,
-						});
-					}
 				},
 			});
 
@@ -1677,12 +1632,10 @@ export class ChatApplicationService {
 				await this.#finishCancelledRun(activeRun);
 				return;
 			}
-			this.#flushPendingAssistantDelta(activeRun);
-			if (activeRun.terminalCommitted || activeRun.cancelRequested) {
-				return;
-			}
-
-			if (result.text.length === 0) {
+			if (
+				result.text.length === 0 &&
+				![...activeRun.textParts.values()].some((part) => part.content.length > 0)
+			) {
 				throw new AskChatRuntimeError({
 					kind: "provider_failure",
 					message: "Provider returned an empty response.",
@@ -1691,21 +1644,9 @@ export class ChatApplicationService {
 				});
 			}
 
-			if (result.text.length > maxAssistantMessageContentCharacters) {
-				this.#fenceExecution(activeRun, "Assistant output exceeded the supported limit.");
-				this.#commitOutputLimitFailure(
-					activeRun,
-					result.text.slice(0, maxAssistantMessageContentCharacters),
-				);
-				return;
-			}
 			const completed = this.#runs.commitTerminal({
 				runId: activeRun.runId,
-				message: {
-					messageId: activeRun.assistantMessageId,
-					status: "complete",
-					content: result.text,
-				},
+				status: "completed",
 			});
 			activeRun.terminalCommitted = true;
 			this.#publish(completed.events);
@@ -1725,9 +1666,9 @@ export class ChatApplicationService {
 			this.#fenceExecution(activeRun, "Chat output persistence failed.");
 			if (activeRun.persistenceFailure === undefined) {
 				try {
-					this.#flushPendingAssistantDelta(activeRun);
-				} catch (flushError) {
-					failure = flushError;
+					this.#interruptActiveParts(activeRun, "failed");
+				} catch (projectionError) {
+					failure = projectionError;
 				}
 			}
 			this.#handleFailedRun(activeRun, failure);
@@ -1738,14 +1679,317 @@ export class ChatApplicationService {
 		}
 	}
 
+	#handleRuntimeEvent(activeRun: ActiveChatRun, event: AskChatRuntimeEvent): void {
+		switch (event.type) {
+			case "assistant.text.started": {
+				const now = new Date().toISOString();
+				const part = chatRunTextPartSchema.parse({
+					schemaVersion: 1,
+					id: createUuidV7(),
+					runId: activeRun.runId,
+					position: ++activeRun.nextPartPosition,
+					assistantTurnId: this.#assistantTurnId(activeRun, event.turnIndex),
+					kind: "text",
+					status: "streaming",
+					content: "",
+					revision: 1,
+					createdAt: now,
+					updatedAt: now,
+				});
+				const persisted = this.#runs.appendEvent({
+					runId: activeRun.runId,
+					type: "timeline.part.created",
+					source: { kind: "assistant" },
+					payload: { part },
+				});
+				activeRun.textParts.set(textPartKey(event.turnIndex, event.contentIndex), part);
+				this.#publish([persisted]);
+				return;
+			}
+			case "assistant.text.delta":
+				this.#appendTextDelta(activeRun, event.turnIndex, event.contentIndex, event.delta);
+				return;
+			case "assistant.text.completed": {
+				const part = this.#requireTextPart(activeRun, event.turnIndex, event.contentIndex);
+				const content = event.content.slice(0, maxChatTextPartContentCharacters);
+				this.#completeTextPart(
+					activeRun,
+					part,
+					content,
+					content.length === event.content.length ? "completed" : "interrupted",
+				);
+				if (content.length < event.content.length) {
+					this.#fenceExecution(activeRun, "Assistant output exceeded the supported limit.");
+					this.#commitOutputLimitFailure(activeRun);
+					throw new AskChatRuntimeError({
+						kind: "provider_failure",
+						message: "Assistant output exceeded the supported limit.",
+						retryable: true,
+						runId: activeRun.runId,
+					});
+				}
+				return;
+			}
+			case "tool.call.created": {
+				const now = new Date().toISOString();
+				const part = chatRunToolPartSchema.parse({
+					schemaVersion: 1,
+					id: createUuidV7(),
+					runId: activeRun.runId,
+					position: ++activeRun.nextPartPosition,
+					assistantTurnId: this.#assistantTurnId(activeRun, event.turnIndex),
+					kind: "tool",
+					toolCallId: event.toolCallId,
+					tool: event.tool,
+					status: "queued",
+					summary: event.summary,
+					input: event.input,
+					revision: 1,
+					createdAt: now,
+					updatedAt: now,
+				});
+				const persisted = this.#runs.appendEvent({
+					runId: activeRun.runId,
+					type: "timeline.part.created",
+					source: { kind: "assistant" },
+					payload: { part },
+				});
+				activeRun.toolParts.set(event.toolCallId, part);
+				this.#publish([persisted]);
+				return;
+			}
+			case "tool.execution.started":
+				// Pi emits this before host policy and approval, so it is not proof that execution began.
+				return;
+			case "tool.execution.updated": {
+				const part = this.#requireToolPart(activeRun, event.toolCallId);
+				if (isTerminalToolStatus(part.status)) {
+					return;
+				}
+				const now = new Date().toISOString();
+				this.#updateToolPart(
+					activeRun,
+					chatRunToolPartSchema.parse({
+						...part,
+						status: "running",
+						progress: event.progress,
+						startedAt: part.startedAt ?? now,
+						revision: part.revision + 1,
+						updatedAt: now,
+					}),
+				);
+				return;
+			}
+			case "tool.execution.completed": {
+				const part = this.#requireToolPart(activeRun, event.toolCallId);
+				const now = new Date().toISOString();
+				const startedAt = part.startedAt ?? now;
+				const authorityAlreadyTerminal = isTerminalToolStatus(part.status);
+				this.#updateToolPart(
+					activeRun,
+					chatRunToolPartSchema.parse({
+						...part,
+						status: authorityAlreadyTerminal ? part.status : event.isError ? "failed" : "completed",
+						output: event.output,
+						...(!authorityAlreadyTerminal && event.isError
+							? { error: createToolExecutionAppError(activeRun.runId, event.tool.name) }
+							: {}),
+						...(authorityAlreadyTerminal
+							? {}
+							: {
+									startedAt,
+									completedAt: now,
+									durationMs: Math.max(0, Date.parse(now) - Date.parse(startedAt)),
+								}),
+						revision: part.revision + 1,
+						updatedAt: now,
+					}),
+				);
+				return;
+			}
+		}
+	}
+
+	#assistantTurnId(activeRun: ActiveChatRun, turnIndex: number): string {
+		const existing = activeRun.assistantTurnIds.get(turnIndex);
+		if (existing !== undefined) {
+			return existing;
+		}
+		const id = createUuidV7();
+		activeRun.assistantTurnIds.set(turnIndex, id);
+		return id;
+	}
+
+	#requireTextPart(
+		activeRun: ActiveChatRun,
+		turnIndex: number,
+		contentIndex: number,
+	): ChatRunTextPart {
+		return (
+			activeRun.textParts.get(textPartKey(turnIndex, contentIndex)) ??
+			fail(`Run ${activeRun.runId} has no text Part at ${turnIndex}:${contentIndex}.`)
+		);
+	}
+
+	#requireToolPart(activeRun: ActiveChatRun, toolCallId: string): ChatRunToolPart {
+		const persisted = this.#runs
+			.listParts(activeRun.runId)
+			.find(
+				(part): part is ChatRunToolPart => part.kind === "tool" && part.toolCallId === toolCallId,
+			);
+		const part =
+			persisted ??
+			activeRun.toolParts.get(toolCallId) ??
+			fail(`Run ${activeRun.runId} has no Tool Part for call ${toolCallId}.`);
+		activeRun.toolParts.set(toolCallId, part);
+		return part;
+	}
+
+	#appendTextDelta(
+		activeRun: ActiveChatRun,
+		turnIndex: number,
+		contentIndex: number,
+		delta: string,
+	): void {
+		let part = this.#requireTextPart(activeRun, turnIndex, contentIndex);
+		if (part.status !== "streaming") {
+			throw new Error(`Text Part ${part.id} no longer accepts deltas.`);
+		}
+		const remaining = maxChatTextPartContentCharacters - part.content.length;
+		const accepted = delta.slice(0, Math.max(0, remaining));
+		for (let offset = 0; offset < accepted.length; offset += maxChatDeltaCharacters) {
+			const chunk = accepted.slice(offset, offset + maxChatDeltaCharacters);
+			const revision = part.revision + 1;
+			const persisted = this.#runs.appendEvent({
+				runId: activeRun.runId,
+				type: "timeline.text.delta",
+				source: { kind: "assistant" },
+				payload: { partId: part.id, revision, delta: chunk },
+			});
+			part = chatRunTextPartSchema.parse({
+				...part,
+				content: `${part.content}${chunk}`,
+				revision,
+				updatedAt: persisted.createdAt,
+			});
+			activeRun.textParts.set(textPartKey(turnIndex, contentIndex), part);
+			this.#publish([persisted]);
+		}
+		if (accepted.length < delta.length) {
+			this.#completeTextPart(activeRun, part, part.content, "interrupted");
+			this.#fenceExecution(activeRun, "Assistant output exceeded the supported limit.");
+			this.#commitOutputLimitFailure(activeRun);
+			throw new AskChatRuntimeError({
+				kind: "provider_failure",
+				message: "Assistant output exceeded the supported limit.",
+				retryable: true,
+				runId: activeRun.runId,
+			});
+		}
+	}
+
+	#completeTextPart(
+		activeRun: ActiveChatRun,
+		part: ChatRunTextPart,
+		content: string,
+		status: "completed" | "interrupted",
+	): void {
+		if (part.status !== "streaming") {
+			return;
+		}
+		const completedPart = chatRunTextPartSchema.parse({
+			...part,
+			status,
+			content,
+			revision: part.revision + 1,
+			updatedAt: new Date().toISOString(),
+		});
+		const persisted = this.#runs.appendEvent({
+			runId: activeRun.runId,
+			type: "timeline.text.completed",
+			source: { kind: "assistant" },
+			payload: { part: completedPart },
+		});
+		for (const [key, candidate] of activeRun.textParts) {
+			if (candidate.id === part.id) {
+				activeRun.textParts.set(key, completedPart);
+				break;
+			}
+		}
+		this.#publish([persisted]);
+	}
+
+	#updateToolPart(activeRun: ActiveChatRun, part: ChatRunToolPart): void {
+		const persisted = this.#runs.appendEvent({
+			runId: activeRun.runId,
+			type: "timeline.tool.updated",
+			source: { kind: "assistant" },
+			payload: { part },
+		});
+		activeRun.toolParts.set(part.toolCallId, part);
+		this.#publish([persisted]);
+	}
+
+	#interruptActiveParts(activeRun: ActiveChatRun, reason: "cancelled" | "failed"): void {
+		for (const part of [...activeRun.textParts.values()]) {
+			this.#completeTextPart(activeRun, part, part.content, "interrupted");
+		}
+		for (const candidate of [...activeRun.toolParts.values()]) {
+			const part = this.#requireToolPart(activeRun, candidate.toolCallId);
+			if (isTerminalToolStatus(part.status)) {
+				continue;
+			}
+			this.#updateToolPart(activeRun, interruptToolPart(part, reason));
+		}
+	}
+
+	#interruptPersistedParts(runId: string, reason: "cancelled" | "failed", publish = true): void {
+		for (const part of this.#runs.listParts(runId)) {
+			if (part.kind === "text") {
+				if (part.status !== "streaming") {
+					continue;
+				}
+				const interrupted = chatRunTextPartSchema.parse({
+					...part,
+					status: "interrupted",
+					revision: part.revision + 1,
+					updatedAt: new Date().toISOString(),
+				});
+				const event = this.#runs.appendEvent({
+					runId,
+					type: "timeline.text.completed",
+					source: { kind: "system" },
+					payload: { part: interrupted },
+				});
+				if (publish) {
+					this.#publish([event]);
+				}
+				continue;
+			}
+			if (isTerminalToolStatus(part.status)) {
+				continue;
+			}
+			const interrupted = interruptToolPart(part, reason);
+			const event = this.#runs.appendEvent({
+				runId,
+				type: "timeline.tool.updated",
+				source: { kind: "system" },
+				payload: { part: interrupted },
+			});
+			if (publish) {
+				this.#publish([event]);
+			}
+		}
+	}
+
 	async #finishCancelledRun(activeRun: ActiveChatRun): Promise<void> {
 		if (activeRun.terminalCommitted) {
 			return;
 		}
 		try {
-			this.#flushPendingAssistantDelta(activeRun);
+			this.#interruptActiveParts(activeRun, "cancelled");
 		} catch (error) {
-			this.#handleFailedRun(activeRun, error);
+			this.#markDataPlaneFatal(activeRun, error);
 			return;
 		}
 		if (activeRun.terminalCommitted) {
@@ -1755,11 +1999,7 @@ export class ChatApplicationService {
 		try {
 			terminal = this.#runs.commitTerminal({
 				runId: activeRun.runId,
-				message: {
-					messageId: activeRun.assistantMessageId,
-					status: "cancelled",
-					content: activeRun.durableAssistantContent,
-				},
+				status: "cancelled",
 			});
 		} catch (error) {
 			this.#markDataPlaneFatal(activeRun, error);
@@ -1771,19 +2011,7 @@ export class ChatApplicationService {
 		await Promise.resolve();
 	}
 
-	#commitOutputLimitFailure(
-		activeRun: ActiveChatRun,
-		terminalContent = activeRun.durableAssistantContent,
-	): void {
-		if (activeRun.terminalCommitted) {
-			return;
-		}
-		try {
-			this.#flushPendingAssistantDelta(activeRun);
-		} catch (error) {
-			this.#handleFailedRun(activeRun, error);
-			return;
-		}
+	#commitOutputLimitFailure(activeRun: ActiveChatRun): void {
 		if (activeRun.terminalCommitted) {
 			return;
 		}
@@ -1791,12 +2019,8 @@ export class ChatApplicationService {
 		try {
 			terminal = this.#runs.commitTerminal({
 				runId: activeRun.runId,
-				message: {
-					messageId: activeRun.assistantMessageId,
-					status: "failed",
-					content: terminalContent.slice(0, maxAssistantMessageContentCharacters),
-					error: createOutputLimitAppError(activeRun.runId),
-				},
+				status: "failed",
+				error: createOutputLimitAppError(activeRun.runId),
 			});
 		} catch (error) {
 			this.#markDataPlaneFatal(activeRun, error);
@@ -1810,22 +2034,14 @@ export class ChatApplicationService {
 		activeRun: ActiveChatRun,
 		error: unknown,
 	): ReturnType<RunJournalRepository["commitTerminal"]> {
-		const content = activeRun.durableAssistantContent.slice(
-			0,
-			maxAssistantMessageContentCharacters,
-		);
 		// The client only ever sees a redacted AppError, so the underlying provider failure has to
 		// reach the server log or the failure is undiagnosable.
 		this.#logger.error(`Chat run ${activeRun.runId} failed against the Provider.`, error);
 		try {
 			return this.#runs.commitTerminal({
 				runId: activeRun.runId,
-				message: {
-					messageId: activeRun.assistantMessageId,
-					status: "failed",
-					content,
-					error: toAppError(error, activeRun.runId),
-				},
+				status: "failed",
+				error: toAppError(error, activeRun.runId),
 			});
 		} catch (commitError) {
 			this.#logger.error(
@@ -1835,12 +2051,8 @@ export class ChatApplicationService {
 			void commitError;
 			return this.#runs.commitTerminal({
 				runId: activeRun.runId,
-				message: {
-					messageId: activeRun.assistantMessageId,
-					status: "failed",
-					content,
-					error: createLastResortAppError(activeRun.runId),
-				},
+				status: "failed",
+				error: createLastResortAppError(activeRun.runId),
 			});
 		}
 	}
@@ -1893,154 +2105,6 @@ export class ChatApplicationService {
 		return page;
 	}
 
-	#buildJournalMessages(items: RunJournalPageItem[]): ChatMessage[] {
-		const messages: ChatMessage[] = [];
-
-		for (const item of items) {
-			const { run } = item;
-			const sequence = messages.length + 1;
-			messages.push(createUserMessage(run, item.userContent, sequence));
-
-			const terminalEvent = item.events.findLast((event) => event.type === "message.completed");
-			const streamedContent =
-				item.assistantContent ??
-				item.events.reduce((content, event) => {
-					return event.type === "message.delta" ? `${content}${event.payload.delta}` : content;
-				}, "");
-			const assistantSequence = messages.length + 1;
-			const terminalContent =
-				item.assistantContent ??
-				(terminalEvent?.type === "message.completed"
-					? terminalEvent.payload.content
-					: streamedContent);
-
-			if (run.status === "completed") {
-				if (terminalContent.length > 0) {
-					messages.push(
-						createAssistantMessage(run, "complete", terminalContent, assistantSequence),
-					);
-				}
-				continue;
-			}
-
-			if (run.status === "failed") {
-				messages.push(
-					createAssistantMessage(run, "failed", terminalContent, assistantSequence, run.lastError),
-				);
-				continue;
-			}
-
-			if (run.status === "cancelled") {
-				messages.push(createAssistantMessage(run, "cancelled", terminalContent, assistantSequence));
-				continue;
-			}
-
-			messages.push(createAssistantMessage(run, "streaming", streamedContent, assistantSequence));
-		}
-
-		return messages;
-	}
-
-	#readPartialAssistantContent(runId: string): { content: string; exceeded: boolean } {
-		let content = "";
-		let exceeded = false;
-		let afterSeq = 0;
-		while (true) {
-			const page = this.#runs.listEventPage({
-				runId,
-				afterSeq,
-				limit: maxRunEventPageSize,
-			});
-			for (const event of page.events) {
-				if (event.type !== "message.delta") {
-					continue;
-				}
-				const remaining = maxAssistantMessageContentCharacters - content.length;
-				if (remaining <= 0) {
-					exceeded = true;
-					continue;
-				}
-				const acceptedDelta = event.payload.delta.slice(0, remaining);
-				content += acceptedDelta;
-				if (acceptedDelta.length < event.payload.delta.length) {
-					exceeded = true;
-				}
-			}
-			if (!page.hasMore) {
-				break;
-			}
-			const nextSeq = page.events.at(-1)?.seq;
-			if (nextSeq === undefined || nextSeq <= afterSeq) {
-				throw new Error(`Event paging for Run ${runId} did not advance.`);
-			}
-			afterSeq = nextSeq;
-		}
-		return { content, exceeded };
-	}
-
-	#schedulePendingAssistantDeltaFlush(activeRun: ActiveChatRun): void {
-		if (
-			activeRun.pendingAssistantDelta.length === 0 ||
-			activeRun.pendingDeltaFlushTimer !== undefined ||
-			activeRun.cancelRequested ||
-			activeRun.terminalCommitted
-		) {
-			return;
-		}
-		activeRun.pendingDeltaFlushTimer = setTimeout(() => {
-			activeRun.pendingDeltaFlushTimer = undefined;
-			if (
-				activeRun.cancelRequested ||
-				activeRun.terminalCommitted ||
-				this.#activeRuns.get(activeRun.runId) !== activeRun
-			) {
-				return;
-			}
-			try {
-				this.#flushPendingAssistantDelta(activeRun);
-			} catch (error) {
-				activeRun.persistenceFailure = error;
-				this.#handleFailedRun(activeRun, error);
-			}
-		}, STREAMED_DELTA_FLUSH_LATENCY_MS);
-	}
-
-	#flushPendingAssistantDelta(activeRun: ActiveChatRun): void {
-		if (activeRun.pendingDeltaFlushTimer !== undefined) {
-			clearTimeout(activeRun.pendingDeltaFlushTimer);
-			activeRun.pendingDeltaFlushTimer = undefined;
-		}
-		while (activeRun.pendingAssistantDelta.length > 0 && !activeRun.terminalCommitted) {
-			this.#persistPendingAssistantDeltaChunk(
-				activeRun,
-				Math.min(maxChatDeltaCharacters, activeRun.pendingAssistantDelta.length),
-			);
-		}
-	}
-
-	#persistPendingAssistantDeltaChunk(activeRun: ActiveChatRun, length: number): void {
-		const chunk = activeRun.pendingAssistantDelta.slice(0, length);
-		let persistedEvent: ChatRunEvent;
-		try {
-			persistedEvent = this.#runs.appendEvent({
-				runId: activeRun.runId,
-				type: "message.delta",
-				source: { kind: "assistant" },
-				payload: {
-					messageId: activeRun.assistantMessageId,
-					delta: chunk,
-				},
-			});
-		} catch (error) {
-			activeRun.persistenceFailure = error;
-			this.#handleFailedRun(activeRun, error);
-			throw error;
-		}
-		activeRun.pendingAssistantDelta = activeRun.pendingAssistantDelta.slice(chunk.length);
-		activeRun.durableAssistantContent += chunk;
-		this.#publish([persistedEvent]);
-	}
-
 	#publish(events: readonly ChatRunEvent[]): void {
 		if (events.length === 0) {
 			return;
@@ -2074,10 +2138,6 @@ export class ChatApplicationService {
 	}
 
 	#releaseRun(activeRun: ActiveChatRun): void {
-		if (activeRun.pendingDeltaFlushTimer !== undefined) {
-			clearTimeout(activeRun.pendingDeltaFlushTimer);
-			activeRun.pendingDeltaFlushTimer = undefined;
-		}
 		if (this.#activeRuns.get(activeRun.runId) === activeRun) {
 			this.#activeRuns.delete(activeRun.runId);
 		}
@@ -2112,10 +2172,6 @@ export class ChatApplicationService {
 	#markDataPlaneFatal(activeRun: ActiveChatRun, error: unknown): void {
 		activeRun.retainFence = true;
 		this.#fenceExecution(activeRun, "Chat persistence is unavailable.");
-		if (activeRun.pendingDeltaFlushTimer !== undefined) {
-			clearTimeout(activeRun.pendingDeltaFlushTimer);
-			activeRun.pendingDeltaFlushTimer = undefined;
-		}
 		this.#markDataPlanePersistenceFatal(activeRun.runId);
 		void error;
 	}
@@ -2287,25 +2343,18 @@ export class ChatApplicationService {
 			reservation = this.#reserveSessionStart(run.sessionId);
 		}
 		try {
-			const partial = this.#readPartialAssistantContent(run.id);
-			const messageId =
-				run.assistantMessageId ?? fail(`Run ${run.id} is missing its assistant message ID.`);
 			let terminal: ReturnType<RunJournalRepository["commitTerminal"]>;
 			try {
+				const status = run.status === "queued" ? "cancelled" : "failed";
+				this.#interruptPersistedParts(
+					run.id,
+					status === "cancelled" ? "cancelled" : "failed",
+					publish,
+				);
 				terminal = this.#runs.commitTerminal({
 					runId: run.id,
-					message: partial.exceeded
-						? {
-								messageId,
-								status: "failed",
-								content: partial.content,
-								error: createOutputLimitAppError(run.id),
-							}
-						: {
-								messageId,
-								status: "cancelled",
-								content: partial.content,
-							},
+					status,
+					...(status === "failed" ? { error: createInterruptedRunAppError(run.id) } : {}),
 				});
 			} catch {
 				this.#markDataPlanePersistenceFatal(run.id);
@@ -2380,47 +2429,54 @@ function createSessionTitle(content: string): string {
 	return normalized.length <= 60 ? normalized : `${normalized.slice(0, 57)}...`;
 }
 
-function createUserMessage(run: ChatRun, content: string, sequence: number): ChatMessage {
-	return chatMessageSchema.parse({
+function createUserMessage(run: ChatRun, content: string): ChatUserMessage {
+	return chatUserMessageSchema.parse({
 		schemaVersion: 1,
 		id: run.userMessageId,
 		sessionId: run.sessionId,
 		runId: run.id,
 		role: "user",
-		status: "complete",
 		content,
-		sequence,
 		createdAt: run.createdAt,
-		updatedAt: run.createdAt,
 	});
 }
 
-function createAssistantMessage(
-	run: ChatRun,
-	status: "streaming" | "complete" | "failed" | "cancelled",
-	content: string,
-	sequence: number,
-	error?: AppError,
-): ChatMessage {
-	if (run.assistantMessageId === undefined) {
-		throw new Error(`Run ${run.id} is missing its assistant message ID.`);
-	}
-	if (status === "failed" && error === undefined) {
-		throw new Error(`Failed run ${run.id} is missing its error projection.`);
-	}
+function toChatRunSnapshot(item: RunJournalPageItem): ChatRunSnapshot {
+	return chatRunSnapshotSchema.parse({
+		...item.run,
+		userMessage: item.userMessage,
+		timeline: item.timeline,
+		lastEventSeq: item.lastEventSeq,
+	});
+}
 
-	return chatMessageSchema.parse({
-		schemaVersion: 1,
-		id: run.assistantMessageId,
-		sessionId: run.sessionId,
-		runId: run.id,
-		role: "assistant",
+function textPartKey(turnIndex: number, contentIndex: number): string {
+	return `${turnIndex}:${contentIndex}`;
+}
+
+function isTerminalToolStatus(status: ChatRunToolPart["status"]): boolean {
+	return (
+		status === "completed" ||
+		status === "failed" ||
+		status === "denied" ||
+		status === "cancelled" ||
+		status === "outcome_unknown"
+	);
+}
+
+function interruptToolPart(part: ChatRunToolPart, reason: "cancelled" | "failed"): ChatRunToolPart {
+	const now = new Date().toISOString();
+	const status = reason === "failed" && part.status === "running" ? "outcome_unknown" : "cancelled";
+	return chatRunToolPartSchema.parse({
+		...part,
 		status,
-		content,
-		sequence,
-		createdAt: run.createdAt,
-		updatedAt: run.updatedAt,
-		...(error === undefined ? {} : { error }),
+		...(status === "outcome_unknown" ? { error: createInterruptedRunAppError(part.runId) } : {}),
+		completedAt: now,
+		...(part.startedAt === undefined
+			? {}
+			: { durationMs: Math.max(0, Date.parse(now) - Date.parse(part.startedAt)) }),
+		revision: part.revision + 1,
+		updatedAt: now,
 	});
 }
 
@@ -2456,6 +2512,17 @@ function takeReplayEventsWithinByteBudget(events: readonly ChatRunEvent[]): Chat
 
 function encodeRunPageCursor(cursor: RunPageCursor): string {
 	return Buffer.from(JSON.stringify(cursor), "utf8").toString("base64url");
+}
+
+function runPageCursorForItem(item: RunJournalPageItem): RunPageCursor {
+	return {
+		createdAtMs: Date.parse(item.run.createdAt),
+		id: item.run.id,
+	};
+}
+
+function encodedJsonBytes(value: unknown): number {
+	return replayTextEncoder.encode(JSON.stringify(value)).byteLength;
 }
 
 function decodeRunPageCursor(value: string): RunPageCursor {
@@ -2522,6 +2589,28 @@ function createOutputLimitAppError(runId: string): AppError {
 		category: "provider",
 		messageKey: "errors.chatOutputLimitExceeded",
 		safeMessage: "The response exceeded the supported output limit.",
+		retryable: true,
+		causeId: runId,
+	});
+}
+
+function createToolExecutionAppError(runId: string, toolName: string): AppError {
+	return appErrorSchema.parse({
+		code: "TOOL_EXECUTION_FAILED",
+		category: "tool",
+		messageKey: "errors.toolExecutionFailed",
+		safeMessage: `${toolName} failed.`,
+		retryable: false,
+		causeId: runId,
+	});
+}
+
+function createInterruptedRunAppError(runId: string): AppError {
+	return appErrorSchema.parse({
+		code: "CHAT_RUN_INTERRUPTED",
+		category: "runtime",
+		messageKey: "errors.chatRunInterrupted",
+		safeMessage: "The chat response was interrupted before completion.",
 		retryable: true,
 		causeId: runId,
 	});

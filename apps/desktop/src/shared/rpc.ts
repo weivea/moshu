@@ -6,6 +6,7 @@ import {
 	type ApproveRuntimeBoxPairingOutput,
 	type CancelChatRunInput,
 	type CancelChatRunOutput,
+	type ChatEventDelivery,
 	type ChatRunEvent,
 	type ChatSendAcceptedOutput,
 	type CheckProjectPathInput,
@@ -123,6 +124,7 @@ import {
 	type UpdateProjectInput,
 	type UpdateProjectOutput,
 	type UpdateProviderInput,
+	chatEventDeliverySchema,
 	type UpdateRuntimeProfileInput,
 	type UpdateSessionApprovalPolicyInput,
 	type UpdateSessionApprovalPolicyOutput,
@@ -135,6 +137,25 @@ import type { RPCSchema } from "electrobun/bun";
 import { z } from "zod";
 
 type EmptyRpcMap = Record<never, never>;
+
+export type DesktopChatEvent = ChatRunEvent & {
+	clientRequestId?: string;
+};
+
+export function toDesktopChatEvent(delivery: ChatEventDelivery): DesktopChatEvent {
+	return delivery.clientRequestId === undefined
+		? delivery.event
+		: { ...delivery.event, clientRequestId: delivery.clientRequestId };
+}
+
+export function toChatEventDelivery(event: DesktopChatEvent): ChatEventDelivery {
+	const eventValue: Record<string, unknown> = { ...event };
+	delete eventValue.clientRequestId;
+	return chatEventDeliverySchema.parse({
+		event: eventValue,
+		...(event.clientRequestId === undefined ? {} : { clientRequestId: event.clientRequestId }),
+	});
+}
 
 export interface CreateDesktopChatSessionInput {
 	model?: SessionModelSelection;
@@ -535,7 +556,7 @@ export type DesktopRpc = {
 		requests: EmptyRpcMap;
 		messages: {
 			agentsReady: EmptyParams;
-			chatEvent: ChatRunEvent;
+			chatEvent: ChatEventDelivery;
 			chatSessionInvalidated: ChatSessionInvalidation;
 			runtimeBoxesChanged: ListRuntimeBoxesOutput;
 			approvalEvent: ApprovalEventDelivery;

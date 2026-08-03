@@ -16,6 +16,7 @@ describe("MCP Tool request handler", () => {
 	test("journals and executes an authorized MCP Tool through the shared Action boundary", async () => {
 		const directory = mkdtempSync(join(tmpdir(), "moshu-mcp-tool-handler-"));
 		try {
+			const projectionSecret = "runtime-box-injected-secret";
 			const store = new RuntimeResourceStore(join(directory, "resources"));
 			store.upsertMcpServer({
 				commandId: crypto.randomUUID(),
@@ -28,6 +29,7 @@ describe("MCP Tool request handler", () => {
 					args: [],
 					startupTimeoutMs: 10_000,
 				},
+				secret: { headers: { Authorization: projectionSecret } },
 			});
 			const manager = new McpLifecycleManager(store, {
 				connect: async () => ({
@@ -48,7 +50,14 @@ describe("MCP Tool request handler", () => {
 						) {
 							throw new McpToolOutcomeUnknownError("transport lost after dispatch");
 						}
-						return { content: [{ type: "text", text: JSON.stringify(argumentsValue) }] };
+						return {
+							content: [
+								{
+									type: "text",
+									text: `${JSON.stringify(argumentsValue)} ${projectionSecret}`,
+								},
+							],
+						};
 					},
 					async close() {},
 				}),
@@ -124,6 +133,8 @@ describe("MCP Tool request handler", () => {
 				stableToolId: "tool-query",
 				isError: false,
 			});
+			expect(JSON.stringify(output)).not.toContain(projectionSecret);
+			expect(JSON.stringify(output)).toContain("[redacted]");
 			expect(journal.listEvidence()).toMatchObject([
 				{
 					invocationId: parameters.invocationId,
@@ -131,6 +142,7 @@ describe("MCP Tool request handler", () => {
 					result: { mcpServerId: "database-tools", stableToolId: "tool-query" },
 				},
 			]);
+			expect(JSON.stringify(journal.listEvidence())).not.toContain(projectionSecret);
 			const unknownParameters = {
 				...parameters,
 				invocationId: crypto.randomUUID(),

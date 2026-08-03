@@ -67,7 +67,9 @@ describe("Pi Agent runtime", () => {
 				provider,
 				messages: [{ role: "user", content: "Answer deterministically." }],
 				onEvent: (event) => {
-					deltas.push(event.delta);
+					if (event.type === "assistant.text.delta") {
+						deltas.push(event.delta);
+					}
 				},
 			});
 			for await (const _event of stream) {
@@ -177,6 +179,8 @@ describe("Pi Agent runtime", () => {
 				throw new Error("Expected the fake Provider model.");
 			}
 			const mcpCalls: RuntimeBoxMcpToolInvokeInput[] = [];
+			const projectionSecret = "runtime-box-secret-value";
+			const publicEvents: unknown[] = [];
 			const runtime = new PiAgentRuntime({
 				agentDataDirectory,
 				modelRuntime,
@@ -197,7 +201,9 @@ describe("Pi Agent runtime", () => {
 							invocationId: input.invocationId,
 							mcpServerId: input.mcpServerId,
 							stableToolId: input.stableToolId,
-							result: { content: [{ type: "text", text: "one row" }] },
+							result: {
+								content: [{ type: "text", text: `one row ${projectionSecret}` }],
+							},
 							isError: false,
 						};
 					},
@@ -216,6 +222,9 @@ describe("Pi Agent runtime", () => {
 						source: "builtin",
 						api: model.api,
 						model: model.id,
+					},
+					onEvent: (event) => {
+						publicEvents.push(event);
 					},
 					messages: [{ role: "user", content: "Use the database Skill." }],
 					skills: [
@@ -245,6 +254,7 @@ describe("Pi Agent runtime", () => {
 							stableResourceId: "database-tools",
 							version: "550e8400-e29b-41d4-a716-446655440001",
 							contentHash: "c".repeat(64),
+							projectionSecretValues: [projectionSecret],
 							tools: [
 								{
 									stableToolId: "tool-query",
@@ -269,6 +279,9 @@ describe("Pi Agent runtime", () => {
 						arguments: { sql: "select 1" },
 					},
 				]);
+				const serializedEvents = JSON.stringify(publicEvents);
+				expect(serializedEvents).not.toContain(projectionSecret);
+				expect(serializedEvents).toContain("[redacted]");
 			} finally {
 				await runtime.shutdown();
 			}

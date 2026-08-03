@@ -1,7 +1,12 @@
 import type { McpSecretInput, McpToolDescriptor, McpTransportConfig } from "@moshu/contracts";
 import type { JsonValue } from "@moshu/process-rpc";
 
-import { connectMcpServer, type McpConnection } from "./mcp-client";
+import {
+	connectMcpServer,
+	McpDefinitiveResponseError,
+	type McpConnection,
+	McpToolOutcomeUnknownError,
+} from "./mcp-client";
 
 export interface McpConnectionConfig {
 	server: {
@@ -146,7 +151,12 @@ export class McpLifecycleManager {
 			throw new McpToolNotReadyError();
 		}
 
-		return connection.callTool(stableToolId, argumentsValue, signal);
+		try {
+			const result = await connection.callTool(stableToolId, argumentsValue, signal);
+			return redactInjectedMcpSecrets(result, config.secret);
+		} catch (error) {
+			throw redactMcpCallError(error, config.secret);
+		}
 	}
 
 	isToolReady(
@@ -407,6 +417,69 @@ export class McpLifecycleManager {
 		}, delay);
 		this.#reconnectTimers.set(stableResourceId, timer);
 	}
+}
+
+function redactInjectedMcpSecrets(value: JsonValue, secret: McpSecretInput | undefined): JsonValue {
+	const secretValues = collectSecretValues(secret);
+	if (secretValues.length === 0) {
+		return value;
+	}
+	return redactJsonStrings(value, secretValues);
+}
+
+function redactJsonStrings(value: JsonValue, secretValues: readonly string[]): JsonValue {
+	if (typeof value === "string") {
+		return redactText(value, secretValues);
+	}
+	if (Array.isArray(value)) {
+		return value.map((item) => redactJsonStrings(item, secretValues));
+	}
+	if (typeof value === "object" && value !== null) {
+		return Object.fromEntries(
+			Object.entries(value).map(([key, item]) => [
+				redactText(key, secretValues),
+				redactJsonStrings(item, secretValues),
+			]),
+		);
+	}
+	return value;
+}
+
+function redactMcpCallError(error: unknown, secret: McpSecretInput | undefined): Error {
+	const secretValues = collectSecretValues(secret);
+	const message = redactText(error instanceof Error ? error.message : String(error), secretValues);
+	if (error instanceof McpToolOutcomeUnknownError) {
+		return new McpToolOutcomeUnknownError(message);
+	}
+	if (error instanceof McpDefinitiveResponseError) {
+		return new McpDefinitiveResponseError(message);
+	}
+	const redacted = new Error(message);
+	if (error instanceof Error) {
+		redacted.name = error.name;
+	}
+	return redacted;
+}
+
+function collectSecretValues(secret: McpSecretInput | undefined): readonly string[] {
+	if (secret === undefined) {
+		return [];
+	}
+	return [
+		...new Set(
+			[...Object.values(secret.environment ?? {}), ...Object.values(secret.headers ?? {})].filter(
+				(value) => value.length > 0,
+			),
+		),
+	].sort((left, right) => right.length - left.length);
+}
+
+function redactText(value: string, secretValues: readonly string[]): string {
+	let redacted = value;
+	for (const secretValue of secretValues) {
+		redacted = redacted.split(secretValue).join("[redacted]");
+	}
+	return redacted;
 }
 
 function isResourceNotFound(error: unknown): boolean {

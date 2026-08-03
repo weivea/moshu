@@ -353,7 +353,7 @@ function createProjectTransport(
 				title: "Created from Project",
 				updatedAt: "2026-07-30T12:00:00.000Z",
 				askMode: "Ask",
-				messages: [],
+				runs: [],
 			};
 			sessions.push(createSessionSummary(session.id, session.title));
 			onCreated?.(session);
@@ -368,19 +368,37 @@ function createProjectTransport(
 			message: string;
 		}): Promise<ChatSendResult> => ({
 			requestId,
-			userMessage: {
-				id: "user-message-1",
-				role: "user",
-				content: message,
-				createdAt: "2026-07-30T12:00:00.000Z",
+			run: {
+				schemaVersion: 1,
+				id: requestId,
+				sessionId: "project-session-1",
+				runtimeBoxId: defaultLocalRuntimeBoxId,
+				mode: "agent",
 				status: "completed",
-			},
-			assistantMessage: {
-				id: "assistant-message-1",
-				role: "assistant",
-				content: "Done",
+				provider: {
+					schemaVersion: 1,
+					providerId: "test-provider",
+					name: "Test Provider",
+					source: "builtin",
+					api: "openai-responses",
+					model: "gpt-5.4",
+					status: "ready",
+				},
+				userMessageId: "user-message-1",
 				createdAt: "2026-07-30T12:00:00.000Z",
-				status: "completed",
+				updatedAt: "2026-07-30T12:00:00.000Z",
+				completedAt: "2026-07-30T12:00:00.000Z",
+				userMessage: {
+					schemaVersion: 1,
+					id: "user-message-1",
+					sessionId: "project-session-1",
+					runId: requestId,
+					role: "user",
+					content: message,
+					createdAt: "2026-07-30T12:00:00.000Z",
+				},
+				timeline: [],
+				lastEventSeq: 1,
 			},
 		}),
 		subscribe: () => () => undefined,

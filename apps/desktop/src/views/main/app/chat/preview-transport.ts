@@ -1,5 +1,6 @@
 import type {
 	CreateProviderInput,
+	ChatRunSnapshot,
 	ProviderAuthAttempt,
 	ProviderAuthType,
 	UpdateProviderInput,
@@ -7,12 +8,10 @@ import type {
 import { defaultLocalRuntimeBoxId } from "@moshu/contracts";
 import type {
 	AvailableModel,
-	ChatMessage,
 	ChatSendResult,
 	ChatSession,
 	ChatSessionSummary,
 	ChatTransport,
-	ChatTransportEvent,
 	ChatTransportListener,
 	DefaultModelSelection,
 	ProviderConnectionTestResult,
@@ -20,39 +19,18 @@ import type {
 	SessionModelSelection,
 } from "./transport";
 
-interface PendingPreviewResponse {
-	sessionId: string;
-	messageId: string;
-	timers: number[];
-}
-
 export function createPreviewChatTransport(): ChatTransport {
 	const providers: ProviderSummary[] = [];
 	let defaultModel: DefaultModelSelection | undefined;
 	let nextSessionNumber = 1;
-	let nextMessageNumber = 1;
 	let nextRequestNumber = 1;
 	let nextProviderNumber = 1;
 	const listeners = new Set<ChatTransportListener>();
 	const sessions = new Map<string, ChatSession>();
-	const pendingResponses = new Map<string, PendingPreviewResponse>();
 	const authAttempts = new Map<string, ProviderAuthAttempt>();
 
-	function cloneMessage(message: ChatMessage): ChatMessage {
-		return { ...message };
-	}
-
 	function cloneSession(session: ChatSession): ChatSession {
-		return {
-			...session,
-			messages: session.messages.map(cloneMessage),
-		};
-	}
-
-	function notify(event: ChatTransportEvent) {
-		for (const listener of listeners) {
-			listener(event);
-		}
+		return structuredClone(session);
 	}
 
 	function requireConfiguredProvider(): SessionModelSelection {
@@ -71,12 +49,7 @@ export function createPreviewChatTransport(): ChatTransport {
 	}
 
 	function requireNoPendingResponse(sessionId?: string) {
-		const hasPendingResponse = [...pendingResponses.values()].some(
-			(response) => sessionId === undefined || response.sessionId === sessionId,
-		);
-		if (hasPendingResponse) {
-			throw new Error("Stop active responses before changing this configuration.");
-		}
+		void sessionId;
 	}
 
 	function getStoredSession(sessionId: string): ChatSession {
@@ -85,82 +58,6 @@ export function createPreviewChatTransport(): ChatTransport {
 			throw new Error("The requested chat session could not be found.");
 		}
 		return session;
-	}
-
-	function getStoredMessage(sessionId: string, messageId: string): ChatMessage {
-		const message = getStoredSession(sessionId).messages.find(
-			(candidate) => candidate.id === messageId,
-		);
-		if (!message) {
-			throw new Error("The requested chat message could not be found.");
-		}
-		return message;
-	}
-
-	function updateMessage(
-		sessionId: string,
-		messageId: string,
-		updater: (message: ChatMessage) => ChatMessage,
-	) {
-		const session = getStoredSession(sessionId);
-		session.messages = session.messages.map((message) =>
-			message.id === messageId ? updater(message) : message,
-		);
-	}
-
-	function schedulePreviewResponse(
-		requestId: string,
-		sessionId: string,
-		messageId: string,
-		userPrompt: string,
-	) {
-		const response = buildPreviewResponse(userPrompt, defaultModel?.modelId ?? "preview-model");
-		const chunks = splitIntoChunks(response);
-		const timers = chunks.map((chunk, index) =>
-			window.setTimeout(
-				() => {
-					updateMessage(sessionId, messageId, (message) => ({
-						...message,
-						content: `${message.content}${chunk}`,
-						status: "streaming",
-					}));
-					notify({
-						type: "response.delta",
-						sessionId,
-						requestId,
-						messageId,
-						delta: chunk,
-					});
-				},
-				180 * (index + 1),
-			),
-		);
-
-		timers.push(
-			window.setTimeout(
-				() => {
-					updateMessage(sessionId, messageId, (message) => ({
-						...message,
-						status: "completed",
-					}));
-					pendingResponses.delete(requestId);
-					notify({
-						type: "response.completed",
-						sessionId,
-						requestId,
-						messageId,
-						content: response,
-					});
-				},
-				180 * (chunks.length + 1),
-			),
-		);
-
-		pendingResponses.set(requestId, {
-			sessionId,
-			messageId,
-			timers,
-		});
 	}
 
 	return {
@@ -329,7 +226,7 @@ export function createPreviewChatTransport(): ChatTransport {
 				updatedAt: new Date().toISOString(),
 				model: structuredClone(selection),
 				askMode: "Ask",
-				messages: [],
+				runs: [],
 			};
 			nextSessionNumber += 1;
 			sessions.set(session.id, session);
@@ -387,66 +284,35 @@ export function createPreviewChatTransport(): ChatTransport {
 			if (session.archivedAt !== undefined) {
 				throw new Error("Archived chat Sessions cannot send new messages.");
 			}
-			if (session.messages.length === 0 && session.title === "New chat") {
+			if (session.runs.length === 0 && session.title === "New chat") {
 				const normalizedTitle = trimmedMessage.replace(/\s+/g, " ");
 				session.title =
 					normalizedTitle.length <= 60 ? normalizedTitle : `${normalizedTitle.slice(0, 57)}...`;
 			}
 			session.updatedAt = new Date().toISOString();
-			const userMessage: ChatMessage = {
-				id: `preview-user-${nextMessageNumber}`,
-				role: "user",
-				content: trimmedMessage,
-				createdAt: new Date().toISOString(),
-				status: "completed",
-			};
-			nextMessageNumber += 1;
-
-			const assistantMessage: ChatMessage = {
-				id: `preview-assistant-${nextMessageNumber}`,
-				role: "assistant",
-				content: "",
-				createdAt: new Date().toISOString(),
-				status: "streaming",
-			};
-			nextMessageNumber += 1;
-
-			session.messages.push(userMessage, assistantMessage);
-
 			const requestId = `preview-request-${nextRequestNumber}`;
 			nextRequestNumber += 1;
-			schedulePreviewResponse(requestId, session.id, assistantMessage.id, trimmedMessage);
+			const run = createPreviewRun(
+				requestId,
+				session.id,
+				trimmedMessage,
+				buildPreviewResponse(trimmedMessage, defaultModel?.modelId ?? "preview-model"),
+				requireProvider(defaultModel?.providerId ?? ""),
+			);
+			session.runs.push(run);
 
 			return {
 				requestId,
-				userMessage: cloneMessage(userMessage),
-				assistantMessage: cloneMessage(assistantMessage),
+				run: structuredClone(run),
 			};
 		},
 		async cancel(input: { sessionId: string; requestId: string }) {
-			const pending = pendingResponses.get(input.requestId);
-			if (!pending || pending.sessionId !== input.sessionId) {
+			const run = getStoredSession(input.sessionId).runs.find(
+				(candidate) => candidate.id === input.requestId,
+			);
+			if (run === undefined) {
 				throw new Error("The current response can no longer be stopped.");
 			}
-
-			for (const timer of pending.timers) {
-				window.clearTimeout(timer);
-			}
-
-			updateMessage(input.sessionId, pending.messageId, (message) => ({
-				...message,
-				status: "cancelled",
-			}));
-			pendingResponses.delete(input.requestId);
-
-			notify({
-				type: "response.cancelled",
-				sessionId: input.sessionId,
-				requestId: input.requestId,
-				messageId: pending.messageId,
-				content: getStoredMessage(input.sessionId, pending.messageId).content,
-				reason: "Preview response stopped.",
-			});
 		},
 		subscribe(listener: ChatTransportListener) {
 			listeners.add(listener);
@@ -458,7 +324,7 @@ export function createPreviewChatTransport(): ChatTransport {
 }
 
 function toSessionSummary(session: ChatSession): ChatSessionSummary {
-	const lastMessageAt = session.messages.at(-1)?.createdAt;
+	const lastMessageAt = session.runs.at(-1)?.userMessage.createdAt;
 	return {
 		id: session.id,
 		runtimeBoxId: session.runtimeBoxId,
@@ -470,6 +336,146 @@ function toSessionSummary(session: ChatSession): ChatSessionSummary {
 	};
 }
 
+function createPreviewRun(
+	runId: string,
+	sessionId: string,
+	prompt: string,
+	response: string,
+	provider: ProviderSummary,
+): ChatRunSnapshot {
+	const now = new Date().toISOString();
+	const model =
+		provider.models.find((candidate) => candidate.id === defaultModelId(provider)) ??
+		provider.models[0];
+	if (model === undefined) {
+		throw new Error("Preview Provider has no model.");
+	}
+	const turnId = `${runId}-turn-1`;
+	return {
+		schemaVersion: 1,
+		id: runId,
+		sessionId,
+		runtimeBoxId: defaultLocalRuntimeBoxId,
+		mode: "agent",
+		status: "completed",
+		provider: {
+			schemaVersion: 1,
+			providerId: provider.id,
+			name: provider.displayName,
+			source: provider.source,
+			api: model.api,
+			model: model.id,
+			status: "ready",
+		},
+		userMessageId: `${runId}-user`,
+		userMessage: {
+			schemaVersion: 1,
+			id: `${runId}-user`,
+			sessionId,
+			runId,
+			role: "user",
+			content: prompt,
+			createdAt: now,
+		},
+		timeline: [
+			{
+				schemaVersion: 1,
+				id: `${runId}-text-1`,
+				runId,
+				position: 1,
+				assistantTurnId: turnId,
+				kind: "text",
+				status: "completed",
+				content: "I'll inspect the workspace before answering.",
+				revision: 2,
+				createdAt: now,
+				updatedAt: now,
+			},
+			{
+				schemaVersion: 1,
+				id: `${runId}-tool-1`,
+				runId,
+				position: 2,
+				assistantTurnId: turnId,
+				kind: "tool",
+				toolCallId: `${runId}-call-1`,
+				tool: { kind: "builtin", name: "read" },
+				status: "completed",
+				summary: "Read package.json",
+				input: {
+					format: "json",
+					value: { path: "package.json" },
+					truncated: false,
+					redactionCount: 0,
+				},
+				output: {
+					format: "text",
+					value: "Workspace metadata loaded.",
+					truncated: false,
+					redactionCount: 0,
+				},
+				startedAt: now,
+				completedAt: now,
+				durationMs: 24,
+				revision: 3,
+				createdAt: now,
+				updatedAt: now,
+			},
+			{
+				schemaVersion: 1,
+				id: `${runId}-tool-2`,
+				runId,
+				position: 3,
+				assistantTurnId: turnId,
+				kind: "tool",
+				toolCallId: `${runId}-call-2`,
+				tool: { kind: "builtin", name: "grep" },
+				status: "completed",
+				summary: "Search the workspace",
+				input: {
+					format: "json",
+					value: { pattern: prompt.slice(0, 80) },
+					truncated: false,
+					redactionCount: 0,
+				},
+				output: {
+					format: "text",
+					value: "Search completed.",
+					truncated: false,
+					redactionCount: 0,
+				},
+				startedAt: now,
+				completedAt: now,
+				durationMs: 31,
+				revision: 3,
+				createdAt: now,
+				updatedAt: now,
+			},
+			{
+				schemaVersion: 1,
+				id: `${runId}-text-2`,
+				runId,
+				position: 4,
+				assistantTurnId: `${runId}-turn-2`,
+				kind: "text",
+				status: "completed",
+				content: response,
+				revision: 2,
+				createdAt: now,
+				updatedAt: now,
+			},
+		],
+		lastEventSeq: 10,
+		createdAt: now,
+		updatedAt: now,
+		completedAt: now,
+	};
+}
+
+function defaultModelId(provider: ProviderSummary): string | undefined {
+	return provider.models.find((model) => model.enabled)?.id;
+}
+
 function buildPreviewResponse(userPrompt: string, model: string) {
 	return [
 		`Preview assistant (${model}) received your message:`,
@@ -478,17 +484,6 @@ function buildPreviewResponse(userPrompt: string, model: string) {
 		"",
 		"This standalone module only demonstrates provider setup, session bootstrap, streaming text, cancellation, and retry-ready UI states.",
 	].join("\n");
-}
-
-function splitIntoChunks(response: string) {
-	const size = Math.max(18, Math.ceil(response.length / 4));
-	const chunks: string[] = [];
-
-	for (let index = 0; index < response.length; index += size) {
-		chunks.push(response.slice(index, index + size));
-	}
-
-	return chunks.length > 0 ? chunks : [response];
 }
 
 function previewCatalog(api: NonNullable<ProviderSummary["api"]>): ProviderSummary["models"] {

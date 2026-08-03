@@ -17,13 +17,15 @@ import {
 } from "@moshu/agent-runtime";
 import {
 	type ChatRunEvent,
+	type ChatRunSnapshot,
 	type DefaultModelSelection,
 	defaultLocalRuntimeBoxId,
 	maxAppErrorSafeMessageCharacters,
-	maxAssistantMessageContentCharacters,
+	maxChatTextPartContentCharacters,
 	maxProviderCount,
 	maxReplayEventBytesPerPage,
 	maxReplayEventsPerPage,
+	productRpcMaxFrameBytes,
 	type ProviderModel,
 	retiredSessionTombstoneTtlMs,
 } from "@moshu/contracts";
@@ -77,17 +79,17 @@ describe("ChatApplicationService", () => {
 
 			expect(accepted.run.status).toBe("queued");
 			expect(accepted.run.mode).toBe("agent");
-			expect(accepted.assistantMessage.status).toBe("streaming");
+			expect(accepted.run.timeline).toEqual([]);
 			scheduler.runAll();
 			await service.waitForIdle();
 
 			const restored = await service.getSession({ sessionId: session.id });
 			expect(restored.session.title).toBe("Say hello");
-			expect(restored.messages.map((message) => message.content)).toEqual([
+			expect(snapshotMessages(restored).map((message) => message.content)).toEqual([
 				"Say hello",
 				"Hello world",
 			]);
-			expect(restored.messages[1]?.status).toBe("complete");
+			expect(lastTextPart(restored.runs[0])?.status).toBe("completed");
 			expect(restored.runs[0]?.status).toBe("completed");
 			expect(runtime.inputs[0]?.threadId).toBe(session.id);
 			expect(
@@ -98,10 +100,11 @@ describe("ChatApplicationService", () => {
 			).toEqual([{ role: "user", content: "Say hello" }]);
 			expect(publishedEvents.map((event) => event.type)).toEqual([
 				"run.status",
-				"message.started",
 				"run.status",
-				"message.delta",
-				"message.completed",
+				"timeline.part.created",
+				"timeline.text.delta",
+				"timeline.text.delta",
+				"timeline.text.completed",
 				"run.status",
 			]);
 			const eventCount = publishedEvents.length;
@@ -145,13 +148,8 @@ describe("ChatApplicationService", () => {
 				content: "cancel in listener",
 			});
 			expect(database.runs.get(accepted.run.id).status).toBe("cancelled");
-			expect(published.map((event) => event.seq)).toEqual([1, 2, 3, 4]);
-			expect(published.map((event) => event.type)).toEqual([
-				"run.status",
-				"message.started",
-				"message.completed",
-				"run.status",
-			]);
+			expect(published.map((event) => event.seq)).toEqual([1, 2]);
+			expect(published.map((event) => event.type)).toEqual(["run.status", "run.status"]);
 		} finally {
 			await service.shutdown();
 			database.close();
@@ -183,7 +181,7 @@ describe("ChatApplicationService", () => {
 			const accepted = service.sendMessage({ sessionId: session.id, content: "cancel soon" });
 			await cancellation;
 			expect(database.runs.get(accepted.run.id).status).toBe("cancelled");
-			expect(published.map((event) => event.seq)).toEqual([1, 2, 3, 4]);
+			expect(published.map((event) => event.seq)).toEqual([1, 2]);
 		} finally {
 			await service.shutdown();
 			database.close();
@@ -282,11 +280,13 @@ describe("ChatApplicationService", () => {
 
 			const snapshot = await service.getSession({ sessionId: session.id });
 			expect(snapshot.runs[0]?.status).toBe("completed");
-			expect(snapshot.messages.at(-1)?.content).toHaveLength(maxAssistantMessageContentCharacters);
+			expect(snapshotMessages(snapshot).at(-1)?.content).toHaveLength(
+				maxChatTextPartContentCharacters,
+			);
 			expect(
 				database.runs
 					.listEvents({ runId: accepted.run.id })
-					.filter((event) => event.type === "message.delta"),
+					.filter((event) => event.type === "timeline.text.delta"),
 			).toHaveLength(25);
 		} finally {
 			await service.shutdown();
@@ -294,11 +294,11 @@ describe("ChatApplicationService", () => {
 		}
 	});
 
-	test("aggregates 100k token-sized deltas into bounded durable chunks", async () => {
+	test("persists token-sized deltas in exact order", async () => {
 		const database = openAppDatabase(":memory:");
 		const scheduler = new ManualScheduler();
 		const runtime = new FakeAskChatRuntime({
-			deltas: Array.from({ length: 100_000 }, () => "x"),
+			deltas: Array.from({ length: 100 }, () => "x"),
 		});
 		const service = createService(database, runtime, scheduler);
 
@@ -306,14 +306,14 @@ describe("ChatApplicationService", () => {
 			const { session } = service.createSession();
 			const accepted = service.sendMessage({ sessionId: session.id, content: "many tokens" });
 			scheduler.runAll();
-			await withDeadline(service.waitForIdle(), 10_000, "100k delta aggregation");
+			await service.waitForIdle();
 
 			const deltas = database.runs
 				.listEvents({ runId: accepted.run.id })
-				.filter((event) => event.type === "message.delta");
-			expect(deltas).toHaveLength(13);
+				.filter((event) => event.type === "timeline.text.delta");
+			expect(deltas).toHaveLength(100);
 			expect(deltas.every((event) => event.payload.delta.length <= 8_000)).toBe(true);
-			expect(deltas.map((event) => event.payload.delta).join("")).toHaveLength(100_000);
+			expect(deltas.map((event) => event.payload.delta).join("")).toHaveLength(100);
 			expect(database.runs.get(accepted.run.id).status).toBe("completed");
 		} finally {
 			await service.shutdown();
@@ -337,9 +337,9 @@ describe("ChatApplicationService", () => {
 			expect(
 				database.runs
 					.listEvents({ runId: accepted.run.id })
-					.filter((event) => event.type === "message.delta")
-					.map((event) => (event.type === "message.delta" ? event.payload.delta.length : 0)),
-			).toEqual([8_000, 2]);
+					.filter((event) => event.type === "timeline.text.delta")
+					.map((event) => (event.type === "timeline.text.delta" ? event.payload.delta.length : 0)),
+			).toEqual([8_000, 1, 1]);
 		} finally {
 			await service.shutdown();
 			database.close();
@@ -357,7 +357,7 @@ describe("ChatApplicationService", () => {
 			const accepted = service.sendMessage({ sessionId: session.id, content: "cancel reentry" });
 			let cancelled = false;
 			service.subscribe((event) => {
-				if (!cancelled && event.type === "message.delta") {
+				if (!cancelled && event.type === "timeline.text.delta") {
 					cancelled = true;
 					service.cancel({ runId: accepted.run.id, reason: "listener cancellation" });
 				}
@@ -366,14 +366,14 @@ describe("ChatApplicationService", () => {
 			await service.waitForIdle();
 
 			const events = database.runs.listEvents({ runId: accepted.run.id });
-			const terminalIndex = events.findIndex((event) => event.type === "message.completed");
-			expect(events.slice(terminalIndex + 1).some((event) => event.type === "message.delta")).toBe(
-				false,
-			);
+			const terminalIndex = events.findIndex((event) => event.type === "timeline.text.completed");
+			expect(
+				events.slice(terminalIndex + 1).some((event) => event.type === "timeline.text.delta"),
+			).toBe(false);
 			expect(
 				events
-					.filter((event) => event.type === "message.delta")
-					.map((event) => (event.type === "message.delta" ? event.payload.delta.length : 0)),
+					.filter((event) => event.type === "timeline.text.delta")
+					.map((event) => (event.type === "timeline.text.delta" ? event.payload.delta.length : 0)),
 			).toEqual([8_000]);
 			expect(database.runs.get(accepted.run.id).status).toBe("cancelled");
 		} finally {
@@ -382,7 +382,7 @@ describe("ChatApplicationService", () => {
 		}
 	});
 
-	test("flushes a small aggregate promptly and orders reentrant cancellation after it", async () => {
+	test("persists a small delta promptly and orders reentrant cancellation after it", async () => {
 		const database = openAppDatabase(":memory:");
 		const scheduler = new ManualScheduler();
 		const runtime = new FakeAskChatRuntime({ deltas: ["a", "b"], pending: true });
@@ -395,7 +395,7 @@ describe("ChatApplicationService", () => {
 			const deltaPublished = new Promise<void>((resolve) => {
 				service.subscribe((event) => {
 					published.push(event);
-					if (event.type === "message.delta") {
+					if (event.type === "timeline.text.delta") {
 						service.cancel({ runId: accepted.run.id, reason: "reentrant stop" });
 						resolve();
 					}
@@ -406,19 +406,19 @@ describe("ChatApplicationService", () => {
 			await service.waitForIdle();
 
 			const events = database.runs.listEvents({ runId: accepted.run.id });
-			const deltaIndex = events.findIndex((event) => event.type === "message.delta");
-			const terminalIndex = events.findIndex((event) => event.type === "message.completed");
-			expect(events[deltaIndex]?.type === "message.delta" && events[deltaIndex].payload.delta).toBe(
-				"ab",
-			);
+			const deltaIndex = events.findIndex((event) => event.type === "timeline.text.delta");
+			const terminalIndex = events.findIndex((event) => event.type === "timeline.text.completed");
+			expect(
+				events[deltaIndex]?.type === "timeline.text.delta" && events[deltaIndex].payload.delta,
+			).toBe("a");
 			expect(deltaIndex).toBeGreaterThan(-1);
 			expect(terminalIndex).toBeGreaterThan(deltaIndex);
-			expect(events.slice(terminalIndex + 1).some((event) => event.type === "message.delta")).toBe(
-				false,
-			);
-			expect(published.findIndex((event) => event.type === "message.completed")).toBeGreaterThan(
-				published.findIndex((event) => event.type === "message.delta"),
-			);
+			expect(
+				events.slice(terminalIndex + 1).some((event) => event.type === "timeline.text.delta"),
+			).toBe(false);
+			expect(
+				published.findIndex((event) => event.type === "timeline.text.completed"),
+			).toBeGreaterThan(published.findIndex((event) => event.type === "timeline.text.delta"));
 			expect(database.runs.get(accepted.run.id).status).toBe("cancelled");
 		} finally {
 			await service.shutdown();
@@ -426,7 +426,7 @@ describe("ChatApplicationService", () => {
 		}
 	});
 
-	test("forces a pending aggregate durable before an immediate cancellation terminal", async () => {
+	test("persists a pending delta before an immediate cancellation terminal", async () => {
 		const database = openAppDatabase(":memory:");
 		const scheduler = new ManualScheduler();
 		const runtime = new FakeAskChatRuntime({
@@ -444,22 +444,24 @@ describe("ChatApplicationService", () => {
 			await service.waitForIdle();
 
 			const events = database.runs.listEvents({ runId: accepted.run.id });
-			const deltaIndex = events.findIndex((event) => event.type === "message.delta");
-			const terminalIndex = events.findIndex((event) => event.type === "message.completed");
+			const deltaIndex = events.findIndex((event) => event.type === "timeline.text.delta");
+			const terminalIndex = events.findIndex((event) => event.type === "timeline.text.completed");
 			expect(
-				events[deltaIndex]?.type === "message.delta" ? events[deltaIndex].payload.delta : undefined,
+				events[deltaIndex]?.type === "timeline.text.delta"
+					? events[deltaIndex].payload.delta
+					: undefined,
 			).toBe("pending-before-cancel");
 			expect(terminalIndex).toBeGreaterThan(deltaIndex);
-			expect(events.slice(terminalIndex + 1).some((event) => event.type === "message.delta")).toBe(
-				false,
-			);
+			expect(
+				events.slice(terminalIndex + 1).some((event) => event.type === "timeline.text.delta"),
+			).toBe(false);
 		} finally {
 			await service.shutdown();
 			database.close();
 		}
 	});
 
-	test("hydrates snapshots only through their durable cursor boundary", async () => {
+	test("hydrates snapshots through their latest durable revision", async () => {
 		const database = openAppDatabase(":memory:");
 		const scheduler = new ManualScheduler();
 		const runtime = new FakeAskChatRuntime({ deltas: ["pending-delta"], pending: true });
@@ -475,45 +477,26 @@ describe("ChatApplicationService", () => {
 			await runtime.started;
 
 			const beforeFlush = await service.getSessionSnapshot({ sessionId: session.id });
-			const cursor = beforeFlush.eventCursors.find(({ runId }) => runId === accepted.run.id);
-			expect(beforeFlush.messages.at(-1)?.content).toBe("");
-			expect(
-				database.runs
-					.listEvents({ runId: accepted.run.id })
-					.some((event) => event.type === "message.delta"),
-			).toBe(false);
-
-			await waitUntil(
-				() =>
-					database.runs
-						.listEvents({ runId: accepted.run.id })
-						.some((event) => event.type === "message.delta"),
-				250,
-				"coalesced delta persistence",
-			);
+			const cursor = beforeFlush.runs.find((run) => run.id === accepted.run.id);
+			expect(lastTextPart(cursor)?.content).toBe("pending-delta");
 			const replay = service.replayEvents({
 				cursors: [
 					{
 						runId: accepted.run.id,
 						sessionId: session.id,
 						issuedAtMs: beforeFlush.session.updatedAt === undefined ? 0 : Date.now(),
-						lastSeq: cursor?.lastSeq ?? 0,
+						lastSeq: cursor?.lastEventSeq ?? 0,
 					},
 				],
 			});
-			const replayedText = replay.events
-				.filter((event) => event.type === "message.delta")
-				.map((event) => (event.type === "message.delta" ? event.payload.delta : ""))
-				.join("");
-			expect(`${beforeFlush.messages.at(-1)?.content ?? ""}${replayedText}`).toBe("pending-delta");
+			expect(replay.events).toEqual([]);
 			expect(
-				(await service.getSessionSnapshot({ sessionId: session.id })).messages.at(-1)?.content,
+				lastTextPart((await service.getSessionSnapshot({ sessionId: session.id })).runs.at(-1))
+					?.content,
 			).toBe("pending-delta");
-			expect(
-				database.runs
-					.listEvents({ runId: accepted.run.id })
-					.filter((event) => event.type === "message.delta"),
-			).toHaveLength(1);
+			expect(cursor?.lastEventSeq).toBe(
+				database.runs.listEvents({ runId: accepted.run.id }).at(-1)?.seq,
+			);
 			service.cancel({ runId: accepted.run.id });
 			await service.waitForIdle();
 		} finally {
@@ -554,7 +537,7 @@ describe("ChatApplicationService", () => {
 			expect(runtime.cancelAttempts).toContain(accepted.run.id);
 			const restored = await service.getSession({ sessionId: session.id });
 			expect(restored.runs[0]?.status).toBe("failed");
-			expect(restored.messages.at(-1)?.content).toBe("");
+			expect(lastTextPart(restored.runs[0])?.content ?? "").toBe("");
 			expect(restored.runs[0]?.lastError?.safeMessage).toBe("The chat response failed.");
 			expect(JSON.stringify(restored)).not.toContain("unbounded persistence detail");
 		} finally {
@@ -619,7 +602,7 @@ describe("ChatApplicationService", () => {
 				}
 				if (property === "commitTerminal") {
 					return (input: Parameters<RunJournalRepository["commitTerminal"]>[0]) => {
-						if (input.message.status === "failed") {
+						if (input.status === "failed") {
 							failedTerminalAttempts += 1;
 							throw new Error("terminal unavailable");
 						}
@@ -652,7 +635,7 @@ describe("ChatApplicationService", () => {
 
 			restarted = createService(database, new FakeAskChatRuntime({}), new ManualScheduler());
 			const recovered = await restarted.getSession({ sessionId: session.id });
-			expect(recovered.runs[0]?.status).toBe("cancelled");
+			expect(recovered.runs[0]?.status).toBe("failed");
 			expect(
 				restarted.sendMessage({
 					sessionId: session.id,
@@ -733,7 +716,7 @@ describe("ChatApplicationService", () => {
 			await service.shutdown();
 			restarted = createService(database, new FakeAskChatRuntime({}), new ManualScheduler());
 			const recovered = await restarted.getSession({ sessionId: orphaned.sessionId });
-			expect(recovered.runs[0]?.status).toBe("cancelled");
+			expect(recovered.runs[0]?.status).toBe("failed");
 			await restarted.getSession({ sessionId: orphaned.sessionId });
 			const terminalEvents = database.runs
 				.listEventPage({ runId: orphaned.runId, afterSeq: 0, limit: 100 })
@@ -802,25 +785,25 @@ describe("ChatApplicationService", () => {
 			await service.waitForIdle();
 
 			const snapshot = await service.getSession({ sessionId: session.id });
-			const assistant = snapshot.messages.at(-1);
+			const assistant = lastTextPart(snapshot.runs[0]);
 			expect(snapshot.runs[0]?.status).toBe("failed");
 			expect(snapshot.runs[0]?.lastError?.code).toBe("CHAT_OUTPUT_LIMIT_EXCEEDED");
-			expect(assistant?.content).toHaveLength(maxAssistantMessageContentCharacters);
+			expect(assistant?.content).toHaveLength(maxChatTextPartContentCharacters);
 			expect(runtime.cancelAttempts).toContain(accepted.run.id);
 			const deltas = database.runs
 				.listEvents({ runId: accepted.run.id })
-				.filter((event) => event.type === "message.delta");
+				.filter((event) => event.type === "timeline.text.delta");
 			expect(
 				deltas.reduce(
 					(length, event) =>
-						event.type === "message.delta" ? length + event.payload.delta.length : length,
+						event.type === "timeline.text.delta" ? length + event.payload.delta.length : length,
 					0,
 				),
-			).toBe(maxAssistantMessageContentCharacters);
+			).toBe(maxChatTextPartContentCharacters);
 			expect(
 				deltas.some(
 					(event) =>
-						event.type === "message.delta" &&
+						event.type === "timeline.text.delta" &&
 						(event.payload.delta === "yz" || event.payload.delta === "late-output"),
 				),
 			).toBe(false);
@@ -830,8 +813,8 @@ describe("ChatApplicationService", () => {
 				content: "overflow",
 			});
 			expect(retry.run.id).toBe(accepted.run.id);
-			expect(retry.assistantMessage.status).toBe("failed");
-			expect(retry.assistantMessage.content).toHaveLength(maxAssistantMessageContentCharacters);
+			expect(retry.run.status).toBe("failed");
+			expect(lastTextPart(retry.run)?.content).toHaveLength(maxChatTextPartContentCharacters);
 		} finally {
 			await service.shutdown();
 			database.close();
@@ -842,7 +825,7 @@ describe("ChatApplicationService", () => {
 		const database = openAppDatabase(":memory:");
 		const scheduler = new ManualScheduler();
 		const runtime = new FakeAskChatRuntime({
-			resultText: "z".repeat(maxAssistantMessageContentCharacters + 1),
+			resultText: "z".repeat(maxChatTextPartContentCharacters + 1),
 		});
 		const service = createService(database, runtime, scheduler);
 
@@ -855,7 +838,9 @@ describe("ChatApplicationService", () => {
 			const snapshot = await service.getSession({ sessionId: session.id });
 			expect(snapshot.runs[0]?.status).toBe("failed");
 			expect(snapshot.runs[0]?.lastError?.code).toBe("CHAT_OUTPUT_LIMIT_EXCEEDED");
-			expect(snapshot.messages.at(-1)?.content).toHaveLength(maxAssistantMessageContentCharacters);
+			expect(lastTextPart(snapshot.runs[0])?.content).toHaveLength(
+				maxChatTextPartContentCharacters,
+			);
 		} finally {
 			await service.shutdown();
 			database.close();
@@ -1190,11 +1175,9 @@ describe("ChatApplicationService", () => {
 			await service.waitForIdle();
 
 			const snapshot = await service.getSession({ sessionId: session.id });
-			expect(snapshot.messages.map((message) => message.content)).toEqual([
+			expect(snapshotMessages(snapshot).map((message) => message.content)).toEqual([
 				"durable before execution",
-				"",
 			]);
-			expect(snapshot.messages.at(-1)?.status).toBe("failed");
 			expect(snapshot.runs.find((run) => run.id === accepted.run.id)?.status).toBe("failed");
 			expect(runtime.inputs).toEqual([]);
 		} finally {
@@ -1243,8 +1226,8 @@ describe("ChatApplicationService", () => {
 				content: "send once",
 			});
 			expect(terminalRetry.run.id).toBe(first.run.id);
-			expect(terminalRetry.assistantMessage.status).toBe("complete");
-			expect(terminalRetry.assistantMessage.content).toBe("answer");
+			expect(lastTextPart(terminalRetry.run)?.status).toBe("completed");
+			expect(lastTextPart(terminalRetry.run)?.content).toBe("answer");
 		} finally {
 			await service.shutdown();
 			database.close();
@@ -1278,7 +1261,7 @@ describe("ChatApplicationService", () => {
 				content: "durable replay",
 			});
 			expect(activeRetry.run.id).toBe(first.run.id);
-			expect(activeRetry.assistantMessage.status).toBe("streaming");
+			expect(activeRetry.run.status).toBe("queued");
 			expect(() =>
 				service.sendMessage({
 					requestId,
@@ -1311,7 +1294,7 @@ describe("ChatApplicationService", () => {
 				content: "durable replay",
 			});
 			expect(terminalRetry.run.id).toBe(first.run.id);
-			expect(terminalRetry.assistantMessage.status).toBe("complete");
+			expect(lastTextPart(terminalRetry.run)?.status).toBe("completed");
 		} finally {
 			await service.shutdown();
 			database.close();
@@ -1353,6 +1336,80 @@ describe("ChatApplicationService", () => {
 		}
 	});
 
+	test("pages Session snapshots by encoded byte size before the Product RPC frame limit", async () => {
+		const database = openAppDatabase(":memory:");
+		const service = createService(
+			database,
+			new FakeAskChatRuntime({ deltas: ["unused"] }),
+			new ManualScheduler(),
+		);
+
+		try {
+			const { session } = service.createSession();
+			const runIds: string[] = [];
+			for (let runIndex = 0; runIndex < 2; runIndex += 1) {
+				const run = database.runs.create({
+					clientRequestId: crypto.randomUUID(),
+					sessionId: session.id,
+					mode: "agent",
+					provider: {
+						schemaVersion: 1,
+						providerId: createUuidV7(),
+						name: "Provider",
+						source: "custom",
+						api: "openai-responses",
+						model: "model",
+					},
+					userMessageId: createUuidV7(),
+					userContent: `large-${runIndex}`,
+				}).run;
+				runIds.push(run.id);
+				const assistantTurnId = createUuidV7();
+				for (let partIndex = 0; partIndex < 11; partIndex += 1) {
+					const now = new Date().toISOString();
+					database.runs.appendEvent({
+						runId: run.id,
+						type: "timeline.part.created",
+						source: { kind: "assistant" },
+						payload: {
+							part: {
+								schemaVersion: 1,
+								id: createUuidV7(),
+								runId: run.id,
+								position: partIndex + 1,
+								assistantTurnId,
+								revision: 1,
+								createdAt: now,
+								updatedAt: now,
+								kind: "text",
+								status: "completed",
+								content: "x".repeat(maxChatTextPartContentCharacters),
+							},
+						},
+					});
+				}
+			}
+
+			const first = await service.getSessionPage({ sessionId: session.id, limit: 2 });
+			expect(first.runs).toHaveLength(1);
+			expect(first.nextCursor).toBeDefined();
+			expect(new TextEncoder().encode(JSON.stringify(first)).byteLength).toBeLessThan(
+				productRpcMaxFrameBytes,
+			);
+			const second = await service.getSessionPage({
+				sessionId: session.id,
+				limit: 2,
+				cursor: first.nextCursor,
+			});
+			expect(second.runs).toHaveLength(1);
+			expect(second.nextCursor).toBeUndefined();
+			expect([...first.runs, ...second.runs].map((run) => run.id)).toEqual(runIds);
+		} finally {
+			await service.shutdown();
+			database.close();
+		}
+	});
+
 	test("replays one SQL-backed event page without loading the remaining journal", async () => {
 		const database = openAppDatabase(":memory:");
 		const scheduler = new ManualScheduler();
@@ -1360,18 +1417,18 @@ describe("ChatApplicationService", () => {
 		for (let index = 0; index < maxReplayEventsPerPage + 10; index += 1) {
 			database.runs.appendEvent({
 				runId: orphaned.runId,
-				type: "message.delta",
+				type: "timeline.text.delta",
 				source: { kind: "assistant" },
-				payload: { messageId: orphaned.assistantMessageId, delta: "x" },
+				payload: {
+					partId: orphaned.textPartId,
+					revision: index + 2,
+					delta: "x",
+				},
 			});
 		}
 		database.runs.commitTerminal({
 			runId: orphaned.runId,
-			message: {
-				messageId: orphaned.assistantMessageId,
-				status: "complete",
-				content: "x".repeat(maxReplayEventsPerPage + 10),
-			},
+			status: "completed",
 		});
 		const pageInputs: Array<{ runId: string; afterSeq?: number; limit: number }> = [];
 		const runs: RunJournalRepository = new Proxy(database.runs, {
@@ -1429,21 +1486,50 @@ describe("ChatApplicationService", () => {
 	test("bounds replay pages by encoded bytes while always advancing", async () => {
 		const database = openAppDatabase(":memory:");
 		const orphaned = createOrphanedRun(database, "running");
-		for (let index = 0; index < 100; index += 1) {
+		const toolPartId = createUuidV7();
+		const now = new Date().toISOString();
+		database.runs.appendEvent({
+			runId: orphaned.runId,
+			type: "timeline.part.created",
+			source: { kind: "assistant" },
+			payload: {
+				part: {
+					schemaVersion: 1,
+					id: toolPartId,
+					runId: orphaned.runId,
+					position: 2,
+					assistantTurnId: createUuidV7(),
+					revision: 1,
+					kind: "tool",
+					toolCallId: "replay-size-tool",
+					tool: { kind: "builtin", name: "bash" },
+					status: "running",
+					summary: "Generate replay payload",
+					createdAt: now,
+					updatedAt: now,
+				},
+			},
+		});
+		for (let index = 0; index < 70; index += 1) {
 			database.runs.appendEvent({
 				runId: orphaned.runId,
-				type: "message.delta",
+				type: "timeline.tool.progress",
 				source: { kind: "assistant" },
-				payload: { messageId: orphaned.assistantMessageId, delta: "\0".repeat(8_000) },
+				payload: {
+					partId: toolPartId,
+					revision: index + 2,
+					progress: {
+						format: "text",
+						value: "x".repeat(32_000),
+						truncated: false,
+						redactionCount: 0,
+					},
+				},
 			});
 		}
 		database.runs.commitTerminal({
 			runId: orphaned.runId,
-			message: {
-				messageId: orphaned.assistantMessageId,
-				status: "complete",
-				content: "x",
-			},
+			status: "completed",
 		});
 		const service = createService(database, new FakeAskChatRuntime({}), new ManualScheduler());
 
@@ -1539,7 +1625,7 @@ describe("ChatApplicationService", () => {
 			await service.waitForIdle();
 
 			const restored = await service.getSession({ sessionId: session.id });
-			expect(restored.messages[1]?.status).toBe("cancelled");
+			expect(lastTextPart(restored.runs[0])?.status).toBe("interrupted");
 			expect(restored.runs[0]?.status).toBe("cancelled");
 			expect(runtime.cancelledRunIds).toEqual([accepted.run.id]);
 		} finally {
@@ -1558,14 +1644,22 @@ describe("ChatApplicationService", () => {
 		});
 		const runtime: AskChatRuntime = {
 			async run(input) {
+				await input.onEvent?.({
+					type: "assistant.text.started",
+					runId: input.runId,
+					turnIndex: 0,
+					contentIndex: 0,
+				});
 				for (let index = 0; index < 500; index += 1) {
 					if (input.signal?.aborted) {
 						throw new AskChatCancelledError(input.runId, "signal aborted");
 					}
 					consumed += 1;
 					await input.onEvent?.({
-						type: "message.delta",
+						type: "assistant.text.delta",
 						runId: input.runId,
+						turnIndex: 0,
+						contentIndex: 0,
 						delta: "x",
 					});
 					if (index === 0) {
@@ -1634,12 +1728,8 @@ describe("ChatApplicationService", () => {
 			await service.waitForIdle();
 
 			const restored = await service.getSession({ sessionId: session.id });
-			const assistant = restored.messages[1];
-			expect(assistant?.status).toBe("failed");
-			if (assistant?.status !== "failed") {
-				throw new Error("Expected a failed assistant message.");
-			}
-			expect(assistant.error.safeMessage).toBe("Provider authentication failed.");
+			expect(restored.runs[0]?.status).toBe("failed");
+			expect(restored.runs[0]?.lastError?.safeMessage).toBe("Provider authentication failed.");
 			expect(JSON.stringify(restored)).not.toContain("sk-test-secret");
 		} finally {
 			await service.shutdown();
@@ -1689,7 +1779,7 @@ describe("ChatApplicationService", () => {
 				sessionId: session.id,
 				content: "normalize error",
 			});
-			expect(retry.assistantMessage.status).toBe("failed");
+			expect(retry.run.status).toBe("failed");
 			expect(JSON.stringify(retry).length).toBeLessThan(1_000_000);
 			const replay = service.replayEvents({
 				cursors: [
@@ -1756,7 +1846,7 @@ describe("ChatApplicationService", () => {
 			get(target, property) {
 				if (property === "commitTerminal") {
 					return (input: Parameters<RunJournalRepository["commitTerminal"]>[0]) => {
-						if (input.message.status === "failed" && failedCommitAttempts === 0) {
+						if (input.status === "failed" && failedCommitAttempts === 0) {
 							failedCommitAttempts += 1;
 							throw new Error("primary terminal serialization failed");
 						}
@@ -2041,7 +2131,6 @@ describe("ChatApplicationService", () => {
 				},
 				userMessageId: createUuidV7(),
 				userContent: "Do not expose this",
-				assistantMessageId: createUuidV7(),
 				projectContext: {
 					projectId: project.id,
 					runtimeBoxId: project.runtimeBoxId,
@@ -2892,7 +2981,7 @@ describe("ChatApplicationService", () => {
 
 		try {
 			service.subscribe((event) => {
-				if (event.runId === orphaned.runId && event.type === "message.completed") {
+				if (event.runId === orphaned.runId && event.type === "timeline.text.completed") {
 					try {
 						service.sendMessage({
 							sessionId: orphaned.sessionId,
@@ -2930,7 +3019,7 @@ describe("ChatApplicationService", () => {
 
 		try {
 			service.subscribe((event) => {
-				if (event.runId === orphaned.runId && event.type === "message.completed") {
+				if (event.runId === orphaned.runId && event.type === "timeline.text.completed") {
 					reentrant = Promise.resolve().then(() => {
 						try {
 							return service.sendMessage({
@@ -3008,8 +3097,9 @@ describe("ChatApplicationService", () => {
 		try {
 			expect(service.cancel({ runId: cancelling.runId }).run.status).toBe("cancelled");
 			expect(
-				(await service.getSession({ sessionId: cancelling.sessionId })).messages.at(-1)?.status,
-			).toBe("cancelled");
+				lastTextPart((await service.getSession({ sessionId: cancelling.sessionId })).runs[0])
+					?.status,
+			).toBe("interrupted");
 
 			expect(
 				service.setSessionArchived({
@@ -3020,8 +3110,8 @@ describe("ChatApplicationService", () => {
 			const recovered = await service.getSession({
 				sessionId: running.sessionId,
 			});
-			expect(recovered.runs[0]?.status).toBe("cancelled");
-			expect(recovered.messages.at(-1)?.status).toBe("cancelled");
+			expect(recovered.runs[0]?.status).toBe("failed");
+			expect(lastTextPart(recovered.runs[0])?.status).toBe("interrupted");
 
 			await service.deleteSession({ sessionId: deleting.sessionId });
 			await expect(service.getSession({ sessionId: deleting.sessionId })).rejects.toThrow();
@@ -3030,7 +3120,7 @@ describe("ChatApplicationService", () => {
 				sessionId: sending.sessionId,
 				content: "Recovered question",
 			});
-			expect(database.runs.get(sending.runId).status).toBe("cancelled");
+			expect(database.runs.get(sending.runId).status).toBe("failed");
 			expect(accepted.run.status).toBe("queued");
 			service.cancel({ runId: accepted.run.id });
 
@@ -3045,36 +3135,15 @@ describe("ChatApplicationService", () => {
 					},
 				],
 			});
-			expect(replay.events.some((event) => event.type === "message.completed")).toBe(true);
-			expect(database.runs.get(replaying.runId).status).toBe("cancelled");
-
-			const oversized = createOrphanedRun(database, "running");
-			for (let index = 0; index < 26; index += 1) {
-				database.runs.appendEvent({
-					runId: oversized.runId,
-					type: "message.delta",
-					source: { kind: "assistant" },
-					payload: {
-						messageId: oversized.assistantMessageId,
-						delta: "x".repeat(8_000),
-					},
-				});
-			}
-			const oversizedRecovery = await service.getSession({
-				sessionId: oversized.sessionId,
-			});
-			expect(oversizedRecovery.runs[0]?.status).toBe("failed");
-			expect(oversizedRecovery.runs[0]?.lastError?.code).toBe("CHAT_OUTPUT_LIMIT_EXCEEDED");
-			expect(oversizedRecovery.messages.at(-1)?.content).toHaveLength(
-				maxAssistantMessageContentCharacters,
-			);
+			expect(replay.events.some((event) => event.type === "timeline.text.completed")).toBe(true);
+			expect(database.runs.get(replaying.runId).status).toBe("failed");
 		} finally {
 			await service.shutdown();
 			database.close();
 		}
 	});
 
-	test("recovers a 100k-row legacy delta journal with bounded forward paging", async () => {
+	test("recovers a 100k-row timeline journal with bounded forward paging", async () => {
 		const database = openAppDatabase(":memory:");
 		const scheduler = new ManualScheduler();
 		const orphaned = createOrphanedRun(database, "running");
@@ -3096,15 +3165,31 @@ describe("ChatApplicationService", () => {
 			expect(performance.now() - startedAt).toBeLessThan(10_000);
 			expect(replay.events).toHaveLength(maxReplayEventsPerPage);
 			expect(replay.hasMore).toBe(true);
-			expect(database.runs.get(orphaned.runId).status).toBe("cancelled");
+			expect(database.runs.get(orphaned.runId).status).toBe("failed");
 			const snapshot = await service.getSession({ sessionId: orphaned.sessionId });
-			expect(snapshot.messages.at(-1)?.content).toHaveLength(100_000);
+			expect(lastTextPart(snapshot.runs[0])?.content).toHaveLength(100_000);
 		} finally {
 			await service.shutdown();
 			database.close();
 		}
 	});
 });
+
+function snapshotMessages(snapshot: { runs: readonly ChatRunSnapshot[] }): Array<{
+	role: "user" | "assistant";
+	content: string;
+}> {
+	return snapshot.runs.flatMap((run) => [
+		{ role: "user" as const, content: run.userMessage.content },
+		...run.timeline
+			.filter((part) => part.kind === "text")
+			.map((part) => ({ role: "assistant" as const, content: part.content })),
+	]);
+}
+
+function lastTextPart(run: ChatRunSnapshot | undefined) {
+	return run?.timeline.filter((part) => part.kind === "text").at(-1);
+}
 
 function createOrphanedRun(
 	database: ReturnType<typeof openAppDatabase>,
@@ -3125,20 +3210,37 @@ function createOrphanedRun(
 		},
 		userMessageId: createUuidV7(),
 		userContent: "Interrupted prompt",
-		assistantMessageId: createUuidV7(),
 	});
 	database.runs.updateStatus({ runId: created.run.id, status: "running" });
+	const textPartId = createUuidV7();
+	const now = new Date().toISOString();
+	database.runs.appendEvent({
+		runId: created.run.id,
+		type: "timeline.part.created",
+		source: { kind: "assistant" },
+		payload: {
+			part: {
+				schemaVersion: 1,
+				id: textPartId,
+				runId: created.run.id,
+				position: 1,
+				assistantTurnId: createUuidV7(),
+				revision: 1,
+				kind: "text",
+				status: "streaming",
+				content: "",
+				createdAt: now,
+				updatedAt: now,
+			},
+		},
+	});
 	if (status === "cancelling") {
 		database.runs.updateStatus({ runId: created.run.id, status: "cancelling" });
-	}
-	const assistantMessageId = created.run.assistantMessageId;
-	if (assistantMessageId === undefined) {
-		throw new Error("Expected orphaned Run assistant message ID.");
 	}
 	return {
 		sessionId: session.id,
 		runId: created.run.id,
-		assistantMessageId,
+		textPartId,
 	};
 }
 
@@ -3149,10 +3251,6 @@ function insertSmallDeltaFixture(
 ): void {
 	const firstSeq = 4;
 	const lastSeq = firstSeq + count - 1;
-	const payloadJson = JSON.stringify({
-		messageId: run.assistantMessageId,
-		delta: "x",
-	});
 	database.client
 		.query(
 			`WITH RECURSIVE fixture(seq) AS (
@@ -3169,11 +3267,15 @@ function insertSmallDeltaFixture(
 				$runId,
 				$sessionId,
 				seq,
-				'message.delta',
+				'timeline.text.delta',
 				'assistant',
 				NULL,
 				'user',
-				$payloadJson,
+				json_object(
+					'partId', $partId,
+					'revision', seq - 2,
+					'delta', 'x'
+				),
 				$createdAtMs
 			FROM fixture`,
 		)
@@ -3182,8 +3284,24 @@ function insertSmallDeltaFixture(
 			lastSeq,
 			runId: run.runId,
 			sessionId: run.sessionId,
-			payloadJson,
+			partId: run.textPartId,
 			createdAtMs: Date.now(),
+		});
+	database.client
+		.query(
+			`UPDATE chat_run_parts
+			 SET revision = $revision,
+			     text_content = $content,
+			     last_event_seq = $lastEventSeq,
+			     updated_at_ms = $updatedAtMs
+			 WHERE id = $partId`,
+		)
+		.run({
+			revision: count + 1,
+			content: "x".repeat(count),
+			lastEventSeq: lastSeq,
+			updatedAtMs: Date.now(),
+			partId: run.textPartId,
 		});
 }
 
@@ -3491,7 +3609,7 @@ class FakeAskChatRuntime implements AskChatRuntime {
 		| undefined;
 	#deleteThreadFailuresRemaining: number | undefined;
 	readonly #error: unknown;
-	readonly #pendingRuns = new Map<string, { reject(error: AskChatCancelledError): void }>();
+	readonly #pendingRuns = new Map<string, { resolve(result: AskChatRunResult): void }>();
 	readonly #threadMessages = new Map<string, AskChatMessage[]>();
 	#resolveStarted: () => void = () => {};
 
@@ -3522,7 +3640,6 @@ class FakeAskChatRuntime implements AskChatRuntime {
 
 	async run(input: AskChatRunInput): Promise<AskChatRunResult> {
 		this.inputs.push(input);
-		this.#resolveStarted();
 		const threadId = input.threadId ?? input.runId;
 		const messages = this.#threadMessages.get(threadId) ?? [];
 		messages.push(...input.messages.map((message) => ({ ...message })));
@@ -3532,11 +3649,19 @@ class FakeAskChatRuntime implements AskChatRuntime {
 			throw this.#error;
 		}
 
+		await input.onEvent?.({
+			type: "assistant.text.started",
+			runId: input.runId,
+			turnIndex: 1,
+			contentIndex: 0,
+		});
 		for (const delta of this.#deltas) {
 			try {
 				await input.onEvent?.({
-					type: "message.delta",
+					type: "assistant.text.delta",
 					runId: input.runId,
+					turnIndex: 1,
+					contentIndex: 0,
 					delta,
 				});
 			} catch (error) {
@@ -3546,11 +3671,20 @@ class FakeAskChatRuntime implements AskChatRuntime {
 			}
 		}
 		if (this.#pending) {
-			return new Promise<AskChatRunResult>((_resolve, reject) => {
-				this.#pendingRuns.set(input.runId, { reject });
+			return new Promise<AskChatRunResult>((resolve) => {
+				this.#pendingRuns.set(input.runId, { resolve });
+				this.#resolveStarted();
 			});
 		}
+		this.#resolveStarted();
 		const text = this.#resultText ?? this.#deltas.join("");
+		await input.onEvent?.({
+			type: "assistant.text.completed",
+			runId: input.runId,
+			turnIndex: 1,
+			contentIndex: 0,
+			content: text,
+		});
 		messages.push({ role: "assistant", content: text });
 
 		return {
@@ -3563,7 +3697,7 @@ class FakeAskChatRuntime implements AskChatRuntime {
 		throw new Error("FakeAskChatRuntime.stream is not used by ChatApplicationService.");
 	}
 
-	cancel(runId: string, reason?: string): boolean {
+	cancel(runId: string, _reason?: string): boolean {
 		this.cancelAttempts.push(runId);
 		const pending = this.#pendingRuns.get(runId);
 		if (pending === undefined) {
@@ -3572,7 +3706,7 @@ class FakeAskChatRuntime implements AskChatRuntime {
 
 		this.cancelledRunIds.push(runId);
 		this.#pendingRuns.delete(runId);
-		pending.reject(new AskChatCancelledError(runId, reason));
+		pending.resolve({ runId, text: "" });
 		return true;
 	}
 

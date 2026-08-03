@@ -18,6 +18,7 @@
 | [MCP 双归属接入](./mcp-integration.md) | Server-owned/Box-owned MCP 的所有权、生命周期和调用链 |
 | [Skill 双归属管理](./skill-integration.md) | prompt-only Server Skill 与完整 Box Skill package |
 | [质量与发布](./quality-release.md) | 跨角色测试、故障恢复、安全、打包和发布门槛 |
+| [已批准技术设计](../design/README.md) | 尚未实现的目标技术设计；不得当作当前代码事实 |
 | [Remote Runtime Box 指南](../guides/remote-runtime-box.md) | 终端用户配对、安装、验证、排障和解除绑定 |
 
 产品需求和路线图描述“要做什么”；本目录描述“当前系统如何工作”。当前实现证据只写入

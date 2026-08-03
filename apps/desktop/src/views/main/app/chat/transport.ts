@@ -1,5 +1,7 @@
 import type {
 	AvailableModel,
+	ChatRunEvent,
+	ChatRunSnapshot,
 	CreateProviderInput,
 	DefaultModelSelection,
 	ProviderAuthAttempt,
@@ -13,11 +15,10 @@ import type {
 
 export const DEFAULT_PROVIDER_ENDPOINT = "https://api.openai.com/v1";
 
-export type ChatRole = "user" | "assistant";
-export type ChatMessageStatus = "streaming" | "completed" | "cancelled" | "error";
-
 export type {
 	AvailableModel,
+	ChatRunEvent,
+	ChatRunSnapshot,
 	CreateProviderInput,
 	DefaultModelSelection,
 	ProviderSummary,
@@ -31,15 +32,6 @@ export interface ProviderConnectionTestResult {
 	errorMessage?: string;
 }
 
-export interface ChatMessage {
-	id: string;
-	role: ChatRole;
-	content: string;
-	createdAt: string;
-	status?: ChatMessageStatus;
-	errorMessage?: string;
-}
-
 export interface ChatSession {
 	id: string;
 	runtimeBoxId: string;
@@ -49,11 +41,9 @@ export interface ChatSession {
 	archivedAt?: string;
 	model?: SessionModelSelection;
 	askMode: string;
-	messages: ChatMessage[];
-	eventCursors?: Record<string, number>;
+	runs: ChatRunSnapshot[];
 	activeResponse?: {
 		requestId: string;
-		messageId: string;
 	};
 }
 
@@ -78,53 +68,12 @@ export interface ListChatSessionsOptions {
 
 export interface ChatSendResult {
 	requestId: string;
-	userMessage: ChatMessage;
-	assistantMessage: ChatMessage;
+	run: ChatRunSnapshot;
 }
 
-export type ChatTransportEvent =
-	| {
-			type: "response.delta";
-			sessionId: string;
-			requestId: string;
-			messageId: string;
-			delta: string;
-			sequence?: number;
-	  }
-	| {
-			type: "response.completed";
-			sessionId: string;
-			requestId: string;
-			messageId: string;
-			content: string;
-			sequence?: number;
-	  }
-	| {
-			type: "response.cancelled";
-			sessionId: string;
-			requestId: string;
-			messageId: string;
-			content?: string;
-			reason?: string;
-			sequence?: number;
-	  }
-	| {
-			type: "response.error";
-			sessionId: string;
-			requestId: string;
-			messageId: string;
-			content: string;
-			message: string;
-			sequence?: number;
-	  }
-	| {
-			type: "run.warning";
-			sessionId: string;
-			requestId: string;
-			code: "ROOT_AGENTS_SKIPPED";
-			reason: "not_regular_file" | "permission_denied" | "too_large" | "invalid_utf8" | "unknown";
-			sequence?: number;
-	  };
+export type ChatTransportEvent = ChatRunEvent & {
+	clientRequestId?: string;
+};
 
 export type ChatTransportListener = (event: ChatTransportEvent) => void;
 export interface ChatSessionInvalidation {

@@ -1,5 +1,5 @@
 import { z } from "zod";
-import { isoDateTimeSchema, uuidV7Schema } from "./contract-primitives";
+import { isoDateTimeSchema, toolCallIdSchema, uuidV7Schema } from "./contract-primitives";
 
 // ---------------------------------------------------------------------------
 // Durable Tool/Action approval domain contracts.
@@ -117,7 +117,7 @@ export const approvalRequestSchema = z
 		sessionId: uuidV7Schema,
 		runId: uuidV7Schema,
 		actionId: z.string().uuid(),
-		toolCallId: z.string().min(1).max(256),
+		toolCallId: toolCallIdSchema,
 		action: approvalActionSummarySchema,
 		risk: actionRiskSchema,
 		state: approvalStateSchema,
@@ -228,8 +228,24 @@ export const updateSessionApprovalPolicyInputSchema = z
 		allowAll: z.boolean(),
 		expectedRevision: z.number().int().nonnegative(),
 		idempotencyKey: z.string().uuid(),
+		approveRequest: z
+			.object({
+				approvalId: z.string().uuid(),
+				expectedRevision: z.number().int().min(1),
+			})
+			.strict()
+			.optional(),
 	})
-	.strict();
+	.strict()
+	.superRefine((value, context) => {
+		if (!value.allowAll && value.approveRequest !== undefined) {
+			context.addIssue({
+				code: "custom",
+				path: ["approveRequest"],
+				message: "A current approval can only be approved while enabling Allow all.",
+			});
+		}
+	});
 export type UpdateSessionApprovalPolicyInput = z.infer<
 	typeof updateSessionApprovalPolicyInputSchema
 >;
@@ -238,6 +254,7 @@ export const updateSessionApprovalPolicyOutputSchema = z
 	.object({
 		schemaVersion: z.literal(1),
 		policy: sessionApprovalPolicySchema,
+		request: approvalRequestSchema.optional(),
 	})
 	.strict();
 export type UpdateSessionApprovalPolicyOutput = z.infer<

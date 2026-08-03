@@ -62,11 +62,11 @@ function createEvent(
 		runId: overrides.runId ?? runA,
 		sessionId: overrides.sessionId ?? sessionA,
 		seq: overrides.seq ?? 1,
-		type: "message.delta",
+		type: "timeline.text.delta",
 		source: { kind: "assistant" },
 		visibility: "user",
 		createdAt,
-		payload: { messageId, delta: "chunk" },
+		payload: { partId: messageId, revision: 2, delta: "chunk" },
 	};
 }
 

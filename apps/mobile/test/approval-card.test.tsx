@@ -66,7 +66,10 @@ describe("ApprovalCard security", () => {
 	});
 
 	it("decides with the observed revision and a fresh idempotency key (CAS)", async () => {
-		decideApproval.mockResolvedValue({ outcome: "applied", request: bashApproval({ state: "approved" }) });
+		decideApproval.mockResolvedValue({
+			outcome: "applied",
+			request: bashApproval({ state: "approved" }),
+		});
 		renderCard(bashApproval());
 		await userEvent.click(screen.getByRole("button", { name: "Approve once" }));
 
@@ -105,18 +108,27 @@ describe("ApprovalCard security", () => {
 		expect(refreshApprovals).toHaveBeenCalled();
 	});
 
-	it("enables Session Allow-all via the policy update with its own revision", async () => {
-		updateSessionApprovalPolicy.mockResolvedValue({});
-		renderCard(bashApproval());
+	it("enables Session Allow-all and approves the current request atomically", async () => {
+		const request = bashApproval();
+		updateSessionApprovalPolicy.mockResolvedValue({
+			request: bashApproval({ state: "approved", revision: 4 }),
+		});
+		renderCard(request);
 		await userEvent.click(screen.getByRole("button", { name: "Allow all for this session" }));
 		expect(updateSessionApprovalPolicy).toHaveBeenCalledTimes(1);
 		const args = updateSessionApprovalPolicy.mock.calls[0]?.[0] as {
 			allowAll: boolean;
 			expectedRevision: number;
 			sessionId: string;
+			approveRequest: { approvalId: string; expectedRevision: number };
 		};
 		expect(args.allowAll).toBe(true);
 		expect(args.expectedRevision).toBe(0);
 		expect(args.sessionId).toBe("00000000-0000-7000-8000-000000000001");
+		expect(args.approveRequest).toEqual({
+			approvalId: request.id,
+			expectedRevision: request.revision,
+		});
+		expect(await screen.findByText(/approved/)).toBeInTheDocument();
 	});
 });

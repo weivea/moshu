@@ -47,6 +47,10 @@ import {
 } from "./remote-access-repository";
 import { createRunJournalRepository, type RunJournalRepository } from "./run-journal-repository";
 import {
+	type RunTimelineOutboxRepository,
+	SqliteRunTimelineOutboxRepository,
+} from "./run-timeline-outbox-repository";
+import {
 	type RuntimeBoxInventoryRepository,
 	SqliteRuntimeBoxInventoryRepository,
 } from "./runtime-box-inventory-repository";
@@ -69,6 +73,7 @@ export interface AppDatabase {
 	orm: AppDrizzleDatabase;
 	sessions: SessionRepository;
 	runs: RunJournalRepository;
+	runTimelineOutbox: RunTimelineOutboxRepository;
 	actions: ActionRepository;
 	approvals: ApprovalRepository;
 	runtimeBoxes: RuntimeBoxRepository;
@@ -185,6 +190,8 @@ export function openAppDatabase(
 	// One outbox instance shared by the approval and Run repositories so their business writes and the
 	// Mobile attention enqueue land in the same SQLite transaction (single synchronous connection).
 	const mobileAttentionOutbox = new SqliteMobileAttentionOutboxRepository(orm);
+	const runTimelineOutbox = new SqliteRunTimelineOutboxRepository(orm);
+	const runs = createRunJournalRepository({ client, orm, attentionOutbox: mobileAttentionOutbox });
 	return {
 		client,
 		orm,
@@ -205,11 +212,17 @@ export function openAppDatabase(
 		mobileDevices: new SqliteMobileDeviceRepository(orm),
 		mobileAttention: new SqliteMobileAttentionRepository(orm),
 		mobileAttentionOutbox,
+		runTimelineOutbox,
 		remoteAccess: new SqliteRemoteAccessRepository(orm),
 		sessions: createSessionRepository({ orm, runtimeBoxes, projects }),
-		runs: createRunJournalRepository({ client, orm, attentionOutbox: mobileAttentionOutbox }),
-		actions: new SqliteActionRepository(orm),
-		approvals: new SqliteApprovalRepository(orm, { now: Date.now }, mobileAttentionOutbox),
+		runs,
+		actions: new SqliteActionRepository(orm, { now: Date.now }, runTimelineOutbox),
+		approvals: new SqliteApprovalRepository(
+			orm,
+			{ now: Date.now },
+			mobileAttentionOutbox,
+			runTimelineOutbox,
+		),
 		close: () => client.close(),
 	};
 }

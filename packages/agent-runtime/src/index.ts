@@ -10,3 +10,4 @@ export * from "./provider-registry";
 export * from "./runtime-probe";
 export * from "./secret-vault-credential-store";
 export * from "./service";
+export * from "./tool-public-projection";

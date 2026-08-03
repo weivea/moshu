@@ -7,11 +7,11 @@ import {
 	approveMobilePairingOutputSchema,
 	approveRuntimeBoxPairingInputSchema,
 	approveRuntimeBoxPairingOutputSchema,
-	type ChatRunEvent,
+	type ChatEventDelivery,
 	type ConfirmCreateProjectInput,
 	type CreateProviderInput,
 	cancelChatRunOutputSchema,
-	chatRunEventSchema,
+	chatEventDeliverySchema,
 	chatSendAcceptedOutputSchema,
 	checkProjectPathInputSchema,
 	checkProjectPathOutputSchema,
@@ -174,17 +174,19 @@ import { logChatRpcDiagnostic, traceChatRpcRequest } from "../../../shared/chat-
 import {
 	type ChatSessionInvalidation,
 	chatSessionInvalidationSchema,
+	type DesktopChatEvent,
 	type DesktopRpc,
 	openExternalUrlInputSchema,
 	openExternalUrlOutputSchema,
 	pickProjectDirectoryOutputSchema,
+	toDesktopChatEvent,
 } from "../../../shared/rpc";
 import { normalizeDesktopRpcError } from "../../../shared/rpc-errors";
 import { ChatSessionInvalidationBridge } from "./session-invalidation-bridge";
 
 const invalidationListenerTimeoutMs = 10_000;
 const maxPendingChatSessionInvalidations = 256;
-const chatEventListeners = new Set<(event: ChatRunEvent) => void>();
+const chatEventListeners = new Set<(event: DesktopChatEvent) => void>();
 const agentsReadyListeners = new Set<() => void>();
 const runtimeBoxesChangedListeners = new Set<
 	(snapshot: ReturnType<typeof listRuntimeBoxesOutputSchema.parse>) => void
@@ -210,7 +212,8 @@ const rpc = Electroview.defineRPC<DesktopRpc>({
 				}
 			},
 			chatEvent: (payload) => {
-				const event = chatRunEventSchema.parse(payload);
+				const delivery: ChatEventDelivery = chatEventDeliverySchema.parse(payload);
+				const event = toDesktopChatEvent(delivery);
 				logChatRpcDiagnostic("web", "receive", "chatEvent", event);
 				for (const listener of chatEventListeners) {
 					listener(event);
@@ -841,7 +844,7 @@ export const desktopClient = {
 				),
 		});
 	},
-	subscribeChatEvents(listener: (event: ChatRunEvent) => void) {
+	subscribeChatEvents(listener: (event: DesktopChatEvent) => void) {
 		chatEventListeners.add(listener);
 		return () => {
 			chatEventListeners.delete(listener);

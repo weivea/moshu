@@ -1,9 +1,11 @@
 import {
 	agentModeValues,
 	approvalStateValues,
+	chatRunPartStatusValues,
 	chatRunEventSourceKindValues,
 	chatRunEventVisibilityValues,
 	chatRunStatusValues,
+	chatRunToolStatusValues,
 	projectPathIssueCodeValues,
 	projectPathStatusValues,
 } from "@moshu/contracts";
@@ -473,8 +475,7 @@ export const chatRunsTable = sqliteTable(
 		providerJson: text("provider_json").notNull(),
 		userMessageId: text("user_message_id").notNull(),
 		userContent: text("user_content").notNull(),
-		assistantMessageId: text("assistant_message_id").notNull(),
-		assistantContent: text("assistant_content"),
+		publicToolPayloadBytes: integer("public_tool_payload_bytes").notNull().default(0),
 		lastErrorJson: text("last_error_json"),
 		projectId: text("project_id").references(() => projectsTable.id),
 		projectPath: text("project_path"),
@@ -490,9 +491,12 @@ export const chatRunsTable = sqliteTable(
 		index("chat_runs_session_created_at_idx").on(table.sessionId, table.createdAtMs),
 		index("chat_runs_session_cursor_idx").on(table.sessionId, table.createdAtMs, table.id),
 		uniqueIndex("chat_runs_user_message_unique").on(table.userMessageId),
-		uniqueIndex("chat_runs_assistant_message_unique").on(table.assistantMessageId),
 		uniqueIndex("chat_runs_client_request_unique").on(table.clientRequestId),
 		index("chat_runs_project_status_idx").on(table.projectId, table.status),
+		check(
+			"chat_runs_public_tool_payload_bytes_check",
+			sql`${table.publicToolPayloadBytes} >= 0 AND ${table.publicToolPayloadBytes} <= 2097152`,
+		),
 		check(
 			"chat_runs_project_context_check",
 			sql`(${table.projectId} IS NULL AND ${table.projectPath} IS NULL AND ${table.projectPathRevision} IS NULL
@@ -502,6 +506,107 @@ export const chatRunsTable = sqliteTable(
 					AND ${table.projectPathRevision} > 0)`,
 		),
 	],
+);
+
+export const chatRunPartsTable = sqliteTable(
+	"chat_run_parts",
+	{
+		id: text("id").primaryKey(),
+		sessionId: text("session_id")
+			.notNull()
+			.references(() => chatSessionsTable.id, { onDelete: "cascade" }),
+		runId: text("run_id")
+			.notNull()
+			.references(() => chatRunsTable.id, { onDelete: "cascade" }),
+		position: integer("position").notNull(),
+		kind: text("kind", { enum: ["text", "tool"] }).notNull(),
+		assistantTurnId: text("assistant_turn_id").notNull(),
+		status: text("status", { enum: chatRunPartStatusValues }).notNull(),
+		revision: integer("revision").notNull(),
+		textContent: text("text_content"),
+		toolCallId: text("tool_call_id"),
+		toolKind: text("tool_kind", { enum: ["builtin", "mcp"] }),
+		toolName: text("tool_name"),
+		mcpServerId: text("mcp_server_id"),
+		mcpToolId: text("mcp_tool_id"),
+		summary: text("summary"),
+		inputJson: text("input_json"),
+		progressJson: text("progress_json"),
+		outputJson: text("output_json"),
+		payloadsTruncated: integer("payloads_truncated", { mode: "boolean" }),
+		errorJson: text("error_json"),
+		approvalId: text("approval_id"),
+		startedAtMs: integer("started_at_ms"),
+		completedAtMs: integer("completed_at_ms"),
+		durationMs: integer("duration_ms"),
+		lastEventSeq: integer("last_event_seq").notNull(),
+		createdAtMs: integer("created_at_ms").notNull(),
+		updatedAtMs: integer("updated_at_ms").notNull(),
+	},
+	(table) => [
+		uniqueIndex("chat_run_parts_run_position_unique").on(table.runId, table.position),
+		uniqueIndex("chat_run_parts_run_tool_call_unique").on(table.runId, table.toolCallId),
+		index("chat_run_parts_session_run_position_idx").on(
+			table.sessionId,
+			table.runId,
+			table.position,
+		),
+		index("chat_run_parts_run_event_seq_idx").on(table.runId, table.lastEventSeq),
+		check("chat_run_parts_position_positive_check", sql`${table.position} > 0`),
+		check("chat_run_parts_revision_positive_check", sql`${table.revision} > 0`),
+		check("chat_run_parts_last_event_seq_positive_check", sql`${table.lastEventSeq} > 0`),
+		check(
+			"chat_run_parts_shape_check",
+			sql`(
+					${table.kind} = 'text'
+					AND ${table.textContent} IS NOT NULL
+					AND ${table.toolCallId} IS NULL
+					AND ${table.toolKind} IS NULL
+					AND ${table.toolName} IS NULL
+					AND ${table.summary} IS NULL
+				)
+				OR (
+					${table.kind} = 'tool'
+					AND ${table.textContent} IS NULL
+					AND ${table.toolCallId} IS NOT NULL
+					AND ${table.toolKind} IS NOT NULL
+					AND ${table.toolName} IS NOT NULL
+					AND ${table.summary} IS NOT NULL
+				)`,
+		),
+		check(
+			"chat_run_parts_tool_identity_check",
+			sql`${table.kind} = 'text'
+				OR (
+					${table.toolKind} = 'builtin'
+					AND ${table.mcpServerId} IS NULL
+					AND ${table.mcpToolId} IS NULL
+				)
+				OR (
+					${table.toolKind} = 'mcp'
+					AND ${table.mcpServerId} IS NOT NULL
+					AND ${table.mcpToolId} IS NOT NULL
+				)`,
+		),
+	],
+);
+
+export const runTimelineOutboxTable = sqliteTable(
+	"run_timeline_outbox",
+	{
+		sequence: integer("sequence").primaryKey({ autoIncrement: true }),
+		runId: text("run_id")
+			.notNull()
+			.references(() => chatRunsTable.id, { onDelete: "cascade" }),
+		toolCallId: text("tool_call_id").notNull(),
+		authority: text("authority", { enum: ["approval", "action"] }).notNull(),
+		status: text("status", { enum: chatRunToolStatusValues }).notNull(),
+		approvalId: text("approval_id"),
+		safeError: text("safe_error"),
+		publicOutputJson: text("public_output_json"),
+		createdAtMs: integer("created_at_ms").notNull(),
+	},
+	(table) => [index("run_timeline_outbox_sequence_idx").on(table.sequence)],
 );
 
 export const actionIntentsTable = sqliteTable(
@@ -744,7 +849,9 @@ export const appSchema = {
 	projectDeletionJobsTable,
 	agentSessionCleanupOutboxTable,
 	chatRunEventsTable,
+	chatRunPartsTable,
 	chatRunsTable,
+	runTimelineOutboxTable,
 	actionIntentsTable,
 	actionApprovalRequestsTable,
 	sessionApprovalPoliciesTable,

@@ -811,9 +811,7 @@ async function getCompleteSessionSnapshot(agentsClient: DesktopAgentsClient, inp
 	const parsedInput = getChatSessionInputSchema.parse(input);
 	let cursor: string | undefined;
 	let session: GetChatSessionPageOutput["session"] | undefined;
-	const messages: GetChatSessionPageOutput["messages"] = [];
 	const chronologicalRuns: GetChatSessionPageOutput["runs"] = [];
-	const eventCursors: GetChatSessionPageOutput["eventCursors"] = [];
 
 	while (true) {
 		const page = await agentsClient.request(
@@ -827,9 +825,7 @@ async function getCompleteSessionSnapshot(agentsClient: DesktopAgentsClient, inp
 			getChatSessionPageOutputSchema,
 		);
 		session = page.session;
-		messages.push(...page.messages);
 		chronologicalRuns.push(...page.runs);
-		eventCursors.push(...page.eventCursors);
 		if (page.nextCursor === undefined) {
 			break;
 		}
@@ -838,8 +834,6 @@ async function getCompleteSessionSnapshot(agentsClient: DesktopAgentsClient, inp
 
 	return getChatSessionSnapshotOutputSchema.parse({
 		session,
-		messages: messages.map((message, index) => ({ ...message, sequence: index + 1 })),
-		runs: chronologicalRuns.reverse(),
-		eventCursors,
+		runs: chronologicalRuns,
 	});
 }

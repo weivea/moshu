@@ -9,7 +9,7 @@ import {
 	type ProviderRegistry,
 	SecretVaultCredentialStore,
 } from "@moshu/agent-runtime";
-import type { AgentsServerBootstrapRecord } from "@moshu/contracts";
+import type { AgentsServerBootstrapRecord, ChatRunEvent, McpSecretInput } from "@moshu/contracts";
 import {
 	executorToolRpcTimeoutMs,
 	productRpcEvents,
@@ -173,6 +173,7 @@ export async function createAgentsServer(
 	let devTunnelService: DevTunnelService | undefined;
 	let unsubscribe: (() => void) | undefined;
 	let unsubscribeApprovals: (() => void) | undefined;
+	let unsubscribeAuthorityTimeline: (() => void) | undefined;
 	let approvalSweepTimer: ReturnType<typeof setInterval> | undefined;
 	let attentionDrainerHandle: { stop: () => void } | undefined;
 	let authController: HeadlessAuthController | undefined;
@@ -430,13 +431,19 @@ export async function createAgentsServer(
 				});
 				const serverMcpResources = database.agentServerMcps
 					.resolveRefs(globalProfile.serverMcpRefs)
-					.map((resource) => ({
-						owner: { kind: "agent-server" as const },
-						stableResourceId: resource.stableResourceId,
-						version: resource.version,
-						contentHash: resource.contentHash,
-						tools: resource.tools,
-					}));
+					.map((resource) => {
+						const connection = database.agentServerMcps.getMcpConnectionConfig(
+							resource.stableResourceId,
+						);
+						return {
+							owner: { kind: "agent-server" as const },
+							stableResourceId: resource.stableResourceId,
+							version: resource.version,
+							contentHash: resource.contentHash,
+							tools: resource.tools,
+							projectionSecretValues: collectMcpSecretValues(connection.secret),
+						};
+					});
 				const runtimeBoxMcpResources = validation.resources
 					.filter((resource) => resource.resourceKind === "mcp")
 					.map((resource) => ({
@@ -705,6 +712,17 @@ export async function createAgentsServer(
 				attentionDrainer.drain();
 			}
 		});
+		const publishAuthorityTimeline = (events: readonly ChatRunEvent[]) => {
+			for (const event of events) {
+				eventRouter.publish(productEventPeers(), event, service.getClientRequestId(event.runId));
+			}
+		};
+		const unsubscribeApprovalTimeline = approvalService.subscribeTimeline(publishAuthorityTimeline);
+		const unsubscribeActionTimeline = actionAuthorizer.subscribeTimeline(publishAuthorityTimeline);
+		unsubscribeAuthorityTimeline = () => {
+			unsubscribeApprovalTimeline();
+			unsubscribeActionTimeline();
+		};
 		// Fan approval state changes out to the multi-client event hub: Session-scoped events reach
 		// that Session's subscribers, and a no-payload activity hint tells every client to refresh its
 		// cross-session pending-approvals snapshot.
@@ -757,6 +775,7 @@ export async function createAgentsServer(
 				const execution = (async () => {
 					unsubscribe?.();
 					unsubscribeApprovals?.();
+					unsubscribeAuthorityTimeline?.();
 					attentionDrainerHandle?.stop();
 					if (approvalSweepTimer !== undefined) {
 						clearInterval(approvalSweepTimer);
@@ -784,6 +803,7 @@ export async function createAgentsServer(
 	} catch (error) {
 		unsubscribe?.();
 		unsubscribeApprovals?.();
+		unsubscribeAuthorityTimeline?.();
 		attentionDrainerHandle?.stop();
 		await devTunnelService?.shutdown();
 		productRpcServer?.stop();
@@ -813,6 +833,16 @@ function findAppOwnedPiSessionsDirectory(agentDataDirectory: string): string | u
 		throw new Error("Pi Session storage must be a regular directory.");
 	}
 	return sessionsDirectory;
+}
+
+function collectMcpSecretValues(secret: McpSecretInput | undefined): readonly string[] {
+	if (secret === undefined) {
+		return [];
+	}
+	return [
+		...Object.values(secret.environment ?? {}),
+		...Object.values(secret.headers ?? {}),
+	].filter((value) => value.length > 0);
 }
 
 function assertAbsoluteDataPaths(bootstrap: AgentsServerBootstrapRecord): void {

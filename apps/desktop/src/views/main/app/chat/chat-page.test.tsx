@@ -1,10 +1,16 @@
-import { defaultLocalRuntimeBoxId } from "@moshu/contracts";
+import {
+	type ChatRunEvent,
+	type ChatRunSnapshot,
+	type ChatRunTextPart,
+	defaultLocalRuntimeBoxId,
+} from "@moshu/contracts";
 import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { beforeEach, describe, expect, test, vi } from "vitest";
 import { AgentsUnavailableError, ChatSessionNotFoundError } from "../../../../shared/rpc-errors";
 import { I18nProvider } from "../i18n";
 import { ChatPage, type ChatPageProps } from "./chat-page";
+import { applyChatRunEvent as applyFixtureEvent } from "./run-timeline-reducer";
 import { isRendererSessionRetired } from "./session-recovery-coordinator";
 import {
 	availableModelFor,
@@ -13,7 +19,6 @@ import {
 	testProviderId,
 } from "./test-transport-defaults";
 import type {
-	ChatMessage,
 	ChatSession,
 	ChatSessionInvalidation,
 	ChatSessionInvalidationListener,
@@ -132,7 +137,9 @@ describe("ChatPage", () => {
 		).toBeVisible();
 
 		transport.emitCompleted(requestId);
-		expect(await screen.findByText("Complete")).toBeVisible();
+		await waitFor(() =>
+			expect(screen.queryByRole("button", { name: "Stop" })).not.toBeInTheDocument(),
+		);
 	});
 
 	test("renders a completed response that arrives before the send acknowledgement", async () => {
@@ -151,8 +158,10 @@ describe("ChatPage", () => {
 		fireEvent.click(sendButton);
 
 		expect(await screen.findByText("Fast answer")).toBeVisible();
-		expect(await screen.findByText("Complete")).toBeVisible();
-		expect(screen.queryByRole("button", { name: "Stop" })).not.toBeInTheDocument();
+		expect(transport.lastRequestId).not.toBe(transport.sendCalls[0]?.requestId);
+		await waitFor(() =>
+			expect(screen.queryByRole("button", { name: "Stop" })).not.toBeInTheDocument(),
+		);
 	});
 
 	test("accepts only one send while the acknowledgement is pending", async () => {
@@ -280,7 +289,7 @@ describe("ChatPage", () => {
 		expect(await screen.findByRole("status")).toHaveTextContent(
 			"The assistant response was stopped. You can retry the same message.",
 		);
-		expect(screen.getByText("Stopped")).toBeVisible();
+		expect(screen.getByText("interrupted")).toBeVisible();
 		expect(transport.cancelCalls).toHaveLength(1);
 	});
 
@@ -624,7 +633,6 @@ describe("ChatPage", () => {
 
 		expect(await screen.findByText("Buffered answer")).toBeVisible();
 		expect(screen.getAllByText("Buffered answer")).toHaveLength(1);
-		expect(await screen.findByText("Complete")).toBeVisible();
 	});
 
 	test("shows an initial snapshot optimistically, then reconciles a terminal event during authoritative hydration", async () => {
@@ -635,7 +643,7 @@ describe("ChatPage", () => {
 		const gate = createDeferred();
 		transport.sessionLoadGate = gate.promise;
 		transport.captureSessionBeforeGate = true;
-		const initialSession: ChatSession = {
+		const initialSession: ChatSessionFixture = {
 			id: "initial-hydration-session",
 			runtimeBoxId: defaultLocalRuntimeBoxId,
 			title: "Stale initial title",
@@ -668,7 +676,7 @@ describe("ChatPage", () => {
 		renderChatPage({
 			transport,
 			sessionId: "initial-hydration-session",
-			initialSession,
+			initialSession: cloneSession(initialSession),
 		});
 
 		expect(screen.getByText("Stale partial")).toBeVisible();
@@ -680,7 +688,6 @@ describe("ChatPage", () => {
 
 		expect(await screen.findByRole("heading", { name: "Authoritative title" })).toBeVisible();
 		expect(screen.getAllByText("Answer during fetch")).toHaveLength(1);
-		expect(await screen.findByText("Complete")).toBeVisible();
 		expect(screen.queryByRole("button", { name: "Stop" })).not.toBeInTheDocument();
 	});
 
@@ -691,7 +698,7 @@ describe("ChatPage", () => {
 		});
 		const gate = createDeferred();
 		transport.sessionLoadGate = gate.promise;
-		const session: ChatSession = {
+		const session: ChatSessionFixture = {
 			id: "subscribe-first-session",
 			runtimeBoxId: defaultLocalRuntimeBoxId,
 			title: "Subscribe first",
@@ -777,7 +784,7 @@ describe("ChatPage", () => {
 		const gate = createDeferred();
 		transport.sessionLoadGate = gate.promise;
 		transport.captureSessionBeforeGate = true;
-		const session: ChatSession = {
+		const session: ChatSessionFixture = {
 			id: "cursor-session",
 			runtimeBoxId: defaultLocalRuntimeBoxId,
 			title: "Cursor reconciliation",
@@ -830,7 +837,6 @@ describe("ChatPage", () => {
 
 		expect(await screen.findByText("ABC")).toBeVisible();
 		expect(screen.getAllByText("ABC")).toHaveLength(1);
-		expect(await screen.findByText("Complete")).toBeVisible();
 		expect(screen.queryByText("ABBC")).not.toBeInTheDocument();
 	});
 
@@ -839,7 +845,7 @@ describe("ChatPage", () => {
 			configured: true,
 			model: "gpt-4.1-mini",
 		});
-		const staleSession: ChatSession = {
+		const staleSession: ChatSessionFixture = {
 			id: "back-session",
 			runtimeBoxId: defaultLocalRuntimeBoxId,
 			title: "Stale history title",
@@ -864,7 +870,7 @@ describe("ChatPage", () => {
 		const rendered = renderChatPage({
 			transport,
 			sessionId: staleSession.id,
-			initialSession: staleSession,
+			initialSession: cloneSession(staleSession),
 		});
 		expect(await screen.findByText("First authoritative")).toBeVisible();
 
@@ -881,7 +887,11 @@ describe("ChatPage", () => {
 		});
 		rendered.rerender(
 			<I18nProvider>
-				<ChatPage transport={transport} sessionId={staleSession.id} initialSession={staleSession} />
+				<ChatPage
+					transport={transport}
+					sessionId={staleSession.id}
+					initialSession={cloneSession(staleSession)}
+				/>
 			</I18nProvider>,
 		);
 
@@ -1111,13 +1121,15 @@ describe("ChatPage", () => {
 		});
 		renderChatPage({ transport, sessionId: "expired-session" });
 		expect(await screen.findByText("Stale snapshot")).toBeVisible();
-		transport.sessions
-			.get("expired-session")
-			?.messages.splice(
-				0,
-				1,
-				createMessage("new-message", "assistant", "Rebuilt snapshot", "completed"),
-			);
+		const expiredSession = transport.sessions.get("expired-session");
+		if (expiredSession === undefined) {
+			throw new Error("Expired Session fixture was not found.");
+		}
+		expiredSession.runs = createRunsFromMessages({
+			sessionId: expiredSession.id,
+			runtimeBoxId: expiredSession.runtimeBoxId,
+			messages: [createMessage("new-message", "user", "Rebuilt snapshot")],
+		});
 
 		await act(async () => {
 			await transport.emitInvalidation({
@@ -1288,7 +1300,7 @@ describe("Project Chat", () => {
 
 	test("rejects route ownership mismatch before subscribing or sending", async () => {
 		const transport = new FakeChatTransport({ configured: true, model: "gpt-4.1-mini" });
-		const mismatchedSession: ChatSession = {
+		const mismatchedSession: ChatSessionFixture = {
 			id: "project-session",
 			runtimeBoxId: defaultLocalRuntimeBoxId,
 			projectId: "project-b",
@@ -1305,7 +1317,7 @@ describe("Project Chat", () => {
 		renderChatPage({
 			transport,
 			sessionId: "project-session",
-			initialSession: mismatchedSession,
+			initialSession: cloneSession(mismatchedSession),
 			routeProjectId: "project-a",
 			projectContext,
 		});
@@ -1438,7 +1450,6 @@ describe("Project Chat", () => {
 		gate.resolve();
 
 		expect(await screen.findByText("Buffered Project answer")).toBeVisible();
-		expect(await screen.findByText("Complete")).toBeVisible();
 	});
 
 	test("discards buffered events when hydrated Project ownership mismatches", async () => {
@@ -1555,13 +1566,80 @@ async function waitForRequest(transport: FakeChatTransport) {
 	return transport.lastRequestId;
 }
 
-type ChatSessionFixture = Omit<ChatSession, "runtimeBoxId"> & { runtimeBoxId?: string };
+interface ChatMessageFixture {
+	id: string;
+	role: "user" | "assistant";
+	content: string;
+	createdAt: string;
+	status: "streaming" | "completed";
+}
+
+type ChatSessionFixture = Omit<ChatSession, "runtimeBoxId" | "runs" | "activeResponse"> & {
+	runtimeBoxId?: string;
+	runs?: ChatRunSnapshot[];
+	messages?: ChatMessageFixture[];
+	activeResponse?: {
+		requestId: string;
+		messageId?: string;
+	};
+	eventCursors?: Record<string, number>;
+};
+
+type LegacyTransportEvent =
+	| {
+			type: "response.delta";
+			sessionId: string;
+			requestId: string;
+			messageId: string;
+			delta: string;
+			sequence: number;
+	  }
+	| {
+			type: "response.completed";
+			sessionId: string;
+			requestId: string;
+			messageId: string;
+			content: string;
+			sequence: number;
+	  }
+	| {
+			type: "response.cancelled";
+			sessionId: string;
+			requestId: string;
+			messageId: string;
+			content: string;
+			reason: string;
+			sequence: number;
+	  }
+	| {
+			type: "run.warning";
+			sessionId: string;
+			requestId: string;
+			code: "ROOT_AGENTS_SKIPPED";
+			reason: "unknown" | "permission_denied" | "not_regular_file" | "too_large" | "invalid_utf8";
+			sequence: number;
+	  };
 
 class FakeSessionMap extends Map<string, ChatSession> {
 	override set(key: string, value: ChatSessionFixture): this {
+		const runtimeBoxId = value.runtimeBoxId ?? defaultLocalRuntimeBoxId;
+		const runs =
+			value.messages === undefined
+				? (value.runs ?? [])
+				: createRunsFromMessages({
+						sessionId: value.id,
+						runtimeBoxId,
+						messages: value.messages,
+						activeResponse: value.activeResponse,
+						eventCursors: value.eventCursors,
+					});
 		return super.set(key, {
 			...value,
-			runtimeBoxId: value.runtimeBoxId ?? defaultLocalRuntimeBoxId,
+			runtimeBoxId,
+			runs,
+			...(value.activeResponse === undefined
+				? {}
+				: { activeResponse: { requestId: value.activeResponse.requestId } }),
 		});
 	}
 }
@@ -1578,6 +1656,7 @@ class FakeChatTransport extends ProviderModelTransportDefaults implements ChatTr
 	invalidationListeners = new Set<ChatSessionInvalidationListener>();
 	sessions = new FakeSessionMap();
 	pending = new Map<string, { sessionId: string; messageId: string }>();
+	clientRequestIds = new Map<string, string>();
 	nextSendError: Error | null = null;
 	nextCancelError: Error | null = null;
 	nextGetSessionError: Error | null = null;
@@ -1589,13 +1668,12 @@ class FakeChatTransport extends ProviderModelTransportDefaults implements ChatTr
 	responseBeforeSendReturns: string | null = null;
 	sendReturnGate: Promise<void> | null = null;
 	cancelReturnGate: Promise<void> | null = null;
-	eventOnSubscribe: ChatTransportEvent | null = null;
+	eventOnSubscribe: ChatTransportEvent | LegacyTransportEvent | null = null;
 	createdSessionProjectIdOverride: string | undefined;
 	private readonly configuredModel: string;
 	private eventSequences = new Map<string, number>();
 	private nextSessionNumber = 1;
 	private nextMessageNumber = 1;
-	private nextRequestNumber = 1;
 
 	constructor({
 		configured,
@@ -1626,7 +1704,7 @@ class FakeChatTransport extends ProviderModelTransportDefaults implements ChatTr
 			...(resolvedProjectId === undefined ? {} : { projectId: resolvedProjectId }),
 			...(resolvedModel === undefined ? {} : { model: resolvedModel }),
 			askMode: "Ask",
-			messages: [],
+			runs: [],
 		};
 		this.nextSessionNumber += 1;
 		this.sessions.set(session.id, session);
@@ -1706,31 +1784,60 @@ class FakeChatTransport extends ProviderModelTransportDefaults implements ChatTr
 			throw new Error("Session not found.");
 		}
 
-		const userMessage = createMessage(
-			`user-${this.nextMessageNumber}`,
-			"user",
-			input.message,
-			"completed",
-		);
+		const userMessageId = `user-${this.nextMessageNumber}`;
 		this.nextMessageNumber += 1;
-		const assistantMessage = createMessage(
-			`assistant-${this.nextMessageNumber}`,
-			"assistant",
-			"",
-			"streaming",
-		);
+		const textPartId = `assistant-${this.nextMessageNumber}`;
 		this.nextMessageNumber += 1;
-		const requestId = `request-${this.nextRequestNumber}`;
-		this.nextRequestNumber += 1;
-
-		session.messages.push(userMessage, assistantMessage);
+		const requestId =
+			this.responseBeforeSendReturns === null ? input.requestId : `run-${input.requestId}`;
+		const createdAt = "2026-01-01T00:00:00.000Z";
+		const textPart: ChatRunTextPart = {
+			schemaVersion: 1,
+			id: textPartId,
+			runId: requestId,
+			position: 1,
+			assistantTurnId: `${requestId}-turn`,
+			revision: 1,
+			kind: "text",
+			status: "streaming",
+			content: "",
+			createdAt,
+			updatedAt: createdAt,
+		};
+		const run: ChatRunSnapshot = {
+			schemaVersion: 1,
+			id: requestId,
+			sessionId: input.sessionId,
+			runtimeBoxId: session.runtimeBoxId,
+			mode: "agent",
+			status: "running",
+			provider: createRunProvider(),
+			userMessageId,
+			createdAt,
+			updatedAt: createdAt,
+			userMessage: {
+				schemaVersion: 1,
+				id: userMessageId,
+				sessionId: input.sessionId,
+				runId: requestId,
+				role: "user",
+				content: input.message,
+				createdAt,
+			},
+			timeline: [textPart],
+			lastEventSeq: 1,
+		};
+		session.runs.push(run);
 		if (session.title === "New chat") {
 			session.title = input.message;
 		}
 		this.pending.set(requestId, {
 			sessionId: input.sessionId,
-			messageId: assistantMessage.id,
+			messageId: textPart.id,
 		});
+		this.clientRequestIds.set(requestId, input.requestId);
+		session.activeResponse = { requestId };
+		this.eventSequences.set(requestId, 1);
 		this.lastRequestId = requestId;
 		if (this.responseBeforeSendReturns !== null) {
 			this.emitDelta(requestId, this.responseBeforeSendReturns);
@@ -1740,8 +1847,7 @@ class FakeChatTransport extends ProviderModelTransportDefaults implements ChatTr
 
 		return {
 			requestId,
-			userMessage: { ...userMessage },
-			assistantMessage: { ...assistantMessage },
+			run: structuredClone(run),
 		};
 	}
 
@@ -1759,19 +1865,29 @@ class FakeChatTransport extends ProviderModelTransportDefaults implements ChatTr
 		}
 
 		this.pending.delete(input.requestId);
-		const sequence = this.nextEventSequence(input.requestId, input.sessionId);
-		this.notify({
-			type: "response.cancelled",
-			sessionId: input.sessionId,
-			requestId: input.requestId,
-			messageId: pending.messageId,
-			content:
-				this.sessions
-					.get(input.sessionId)
-					?.messages.find((message) => message.id === pending.messageId)?.content ?? "",
-			reason: "Preview response stopped.",
-			sequence,
+		const session = this.requireSession(input.sessionId);
+		const run = requireRun(session, input.requestId);
+		const part = requireTextPart(run, pending.messageId);
+		const completedEvent = makeTextCompletedEvent({
+			run,
+			part: {
+				...part,
+				revision: part.revision + 1,
+				status: "interrupted",
+				updatedAt: "2026-01-01T00:00:01.000Z",
+			},
+			seq: this.nextEventSequence(input.requestId),
 		});
+		this.applyStoredEvent(session, completedEvent);
+		this.notify(completedEvent);
+		const statusEvent = makeRunStatusEvent(
+			run,
+			"cancelled",
+			this.nextEventSequence(input.requestId),
+		);
+		this.applyStoredEvent(session, statusEvent);
+		delete session.activeResponse;
+		this.notify(statusEvent);
 	}
 
 	subscribe(listener: ChatTransportListener) {
@@ -1779,7 +1895,9 @@ class FakeChatTransport extends ProviderModelTransportDefaults implements ChatTr
 		if (this.eventOnSubscribe !== null) {
 			const event = this.eventOnSubscribe;
 			this.eventOnSubscribe = null;
-			listener(event);
+			for (const normalized of this.normalizeEvent(event)) {
+				listener(normalized);
+			}
 		}
 		return () => {
 			this.listeners.delete(listener);
@@ -1799,8 +1917,10 @@ class FakeChatTransport extends ProviderModelTransportDefaults implements ChatTr
 		}
 	}
 
-	emitEvent(event: ChatTransportEvent): void {
-		this.notify(event);
+	emitEvent(event: ChatTransportEvent | LegacyTransportEvent): void {
+		for (const normalized of this.normalizeEvent(event)) {
+			this.notify(normalized);
+		}
 	}
 
 	emitDelta(requestId: string, delta: string) {
@@ -1814,25 +1934,26 @@ class FakeChatTransport extends ProviderModelTransportDefaults implements ChatTr
 			throw new Error("Session not found.");
 		}
 
-		session.messages = session.messages.map((message) =>
-			message.id === pending.messageId
-				? {
-						...message,
-						content: `${message.content}${delta}`,
-						status: "streaming",
-					}
-				: message,
-		);
-
-		const sequence = this.nextEventSequence(requestId, pending.sessionId);
-		this.notify({
-			type: "response.delta",
+		const run = requireRun(session, requestId);
+		const part = requireTextPart(run, pending.messageId);
+		const event: ChatRunEvent = {
+			schemaVersion: 1,
+			id: `${requestId}-delta-${part.revision + 1}`,
+			runId: requestId,
 			sessionId: pending.sessionId,
-			requestId,
-			messageId: pending.messageId,
-			delta,
-			sequence,
-		});
+			seq: this.nextEventSequence(requestId),
+			type: "timeline.text.delta",
+			source: { kind: "assistant" },
+			visibility: "user",
+			createdAt: "2026-01-01T00:00:01.000Z",
+			payload: {
+				partId: pending.messageId,
+				revision: part.revision + 1,
+				delta,
+			},
+		};
+		this.applyStoredEvent(session, event);
+		this.notify(event);
 	}
 
 	emitCompleted(requestId: string) {
@@ -1846,42 +1967,64 @@ class FakeChatTransport extends ProviderModelTransportDefaults implements ChatTr
 			throw new Error("Session not found.");
 		}
 
-		session.messages = session.messages.map((message) =>
-			message.id === pending.messageId
-				? {
-						...message,
-						status: "completed",
-					}
-				: message,
-		);
-
-		this.pending.delete(requestId);
-		const sequence = this.nextEventSequence(requestId, pending.sessionId);
-		const completedMessage = session.messages.find((message) => message.id === pending.messageId);
-		if (!completedMessage) {
-			throw new Error("Completed assistant message was not found.");
-		}
-		this.notify({
-			type: "response.completed",
-			sessionId: pending.sessionId,
-			requestId,
-			messageId: pending.messageId,
-			content: completedMessage.content,
-			sequence,
+		const run = requireRun(session, requestId);
+		const part = requireTextPart(run, pending.messageId);
+		const completedEvent = makeTextCompletedEvent({
+			run,
+			part: {
+				...part,
+				revision: part.revision + 1,
+				status: "completed",
+				updatedAt: "2026-01-01T00:00:01.000Z",
+			},
+			seq: this.nextEventSequence(requestId),
 		});
+		this.applyStoredEvent(session, completedEvent);
+		this.notify(completedEvent);
+		const statusEvent = makeRunStatusEvent(run, "completed", this.nextEventSequence(requestId));
+		this.applyStoredEvent(session, statusEvent);
+		this.pending.delete(requestId);
+		delete session.activeResponse;
+		this.notify(statusEvent);
 	}
 
-	private nextEventSequence(requestId: string, sessionId: string) {
+	private nextEventSequence(requestId: string) {
 		const sequence = (this.eventSequences.get(requestId) ?? 0) + 1;
 		this.eventSequences.set(requestId, sequence);
-		const session = this.sessions.get(sessionId);
-		if (session) {
-			session.eventCursors = {
-				...(session.eventCursors ?? {}),
-				[requestId]: sequence,
-			};
-		}
 		return sequence;
+	}
+
+	private applyStoredEvent(session: ChatSession, event: ChatRunEvent): void {
+		session.runs = session.runs.map((run) =>
+			run.id === event.runId ? applyFixtureEvent(run, event) : run,
+		);
+	}
+
+	private normalizeEvent(event: ChatTransportEvent | LegacyTransportEvent): ChatRunEvent[] {
+		if ("schemaVersion" in event) {
+			return [event];
+		}
+		if (event.type === "run.warning") {
+			const runId =
+				this.sessions.get(event.sessionId)?.runs.find((run) => run.id === event.requestId)?.id ??
+				this.sessions.get(event.sessionId)?.runs[0]?.id ??
+				event.requestId;
+			return [
+				{
+					schemaVersion: 1,
+					id: `${event.requestId}-warning-${event.sequence}`,
+					runId,
+					sessionId: event.sessionId,
+					seq: event.sequence,
+					type: "run.warning",
+					source: { kind: "system" },
+					visibility: "user",
+					createdAt: "2026-01-01T00:00:01.000Z",
+					payload: { code: event.code, reason: event.reason },
+				},
+			];
+		}
+		return normalizeLegacyEvent(event, this.sessions.get(event.sessionId));
 	}
 
 	private consume(
@@ -1893,8 +2036,10 @@ class FakeChatTransport extends ProviderModelTransportDefaults implements ChatTr
 	}
 
 	private notify(event: ChatTransportEvent) {
+		const clientRequestId = this.clientRequestIds.get(event.runId);
+		const delivery = clientRequestId === undefined ? event : { ...event, clientRequestId };
 		for (const listener of this.listeners) {
-			listener(event);
+			listener(delivery);
 		}
 	}
 
@@ -1920,10 +2065,10 @@ class FakeChatTransport extends ProviderModelTransportDefaults implements ChatTr
 
 function createMessage(
 	id: string,
-	role: ChatMessage["role"],
+	role: ChatMessageFixture["role"],
 	content: string,
-	status: ChatMessage["status"] = "completed",
-): ChatMessage {
+	status: ChatMessageFixture["status"] = "completed",
+): ChatMessageFixture {
 	return {
 		id,
 		role,
@@ -1933,12 +2078,278 @@ function createMessage(
 	};
 }
 
-function cloneSession(session: ChatSession): ChatSession {
+function createRunProvider(): ChatRunSnapshot["provider"] {
 	return {
-		...session,
-		activeResponse: session.activeResponse ? { ...session.activeResponse } : undefined,
-		eventCursors: session.eventCursors ? { ...session.eventCursors } : undefined,
-		messages: session.messages.map((message) => ({ ...message })),
+		schemaVersion: 1,
+		providerId: "provider-openai",
+		name: "OpenAI",
+		source: "custom",
+		api: "openai-responses",
+		model: "gpt-4.1-mini",
+		status: "ready",
+	};
+}
+
+function createRunsFromMessages(input: {
+	sessionId: string;
+	runtimeBoxId: string;
+	messages: ChatMessageFixture[];
+	activeResponse?: ChatSessionFixture["activeResponse"];
+	eventCursors?: Record<string, number>;
+}): ChatRunSnapshot[] {
+	const runs: ChatRunSnapshot[] = [];
+	const cursorRunIds = Object.keys(input.eventCursors ?? {});
+	let cursorIndex = 0;
+
+	for (let index = 0; index < input.messages.length; index += 1) {
+		const fixtureMessage = input.messages[index];
+		if (fixtureMessage === undefined) {
+			continue;
+		}
+		let userMessage: ChatMessageFixture;
+		let assistantMessage: ChatMessageFixture | undefined;
+		if (fixtureMessage.role === "user") {
+			userMessage = fixtureMessage;
+			assistantMessage =
+				input.messages[index + 1]?.role === "assistant" ? input.messages[index + 1] : undefined;
+			if (assistantMessage !== undefined) {
+				index += 1;
+			}
+		} else {
+			assistantMessage = fixtureMessage;
+			userMessage = createMessage(
+				`${fixtureMessage.id}-user`,
+				"user",
+				"Previous question",
+				"completed",
+			);
+		}
+		const isActive =
+			input.activeResponse !== undefined &&
+			(input.activeResponse.messageId === undefined ||
+				input.activeResponse.messageId === assistantMessage?.id);
+		const cursorRunId = cursorRunIds[cursorIndex];
+		if (cursorRunId !== undefined) {
+			cursorIndex += 1;
+		}
+		const runId = isActive
+			? input.activeResponse?.requestId
+			: (cursorRunId ?? `run-${userMessage.id}`);
+		if (runId === undefined) {
+			throw new Error("Run fixture id was not resolved.");
+		}
+		const lastEventSeq = input.eventCursors?.[runId] ?? 0;
+		const runStatus =
+			isActive || assistantMessage?.status === "streaming" ? "running" : "completed";
+		const timeline: ChatRunTextPart[] =
+			assistantMessage === undefined
+				? []
+				: [
+						{
+							schemaVersion: 1,
+							id: assistantMessage.id,
+							runId,
+							position: 1,
+							assistantTurnId: `${runId}-turn`,
+							revision: Math.max(1, lastEventSeq),
+							kind: "text",
+							status: assistantMessage.status === "completed" ? "completed" : "streaming",
+							content: assistantMessage.content,
+							createdAt: assistantMessage.createdAt,
+							updatedAt: assistantMessage.createdAt,
+						},
+					];
+		runs.push({
+			schemaVersion: 1,
+			id: runId,
+			sessionId: input.sessionId,
+			runtimeBoxId: input.runtimeBoxId,
+			mode: "agent",
+			status: runStatus,
+			provider: createRunProvider(),
+			userMessageId: userMessage.id,
+			createdAt: userMessage.createdAt,
+			updatedAt: assistantMessage?.createdAt ?? userMessage.createdAt,
+			...(runStatus === "completed"
+				? { completedAt: assistantMessage?.createdAt ?? userMessage.createdAt }
+				: {}),
+			userMessage: {
+				schemaVersion: 1,
+				id: userMessage.id,
+				sessionId: input.sessionId,
+				runId,
+				role: "user",
+				content: userMessage.content,
+				createdAt: userMessage.createdAt,
+			},
+			timeline,
+			lastEventSeq,
+		});
+	}
+	return runs;
+}
+
+function requireRun(session: ChatSession, runId: string): ChatRunSnapshot {
+	const run = session.runs.find((candidate) => candidate.id === runId);
+	if (run === undefined) {
+		throw new Error(`Run ${runId} was not found.`);
+	}
+	return run;
+}
+
+function requireTextPart(run: ChatRunSnapshot, partId: string): ChatRunTextPart {
+	const part = run.timeline.find((candidate) => candidate.id === partId);
+	if (part?.kind !== "text") {
+		throw new Error(`Text Part ${partId} was not found.`);
+	}
+	return part;
+}
+
+function makeTextCompletedEvent(input: {
+	run: ChatRunSnapshot;
+	part: ChatRunTextPart;
+	seq: number;
+}): ChatRunEvent {
+	return {
+		schemaVersion: 1,
+		id: `${input.run.id}-text-completed-${input.seq}`,
+		runId: input.run.id,
+		sessionId: input.run.sessionId,
+		seq: input.seq,
+		type: "timeline.text.completed",
+		source: { kind: "assistant" },
+		visibility: "user",
+		createdAt: input.part.updatedAt,
+		payload: { part: input.part },
+	};
+}
+
+function makeRunStatusEvent(
+	run: ChatRunSnapshot,
+	status: ChatRunSnapshot["status"],
+	seq: number,
+): ChatRunEvent {
+	return {
+		schemaVersion: 1,
+		id: `${run.id}-status-${seq}`,
+		runId: run.id,
+		sessionId: run.sessionId,
+		seq,
+		type: "run.status",
+		source: { kind: "system" },
+		visibility: "user",
+		createdAt: "2026-01-01T00:00:01.000Z",
+		payload: { status, previousStatus: run.status },
+	};
+}
+
+function normalizeLegacyEvent(
+	event: Exclude<LegacyTransportEvent, { type: "run.warning" }>,
+	session: ChatSession | undefined,
+): ChatRunEvent[] {
+	const run =
+		session?.runs.find((candidate) => candidate.id === event.requestId) ??
+		session?.runs.find((candidate) =>
+			candidate.timeline.some((part) => part.id === event.messageId),
+		);
+	const matchingPart = run?.timeline.find((candidate) => candidate.id === event.messageId);
+	const currentPart: ChatRunTextPart =
+		matchingPart?.kind === "text"
+			? matchingPart
+			: {
+					schemaVersion: 1,
+					id: event.messageId,
+					runId: event.requestId,
+					position: 1,
+					assistantTurnId: `${event.requestId}-turn`,
+					revision: 1,
+					kind: "text",
+					status: "streaming",
+					content: "",
+					createdAt: "2026-01-01T00:00:00.000Z",
+					updatedAt: "2026-01-01T00:00:00.000Z",
+				};
+	const runId = run?.id === event.requestId ? run.id : event.requestId;
+	const revision = Math.max(currentPart.revision + 1, event.sequence);
+	const base = {
+		schemaVersion: 1 as const,
+		runId,
+		sessionId: event.sessionId,
+		seq: event.sequence,
+		source: { kind: "assistant" as const },
+		visibility: "user" as const,
+		createdAt: "2026-01-01T00:00:01.000Z",
+	};
+
+	if (event.type === "response.delta") {
+		return [
+			{
+				...base,
+				id: `${runId}-delta-${event.sequence}`,
+				type: "timeline.text.delta",
+				payload: { partId: event.messageId, revision, delta: event.delta },
+			},
+		];
+	}
+
+	const status = event.type === "response.cancelled" ? "cancelled" : "completed";
+	const partStatus = event.type === "response.cancelled" ? "interrupted" : "completed";
+	const part: ChatRunTextPart = {
+		...currentPart,
+		runId,
+		revision,
+		status: partStatus,
+		content: event.content,
+		updatedAt: base.createdAt,
+	};
+	const completed: ChatRunEvent = {
+		...base,
+		id: `${runId}-text-completed-${event.sequence}`,
+		type: "timeline.text.completed",
+		payload: { part },
+	};
+	const statusEvent: ChatRunEvent = {
+		...base,
+		id: `${runId}-status-${event.sequence + 1}`,
+		seq: event.sequence + 1,
+		type: "run.status",
+		source: { kind: "system" },
+		payload: {
+			status,
+			...(run === undefined ? {} : { previousStatus: run.status }),
+		},
+	};
+	return [completed, statusEvent];
+}
+
+function cloneSession(session: ChatSession | ChatSessionFixture): ChatSession {
+	if ("runs" in session && session.runs !== undefined && !("messages" in session)) {
+		return structuredClone(session) as ChatSession;
+	}
+	const fixture = session as ChatSessionFixture;
+	const runtimeBoxId = fixture.runtimeBoxId ?? defaultLocalRuntimeBoxId;
+	const runs =
+		fixture.runs ??
+		createRunsFromMessages({
+			sessionId: fixture.id,
+			runtimeBoxId,
+			messages: fixture.messages ?? [],
+			activeResponse: fixture.activeResponse,
+			eventCursors: fixture.eventCursors,
+		});
+	return {
+		id: fixture.id,
+		runtimeBoxId,
+		...(fixture.projectId === undefined ? {} : { projectId: fixture.projectId }),
+		title: fixture.title,
+		updatedAt: fixture.updatedAt,
+		...(fixture.archivedAt === undefined ? {} : { archivedAt: fixture.archivedAt }),
+		...(fixture.model === undefined ? {} : { model: fixture.model }),
+		askMode: fixture.askMode,
+		runs: structuredClone(runs),
+		...(fixture.activeResponse === undefined
+			? {}
+			: { activeResponse: { requestId: fixture.activeResponse.requestId } }),
 	};
 }
 

@@ -552,7 +552,7 @@ class SessionRouteTransport {
 		}
 		return {
 			...this.#session,
-			messages: this.#session.messages.map((message) => ({ ...message })),
+			runs: this.#session.runs.map((run) => structuredClone(run)),
 		};
 	}
 
@@ -683,6 +683,6 @@ function createSessionForId(id: string, title: string): ChatSession {
 		updatedAt: "2026-07-26T00:00:00.000Z",
 		model: modelSelectionFor("gpt-5.4"),
 		askMode: "Ask",
-		messages: [],
+		runs: [],
 	};
 }

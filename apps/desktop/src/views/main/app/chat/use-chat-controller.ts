@@ -1,9 +1,14 @@
-import type { AvailableModel, DefaultModelSelection, ThinkingLevel } from "@moshu/contracts";
+import type {
+	AvailableModel,
+	ChatRunSnapshot,
+	DefaultModelSelection,
+	ThinkingLevel,
+} from "@moshu/contracts";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { type MessageKey, useI18n } from "../i18n";
 import { useChatSessionRecovery } from "./session-recovery-coordinator";
+import { applyChatRunEvent, mergeChatRunSnapshot } from "./run-timeline-reducer";
 import type {
-	ChatMessage,
 	ChatSession,
 	ChatSessionSummary,
 	ChatTransport,
@@ -31,7 +36,6 @@ interface ChatNotice {
 
 interface ActiveResponse {
 	requestId: string;
-	messageId: string;
 }
 
 interface SessionHydration {
@@ -97,6 +101,8 @@ export function useChatController({
 	const sessionHydrationRef = useRef<SessionHydration | null>(null);
 	const bufferedEventsRef = useRef<ChatTransportEvent[]>([]);
 	const eventCursorsRef = useRef<Record<string, number>>({});
+	const knownRunIdsRef = useRef(new Set(providedSession?.runs.map((run) => run.id) ?? []));
+	const unacceptedRunEventsRef = useRef(new Map<string, ChatTransportEvent[]>());
 	const unroutedSessionIdRef = useRef<string | null>(null);
 	const acceptedRequestIdsRef = useRef(
 		new Set<string>(
@@ -122,6 +128,8 @@ export function useChatController({
 				? []
 				: bufferedEventsRef.current.filter((event) => event.sessionId === sessionId);
 		eventCursorsRef.current = {};
+		knownRunIdsRef.current.clear();
+		unacceptedRunEventsRef.current.clear();
 		acceptedRequestIdsRef.current.clear();
 		terminalEventsBeforeAcceptanceRef.current.clear();
 	}
@@ -158,37 +166,20 @@ export function useChatController({
 		};
 	}, [routeIdentity]);
 
-	const applyMessageUpdate = useCallback(
-		(messageId: string, updater: (message: ChatMessage) => ChatMessage) => {
+	const applyRunUpdate = useCallback(
+		(runId: string, updater: (run: ChatRunSnapshot) => ChatRunSnapshot) => {
 			setSession((currentSession) => {
 				if (!currentSession) {
 					return currentSession;
 				}
 
-				const messageIndex = currentSession.messages.findIndex(
-					(message) => message.id === messageId,
-				);
-				if (messageIndex === -1) {
-					return {
-						...currentSession,
-						messages: [
-							...currentSession.messages,
-							updater({
-								id: messageId,
-								role: "assistant",
-								content: "",
-								createdAt: new Date().toISOString(),
-								status: "streaming",
-							}),
-						],
-					};
+				if (!currentSession.runs.some((run) => run.id === runId)) {
+					return currentSession;
 				}
 
 				return {
 					...currentSession,
-					messages: currentSession.messages.map((message, index) =>
-						index === messageIndex ? updater(message) : message,
-					),
+					runs: currentSession.runs.map((run) => (run.id === runId ? updater(run) : run)),
 				};
 			});
 		},
@@ -200,7 +191,7 @@ export function useChatController({
 			handleTransportEvent({
 				event,
 				activeSessionId: activeSessionIdRef.current,
-				applyMessageUpdate,
+				applyRunUpdate,
 				setActiveResponse,
 				setAnnouncement,
 				setIsStopping,
@@ -209,24 +200,31 @@ export function useChatController({
 				lastSubmittedText: lastSubmittedTextRef.current,
 			});
 		},
-		[applyMessageUpdate, t],
+		[applyRunUpdate, t],
 	);
 
 	const applyTransportEventIfNew = useCallback(
 		(event: ChatTransportEvent) => {
-			if (event.sequence !== undefined) {
-				const lastSequence = eventCursorsRef.current[event.requestId] ?? 0;
-				if (event.sequence <= lastSequence) {
-					return;
+			const lastSequence = eventCursorsRef.current[event.runId] ?? 0;
+			if (event.seq <= lastSequence) {
+				return;
+			}
+			eventCursorsRef.current[event.runId] = event.seq;
+			if (!knownRunIdsRef.current.has(event.runId)) {
+				const queued = unacceptedRunEventsRef.current.get(event.runId) ?? [];
+				queued.push(event);
+				unacceptedRunEventsRef.current.set(event.runId, queued);
+				if (isTerminalTransportEvent(event)) {
+					terminalEventsBeforeAcceptanceRef.current.add(event.runId);
 				}
-				eventCursorsRef.current[event.requestId] = event.sequence;
+				return;
 			}
 
 			if (isTerminalTransportEvent(event)) {
-				if (acceptedRequestIdsRef.current.has(event.requestId)) {
-					acceptedRequestIdsRef.current.delete(event.requestId);
+				if (acceptedRequestIdsRef.current.has(event.runId)) {
+					acceptedRequestIdsRef.current.delete(event.runId);
 				} else {
-					terminalEventsBeforeAcceptanceRef.current.add(event.requestId);
+					terminalEventsBeforeAcceptanceRef.current.add(event.runId);
 				}
 			}
 			applyTransportEvent(event);
@@ -247,6 +245,8 @@ export function useChatController({
 			sessionHydrationRef.current = null;
 			bufferedEventsRef.current = [];
 			eventCursorsRef.current = {};
+			knownRunIdsRef.current.clear();
+			unacceptedRunEventsRef.current.clear();
 			acceptedRequestIdsRef.current.clear();
 			terminalEventsBeforeAcceptanceRef.current.clear();
 			unroutedSessionIdRef.current = null;
@@ -283,6 +283,8 @@ export function useChatController({
 				(event) => event.sessionId === requestedSessionId,
 			);
 			eventCursorsRef.current = {};
+			knownRunIdsRef.current.clear();
+			unacceptedRunEventsRef.current.clear();
 			acceptedRequestIdsRef.current.clear();
 			terminalEventsBeforeAcceptanceRef.current.clear();
 			setIsSessionLoading(true);
@@ -314,15 +316,21 @@ export function useChatController({
 					setSession(null);
 					setActiveResponse(null);
 					eventCursorsRef.current = {};
+					knownRunIdsRef.current.clear();
+					unacceptedRunEventsRef.current.clear();
 					hydratedSessionIdRef.current = null;
 					setOwnershipMismatch(true);
 				} else {
 					setSession(nextSession);
+					knownRunIdsRef.current = new Set(nextSession.runs.map((run) => run.id));
+					unacceptedRunEventsRef.current.clear();
 					setActiveResponse(nextSession.activeResponse ?? null);
 					if (nextSession.activeResponse !== undefined) {
 						acceptedRequestIdsRef.current.add(nextSession.activeResponse.requestId);
 					}
-					eventCursorsRef.current = { ...(nextSession.eventCursors ?? {}) };
+					eventCursorsRef.current = Object.fromEntries(
+						nextSession.runs.map((run) => [run.id, run.lastEventSeq]),
+					);
 					hydratedSessionIdRef.current = requestedSessionId;
 					for (const event of bufferedEvents) {
 						if (event.sessionId === requestedSessionId) {
@@ -354,6 +362,8 @@ export function useChatController({
 				hydratedSessionIdRef.current = null;
 				bufferedEventsRef.current = [];
 				eventCursorsRef.current = {};
+				knownRunIdsRef.current.clear();
+				unacceptedRunEventsRef.current.clear();
 				acceptedRequestIdsRef.current.clear();
 				terminalEventsBeforeAcceptanceRef.current.clear();
 				setActiveResponse(null);
@@ -482,9 +492,18 @@ export function useChatController({
 				return;
 			}
 
+			if (!knownRunIdsRef.current.has(event.runId)) {
+				if (event.clientRequestId === lastSubmittedRequestIdRef.current) {
+					applyTransportEventIfNew(event);
+					return;
+				}
+				bufferedEventsRef.current.push(event);
+				void loadSession(event.sessionId, false, undefined, true);
+				return;
+			}
 			applyTransportEventIfNew(event);
 		});
-	}, [applyTransportEventIfNew, routedOwnershipMismatch, transport]);
+	}, [applyTransportEventIfNew, loadSession, routedOwnershipMismatch, transport]);
 
 	useEffect(() => {
 		if (sessionId !== undefined) {
@@ -496,6 +515,8 @@ export function useChatController({
 		sessionHydrationRef.current = null;
 		bufferedEventsRef.current = [];
 		eventCursorsRef.current = {};
+		knownRunIdsRef.current.clear();
+		unacceptedRunEventsRef.current.clear();
 		acceptedRequestIdsRef.current.clear();
 		terminalEventsBeforeAcceptanceRef.current.clear();
 		setSession(null);
@@ -663,6 +684,8 @@ export function useChatController({
 					activeSessionIdRef.current = activeSession.id;
 					hydratedSessionIdRef.current = activeSession.id;
 					eventCursorsRef.current = {};
+					knownRunIdsRef.current.clear();
+					unacceptedRunEventsRef.current.clear();
 					unroutedSessionIdRef.current = activeSession.id;
 					createdSession = true;
 				}
@@ -681,7 +704,18 @@ export function useChatController({
 				if (lastSubmittedRequestIdRef.current === requestId) {
 					lastSubmittedRequestIdRef.current = null;
 				}
-				const acceptedAlreadyTerminal = result.assistantMessage.status !== "streaming";
+				let acceptedRun = result.run;
+				const queuedEvents = unacceptedRunEventsRef.current.get(result.requestId) ?? [];
+				for (const event of [...queuedEvents].sort((left, right) => left.seq - right.seq)) {
+					acceptedRun = applyChatRunEvent(acceptedRun, event);
+				}
+				unacceptedRunEventsRef.current.delete(result.requestId);
+				knownRunIdsRef.current.add(result.requestId);
+				eventCursorsRef.current[result.requestId] = Math.max(
+					eventCursorsRef.current[result.requestId] ?? 0,
+					acceptedRun.lastEventSeq,
+				);
+				const acceptedAlreadyTerminal = isTerminalRun(acceptedRun);
 				if (!acceptedAlreadyTerminal) {
 					acceptedRequestIdsRef.current.add(result.requestId);
 				}
@@ -701,15 +735,11 @@ export function useChatController({
 					return {
 						...baseSession,
 						title:
-							baseSession.messages.length === 0 && baseSession.title === "New chat"
+							baseSession.runs.length === 0 && baseSession.title === "New chat"
 								? createSessionTitle(content)
 								: baseSession.title,
 						updatedAt: new Date().toISOString(),
-						messages: mergeAcceptedMessages(
-							baseSession.messages,
-							result.userMessage,
-							result.assistantMessage,
-						),
+						runs: mergeChatRunSnapshot(baseSession.runs, acceptedRun),
 					};
 				});
 				setActiveResponse(
@@ -717,7 +747,6 @@ export function useChatController({
 						? null
 						: {
 								requestId: result.requestId,
-								messageId: result.assistantMessage.id,
 							},
 				);
 				setDraft("");
@@ -926,7 +955,7 @@ function createSessionTitle(content: string): string {
 function handleTransportEvent({
 	event,
 	activeSessionId,
-	applyMessageUpdate,
+	applyRunUpdate,
 	lastSubmittedText,
 	setActiveResponse,
 	setAnnouncement,
@@ -936,7 +965,7 @@ function handleTransportEvent({
 }: {
 	event: ChatTransportEvent;
 	activeSessionId: string | null;
-	applyMessageUpdate(messageId: string, updater: (message: ChatMessage) => ChatMessage): void;
+	applyRunUpdate(runId: string, updater: (run: ChatRunSnapshot) => ChatRunSnapshot): void;
 	lastSubmittedText: string | null;
 	setActiveResponse(value: ActiveResponse | null): void;
 	setAnnouncement(value: string): void;
@@ -948,32 +977,35 @@ function handleTransportEvent({
 		return;
 	}
 
-	switch (event.type) {
-		case "response.delta":
-			applyMessageUpdate(event.messageId, (message) => ({
-				...message,
-				content: `${message.content}${event.delta}`,
-				status: "streaming",
-			}));
-			setAnnouncement(t("chat.status.streaming"));
-			break;
-		case "response.completed":
-			applyMessageUpdate(event.messageId, (message) => ({
-				...message,
-				content: event.content,
-				status: "completed",
-			}));
+	applyRunUpdate(event.runId, (run) => applyChatRunEvent(run, event));
+	if (event.type === "run.warning") {
+		setNotice({
+			tone: "info",
+			message: t("projects.chat.rootAgentsWarning", event.payload.reason),
+		});
+		setAnnouncement(t("projects.chat.rootAgentsWarning", event.payload.reason));
+		return;
+	}
+	if (event.type === "run.error") {
+		setNotice({
+			tone: "danger",
+			message: event.payload.error.safeMessage,
+			action: lastSubmittedText ? "retry-send" : undefined,
+		});
+		setAnnouncement(t("chat.status.failed"));
+		return;
+	}
+	if (event.type !== "run.status") {
+		setAnnouncement(t("chat.status.streaming"));
+		return;
+	}
+	switch (event.payload.status) {
+		case "completed":
 			setActiveResponse(null);
 			setIsStopping(false);
 			setAnnouncement(t("chat.status.completed"));
-			break;
-		case "response.cancelled":
-			applyMessageUpdate(event.messageId, (message) => ({
-				...message,
-				content: event.content ?? message.content,
-				status: "cancelled",
-				errorMessage: event.reason,
-			}));
+			return;
+		case "cancelled":
 			setActiveResponse(null);
 			setIsStopping(false);
 			setNotice({
@@ -982,80 +1014,29 @@ function handleTransportEvent({
 				action: lastSubmittedText ? "retry-send" : undefined,
 			});
 			setAnnouncement(t("chat.status.stopped"));
-			break;
-		case "response.error":
-			applyMessageUpdate(event.messageId, (message) => ({
-				...message,
-				content: event.content,
-				status: "error",
-				errorMessage: event.message,
-			}));
+			return;
+		case "failed":
 			setActiveResponse(null);
 			setIsStopping(false);
-			setNotice({
-				tone: "danger",
-				message: event.message,
-				action: lastSubmittedText ? "retry-send" : undefined,
-			});
 			setAnnouncement(t("chat.status.failed"));
-			break;
-		case "run.warning":
-			setNotice({
-				tone: "info",
-				message: t("projects.chat.rootAgentsWarning", event.reason),
-			});
-			setAnnouncement(t("projects.chat.rootAgentsWarning", event.reason));
-			break;
+			return;
+		default:
+			setAnnouncement(t("chat.status.streaming"));
 	}
-}
-
-function mergeAcceptedMessages(
-	currentMessages: ChatMessage[],
-	userMessage: ChatMessage,
-	assistantMessage: ChatMessage,
-): ChatMessage[] {
-	const acceptedIds = new Set([userMessage.id, assistantMessage.id]);
-	const existingById = new Map(currentMessages.map((message) => [message.id, message]));
-	const existingUserMessage = existingById.get(userMessage.id);
-	const existingAssistantMessage = existingById.get(assistantMessage.id);
-	const mergedAssistantMessage =
-		existingAssistantMessage === undefined
-			? assistantMessage
-			: assistantMessage.status !== "streaming"
-				? existingAssistantMessage.status === "streaming"
-					? assistantMessage
-					: existingAssistantMessage
-				: existingAssistantMessage.status !== "streaming"
-					? existingAssistantMessage
-					: {
-							...assistantMessage,
-							...existingAssistantMessage,
-							createdAt: assistantMessage.createdAt,
-							content: existingAssistantMessage.content || assistantMessage.content,
-						};
-
-	return [
-		...currentMessages.filter((message) => !acceptedIds.has(message.id)),
-		existingUserMessage ?? userMessage,
-		mergedAssistantMessage,
-	];
 }
 
 function orderBufferedTransportEvents(events: ChatTransportEvent[]): ChatTransportEvent[] {
 	const grouped = new Map<string, Array<{ event: ChatTransportEvent; index: number }>>();
 	for (const [index, event] of events.entries()) {
-		const group = grouped.get(event.requestId) ?? [];
+		const group = grouped.get(event.runId) ?? [];
 		group.push({ event, index });
-		grouped.set(event.requestId, group);
+		grouped.set(event.runId, group);
 	}
 
 	return [...grouped.values()].flatMap((group) =>
 		group
 			.sort((left, right) => {
-				if (left.event.sequence === undefined || right.event.sequence === undefined) {
-					return left.index - right.index;
-				}
-				return left.event.sequence - right.event.sequence;
+				return left.event.seq - right.event.seq || left.index - right.index;
 			})
 			.map(({ event }) => event),
 	);
@@ -1063,15 +1044,17 @@ function orderBufferedTransportEvents(events: ChatTransportEvent[]): ChatTranspo
 
 function isTerminalTransportEvent(
 	event: ChatTransportEvent,
-): event is Extract<
-	ChatTransportEvent,
-	{ type: "response.completed" | "response.cancelled" | "response.error" }
-> {
+): event is Extract<ChatTransportEvent, { type: "run.status" }> {
 	return (
-		event.type === "response.completed" ||
-		event.type === "response.cancelled" ||
-		event.type === "response.error"
+		event.type === "run.status" &&
+		(event.payload.status === "completed" ||
+			event.payload.status === "failed" ||
+			event.payload.status === "cancelled")
 	);
+}
+
+function isTerminalRun(run: ChatRunSnapshot): boolean {
+	return run.status === "completed" || run.status === "failed" || run.status === "cancelled";
 }
 
 function getErrorMessage(error: unknown, fallback: string) {

@@ -1,6 +1,10 @@
 import { resolve } from "node:path";
 
+import { stagePackageResources } from "./stage-package-resources";
+
 const repositoryRoot = resolve(import.meta.dir, "../../..");
+await stagePackageResources(repositoryRoot);
+
 const child = Bun.spawn({
 	cmd: [process.execPath, "run", "build:companions"],
 	cwd: repositoryRoot,

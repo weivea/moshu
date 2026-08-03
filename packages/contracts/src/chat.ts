@@ -15,10 +15,12 @@ import {
 	projectPathSchema,
 	projectRootAgentsIssueCodeSchema,
 } from "./project";
-import { isoDateTimeSchema, uuidV7Schema } from "./contract-primitives";
+import { isoDateTimeSchema, toolCallIdSchema, uuidV7Schema } from "./contract-primitives";
 
 export {
 	isoDateTimeSchema,
+	maxToolCallIdBytes,
+	toolCallIdSchema,
 	uuidV7Pattern,
 	uuidV7Schema,
 } from "./contract-primitives";
@@ -30,12 +32,13 @@ const providerModelSchema = z.string().trim().min(1).max(200);
 const sessionTitleSchema = z.string().trim().min(1).max(200);
 const sessionSearchQuerySchema = z.string().trim().max(200);
 const userMessageContentSchema = z.string().trim().min(1).max(20_000);
-export const maxAssistantMessageContentCharacters = 200_000;
+export const maxChatTextPartContentCharacters = 200_000;
 export const maxChatDeltaCharacters = 8_000;
-const assistantMessageContentSchema = z.string().max(maxAssistantMessageContentCharacters);
+const textPartContentSchema = z.string().max(maxChatTextPartContentCharacters);
 const deltaContentSchema = z.string().min(1).max(maxChatDeltaCharacters);
 const cancellationReasonSchema = z.string().trim().min(1).max(500);
 const positiveSequenceSchema = z.int().min(1);
+const nonNegativeDurationSchema = z.int().min(0);
 
 export const runProviderConfigInputSchema = z
 	.object({
@@ -83,63 +86,17 @@ export const runProviderStateSchema = z.discriminatedUnion("status", [
 	errorProviderStateSchema,
 ]);
 
-export const chatMessageRoleValues = ["user", "assistant"] as const;
-export const chatMessageRoleSchema = z.enum(chatMessageRoleValues);
-
-export const chatMessageStatusValues = ["streaming", "complete", "failed", "cancelled"] as const;
-export const chatMessageStatusSchema = z.enum(chatMessageStatusValues);
-
-const chatMessageBaseSchema = z
+export const chatUserMessageSchema = z
 	.object({
 		schemaVersion: z.literal(contractSchemaVersion),
 		id: uuidV7Schema,
 		sessionId: uuidV7Schema,
-		runId: uuidV7Schema.optional(),
-		sequence: positiveSequenceSchema,
+		runId: uuidV7Schema,
+		role: z.literal("user"),
+		content: userMessageContentSchema,
 		createdAt: isoDateTimeSchema,
-		updatedAt: isoDateTimeSchema,
 	})
 	.strict();
-
-export const userChatMessageSchema = chatMessageBaseSchema.extend({
-	role: z.literal("user"),
-	status: z.literal("complete"),
-	content: userMessageContentSchema,
-});
-
-export const assistantStreamingChatMessageSchema = chatMessageBaseSchema.extend({
-	role: z.literal("assistant"),
-	status: z.literal("streaming"),
-	content: assistantMessageContentSchema,
-});
-
-export const assistantCompleteChatMessageSchema = chatMessageBaseSchema.extend({
-	role: z.literal("assistant"),
-	status: z.literal("complete"),
-	content: assistantMessageContentSchema.min(1),
-});
-
-export const assistantFailedChatMessageSchema = chatMessageBaseSchema.extend({
-	role: z.literal("assistant"),
-	status: z.literal("failed"),
-	content: assistantMessageContentSchema,
-	error: appErrorSchema,
-});
-
-export const assistantCancelledChatMessageSchema = chatMessageBaseSchema.extend({
-	role: z.literal("assistant"),
-	status: z.literal("cancelled"),
-	content: assistantMessageContentSchema,
-});
-
-export const assistantChatMessageSchema = z.union([
-	assistantStreamingChatMessageSchema,
-	assistantCompleteChatMessageSchema,
-	assistantFailedChatMessageSchema,
-	assistantCancelledChatMessageSchema,
-]);
-
-export const chatMessageSchema = z.union([userChatMessageSchema, assistantChatMessageSchema]);
 
 export const chatRunStatusValues = [
 	"queued",
@@ -194,11 +151,126 @@ export const chatRunSchema = z
 		status: chatRunStatusSchema,
 		provider: runProviderStateSchema,
 		userMessageId: uuidV7Schema,
-		assistantMessageId: uuidV7Schema.optional(),
 		createdAt: isoDateTimeSchema,
 		updatedAt: isoDateTimeSchema,
 		completedAt: isoDateTimeSchema.optional(),
 		lastError: appErrorSchema.optional(),
+	})
+	.strict();
+
+export const chatRunTextPartStatusValues = ["streaming", "completed", "interrupted"] as const;
+export const chatRunTextPartStatusSchema = z.enum(chatRunTextPartStatusValues);
+
+export const chatRunToolStatusValues = [
+	"queued",
+	"waiting_approval",
+	"running",
+	"completed",
+	"failed",
+	"denied",
+	"cancelled",
+	"outcome_unknown",
+] as const;
+export const chatRunToolStatusSchema = z.enum(chatRunToolStatusValues);
+
+export const chatRunPartStatusValues = [
+	...chatRunTextPartStatusValues,
+	...chatRunToolStatusValues.filter((status) => status !== "completed"),
+] as const;
+
+export const builtinChatToolNameValues = [
+	"read",
+	"bash",
+	"edit",
+	"write",
+	"grep",
+	"find",
+	"ls",
+] as const;
+export const builtinChatToolNameSchema = z.enum(builtinChatToolNameValues);
+
+export const chatToolIdentitySchema = z.discriminatedUnion("kind", [
+	z
+		.object({
+			kind: z.literal("builtin"),
+			name: builtinChatToolNameSchema,
+		})
+		.strict(),
+	z
+		.object({
+			kind: z.literal("mcp"),
+			name: z.string().trim().min(1).max(256),
+			mcpServerId: z.string().trim().min(1).max(256),
+			stableToolId: z.string().trim().min(1).max(256),
+		})
+		.strict(),
+]);
+
+export const toolPublicPayloadFormatValues = ["text", "json", "content"] as const;
+export const toolPublicPayloadFormatSchema = z.enum(toolPublicPayloadFormatValues);
+
+export const toolPublicPayloadSchema = z
+	.object({
+		format: toolPublicPayloadFormatSchema,
+		value: z.json(),
+		truncated: z.boolean(),
+		originalBytes: z.int().min(0).optional(),
+		redactionCount: z.int().min(0),
+	})
+	.strict();
+
+export const chatRunToolPayloadBudgetBytes = 2 * 1024 * 1024;
+
+const chatRunPartBaseShape = {
+	schemaVersion: z.literal(contractSchemaVersion),
+	id: uuidV7Schema,
+	runId: uuidV7Schema,
+	position: positiveSequenceSchema,
+	assistantTurnId: uuidV7Schema,
+	revision: positiveSequenceSchema,
+	createdAt: isoDateTimeSchema,
+	updatedAt: isoDateTimeSchema,
+};
+
+export const chatRunTextPartSchema = z
+	.object({
+		...chatRunPartBaseShape,
+		kind: z.literal("text"),
+		status: chatRunTextPartStatusSchema,
+		content: textPartContentSchema,
+	})
+	.strict();
+
+export const chatRunToolPartSchema = z
+	.object({
+		...chatRunPartBaseShape,
+		kind: z.literal("tool"),
+		toolCallId: toolCallIdSchema,
+		tool: chatToolIdentitySchema,
+		status: chatRunToolStatusSchema,
+		summary: z.string().trim().min(1).max(2_000),
+		input: toolPublicPayloadSchema.optional(),
+		progress: toolPublicPayloadSchema.optional(),
+		output: toolPublicPayloadSchema.optional(),
+		payloadsTruncated: z.boolean().optional(),
+		error: appErrorSchema.optional(),
+		approvalId: uuidV7Schema.optional(),
+		startedAt: isoDateTimeSchema.optional(),
+		completedAt: isoDateTimeSchema.optional(),
+		durationMs: nonNegativeDurationSchema.optional(),
+	})
+	.strict();
+
+export const chatRunPartSchema = z.discriminatedUnion("kind", [
+	chatRunTextPartSchema,
+	chatRunToolPartSchema,
+]);
+
+export const chatRunSnapshotSchema = chatRunSchema
+	.extend({
+		userMessage: chatUserMessageSchema,
+		timeline: z.array(chatRunPartSchema),
+		lastEventSeq: z.int().min(0),
 	})
 	.strict();
 
@@ -237,59 +309,58 @@ export const chatRunStatusEventSchema = chatRunEventBaseSchema.extend({
 		.strict(),
 });
 
-export const chatMessageStartedEventSchema = chatRunEventBaseSchema.extend({
-	type: z.literal("message.started"),
+export const chatTimelinePartCreatedEventSchema = chatRunEventBaseSchema.extend({
+	type: z.literal("timeline.part.created"),
 	payload: z
 		.object({
-			messageId: uuidV7Schema,
-			role: z.literal("assistant"),
-			status: z.literal("streaming"),
+			part: chatRunPartSchema,
 		})
 		.strict(),
 });
 
-export const chatMessageDeltaEventSchema = chatRunEventBaseSchema.extend({
-	type: z.literal("message.delta"),
+export const chatTimelineTextDeltaEventSchema = chatRunEventBaseSchema.extend({
+	type: z.literal("timeline.text.delta"),
 	payload: z
 		.object({
-			messageId: uuidV7Schema,
+			partId: uuidV7Schema,
+			revision: positiveSequenceSchema,
 			delta: deltaContentSchema,
 		})
 		.strict(),
 });
 
-const chatMessageCompletedPayloadCompleteSchema = z
-	.object({
-		messageId: uuidV7Schema,
-		status: z.literal("complete"),
-		content: assistantMessageContentSchema.min(1),
-	})
-	.strict();
+export const chatTimelineTextCompletedEventSchema = chatRunEventBaseSchema.extend({
+	type: z.literal("timeline.text.completed"),
+	payload: z
+		.object({
+			part: chatRunTextPartSchema,
+		})
+		.strict(),
+});
 
-const chatMessageCompletedPayloadFailedSchema = z
-	.object({
-		messageId: uuidV7Schema,
-		status: z.literal("failed"),
-		content: assistantMessageContentSchema,
-		error: appErrorSchema,
-	})
-	.strict();
+export const chatTimelineToolUpdatedEventSchema = chatRunEventBaseSchema.extend({
+	type: z.literal("timeline.tool.updated"),
+	payload: z
+		.object({
+			part: chatRunToolPartSchema,
+		})
+		.strict(),
+});
 
-const chatMessageCompletedPayloadCancelledSchema = z
-	.object({
-		messageId: uuidV7Schema,
-		status: z.literal("cancelled"),
-		content: assistantMessageContentSchema,
-	})
-	.strict();
-
-export const chatMessageCompletedEventSchema = chatRunEventBaseSchema.extend({
-	type: z.literal("message.completed"),
-	payload: z.discriminatedUnion("status", [
-		chatMessageCompletedPayloadCompleteSchema,
-		chatMessageCompletedPayloadFailedSchema,
-		chatMessageCompletedPayloadCancelledSchema,
-	]),
+export const chatTimelineToolProgressEventSchema = chatRunEventBaseSchema.extend({
+	type: z.literal("timeline.tool.progress"),
+	payload: z
+		.object({
+			partId: uuidV7Schema,
+			revision: positiveSequenceSchema,
+			progress: toolPublicPayloadSchema.optional(),
+			payloadsTruncated: z.boolean().optional(),
+		})
+		.strict()
+		.refine(
+			(payload) => payload.progress !== undefined || payload.payloadsTruncated === true,
+			"Tool progress must include a public payload or an explicit truncation marker.",
+		),
 });
 
 export const chatRunErrorEventSchema = chatRunEventBaseSchema.extend({
@@ -313,9 +384,11 @@ export const chatRunWarningEventSchema = chatRunEventBaseSchema.extend({
 
 export const chatRunEventSchema = z.discriminatedUnion("type", [
 	chatRunStatusEventSchema,
-	chatMessageStartedEventSchema,
-	chatMessageDeltaEventSchema,
-	chatMessageCompletedEventSchema,
+	chatTimelinePartCreatedEventSchema,
+	chatTimelineTextDeltaEventSchema,
+	chatTimelineTextCompletedEventSchema,
+	chatTimelineToolUpdatedEventSchema,
+	chatTimelineToolProgressEventSchema,
 	chatRunErrorEventSchema,
 	chatRunWarningEventSchema,
 ]);
@@ -422,8 +495,7 @@ export const getChatSessionInputSchema = z
 export const getChatSessionOutputSchema = z
 	.object({
 		session: chatSessionSchema,
-		messages: z.array(chatMessageSchema),
-		runs: z.array(chatRunSchema),
+		runs: z.array(chatRunSnapshotSchema),
 	})
 	.strict();
 
@@ -434,9 +506,7 @@ export const chatRunEventCursorSchema = z
 	})
 	.strict();
 
-export const getChatSessionSnapshotOutputSchema = getChatSessionOutputSchema.extend({
-	eventCursors: z.array(chatRunEventCursorSchema),
-});
+export const getChatSessionSnapshotOutputSchema = getChatSessionOutputSchema;
 
 export const sendChatMessageInputSchema = z
 	.object({
@@ -449,9 +519,7 @@ export const sendChatMessageInputSchema = z
 
 export const chatSendAcceptedOutputSchema = z
 	.object({
-		run: chatRunSchema,
-		userMessage: userChatMessageSchema,
-		assistantMessage: assistantChatMessageSchema,
+		run: chatRunSnapshotSchema,
 	})
 	.strict();
 
@@ -471,13 +539,19 @@ export const cancelChatRunOutputSchema = z
 export type RunProviderConfigInput = z.infer<typeof runProviderConfigInputSchema>;
 export type RunProviderStatus = z.infer<typeof runProviderStatusSchema>;
 export type RunProviderState = z.infer<typeof runProviderStateSchema>;
-export type ChatMessageRole = z.infer<typeof chatMessageRoleSchema>;
-export type ChatMessageStatus = z.infer<typeof chatMessageStatusSchema>;
-export type ChatMessage = z.infer<typeof chatMessageSchema>;
+export type ChatUserMessage = z.infer<typeof chatUserMessageSchema>;
 export type ChatRunStatus = z.infer<typeof chatRunStatusSchema>;
 export type ChatSession = z.infer<typeof chatSessionSchema>;
 export type ProjectRunContext = z.infer<typeof projectRunContextSchema>;
 export type ChatRun = z.infer<typeof chatRunSchema>;
+export type ChatRunTextPartStatus = z.infer<typeof chatRunTextPartStatusSchema>;
+export type ChatRunToolStatus = z.infer<typeof chatRunToolStatusSchema>;
+export type ChatToolIdentity = z.infer<typeof chatToolIdentitySchema>;
+export type ToolPublicPayload = z.infer<typeof toolPublicPayloadSchema>;
+export type ChatRunTextPart = z.infer<typeof chatRunTextPartSchema>;
+export type ChatRunToolPart = z.infer<typeof chatRunToolPartSchema>;
+export type ChatRunPart = z.infer<typeof chatRunPartSchema>;
+export type ChatRunSnapshot = z.infer<typeof chatRunSnapshotSchema>;
 export type ChatRunEventSource = z.infer<typeof chatRunEventSourceSchema>;
 export type ChatRunEvent = z.infer<typeof chatRunEventSchema>;
 export type CreateChatSessionInput = z.infer<typeof createChatSessionInputSchema>;

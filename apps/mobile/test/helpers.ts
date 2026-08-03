@@ -1,9 +1,13 @@
 import type {
-	ChatMessage,
-	ChatRun,
 	ChatRunEvent,
+	ChatRunSnapshot,
+	ChatRunStatus,
+	ChatRunTextPart,
+	ChatSendAcceptedOutput,
 	GetChatSessionPageOutput,
+	ReplayChatEventsOutput,
 } from "@moshu/contracts";
+import { retiredSessionTombstoneTtlMs } from "@moshu/contracts";
 import type { MobileProductClient } from "../src/rpc/product-client";
 import type {
 	BeginPairingOptions,
@@ -30,9 +34,24 @@ export function v7(seed?: number): string {
 
 const ISO = "2025-01-01T00:00:00.000Z";
 
-export function makeUserMessage(id: string, sessionId: string, sequence: number, content = "hi"): ChatMessage {
+export interface ChatMessageFixture {
+	id: string;
+	sessionId: string;
+	sequence: number;
+	role: "user" | "assistant";
+	status: "streaming" | "complete";
+	content: string;
+	createdAt: string;
+	updatedAt: string;
+}
+
+export function makeUserMessage(
+	id: string,
+	sessionId: string,
+	sequence: number,
+	content = "hi",
+): ChatMessageFixture {
 	return {
-		schemaVersion: 1,
 		id,
 		sessionId,
 		sequence,
@@ -50,9 +69,8 @@ export function makeAssistantMessage(
 	sequence: number,
 	content: string,
 	status: "streaming" | "complete" = "complete",
-): ChatMessage {
+): ChatMessageFixture {
 	return {
-		schemaVersion: 1,
 		id,
 		sessionId,
 		sequence,
@@ -61,10 +79,16 @@ export function makeAssistantMessage(
 		content,
 		createdAt: ISO,
 		updatedAt: ISO,
-	} as ChatMessage;
+	};
 }
 
-export function makeRun(id: string, sessionId: string, status: ChatRun["status"]): ChatRun {
+export function makeRun(
+	id: string,
+	sessionId: string,
+	status: ChatRunStatus,
+	userContent = "hi",
+): ChatRunSnapshot {
+	const userMessageId = v7();
 	return {
 		schemaVersion: 1,
 		id,
@@ -81,14 +105,30 @@ export function makeRun(id: string, sessionId: string, status: ChatRun["status"]
 			model: "m1",
 			status: "ready",
 		},
-		userMessageId: v7(),
+		userMessageId,
 		createdAt: ISO,
 		updatedAt: ISO,
-	} as ChatRun;
+		userMessage: {
+			schemaVersion: 1,
+			id: userMessageId,
+			sessionId,
+			runId: id,
+			role: "user",
+			content: userContent,
+			createdAt: ISO,
+		},
+		timeline: [],
+		lastEventSeq: 0,
+	};
 }
 
 /** Minimal chat run event — the reducer/controller read only `type`/`runId`/`seq`/`payload`. */
-export function runStatusEvent(runId: string, sessionId: string, seq: number, status: ChatRun["status"]): ChatRunEvent {
+export function runStatusEvent(
+	runId: string,
+	sessionId: string,
+	seq: number,
+	status: ChatRunStatus,
+): ChatRunEvent {
 	return {
 		schemaVersion: 1,
 		id: v7(),
@@ -103,19 +143,24 @@ export function runStatusEvent(runId: string, sessionId: string, seq: number, st
 	} as unknown as ChatRunEvent;
 }
 
-export function messageStartedEvent(runId: string, sessionId: string, seq: number, messageId: string): ChatRunEvent {
+export function messageStartedEvent(
+	runId: string,
+	sessionId: string,
+	seq: number,
+	messageId: string,
+): ChatRunEvent {
 	return {
 		schemaVersion: 1,
 		id: v7(),
 		runId,
 		sessionId,
 		seq,
-		type: "message.started",
+		type: "timeline.part.created",
 		source: { kind: "assistant" },
 		visibility: "user",
 		createdAt: ISO,
-		payload: { messageId, role: "assistant", status: "streaming" },
-	} as unknown as ChatRunEvent;
+		payload: { part: textPart(runId, messageId, 1, "", "streaming", 1) },
+	};
 }
 
 export function messageDeltaEvent(
@@ -131,12 +176,12 @@ export function messageDeltaEvent(
 		runId,
 		sessionId,
 		seq,
-		type: "message.delta",
+		type: "timeline.text.delta",
 		source: { kind: "assistant" },
 		visibility: "user",
 		createdAt: ISO,
-		payload: { messageId, delta },
-	} as unknown as ChatRunEvent;
+		payload: { partId: messageId, revision: seq, delta },
+	};
 }
 
 export function messageCompletedEvent(
@@ -152,20 +197,36 @@ export function messageCompletedEvent(
 		runId,
 		sessionId,
 		seq,
-		type: "message.completed",
+		type: "timeline.text.completed",
 		source: { kind: "assistant" },
 		visibility: "user",
 		createdAt: ISO,
-		payload: { messageId, status: "complete", content },
-	} as unknown as ChatRunEvent;
+		payload: { part: textPart(runId, messageId, 1, content, "completed", seq) },
+	};
+}
+
+export interface SessionPageFixture
+	extends Partial<Omit<GetChatSessionPageOutput, "runs" | "session">> {
+	session?: GetChatSessionPageOutput["session"];
+	runs?: ChatRunSnapshot[];
+	messages?: ChatMessageFixture[];
+	eventCursors?: Array<{ runId: string; lastSeq: number }>;
 }
 
 export function makeSessionPage(
 	sessionId: string,
-	overrides: Partial<GetChatSessionPageOutput> = {},
+	overrides: SessionPageFixture = {},
 ): GetChatSessionPageOutput {
+	const runs = (overrides.runs ?? []).map((run) => structuredClone(run));
+	applyMessageFixtures(runs, overrides.messages ?? []);
+	for (const cursor of overrides.eventCursors ?? []) {
+		const run = runs.find((candidate) => candidate.id === cursor.runId);
+		if (run !== undefined) {
+			run.lastEventSeq = cursor.lastSeq;
+		}
+	}
 	return {
-		session: {
+		session: overrides.session ?? {
 			schemaVersion: 1,
 			id: sessionId,
 			agentSessionId: v7(),
@@ -175,14 +236,74 @@ export function makeSessionPage(
 			createdAt: ISO,
 			updatedAt: ISO,
 		},
-		messages: [],
-		runs: [],
-		eventCursors: [],
-		...overrides,
-	} as GetChatSessionPageOutput;
+		runs,
+		...(overrides.nextCursor === undefined ? {} : { nextCursor: overrides.nextCursor }),
+	};
 }
 
-export function makeBinding(overrides: Partial<MobileTransportBinding> = {}): MobileTransportBinding {
+function applyMessageFixtures(
+	runs: ChatRunSnapshot[],
+	messages: readonly ChatMessageFixture[],
+): void {
+	if (messages.length === 0) {
+		return;
+	}
+	const user = messages.find((message) => message.role === "user");
+	const assistants = messages.filter((message) => message.role === "assistant");
+	const target = runs.at(-1);
+	if (target === undefined) {
+		return;
+	}
+	if (user !== undefined) {
+		target.userMessageId = user.id;
+		target.userMessage = {
+			schemaVersion: 1,
+			id: user.id,
+			sessionId: target.sessionId,
+			runId: target.id,
+			role: "user",
+			content: user.content,
+			createdAt: user.createdAt,
+		};
+	}
+	target.timeline = assistants.map((message, index) =>
+		textPart(
+			target.id,
+			message.id,
+			index + 1,
+			message.content,
+			message.status === "streaming" ? "streaming" : "completed",
+			1,
+		),
+	);
+}
+
+function textPart(
+	runId: string,
+	id: string,
+	position: number,
+	content: string,
+	status: ChatRunTextPart["status"],
+	revision: number,
+): ChatRunTextPart {
+	return {
+		schemaVersion: 1,
+		id,
+		runId,
+		position,
+		assistantTurnId: v7(),
+		revision,
+		kind: "text",
+		status,
+		content,
+		createdAt: ISO,
+		updatedAt: ISO,
+	};
+}
+
+export function makeBinding(
+	overrides: Partial<MobileTransportBinding> = {},
+): MobileTransportBinding {
 	return {
 		agentServerId: "22222222-2222-4222-8222-222222222222",
 		mobileClientId: "mobile-client-01",
@@ -199,7 +320,12 @@ export function makeBinding(overrides: Partial<MobileTransportBinding> = {}): Mo
 export function makeConnectResult(overrides: Partial<ConnectResult> = {}): ConnectResult {
 	return {
 		connectionId: "conn-1",
-		localIdentity: { role: "mobile-client", peerId: "mobile-client-01", instanceId: "i-1", generation: 1 },
+		localIdentity: {
+			role: "mobile-client",
+			peerId: "mobile-client-01",
+			instanceId: "i-1",
+			generation: 1,
+		},
 		serverIdentity: { role: "agents", peerId: "agents-1", instanceId: "ai-1", generation: 3 },
 		negotiatedProtocolVersion: 1,
 		transportSecurity: "relay-tls",
@@ -274,7 +400,10 @@ export class FakeTransport implements MobileTransportPlugin {
 		this.unpairCalls += 1;
 		this.status = { state: "unpaired" };
 	}
-	addListener(eventName: "frame", listener: (event: TransportFrameEvent) => void): MobileTransportListenerHandle;
+	addListener(
+		eventName: "frame",
+		listener: (event: TransportFrameEvent) => void,
+	): MobileTransportListenerHandle;
 	addListener(
 		eventName: "connectionState",
 		listener: (event: TransportStateEvent) => void,
@@ -319,7 +448,7 @@ interface ChatClientScript {
 	pageCalls: (string | undefined)[];
 }
 
-type ChatSendResult = { run: ChatRun; userMessage: ChatMessage; assistantMessage: ChatMessage };
+type ChatSendResult = ChatSendAcceptedOutput;
 
 /**
  * A duck-typed fake of {@link MobileProductClient} for the chat-session-controller tests. It records
@@ -332,8 +461,8 @@ type ChatSendResult = { run: ChatRun; userMessage: ChatMessage; assistantMessage
 export function makeFakeChatClient(config: {
 	sessionId: string;
 	snapshot: GetChatSessionPageOutput;
-	replay?: (runId: string, lastSeq: number) => ChatRunEvent[];
-	send?: (content: string, requestId: string) => ChatSendResult;
+	replay?: (runId: string, lastSeq: number) => ChatRunEvent[] | Partial<ReplayChatEventsOutput>;
+	send?: (content: string, requestId: string) => ChatSendResult | Promise<ChatSendResult>;
 	getPage?: (cursor: string | undefined) => GetChatSessionPageOutput;
 }): { client: MobileProductClient; script: ChatClientScript } {
 	const script: ChatClientScript = {
@@ -356,10 +485,27 @@ export function makeFakeChatClient(config: {
 			return config.getPage ? config.getPage(input.cursor) : config.snapshot;
 		},
 		async chatReplay(input: { cursors: { runId: string; lastSeq: number }[] }) {
-			const cursor = input.cursors[0]!;
+			const cursor = input.cursors[0];
+			if (cursor === undefined) {
+				throw new Error("Expected one replay cursor.");
+			}
 			script.replayCalls.push({ runId: cursor.runId, lastSeq: cursor.lastSeq });
-			const events = config.replay ? config.replay(cursor.runId, cursor.lastSeq) : [];
-			return { events };
+			const replayed = config.replay ? config.replay(cursor.runId, cursor.lastSeq) : [];
+			const output = Array.isArray(replayed) ? { events: replayed } : replayed;
+			return {
+				events: output.events ?? [],
+				retiredSessionIds: output.retiredSessionIds ?? [],
+				resnapshotSessionIds: output.resnapshotSessionIds ?? [],
+				cursorSupport:
+					output.cursorSupport ??
+					({
+						schemaVersion: 1,
+						serverTimeMs: Date.now(),
+						oldestSupportedCursorIssuedAtMs: 0,
+						tombstoneTtlMs: retiredSessionTombstoneTtlMs,
+					} as const),
+				hasMore: output.hasMore ?? false,
+			};
 		},
 		async chatSend(input: { requestId: string; content: string }) {
 			script.sendCalls.push({ requestId: input.requestId, content: input.content });
@@ -368,9 +514,7 @@ export function makeFakeChatClient(config: {
 			}
 			const runId = v7();
 			return {
-				run: makeRun(runId, config.sessionId, "running"),
-				userMessage: makeUserMessage(v7(), config.sessionId, 1, input.content),
-				assistantMessage: makeAssistantMessage(v7(), config.sessionId, 2, "", "streaming"),
+				run: makeRun(runId, config.sessionId, "running", input.content),
 			};
 		},
 		async chatCancel(input: { runId: string }) {
@@ -388,7 +532,7 @@ export function makeFakeChatClient(config: {
  */
 export function makePagedSnapshot(
 	sessionId: string,
-	pages: Array<Partial<GetChatSessionPageOutput>>,
+	pages: SessionPageFixture[],
 ): (cursor: string | undefined) => GetChatSessionPageOutput {
 	const built = pages.map((overrides, index) => {
 		const isLast = index === pages.length - 1;

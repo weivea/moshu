@@ -49,7 +49,6 @@ function seedRun(database: AppDatabase) {
 		provider: makeProviderInput(),
 		userMessageId: createUuidV7(),
 		userContent: "Test prompt",
-		assistantMessageId: createUuidV7(),
 	});
 	return { sessionId: session.id, run: created.run };
 }
@@ -139,6 +138,7 @@ describe("mobile attention outbox: transactional enqueue", () => {
 			allowAll: true,
 			expectedRevision: 0,
 			idempotencyKey: crypto.randomUUID(),
+			updatedBy: { kind: "client", clientId: "test-client", clientRole: "client" },
 		});
 		db.approvals.create({
 			id: crypto.randomUUID(),
@@ -157,17 +157,16 @@ describe("mobile attention outbox: transactional enqueue", () => {
 
 	test("a Run terminal transition enqueues one row; a duplicate terminal is idempotent", () => {
 		const { run } = seedRun(db);
-		const assistantMessageId = run.assistantMessageId;
 		db.runs.updateStatus({ runId: run.id, status: "running" });
 		const first = db.runs.commitTerminal({
 			runId: run.id,
-			message: { messageId: assistantMessageId, status: "complete", content: "done" },
+			status: "completed",
 		});
 		expect(first.committed).toBe(true);
 		// Re-committing the same terminal message is a no-op transition and must not enqueue again.
 		db.runs.commitTerminal({
 			runId: run.id,
-			message: { messageId: assistantMessageId, status: "complete", content: "done" },
+			status: "completed",
 		});
 		const pending = db.mobileAttentionOutbox.claimPending();
 		expect(pending).toHaveLength(1);

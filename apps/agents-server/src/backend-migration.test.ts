@@ -94,7 +94,7 @@ describe("agents-server Pi backend foundation", () => {
 			expect(
 				database.runs
 					.listEvents({ runId: accepted.run.id })
-					.some((event) => event.type === "message.delta"),
+					.some((event) => event.type === "timeline.text.delta"),
 			).toBe(true);
 		});
 	});
@@ -144,7 +144,26 @@ class FakeRuntime implements AskChatRuntime {
 	readonly deletedThreads: string[] = [];
 
 	async run(input: AskChatRunInput): Promise<AskChatRunResult> {
-		await input.onEvent?.({ type: "message.delta", runId: input.runId, delta: "Pi reply" });
+		await input.onEvent?.({
+			type: "assistant.text.started",
+			runId: input.runId,
+			turnIndex: 0,
+			contentIndex: 0,
+		});
+		await input.onEvent?.({
+			type: "assistant.text.delta",
+			runId: input.runId,
+			turnIndex: 0,
+			contentIndex: 0,
+			delta: "Pi reply",
+		});
+		await input.onEvent?.({
+			type: "assistant.text.completed",
+			runId: input.runId,
+			turnIndex: 0,
+			contentIndex: 0,
+			content: "Pi reply",
+		});
 		return { runId: input.runId, text: "Pi reply" };
 	}
 

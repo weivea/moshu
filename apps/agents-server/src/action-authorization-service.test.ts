@@ -28,7 +28,6 @@ describe("DurableActionAuthorizationService", () => {
 				},
 				userMessageId: createUuidV7(),
 				userContent: "run",
-				assistantMessageId: createUuidV7(),
 			}).run;
 			const invocation = {
 				schemaVersion: 1 as const,
@@ -46,7 +45,11 @@ describe("DurableActionAuthorizationService", () => {
 			};
 			const service = new DurableActionAuthorizationService(
 				database.actions,
-				{ get: () => ({ ...run, projectContext }) },
+				{
+					get: () => ({ ...run, projectContext }),
+					drainTimelineOutbox: () => [],
+					hasPendingTimelineOutbox: () => false,
+				},
 				{
 					role: "agents",
 					peerId: "agents",
@@ -129,7 +132,6 @@ describe("DurableActionAuthorizationService", () => {
 				},
 				userMessageId: createUuidV7(),
 				userContent: "run",
-				assistantMessageId: createUuidV7(),
 			}).run;
 			const service = new DurableActionAuthorizationService(database.actions, database.runs, {
 				role: "agents",
@@ -148,6 +150,31 @@ describe("DurableActionAuthorizationService", () => {
 					arguments: { path: "file.txt", content: "data" },
 				},
 			};
+			const now = new Date().toISOString();
+			for (const [position, toolCallId] of ["tool-call", "undispatched-tool-call"].entries()) {
+				database.runs.appendEvent({
+					runId: run.id,
+					type: "timeline.part.created",
+					source: { kind: "assistant" },
+					payload: {
+						part: {
+							schemaVersion: 1,
+							id: createUuidV7(),
+							runId: run.id,
+							position: position + 1,
+							assistantTurnId: createUuidV7(),
+							revision: 1,
+							createdAt: now,
+							updatedAt: now,
+							kind: "tool",
+							toolCallId,
+							tool: { kind: "builtin", name: "write" },
+							status: "queued",
+							summary: "Write file",
+						},
+					},
+				});
+			}
 			const authorized = await service.authorize(
 				defaultLocalRuntimeBoxId,
 				invocation,
@@ -303,7 +330,6 @@ describe("DurableActionAuthorizationService", () => {
 				},
 				userMessageId: createUuidV7(),
 				userContent: "run",
-				assistantMessageId: createUuidV7(),
 			}).run;
 			const service = new DurableActionAuthorizationService(database.actions, database.runs, {
 				role: "agents",
@@ -323,6 +349,34 @@ describe("DurableActionAuthorizationService", () => {
 				toolSchemaHash: "b".repeat(64),
 				arguments: { sql: "select 1" },
 			};
+			const now = new Date().toISOString();
+			database.runs.appendEvent({
+				runId: run.id,
+				type: "timeline.part.created",
+				source: { kind: "assistant" },
+				payload: {
+					part: {
+						schemaVersion: 1,
+						id: createUuidV7(),
+						runId: run.id,
+						position: 1,
+						assistantTurnId: createUuidV7(),
+						revision: 1,
+						createdAt: now,
+						updatedAt: now,
+						kind: "tool",
+						toolCallId: input.toolCallId,
+						tool: {
+							kind: "mcp",
+							name: input.stableToolId,
+							mcpServerId: input.mcpServerId,
+							stableToolId: input.stableToolId,
+						},
+						status: "queued",
+						summary: "Query database",
+					},
+				},
+			});
 			const authorized = await service.authorizeMcp(defaultLocalRuntimeBoxId, input, {
 				role: "runtime-box",
 				peerId: defaultLocalRuntimeBoxId,
@@ -345,6 +399,15 @@ describe("DurableActionAuthorizationService", () => {
 					stableToolId: "tool-query",
 				},
 			});
+			expect(database.runs.listParts(run.id)).toEqual([
+				expect.objectContaining({
+					kind: "tool",
+					status: "completed",
+					output: expect.objectContaining({
+						value: { content: [{ type: "text", text: "row" }] },
+					}),
+				}),
+			]);
 		} finally {
 			database.close();
 		}

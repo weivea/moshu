@@ -62,12 +62,19 @@ export function ApprovalCard({
 		setBusy(true);
 		setBanner(null);
 		try {
-			await client.updateSessionApprovalPolicy({
+			const output = await client.updateSessionApprovalPolicy({
 				sessionId: request.sessionId,
 				allowAll: true,
 				expectedRevision: policy?.revision ?? 0,
 				idempotencyKey: newUuid(),
+				approveRequest: {
+					approvalId: request.id,
+					expectedRevision: request.revision,
+				},
 			});
+			if (output.request !== undefined) {
+				setFinalState(output.request.state);
+			}
 		} catch {
 			setBanner("conflict");
 		} finally {
@@ -132,12 +139,7 @@ export function ApprovalCard({
 							{t("approval.allowAllOn")}
 						</span>
 					) : (
-						<Button
-							variant="ghost"
-							size="sm"
-							isDisabled={busy}
-							onPress={() => void allowAll()}
-						>
+						<Button variant="ghost" size="sm" isDisabled={busy} onPress={() => void allowAll()}>
 							{t("approval.allowAll")}
 						</Button>
 					)}

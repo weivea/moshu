@@ -1,6 +1,6 @@
 import type Database from "bun:sqlite";
 
-export const currentAppDatabaseVersion = 26;
+export const currentAppDatabaseVersion = 30;
 
 export class AppDatabaseResetRequiredError extends Error {
 	readonly currentVersion: number;
@@ -71,7 +71,9 @@ export function applyAppMigrations(client: Database): void {
 			DROP TABLE IF EXISTS action_approval_requests;
 			DROP TABLE IF EXISTS session_approval_policies;
 			DROP TABLE IF EXISTS action_intents;
+			DROP TABLE IF EXISTS run_timeline_outbox;
 			DROP TABLE IF EXISTS chat_run_events;
+			DROP TABLE IF EXISTS chat_run_parts;
 			DROP TABLE IF EXISTS chat_runs;
 			DROP TABLE IF EXISTS chat_session_create_requests;
 			DROP TABLE IF EXISTS chat_sessions;
@@ -507,8 +509,8 @@ export function applyAppMigrations(client: Database): void {
 				provider_json TEXT NOT NULL,
 				user_message_id TEXT NOT NULL UNIQUE,
 				user_content TEXT NOT NULL,
-				assistant_message_id TEXT NOT NULL UNIQUE,
-				assistant_content TEXT,
+				public_tool_payload_bytes INTEGER NOT NULL DEFAULT 0
+					CHECK (public_tool_payload_bytes >= 0 AND public_tool_payload_bytes <= 2097152),
 				last_error_json TEXT,
 				project_id TEXT REFERENCES projects(id),
 				project_path TEXT,
@@ -542,6 +544,89 @@ export function applyAppMigrations(client: Database): void {
 				ON chat_runs(session_id, created_at_ms, id);
 			CREATE INDEX chat_runs_project_status_idx
 				ON chat_runs(project_id, status);
+
+			CREATE TABLE chat_run_parts (
+				id TEXT PRIMARY KEY NOT NULL,
+				session_id TEXT NOT NULL REFERENCES chat_sessions(id) ON DELETE CASCADE,
+				run_id TEXT NOT NULL REFERENCES chat_runs(id) ON DELETE CASCADE,
+				position INTEGER NOT NULL CHECK (position > 0),
+				kind TEXT NOT NULL,
+				assistant_turn_id TEXT NOT NULL,
+				status TEXT NOT NULL,
+				revision INTEGER NOT NULL CHECK (revision > 0),
+				text_content TEXT,
+				tool_call_id TEXT,
+				tool_kind TEXT,
+				tool_name TEXT,
+				mcp_server_id TEXT,
+				mcp_tool_id TEXT,
+				summary TEXT,
+				input_json TEXT,
+				progress_json TEXT,
+				output_json TEXT,
+				payloads_truncated INTEGER,
+				error_json TEXT,
+				approval_id TEXT,
+				started_at_ms INTEGER,
+				completed_at_ms INTEGER,
+				duration_ms INTEGER,
+				last_event_seq INTEGER NOT NULL CHECK (last_event_seq > 0),
+				created_at_ms INTEGER NOT NULL,
+				updated_at_ms INTEGER NOT NULL,
+				CHECK (
+					(
+						kind = 'text'
+						AND text_content IS NOT NULL
+						AND tool_call_id IS NULL
+						AND tool_kind IS NULL
+						AND tool_name IS NULL
+						AND summary IS NULL
+					)
+					OR (
+						kind = 'tool'
+						AND text_content IS NULL
+						AND tool_call_id IS NOT NULL
+						AND tool_kind IS NOT NULL
+						AND tool_name IS NOT NULL
+						AND summary IS NOT NULL
+					)
+				),
+				CHECK (
+					kind = 'text'
+					OR (
+						tool_kind = 'builtin'
+						AND mcp_server_id IS NULL
+						AND mcp_tool_id IS NULL
+					)
+					OR (
+						tool_kind = 'mcp'
+						AND mcp_server_id IS NOT NULL
+						AND mcp_tool_id IS NOT NULL
+					)
+				)
+			);
+			CREATE UNIQUE INDEX chat_run_parts_run_position_unique
+				ON chat_run_parts(run_id, position);
+			CREATE UNIQUE INDEX chat_run_parts_run_tool_call_unique
+				ON chat_run_parts(run_id, tool_call_id);
+			CREATE INDEX chat_run_parts_session_run_position_idx
+				ON chat_run_parts(session_id, run_id, position);
+			CREATE INDEX chat_run_parts_run_event_seq_idx
+				ON chat_run_parts(run_id, last_event_seq);
+
+			CREATE TABLE run_timeline_outbox (
+				sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+				run_id TEXT NOT NULL REFERENCES chat_runs(id) ON DELETE CASCADE,
+				tool_call_id TEXT NOT NULL,
+				authority TEXT NOT NULL,
+				status TEXT NOT NULL,
+				approval_id TEXT,
+				safe_error TEXT,
+				public_output_json TEXT,
+				created_at_ms INTEGER NOT NULL
+			);
+			CREATE INDEX run_timeline_outbox_sequence_idx
+				ON run_timeline_outbox(sequence);
 
 			CREATE TABLE action_intents (
 				id TEXT PRIMARY KEY NOT NULL,

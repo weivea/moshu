@@ -27,8 +27,20 @@ class SmokeAgentRuntime implements AskChatRuntime {
 		if (userMessage === undefined || userMessage.role !== "user") {
 			throw new Error("Smoke Ask runtime requires one user message.");
 		}
+		await input.onEvent?.({
+			type: "assistant.text.started",
+			runId: input.runId,
+			turnIndex: 1,
+			contentIndex: 0,
+		});
 		if (userMessage.content === "cancel-me") {
-			await input.onEvent?.({ type: "message.delta", runId: input.runId, delta: "partial" });
+			await input.onEvent?.({
+				type: "assistant.text.delta",
+				runId: input.runId,
+				turnIndex: 1,
+				contentIndex: 0,
+				delta: "partial",
+			});
 			await new Promise<never>((_resolve, reject) => {
 				this.#pending.set(input.runId, reject);
 			});
@@ -47,8 +59,21 @@ class SmokeAgentRuntime implements AskChatRuntime {
 				? await this.#runExecutorToolSmoke(input.runId)
 				: "hello world";
 		for (const delta of text === "hello world" ? ["hello", " world"] : [text]) {
-			await input.onEvent?.({ type: "message.delta", runId: input.runId, delta });
+			await input.onEvent?.({
+				type: "assistant.text.delta",
+				runId: input.runId,
+				turnIndex: 1,
+				contentIndex: 0,
+				delta,
+			});
 		}
+		await input.onEvent?.({
+			type: "assistant.text.completed",
+			runId: input.runId,
+			turnIndex: 1,
+			contentIndex: 0,
+			content: text,
+		});
 		this.#messages.set(threadId, [
 			...(this.#messages.get(threadId) ?? []),
 			{ ...userMessage },

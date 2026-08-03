@@ -414,7 +414,7 @@ export function createProductRpcHandlers(dependencies: ProductRpcDependencies): 
 							mobileAttention: requireMobileAttention(),
 							revokeDeviceKey: (revokeInput) =>
 								requireMobileIngressAuth().revokeDevice(revokeInput),
-							disconnectMobileDevice,
+							...(disconnectMobileDevice === undefined ? {} : { disconnectMobileDevice }),
 						},
 						input,
 					),
@@ -1142,6 +1142,7 @@ export function createProductRpcHandlers(dependencies: ProductRpcDependencies): 
 						expectedRevision: input.expectedRevision,
 						idempotencyKey: input.idempotencyKey,
 						updatedBy: approvalDecisionSource(peer),
+						...(input.approveRequest === undefined ? {} : { approveRequest: input.approveRequest }),
 					});
 				},
 			),

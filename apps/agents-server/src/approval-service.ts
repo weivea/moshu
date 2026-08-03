@@ -4,6 +4,7 @@ import type {
 	ApprovalDecisionKind,
 	ApprovalRequest,
 	ApprovalState,
+	ChatRunEvent,
 	DecideApprovalOutput,
 	DecisionSource,
 	ListApprovalsOutput,
@@ -84,6 +85,10 @@ export interface UpdateSessionPolicyServiceInput {
 	expectedRevision: number;
 	idempotencyKey: string;
 	updatedBy: DecisionSource;
+	approveRequest?: {
+		approvalId: string;
+		expectedRevision: number;
+	};
 }
 
 interface Waiter {
@@ -98,15 +103,19 @@ const defaultApprovalLifetimeMs = 10 * 60_000;
 
 export class ApprovalService implements ActionApprovalGate {
 	readonly #approvals: ApprovalRepository;
-	readonly #runs: Pick<RunJournalRepository, "get">;
+	readonly #runs: Pick<
+		RunJournalRepository,
+		"get" | "drainTimelineOutbox" | "hasPendingTimelineOutbox"
+	>;
 	readonly #clock: { now(): number };
 	readonly #expiryMs: number;
 	readonly #waiters = new Map<string, Waiter>();
 	readonly #listeners = new Set<ApprovalServiceListener>();
+	readonly #timelineListeners = new Set<(events: readonly ChatRunEvent[]) => void>();
 
 	constructor(
 		approvals: ApprovalRepository,
-		runs: Pick<RunJournalRepository, "get">,
+		runs: Pick<RunJournalRepository, "get" | "drainTimelineOutbox" | "hasPendingTimelineOutbox">,
 		options: { clock?: { now(): number }; approvalLifetimeMs?: number } = {},
 	) {
 		this.#approvals = approvals;
@@ -119,6 +128,13 @@ export class ApprovalService implements ActionApprovalGate {
 		this.#listeners.add(listener);
 		return () => {
 			this.#listeners.delete(listener);
+		};
+	}
+
+	subscribeTimeline(listener: (events: readonly ChatRunEvent[]) => void): () => void {
+		this.#timelineListeners.add(listener);
+		return () => {
+			this.#timelineListeners.delete(listener);
 		};
 	}
 
@@ -144,6 +160,7 @@ export class ApprovalService implements ActionApprovalGate {
 			expiresAtMs: now + this.#expiryMs,
 			...(autoApprove ? { policyApproval: { allowAllRevision: policy.revision } } : {}),
 		});
+		this.#flushTimeline();
 		this.#emit({ type: "approval.created", request: toApprovalRequest(record) });
 		if (record.state === "approved") {
 			return;
@@ -153,6 +170,7 @@ export class ApprovalService implements ActionApprovalGate {
 		}
 		if (options.signal?.aborted) {
 			const cancelled = this.#approvals.cancel(record.id, systemSource());
+			this.#flushTimeline();
 			this.#emit({ type: "approval.updated", request: toApprovalRequest(cancelled) });
 			throw new ActionApprovalRejectedError(cancelled);
 		}
@@ -167,6 +185,7 @@ export class ApprovalService implements ActionApprovalGate {
 					this.#waiters.delete(record.id);
 					try {
 						const cancelled = this.#approvals.cancel(record.id, systemSource());
+						this.#flushTimeline();
 						this.#emit({ type: "approval.updated", request: toApprovalRequest(cancelled) });
 						reject(new ActionApprovalRejectedError(cancelled));
 					} catch (error) {
@@ -210,6 +229,7 @@ export class ApprovalService implements ActionApprovalGate {
 			idempotencyKey: input.idempotencyKey,
 			source: input.source,
 		});
+		this.#flushTimeline();
 		const settled = this.#settleWaiter(result.record);
 		if (result.outcome === "applied" || settled) {
 			this.#emit({ type: "approval.updated", request: toApprovalRequest(result.record) });
@@ -228,18 +248,31 @@ export class ApprovalService implements ActionApprovalGate {
 			expectedRevision: input.expectedRevision,
 			idempotencyKey: input.idempotencyKey,
 			updatedBy: input.updatedBy,
+			...(input.approveRequest === undefined ? {} : { approveRequest: input.approveRequest }),
 		});
+		if (result.request !== undefined) {
+			this.#flushTimeline();
+			const settled = this.#settleWaiter(result.request);
+			if (result.requestOutcome === "applied" || settled) {
+				this.#emit({ type: "approval.updated", request: toApprovalRequest(result.request) });
+			}
+		}
 		if (result.outcome === "applied") {
 			this.#emit({
 				type: "sessionApprovalPolicy.changed",
 				policy: toSessionApprovalPolicy(result.policy),
 			});
 		}
-		return { schemaVersion: 1, policy: toSessionApprovalPolicy(result.policy) };
+		return {
+			schemaVersion: 1,
+			policy: toSessionApprovalPolicy(result.policy),
+			...(result.request === undefined ? {} : { request: toApprovalRequest(result.request) }),
+		};
 	}
 
 	sweepExpired(nowMs?: number): number {
 		const expired = this.#approvals.expireDue(nowMs ?? this.#clock.now());
+		this.#flushTimeline();
 		for (const record of expired) {
 			this.#settleWaiter(record);
 			this.#emit({ type: "approval.updated", request: toApprovalRequest(record) });
@@ -248,7 +281,9 @@ export class ApprovalService implements ActionApprovalGate {
 	}
 
 	recoverOnStartup(nowMs?: number): { expired: number; policiesReset: number } {
-		return this.#approvals.recoverOnStartup(nowMs ?? this.#clock.now());
+		const result = this.#approvals.recoverOnStartup(nowMs ?? this.#clock.now());
+		this.#flushTimeline();
+		return result;
 	}
 
 	resetForSession(sessionId: string, nowMs?: number): void {
@@ -257,6 +292,7 @@ export class ApprovalService implements ActionApprovalGate {
 			([, waiter]) => waiter.sessionId === sessionId,
 		);
 		this.#approvals.resetForSession(sessionId, now);
+		this.#flushTimeline();
 		for (const [id] of affected) {
 			const record = this.#approvals.get(id);
 			if (record !== undefined) {
@@ -293,6 +329,18 @@ export class ApprovalService implements ActionApprovalGate {
 				listener(event);
 			} catch {
 				// A misbehaving subscriber must never break approval state transitions.
+			}
+		}
+	}
+
+	#flushTimeline(): void {
+		for (;;) {
+			const events = this.#runs.drainTimelineOutbox();
+			for (const listener of this.#timelineListeners) {
+				listener(events);
+			}
+			if (!this.#runs.hasPendingTimelineOutbox()) {
+				return;
 			}
 		}
 	}

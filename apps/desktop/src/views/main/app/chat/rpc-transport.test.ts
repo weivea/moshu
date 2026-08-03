@@ -111,7 +111,7 @@ describe("RPC Chat transport", () => {
 			message: "Hello",
 		});
 		expect(accepted.requestId).toBe(runId);
-		expect(accepted.assistantMessage.status).toBe("streaming");
+		expect(accepted.run.timeline[0]?.status).toBe("streaming");
 		await transport.cancel({ sessionId, requestId: runId });
 		expect(client.cancelInputs).toEqual([{ sessionId, runId }]);
 
@@ -119,18 +119,20 @@ describe("RPC Chat transport", () => {
 		client.emit(createWarningEvent());
 		client.emit(createCompletedEvent());
 		expect(events.map((event) => event.type)).toEqual([
-			"response.delta",
+			"timeline.text.delta",
 			"run.warning",
-			"response.completed",
+			"timeline.text.completed",
 		]);
 		expect(events[1]).toMatchObject({
 			type: "run.warning",
-			code: "ROOT_AGENTS_SKIPPED",
-			reason: "too_large",
+			payload: {
+				code: "ROOT_AGENTS_SKIPPED",
+				reason: "too_large",
+			},
 		});
 		expect(events[2]).toMatchObject({
-			type: "response.completed",
-			content: "Hi",
+			type: "timeline.text.completed",
+			payload: { part: { content: "Hi" } },
 		});
 	});
 
@@ -141,9 +143,8 @@ describe("RPC Chat transport", () => {
 
 		expect(session.activeResponse).toEqual({
 			requestId: runId,
-			messageId: assistantMessageId,
 		});
-		expect(session.messages[1]?.status).toBe("streaming");
+		expect(session.runs[0]?.timeline[0]?.status).toBe("streaming");
 	});
 
 	test("drops cached and late events for an exactly retired Session", async () => {
@@ -418,23 +419,7 @@ class FakeRpcChatClient implements RpcChatClient {
 	async getChatSession(_sessionId: string): Promise<GetChatSessionSnapshotOutput> {
 		return {
 			session: createContractSession(),
-			messages: [
-				{
-					schemaVersion: 1,
-					id: userMessageId,
-					sessionId,
-					runId,
-					role: "user",
-					status: "complete",
-					content: "Hello",
-					sequence: 1,
-					createdAt,
-					updatedAt: createdAt,
-				},
-				createAssistantMessage(),
-			],
 			runs: [createRun()],
-			eventCursors: [{ runId, lastSeq: 3 }],
 		};
 	}
 
@@ -482,19 +467,6 @@ class FakeRpcChatClient implements RpcChatClient {
 		}
 		return {
 			run: createRun(),
-			userMessage: {
-				schemaVersion: 1,
-				id: userMessageId,
-				sessionId,
-				runId,
-				role: "user",
-				status: "complete",
-				content: "Hello",
-				sequence: 1,
-				createdAt,
-				updatedAt: createdAt,
-			},
-			assistantMessage: createAssistantMessage(),
 		};
 	}
 
@@ -573,12 +545,13 @@ function createAssistantMessage() {
 	return {
 		schemaVersion: 1 as const,
 		id: assistantMessageId,
-		sessionId,
 		runId,
-		role: "assistant" as const,
+		position: 1,
+		assistantTurnId: "01984df0-cf19-759c-a34b-42eaf39d8871",
+		revision: 1,
+		kind: "text" as const,
 		status: "streaming" as const,
 		content: "",
-		sequence: 2,
 		createdAt,
 		updatedAt: createdAt,
 	};
@@ -602,9 +575,19 @@ function createRun() {
 			status: "ready" as const,
 		},
 		userMessageId,
-		assistantMessageId,
 		createdAt,
 		updatedAt: createdAt,
+		userMessage: {
+			schemaVersion: 1 as const,
+			id: userMessageId,
+			sessionId,
+			runId,
+			role: "user" as const,
+			content: "Hello",
+			createdAt,
+		},
+		timeline: [createAssistantMessage()],
+		lastEventSeq: 3,
 	};
 }
 
@@ -615,12 +598,13 @@ function createDeltaEvent(delta: string): ChatRunEvent {
 		runId,
 		sessionId,
 		seq: 4,
-		type: "message.delta",
+		type: "timeline.text.delta",
 		source: { kind: "assistant" },
 		visibility: "user",
 		createdAt,
 		payload: {
-			messageId: assistantMessageId,
+			partId: assistantMessageId,
+			revision: 2,
 			delta,
 		},
 	};
@@ -663,15 +647,18 @@ function createCompletedEvent(): ChatRunEvent {
 		id: "01984df0-cf1c-793f-bc2c-df399f25cd1d",
 		runId,
 		sessionId,
-		seq: 5,
-		type: "message.completed",
+		seq: 6,
+		type: "timeline.text.completed",
 		source: { kind: "assistant" },
 		visibility: "user",
 		createdAt,
 		payload: {
-			messageId: assistantMessageId,
-			status: "complete",
-			content: "Hi",
+			part: {
+				...createAssistantMessage(),
+				revision: 3,
+				status: "completed",
+				content: "Hi",
+			},
 		},
 	};
 }

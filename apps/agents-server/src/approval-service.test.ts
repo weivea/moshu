@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { defaultLocalRuntimeBoxId, listApprovalsOutputSchema } from "@moshu/contracts";
+import {
+	approvalEventDeliverySchema,
+	defaultLocalRuntimeBoxId,
+	getApprovalOutputSchema,
+	listApprovalsOutputSchema,
+} from "@moshu/contracts";
 import { createUuidV7, openAppDatabase } from "@moshu/database";
 import { DurableActionAuthorizationService } from "./action-authorization-service";
 import {
@@ -20,6 +25,39 @@ function makeProviderInput() {
 	};
 }
 
+type TestDatabase = ReturnType<typeof openAppDatabase>;
+
+function appendToolPart(
+	database: TestDatabase,
+	runId: string,
+	toolCallId: string,
+	tool: "bash" | "edit" | "read",
+): void {
+	const now = new Date().toISOString();
+	database.runs.appendEvent({
+		runId,
+		type: "timeline.part.created",
+		source: { kind: "assistant" },
+		payload: {
+			part: {
+				schemaVersion: 1,
+				id: createUuidV7(),
+				runId,
+				position: database.runs.listParts(runId).length + 1,
+				assistantTurnId: createUuidV7(),
+				revision: 1,
+				createdAt: now,
+				updatedAt: now,
+				kind: "tool",
+				toolCallId,
+				tool: { kind: "builtin", name: tool },
+				status: "queued",
+				summary: `${tool} invocation`,
+			},
+		},
+	});
+}
+
 function setup() {
 	const database = openAppDatabase(":memory:");
 	const session = database.sessions.create({ title: "Approval" }).session;
@@ -30,7 +68,6 @@ function setup() {
 		provider: makeProviderInput(),
 		userMessageId: createUuidV7(),
 		userContent: "run",
-		assistantMessageId: createUuidV7(),
 	}).run;
 	const service = new ApprovalService(database.approvals, database.runs);
 	return { database, sessionId: session.id, runId: run.id, service };
@@ -39,8 +76,8 @@ function setup() {
 const clientSource = { kind: "client" as const, clientId: "peer-a", clientRole: "client" };
 const otherSource = { kind: "client" as const, clientId: "peer-b", clientRole: "client" };
 
-function bashInvocation(runId: string, command: string) {
-	return {
+function bashInvocation(database: TestDatabase, runId: string, command: string) {
+	const invocation = {
 		schemaVersion: 1 as const,
 		invocationId: crypto.randomUUID(),
 		runId,
@@ -48,20 +85,29 @@ function bashInvocation(runId: string, command: string) {
 		cwd: "/workspace",
 		call: { tool: "bash" as const, arguments: { command } },
 	};
+	appendToolPart(database, runId, invocation.toolCallId, invocation.call.tool);
+	return invocation;
 }
 
-function editInvocation(runId: string, path: string) {
-	return {
+function editInvocation(
+	database: TestDatabase,
+	runId: string,
+	path: string,
+	toolCallId = `call-${crypto.randomUUID()}`,
+) {
+	const invocation = {
 		schemaVersion: 1 as const,
 		invocationId: crypto.randomUUID(),
 		runId,
-		toolCallId: `call-${crypto.randomUUID()}`,
+		toolCallId,
 		cwd: "/workspace",
 		call: {
 			tool: "edit" as const,
 			arguments: { path, edits: [{ oldText: "a", newText: "b" }] },
 		},
 	};
+	appendToolPart(database, runId, invocation.toolCallId, invocation.call.tool);
+	return invocation;
 }
 
 const runtimeTarget = {
@@ -88,7 +134,7 @@ describe("ApprovalService gate integration", () => {
 				authority,
 				{ allowSideEffects: true, approvalGate: service },
 			);
-			const invocation = bashInvocation(runId, "echo hi");
+			const invocation = bashInvocation(database, runId, "echo hi");
 			const authorizePromise = authorizer.authorize(
 				defaultLocalRuntimeBoxId,
 				invocation,
@@ -129,7 +175,7 @@ describe("ApprovalService gate integration", () => {
 				authority,
 				{ allowSideEffects: true, approvalGate: service },
 			);
-			const invocation = bashInvocation(runId, "echo hi");
+			const invocation = bashInvocation(database, runId, "echo hi");
 			const authorizePromise = authorizer.authorize(
 				defaultLocalRuntimeBoxId,
 				invocation,
@@ -170,6 +216,7 @@ describe("ApprovalService gate integration", () => {
 				cwd: "/workspace",
 				call: { tool: "read" as const, arguments: { path: "README.md" } },
 			};
+			appendToolPart(database, runId, invocation.toolCallId, invocation.call.tool);
 			const authorized = await authorizer.authorize(
 				defaultLocalRuntimeBoxId,
 				invocation,
@@ -192,7 +239,7 @@ describe("ApprovalService gate integration", () => {
 				authority,
 				{ allowSideEffects: true, approvalGate: service },
 			);
-			const invocation = bashInvocation(runId, "echo race");
+			const invocation = bashInvocation(database, runId, "echo race");
 			const authorizePromise = authorizer.authorize(
 				defaultLocalRuntimeBoxId,
 				invocation,
@@ -243,7 +290,7 @@ describe("ApprovalService gate integration", () => {
 			);
 			// Overridable edit (medium, overridable) is auto-approved without waiting.
 			// A shell Action can never be overridable, so `edit` is used here.
-			const ok = editInvocation(runId, "/workspace/app.ts");
+			const ok = editInvocation(database, runId, "/workspace/app.ts");
 			const authorized = await authorizer.authorize(defaultLocalRuntimeBoxId, ok, runtimeTarget, {
 				executionScope: "request-cwd",
 			});
@@ -253,7 +300,7 @@ describe("ApprovalService gate integration", () => {
 			expect(autoRecord?.policyEvidence?.allowAllRevision).toBe(1);
 
 			// Critical, non-overridable bash still blocks despite Allow all.
-			const dangerous = bashInvocation(runId, "sudo rm -rf /");
+			const dangerous = bashInvocation(database, runId, "sudo rm -rf /");
 			const pendingPromise = authorizer.authorize(
 				defaultLocalRuntimeBoxId,
 				dangerous,
@@ -280,6 +327,61 @@ describe("ApprovalService gate integration", () => {
 		}
 	});
 
+	test("Allow all approves the waiting Action in the same durable operation", async () => {
+		const { database, runId, sessionId, service } = setup();
+		try {
+			const events: ApprovalServiceEvent[] = [];
+			service.subscribe((event) => events.push(event));
+			const authorizer = new DurableActionAuthorizationService(
+				database.actions,
+				database.runs,
+				authority,
+				{ allowSideEffects: true, approvalGate: service },
+			);
+			const invocation = editInvocation(database, runId, "README.md");
+			const authorizePromise = authorizer.authorize(
+				defaultLocalRuntimeBoxId,
+				invocation,
+				runtimeTarget,
+				{ executionScope: "request-cwd" },
+			);
+			await Promise.resolve();
+			const pending = service.listApprovals({ states: ["pending"] }).items[0];
+			if (pending === undefined) {
+				throw new Error("Expected a pending approval.");
+			}
+
+			const output = service.updateSessionPolicy({
+				sessionId,
+				allowAll: true,
+				expectedRevision: 0,
+				idempotencyKey: crypto.randomUUID(),
+				updatedBy: clientSource,
+				approveRequest: {
+					approvalId: pending.id,
+					expectedRevision: pending.revision,
+				},
+			});
+
+			expect(output.policy).toMatchObject({ allowAll: true, revision: 1 });
+			expect(output.request).toMatchObject({
+				id: pending.id,
+				state: "approved",
+				revision: 2,
+				policyEvidence: { allowAllRevision: 1 },
+			});
+			await authorizePromise;
+			expect(database.actions.get(invocation.invocationId).state).toBe("running");
+			expect(events.map((event) => event.type)).toEqual([
+				"approval.created",
+				"approval.updated",
+				"sessionApprovalPolicy.changed",
+			]);
+		} finally {
+			database.close();
+		}
+	});
+
 	test("aborting the run signal cancels a pending approval and rejects the waiter", async () => {
 		const { database, runId, service } = setup();
 		try {
@@ -290,7 +392,7 @@ describe("ApprovalService gate integration", () => {
 				{ allowSideEffects: true, approvalGate: service },
 			);
 			const controller = new AbortController();
-			const invocation = bashInvocation(runId, "echo hi");
+			const invocation = bashInvocation(database, runId, "echo hi");
 			const authorizePromise = authorizer.authorize(
 				defaultLocalRuntimeBoxId,
 				invocation,
@@ -325,7 +427,7 @@ describe("ApprovalService gate integration", () => {
 				authority,
 				{ allowSideEffects: true, approvalGate: service },
 			);
-			const invocation = bashInvocation(runId, "echo hi");
+			const invocation = bashInvocation(database, runId, "echo hi");
 			const authorizePromise = authorizer.authorize(
 				defaultLocalRuntimeBoxId,
 				invocation,
@@ -352,13 +454,66 @@ describe("ApprovalService gate integration", () => {
 		}
 	});
 
+	test("publishes provider-sized Tool call IDs through every approval wire surface", async () => {
+		const { database, runId, service } = setup();
+		try {
+			const events: ApprovalServiceEvent[] = [];
+			service.subscribe((event) => events.push(event));
+			const authorizer = new DurableActionAuthorizationService(
+				database.actions,
+				database.runs,
+				authority,
+				{ allowSideEffects: true, approvalGate: service },
+			);
+			const toolCallId = `call_${"x".repeat(437)}`;
+			const invocation = editInvocation(database, runId, "README.md", toolCallId);
+			const authorizePromise = authorizer.authorize(
+				defaultLocalRuntimeBoxId,
+				invocation,
+				runtimeTarget,
+				{ executionScope: "request-cwd" },
+			);
+			await Promise.resolve();
+			const listed = listApprovalsOutputSchema.parse(
+				service.listApprovals({ states: ["pending"] }),
+			);
+			const request = listed.items[0];
+			expect(request?.toolCallId).toBe(toolCallId);
+			expect(
+				approvalEventDeliverySchema.parse({
+					schemaVersion: 1,
+					kind: "created",
+					request: events.find((event) => event.type === "approval.created")?.request,
+				}).request.toolCallId,
+			).toBe(toolCallId);
+			expect(
+				getApprovalOutputSchema.parse({
+					schemaVersion: 1,
+					...service.getApproval(request?.id ?? ""),
+				}).request.toolCallId,
+			).toBe(toolCallId);
+
+			service.decideApproval({
+				approvalId: request?.id ?? "",
+				expectedRevision: request?.revision ?? 0,
+				decision: "reject",
+				idempotencyKey: crypto.randomUUID(),
+				source: clientSource,
+			});
+			await expect(authorizePromise).rejects.toBeInstanceOf(ActionApprovalRejectedError);
+		} finally {
+			database.close();
+		}
+	});
+
 	test("restart recovery expires lingering pending approvals", async () => {
 		const { database, runId, service } = setup();
 		try {
 			// A durable pending request survives a process restart (no in-memory waiter).
 			const now = Date.now();
+			appendToolPart(database, runId, "call-restart", "bash");
 			database.approvals.create({
-				id: crypto.randomUUID(),
+				id: createUuidV7(now),
 				sessionId: database.runs.get(runId).sessionId,
 				runId,
 				actionId: crypto.randomUUID(),
@@ -391,6 +546,7 @@ describe("ApprovalService gate integration", () => {
 			const service = new ApprovalService(database.approvals, database.runs, {
 				approvalLifetimeMs: 5,
 			});
+			appendToolPart(database, runId, "call-expire", "bash");
 			const waitPromise = service.requireApproval({
 				runId,
 				invocationId: crypto.randomUUID(),
@@ -432,7 +588,7 @@ describe("ApprovalService gate integration", () => {
 			);
 			// A perfectly benign shell command is still non-overridable, so Allow all
 			// cannot silently run it — it must block on a real pending approval.
-			const invocation = bashInvocation(runId, "echo hi");
+			const invocation = bashInvocation(database, runId, "echo hi");
 			const pendingPromise = authorizer.authorize(
 				defaultLocalRuntimeBoxId,
 				invocation,
@@ -506,7 +662,6 @@ describe("ApprovalService gate integration", () => {
 					provider: makeProviderInput(),
 					userMessageId: createUuidV7(),
 					userContent: "run",
-					assistantMessageId: createUuidV7(),
 				}).run;
 				service.updateSessionPolicy({
 					sessionId: session.id,

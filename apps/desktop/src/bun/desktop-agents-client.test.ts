@@ -823,7 +823,7 @@ describe("DesktopAgentsClient", () => {
 		const targetSessionId = createRetirementSessionId(1);
 		let connectionOptions: ConnectRpcClientOptions | undefined;
 		let deleteCalls = 0;
-		const peer = new FakePeer(async (method, payload) => {
+		const peer = new FakePeer(async (method, payload): Promise<JsonValue> => {
 			if (method === productRpcMethods.sessionDelete) {
 				deleteCalls += 1;
 				const sessionId = deleteChatSessionInputSchema.parse(payload).sessionId;
@@ -837,7 +837,7 @@ describe("DesktopAgentsClient", () => {
 				await retire({ schemaVersion: 1, sessionIds: [sessionId] }, {} as RpcEventContext);
 				return { sessionId };
 			}
-			return { events: [] };
+			return rpcJsonValueSchema.parse({ events: [] });
 		});
 		const client = new DesktopAgentsClient(async (options) => {
 			connectionOptions = options;
@@ -907,7 +907,7 @@ describe("DesktopAgentsClient", () => {
 		let deleteCalls = 0;
 		const initiator = new DesktopAgentsClient(async (options) => {
 			initiatorOptions = options;
-			return new FakePeer(async (method, payload) => {
+			return new FakePeer(async (method, payload): Promise<JsonValue> => {
 				if (method === productRpcMethods.sessionDelete) {
 					deleteCalls += 1;
 					const sessionId = deleteChatSessionInputSchema.parse(payload).sessionId;
@@ -928,7 +928,7 @@ describe("DesktopAgentsClient", () => {
 					);
 					return { sessionId };
 				}
-				return { events: [] };
+				return rpcJsonValueSchema.parse({ events: [] });
 			});
 		});
 		const initiatorInvalidations: string[] = [];
@@ -2469,17 +2469,28 @@ describe("DesktopAgentsClient", () => {
 						runId: replayedRunId,
 						sessionId,
 						seq: 1,
-						type: "message.delta",
+						type: "timeline.part.created",
 						source: { kind: "assistant" },
 						visibility: "user",
 						createdAt,
 						payload: {
-							messageId:
-								assistantIds[index] ??
-								(() => {
-									throw new Error("Missing fake assistant message ID.");
-								})(),
-							delta: "replayed",
+							part: {
+								schemaVersion: 1,
+								id:
+									assistantIds[index] ??
+									(() => {
+										throw new Error("Missing fake assistant message ID.");
+									})(),
+								runId: replayedRunId,
+								position: 1,
+								assistantTurnId: otherAssistantMessageId,
+								revision: 1,
+								kind: "text",
+								status: "streaming",
+								content: "replayed",
+								createdAt,
+								updatedAt: createdAt,
+							},
 						},
 					},
 				],
@@ -2562,7 +2573,7 @@ describe("DesktopAgentsClient", () => {
 			firstListenerDeliveries += 1;
 		});
 		client.subscribeChatEvents((event) => {
-			if (rejectTerminalOnce && event.type === "message.completed") {
+			if (rejectTerminalOnce && event.type === "run.status") {
 				rejectTerminalOnce = false;
 				throw new Error("second listener rejected terminal event");
 			}
@@ -2580,7 +2591,7 @@ describe("DesktopAgentsClient", () => {
 			AgentsUnavailableError,
 		);
 		await client.connect(createConnectOptions());
-		expect(recoveredCursors).toEqual([0]);
+		expect(recoveredCursors).toEqual([1]);
 		expect(firstListenerDeliveries).toBe(3);
 		client.close();
 	});
@@ -3872,7 +3883,7 @@ function createSessionPayload(index: number): JsonValue {
 function createAcceptedPayload(
 	acceptedRunId = runId,
 	acceptedUserMessageId = userMessageId,
-	acceptedAssistantMessageId = assistantMessageId,
+	_acceptedAssistantMessageId = assistantMessageId,
 	acceptedSessionId = sessionId,
 ): JsonValue {
 	return rpcJsonValueSchema.parse({
@@ -3893,33 +3904,19 @@ function createAcceptedPayload(
 				status: "ready",
 			},
 			userMessageId: acceptedUserMessageId,
-			assistantMessageId: acceptedAssistantMessageId,
 			createdAt,
 			updatedAt: createdAt,
-		},
-		userMessage: {
-			schemaVersion: 1,
-			id: acceptedUserMessageId,
-			sessionId: acceptedSessionId,
-			runId: acceptedRunId,
-			role: "user",
-			status: "complete",
-			content: "hello",
-			sequence: 1,
-			createdAt,
-			updatedAt: createdAt,
-		},
-		assistantMessage: {
-			schemaVersion: 1,
-			id: acceptedAssistantMessageId,
-			sessionId: acceptedSessionId,
-			runId: acceptedRunId,
-			role: "assistant",
-			status: "streaming",
-			content: "",
-			sequence: 2,
-			createdAt,
-			updatedAt: createdAt,
+			userMessage: {
+				schemaVersion: 1,
+				id: acceptedUserMessageId,
+				sessionId: acceptedSessionId,
+				runId: acceptedRunId,
+				role: "user",
+				content: "hello",
+				createdAt,
+			},
+			timeline: [],
+			lastEventSeq: 0,
 		},
 	});
 }
@@ -3936,9 +3933,7 @@ function createSessionPagePayload(): JsonValue {
 			createdAt,
 			updatedAt: createdAt,
 		},
-		messages: [],
 		runs: [],
-		eventCursors: [],
 	});
 }
 
@@ -3950,11 +3945,23 @@ function createTerminalAcceptedPayload(): JsonValue {
 			...accepted.run,
 			status: "completed",
 			completedAt: createdAt,
-		},
-		assistantMessage: {
-			...accepted.assistantMessage,
-			status: "complete",
-			content: "done",
+			updatedAt: createdAt,
+			timeline: [
+				{
+					schemaVersion: 1,
+					id: assistantMessageId,
+					runId,
+					position: 1,
+					assistantTurnId: otherAssistantMessageId,
+					revision: 1,
+					kind: "text",
+					status: "completed",
+					content: "done",
+					createdAt,
+					updatedAt: createdAt,
+				},
+			],
+			lastEventSeq: 2,
 		},
 	});
 }
@@ -3967,14 +3974,24 @@ function createTerminalReplayEvents(): JsonValue[] {
 			runId,
 			sessionId,
 			seq: 1,
-			type: "message.completed",
+			type: "timeline.part.created",
 			source: { kind: "assistant" },
 			visibility: "user",
 			createdAt,
 			payload: {
-				messageId: assistantMessageId,
-				status: "complete",
-				content: "done",
+				part: {
+					schemaVersion: 1,
+					id: assistantMessageId,
+					runId,
+					position: 1,
+					assistantTurnId: otherAssistantMessageId,
+					revision: 1,
+					kind: "text",
+					status: "completed",
+					content: "done",
+					createdAt,
+					updatedAt: createdAt,
+				},
 			},
 		}),
 		rpcJsonValueSchema.parse({
@@ -3999,11 +4016,11 @@ function createDeltaEventPayload(seq: number, delta: string): JsonValue {
 		runId,
 		sessionId,
 		seq,
-		type: "message.delta",
+		type: "timeline.text.delta",
 		source: { kind: "assistant" },
 		visibility: "user",
 		createdAt,
-		payload: { messageId: assistantMessageId, delta },
+		payload: { partId: assistantMessageId, revision: seq, delta },
 	});
 }
 

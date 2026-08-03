@@ -7,14 +7,23 @@ import {
 	type ChatRun,
 	type ChatRunEvent,
 	type ChatRunEventSource,
+	type ChatRunPart,
 	type ChatRunStatus,
+	type ChatRunToolPart,
+	type ChatUserMessage,
+	chatRunToolPayloadBudgetBytes,
 	cancelChatRunInputSchema,
 	cancelChatRunOutputSchema,
 	chatRunEventSchema,
+	chatRunPartSchema,
 	chatRunSchema,
 	chatRunStatusSchema,
+	chatRunTextPartSchema,
+	chatRunToolPartSchema,
+	chatUserMessageSchema,
 	deleteChatSessionOutputSchema,
 	maxRetiredSessionsPerRecoveryPage,
+	normalizeAppErrorSafeMessage,
 	type ProjectRootAgentsIssueCode,
 	type ProjectRunContext,
 	projectRunContextSchema,
@@ -23,6 +32,8 @@ import {
 	retiredSessionTombstoneTtlMs,
 	runProviderStateSchema,
 	sendAskChatMessageInputSchema,
+	type ToolPublicPayload,
+	toolPublicPayloadSchema,
 	uuidV7Schema,
 } from "@moshu/contracts";
 import { and, asc, desc, eq, gt, inArray, sql } from "drizzle-orm";
@@ -34,9 +45,11 @@ import type { MobileAttentionOutboxWriter } from "./mobile-attention-outbox-repo
 import {
 	agentSessionCleanupOutboxTable,
 	chatRunEventsTable,
+	chatRunPartsTable,
 	chatRunsTable,
 	chatSessionsTable,
 	retiredChatSessionsTable,
+	runTimelineOutboxTable,
 } from "./schema";
 import { ChatSessionNotFoundError } from "./session-repository";
 
@@ -60,7 +73,6 @@ export interface CreateRunInput {
 	provider: RunProviderConfigInput;
 	userMessageId: string;
 	userContent: string;
-	assistantMessageId: string;
 	projectContext?: ProjectRunContext;
 	rootAgentsWarning?: ProjectRootAgentsIssueCode;
 }
@@ -82,22 +94,22 @@ export interface RunStatusMutationResult {
 	event: ChatRunEvent;
 }
 
-export interface AppendRunEventInput {
-	runId: string;
-	type: ChatRunEvent["type"];
-	source: ChatRunEventSource;
-	visibility?: ChatRunEvent["visibility"];
-	payload: ChatRunEvent["payload"];
-}
+export type AppendRunEventInput = ChatRunEvent extends infer TEvent
+	? TEvent extends ChatRunEvent
+		? {
+				runId: string;
+				type: TEvent["type"];
+				source: ChatRunEventSource;
+				visibility?: TEvent["visibility"];
+				payload: TEvent["payload"];
+			}
+		: never
+	: never;
 
 export interface FailRunInput {
 	runId: string;
 	error: AppError;
 	source?: ChatRunEventSource;
-	messageEvent?: {
-		messageId: string;
-		content: string;
-	};
 }
 
 export interface FailRunResult {
@@ -167,9 +179,8 @@ export interface RunPageCursor {
 
 export interface RunJournalPageItem {
 	run: ChatRun;
-	userContent: string;
-	assistantContent?: string;
-	events: ChatRunEvent[];
+	userMessage: ChatUserMessage;
+	timeline: ChatRunPart[];
 	lastEventSeq: number;
 }
 
@@ -184,11 +195,10 @@ export interface ListRunPageOutput {
 	nextCursor?: RunPageCursor;
 }
 
-type MessageCompletedPayload = Extract<ChatRunEvent, { type: "message.completed" }>["payload"];
-
 export interface CommitRunTerminalInput {
 	runId: string;
-	message: MessageCompletedPayload;
+	status: Extract<ChatRunStatus, "completed" | "failed" | "cancelled">;
+	error?: AppError;
 	source?: ChatRunEventSource;
 }
 
@@ -205,6 +215,9 @@ export interface RunJournalRepository {
 	get(runId: string): ChatRun;
 	listBySession(sessionId: string): ChatRun[];
 	listPageBySession(input: ListRunPageInput): ListRunPageOutput;
+	listParts(runId: string): ChatRunPart[];
+	drainTimelineOutbox(limit?: number): ChatRunEvent[];
+	hasPendingTimelineOutbox(): boolean;
 	updateStatus(input: UpdateRunStatusInput): RunStatusMutationResult;
 	appendEvent(input: AppendRunEventInput): ChatRunEvent;
 	fail(input: FailRunInput): FailRunResult;
@@ -236,6 +249,9 @@ export class ChatRunNotFoundError extends Error {
 
 type RunRow = typeof chatRunsTable.$inferSelect;
 type EventRow = typeof chatRunEventsTable.$inferSelect;
+type PartRow = typeof chatRunPartsTable.$inferSelect;
+type PartInsert = typeof chatRunPartsTable.$inferInsert;
+type TimelineOutboxRow = typeof runTimelineOutboxTable.$inferSelect;
 
 const terminalRunStatuses = new Set<ChatRunStatus>(["cancelled", "completed", "failed"]);
 
@@ -321,12 +337,250 @@ function buildRun(row: RunRow): ChatRun {
 		status: row.status,
 		provider: parseRunProviderState(row.providerJson),
 		userMessageId: row.userMessageId,
-		assistantMessageId: row.assistantMessageId,
 		createdAt: toIsoDateTime(row.createdAtMs),
 		updatedAt: toIsoDateTime(row.updatedAtMs),
 		completedAt: row.completedAtMs === null ? undefined : toIsoDateTime(row.completedAtMs),
 		lastError: parseError(row.lastErrorJson),
 	});
+}
+
+function buildUserMessage(row: RunRow): ChatUserMessage {
+	return chatUserMessageSchema.parse({
+		schemaVersion: 1,
+		id: row.userMessageId,
+		sessionId: row.sessionId,
+		runId: row.id,
+		role: "user",
+		content: row.userContent,
+		createdAt: toIsoDateTime(row.createdAtMs),
+	});
+}
+
+function parseOptionalPublicPayload(raw: string | null, description: string) {
+	return raw === null ? undefined : toolPublicPayloadSchema.parse(parseJsonValue(raw, description));
+}
+
+function buildPart(row: PartRow): ChatRunPart {
+	const common = {
+		schemaVersion: 1 as const,
+		id: row.id,
+		runId: row.runId,
+		position: row.position,
+		assistantTurnId: row.assistantTurnId,
+		revision: row.revision,
+		createdAt: toIsoDateTime(row.createdAtMs),
+		updatedAt: toIsoDateTime(row.updatedAtMs),
+	};
+	if (row.kind === "text") {
+		return chatRunTextPartSchema.parse({
+			...common,
+			kind: "text",
+			status: row.status,
+			content: row.textContent,
+		});
+	}
+
+	const tool =
+		row.toolKind === "mcp"
+			? {
+					kind: "mcp" as const,
+					name: row.toolName,
+					mcpServerId: row.mcpServerId,
+					stableToolId: row.mcpToolId,
+				}
+			: {
+					kind: "builtin" as const,
+					name: row.toolName,
+				};
+	return chatRunToolPartSchema.parse({
+		...common,
+		kind: "tool",
+		toolCallId: row.toolCallId,
+		tool,
+		status: row.status,
+		summary: row.summary,
+		input: parseOptionalPublicPayload(row.inputJson, "ToolPart input"),
+		progress: parseOptionalPublicPayload(row.progressJson, "ToolPart progress"),
+		output: parseOptionalPublicPayload(row.outputJson, "ToolPart output"),
+		payloadsTruncated: row.payloadsTruncated ?? undefined,
+		error:
+			row.errorJson === null
+				? undefined
+				: appErrorSchema.parse(parseJsonValue(row.errorJson, "ToolPart error")),
+		approvalId: row.approvalId ?? undefined,
+		startedAt: row.startedAtMs === null ? undefined : toIsoDateTime(row.startedAtMs),
+		completedAt: row.completedAtMs === null ? undefined : toIsoDateTime(row.completedAtMs),
+		durationMs: row.durationMs ?? undefined,
+	});
+}
+
+function projectAuthoritativeToolTransition(
+	current: ChatRunToolPart,
+	transition: TimelineOutboxRow,
+): ChatRunToolPart {
+	let status = current.status;
+	if (transition.authority === "approval") {
+		if (transition.status === "waiting_approval" && current.status === "queued") {
+			status = "waiting_approval";
+		} else if (
+			(transition.status === "denied" || transition.status === "cancelled") &&
+			(current.status === "queued" || current.status === "waiting_approval")
+		) {
+			status = transition.status;
+		}
+	} else if (transition.status === "running") {
+		if (!isTerminalToolStatus(current.status)) {
+			status = "running";
+		}
+	} else if (isTerminalToolStatus(transition.status)) {
+		if (!isTerminalToolStatus(current.status) || current.status === "outcome_unknown") {
+			status = transition.status;
+		}
+	}
+
+	const approvalId = transition.approvalId ?? current.approvalId;
+	const output =
+		transition.publicOutputJson === null
+			? current.output
+			: toolPublicPayloadSchema.parse(
+					parseJsonValue(transition.publicOutputJson, "Run timeline public output"),
+				);
+	if (
+		status === current.status &&
+		approvalId === current.approvalId &&
+		JSON.stringify(output) === JSON.stringify(current.output)
+	) {
+		return current;
+	}
+	const updatedAtMs = Math.max(transition.createdAtMs, toEpochMs(current.updatedAt));
+	const updatedAt = toIsoDateTime(updatedAtMs);
+	const enteringRunning = status === "running" && current.status !== "running";
+	const enteringTerminal = isTerminalToolStatus(status) && status !== current.status;
+	const startedAt = enteringRunning ? (current.startedAt ?? updatedAt) : current.startedAt;
+	const completedAt = enteringTerminal ? updatedAt : current.completedAt;
+	const error = enteringTerminal
+		? buildAuthoritativeToolError(status, transition.safeError, current.runId)
+		: current.error;
+	return chatRunToolPartSchema.parse({
+		...current,
+		status,
+		...(approvalId === undefined ? {} : { approvalId }),
+		...(output === undefined ? {} : { output }),
+		...(startedAt === undefined ? {} : { startedAt }),
+		...(completedAt === undefined ? {} : { completedAt }),
+		...(startedAt === undefined || completedAt === undefined
+			? {}
+			: { durationMs: Math.max(0, Date.parse(completedAt) - Date.parse(startedAt)) }),
+		error,
+		revision: current.revision + 1,
+		updatedAt,
+	});
+}
+
+function buildAuthoritativeToolError(
+	status: ChatRunToolPart["status"],
+	safeError: string | null,
+	runId: string,
+): AppError | undefined {
+	if (status === "completed") {
+		return undefined;
+	}
+	const defaults: Partial<Record<ChatRunToolPart["status"], string>> = {
+		cancelled: "Tool execution was cancelled.",
+		denied: "Tool execution was denied.",
+		failed: "Tool execution failed.",
+		outcome_unknown: "The Tool outcome could not be confirmed.",
+	};
+	const fallback = defaults[status];
+	if (fallback === undefined) {
+		return undefined;
+	}
+	return appErrorSchema.parse({
+		code: `TOOL_${status.toUpperCase()}`,
+		category: "tool",
+		messageKey: `chat.tool.${status}`,
+		safeMessage: normalizeAppErrorSafeMessage(safeError, fallback),
+		retryable: false,
+		details: { runId },
+	});
+}
+
+function isTerminalToolStatus(status: ChatRunToolPart["status"]): boolean {
+	return (
+		status === "completed" ||
+		status === "failed" ||
+		status === "denied" ||
+		status === "cancelled" ||
+		status === "outcome_unknown"
+	);
+}
+
+function toEpochMs(value: string): number {
+	const epochMs = Date.parse(value);
+	if (!Number.isSafeInteger(epochMs) || epochMs < 0) {
+		throw new Error("Timeline Part timestamp must be a valid non-negative ISO timestamp.");
+	}
+	return epochMs;
+}
+
+function serializeOptional(value: unknown): string | null {
+	return value === undefined ? null : JSON.stringify(value);
+}
+
+function utf8Bytes(value: string | null): number {
+	return value === null ? 0 : new TextEncoder().encode(value).byteLength;
+}
+
+function createRunBudgetTruncationPayload(payload: ToolPublicPayload): ToolPublicPayload {
+	return toolPublicPayloadSchema.parse({
+		format: "text",
+		value: "Payload omitted because this Run reached its public Tool payload limit.",
+		truncated: true,
+		originalBytes: payload.originalBytes ?? utf8Bytes(JSON.stringify(payload.value)),
+		redactionCount: payload.redactionCount,
+	});
+}
+
+function buildPartInsert(part: ChatRunPart, sessionId: string, lastEventSeq: number): PartInsert {
+	const common = {
+		id: part.id,
+		sessionId,
+		runId: part.runId,
+		position: part.position,
+		assistantTurnId: part.assistantTurnId,
+		status: part.status,
+		revision: part.revision,
+		lastEventSeq,
+		createdAtMs: toEpochMs(part.createdAt),
+		updatedAtMs: toEpochMs(part.updatedAt),
+	};
+	if (part.kind === "text") {
+		return {
+			...common,
+			kind: "text",
+			textContent: part.content,
+		};
+	}
+	return {
+		...common,
+		kind: "tool",
+		textContent: null,
+		toolCallId: part.toolCallId,
+		toolKind: part.tool.kind,
+		toolName: part.tool.name,
+		mcpServerId: part.tool.kind === "mcp" ? part.tool.mcpServerId : null,
+		mcpToolId: part.tool.kind === "mcp" ? part.tool.stableToolId : null,
+		summary: part.summary,
+		inputJson: serializeOptional(part.input),
+		progressJson: serializeOptional(part.progress),
+		outputJson: serializeOptional(part.output),
+		payloadsTruncated: part.payloadsTruncated ?? null,
+		errorJson: serializeOptional(part.error),
+		approvalId: part.approvalId ?? null,
+		startedAtMs: part.startedAt === undefined ? null : toEpochMs(part.startedAt),
+		completedAtMs: part.completedAt === undefined ? null : toEpochMs(part.completedAt),
+		durationMs: part.durationMs ?? null,
+	};
 }
 
 function buildEvent(row: EventRow): ChatRunEvent {
@@ -371,19 +625,6 @@ function assertTransitionAllowed(currentStatus: ChatRunStatus, nextStatus: ChatR
 	}
 }
 
-function runStatusForMessageStatus(
-	status: MessageCompletedPayload["status"],
-): Extract<ChatRunStatus, "completed" | "failed" | "cancelled"> {
-	switch (status) {
-		case "complete":
-			return "completed";
-		case "failed":
-			return "failed";
-		case "cancelled":
-			return "cancelled";
-	}
-}
-
 function requireSafeTimestamp(value: number): number {
 	if (!Number.isSafeInteger(value) || value < 0) {
 		throw new Error("Run page cursor timestamp must be a non-negative safe integer.");
@@ -417,7 +658,6 @@ export class SqliteRunJournalRepository implements RunJournalRepository {
 		const clientRequestId = requireRequestId(input.clientRequestId);
 		const sessionId = uuidV7Schema.parse(input.sessionId);
 		const userMessageId = uuidV7Schema.parse(input.userMessageId);
-		const assistantMessageId = uuidV7Schema.parse(input.assistantMessageId);
 		const userContent = sendAskChatMessageInputSchema.parse({
 			requestId: clientRequestId,
 			sessionId,
@@ -447,8 +687,7 @@ export class SqliteRunJournalRepository implements RunJournalRepository {
 				providerJson: JSON.stringify(provider),
 				userMessageId,
 				userContent,
-				assistantMessageId,
-				assistantContent: null,
+				publicToolPayloadBytes: 0,
 				lastErrorJson: null,
 				projectId: projectContext?.projectId ?? null,
 				projectPath: projectContext?.projectPath ?? null,
@@ -468,19 +707,6 @@ export class SqliteRunJournalRepository implements RunJournalRepository {
 				source: { kind: "user" },
 				visibility: "user",
 				payload: { previousStatus: undefined, status: "queued" },
-				createdAtMs: nowMs,
-			});
-			const startedEvent = this.insertEvent({
-				runId: row.id,
-				sessionId,
-				type: "message.started",
-				source: { kind: "assistant" },
-				visibility: "user",
-				payload: {
-					messageId: assistantMessageId,
-					role: "assistant",
-					status: "streaming",
-				},
 				createdAtMs: nowMs,
 			});
 			const warningEvent =
@@ -503,11 +729,7 @@ export class SqliteRunJournalRepository implements RunJournalRepository {
 			return {
 				run: buildRun(row),
 				event,
-				events: [
-					event,
-					buildEvent(startedEvent),
-					...(warningEvent === undefined ? [] : [buildEvent(warningEvent)]),
-				],
+				events: [event, ...(warningEvent === undefined ? [] : [buildEvent(warningEvent)])],
 			};
 		});
 	}
@@ -531,9 +753,8 @@ export class SqliteRunJournalRepository implements RunJournalRepository {
 		}
 		return {
 			run: buildRun(row),
-			userContent: row.userContent,
-			...(row.assistantContent === null ? {} : { assistantContent: row.assistantContent }),
-			events: terminalRunStatuses.has(row.status) ? [] : this.listEvents({ runId: row.id }),
+			userMessage: buildUserMessage(row),
+			timeline: this.listParts(row.id),
 			lastEventSeq: this.getLastEventSeq(row.id),
 		};
 	}
@@ -593,21 +814,23 @@ export class SqliteRunJournalRepository implements RunJournalRepository {
 			.limit(input.limit + 1)
 			.all();
 		const pageRows = rows.slice(0, input.limit);
-		const eventsByRun = new Map<string, ChatRunEvent[]>();
-		const activeRunIds = pageRows
-			.filter((row) => !terminalRunStatuses.has(row.status))
-			.map((row) => row.id);
-		if (activeRunIds.length > 0) {
-			for (const event of this.orm
+		const partsByRun = new Map<string, ChatRunPart[]>();
+		if (pageRows.length > 0) {
+			for (const part of this.orm
 				.select()
-				.from(chatRunEventsTable)
-				.where(inArray(chatRunEventsTable.runId, activeRunIds))
-				.orderBy(asc(chatRunEventsTable.runId), asc(chatRunEventsTable.seq))
+				.from(chatRunPartsTable)
+				.where(
+					inArray(
+						chatRunPartsTable.runId,
+						pageRows.map((row) => row.id),
+					),
+				)
+				.orderBy(asc(chatRunPartsTable.runId), asc(chatRunPartsTable.position))
 				.all()
-				.map(buildEvent)) {
-				const events = eventsByRun.get(event.runId) ?? [];
-				events.push(event);
-				eventsByRun.set(event.runId, events);
+				.map(buildPart)) {
+				const parts = partsByRun.get(part.runId) ?? [];
+				parts.push(part);
+				partsByRun.set(part.runId, parts);
 			}
 		}
 		const lastSeqByRun = new Map<string, number>();
@@ -633,15 +856,79 @@ export class SqliteRunJournalRepository implements RunJournalRepository {
 		return {
 			items: pageRows.map((row) => ({
 				run: buildRun(row),
-				userContent: row.userContent,
-				...(row.assistantContent === null ? {} : { assistantContent: row.assistantContent }),
-				events: eventsByRun.get(row.id) ?? [],
+				userMessage: buildUserMessage(row),
+				timeline: partsByRun.get(row.id) ?? [],
 				lastEventSeq: lastSeqByRun.get(row.id) ?? 0,
 			})),
 			...(rows.length > input.limit && last !== undefined
 				? { nextCursor: { createdAtMs: last.createdAtMs, id: last.id } }
 				: {}),
 		};
+	}
+
+	listParts(runId: string): ChatRunPart[] {
+		return this.orm
+			.select()
+			.from(chatRunPartsTable)
+			.where(eq(chatRunPartsTable.runId, uuidV7Schema.parse(runId)))
+			.orderBy(asc(chatRunPartsTable.position))
+			.all()
+			.map(buildPart);
+	}
+
+	drainTimelineOutbox(limit = 1_000): ChatRunEvent[] {
+		if (!Number.isInteger(limit) || limit < 1 || limit > 1_000) {
+			throw new Error("Run timeline outbox drain limit must be between 1 and 1000.");
+		}
+
+		return this.inTransaction(() => {
+			const rows = this.orm
+				.select()
+				.from(runTimelineOutboxTable)
+				.orderBy(asc(runTimelineOutboxTable.sequence))
+				.limit(limit)
+				.all();
+			const events: ChatRunEvent[] = [];
+			for (const row of rows) {
+				const run = this.selectRun(row.runId);
+				const current = this.selectToolPartByCallId(row.runId, row.toolCallId);
+				const next = this.applyToolPayloadBudget(
+					projectAuthoritativeToolTransition(current, row),
+					current,
+				);
+				if (JSON.stringify(current) !== JSON.stringify(next)) {
+					const eventAtMs = toEpochMs(next.updatedAt);
+					const event = buildEvent(
+						this.insertEvent({
+							runId: run.id,
+							sessionId: run.sessionId,
+							type: "timeline.tool.updated",
+							source: { kind: "system" },
+							visibility: "user",
+							payload: { part: next },
+							createdAtMs: eventAtMs,
+						}),
+					);
+					this.projectTimelineEvent(event, eventAtMs);
+					this.touchSession(run.sessionId, eventAtMs, true);
+					events.push(event);
+				}
+				this.orm
+					.delete(runTimelineOutboxTable)
+					.where(eq(runTimelineOutboxTable.sequence, row.sequence))
+					.run();
+			}
+			return events;
+		});
+	}
+
+	hasPendingTimelineOutbox(): boolean {
+		return (
+			this.orm
+				.select({ sequence: runTimelineOutboxTable.sequence })
+				.from(runTimelineOutboxTable)
+				.get() !== undefined
+		);
 	}
 
 	updateStatus(input: UpdateRunStatusInput): RunStatusMutationResult {
@@ -681,161 +968,64 @@ export class SqliteRunJournalRepository implements RunJournalRepository {
 		return this.inTransaction(() => {
 			const row = this.selectRun(uuidV7Schema.parse(input.runId));
 			const nowMs = this.clock.now();
-			const event = this.insertEvent({
-				runId: row.id,
-				sessionId: row.sessionId,
-				type: input.type,
-				source: input.source,
-				visibility: input.visibility ?? "user",
-				payload: input.payload,
-				createdAtMs: nowMs,
-			});
-			this.touchSession(row.sessionId, nowMs, input.type.startsWith("message."));
-			return buildEvent(event);
+			const prepared = this.prepareTimelineEvent(input);
+			const event = buildEvent(
+				this.insertEvent({
+					runId: row.id,
+					sessionId: row.sessionId,
+					type: prepared.type,
+					source: prepared.source,
+					visibility: prepared.visibility ?? "user",
+					payload: prepared.payload,
+					createdAtMs: nowMs,
+				}),
+			);
+			this.projectTimelineEvent(event, nowMs);
+			this.touchSession(row.sessionId, nowMs, input.type.startsWith("timeline."));
+			return event;
 		});
 	}
 
 	fail(input: FailRunInput): FailRunResult {
-		const runId = uuidV7Schema.parse(input.runId);
 		const error = appErrorSchema.parse(input.error);
-		return this.inTransaction(() => {
-			const row = this.selectRun(runId);
-			if (terminalRunStatuses.has(row.status)) {
-				throw new Error(`Run ${runId} is already ${row.status}.`);
-			}
-			const nowMs = this.clock.now();
-			const source = input.source ?? { kind: "system" as const };
-			const events: ChatRunEvent[] = [];
-			if (input.messageEvent !== undefined) {
-				events.push(
-					buildEvent(
-						this.insertEvent({
-							runId,
-							sessionId: row.sessionId,
-							type: "message.completed",
-							source: { kind: "assistant" },
-							visibility: "user",
-							payload: {
-								messageId: input.messageEvent.messageId,
-								status: "failed",
-								content: input.messageEvent.content,
-								error,
-							},
-							createdAtMs: nowMs,
-						}),
-					),
-				);
-			}
-			events.push(
-				buildEvent(
-					this.insertEvent({
-						runId,
-						sessionId: row.sessionId,
-						type: "run.error",
-						source,
-						visibility: "user",
-						payload: { error },
-						createdAtMs: nowMs,
-					}),
-				),
-			);
-			this.orm
-				.update(chatRunsTable)
-				.set({
-					status: "failed",
-					assistantContent: input.messageEvent?.content ?? row.assistantContent,
-					lastErrorJson: serializeError(error),
-					updatedAtMs: nowMs,
-					completedAtMs: nowMs,
-				})
-				.where(eq(chatRunsTable.id, runId))
-				.run();
-			events.push(
-				buildEvent(
-					this.insertEvent({
-						runId,
-						sessionId: row.sessionId,
-						type: "run.status",
-						source,
-						visibility: "user",
-						payload: { previousStatus: row.status, status: "failed" },
-						createdAtMs: nowMs,
-					}),
-				),
-			);
-			this.touchSession(row.sessionId, nowMs, false);
-			this.enqueueTerminalAttention("failed", runId, row.sessionId, nowMs);
-			return {
-				run: buildRun({
-					...row,
-					status: "failed",
-					assistantContent: input.messageEvent?.content ?? row.assistantContent,
-					lastErrorJson: serializeError(error),
-					updatedAtMs: nowMs,
-					completedAtMs: nowMs,
-				}),
-				events,
-			};
+		const result = this.commitTerminal({
+			runId: input.runId,
+			status: "failed",
+			error,
+			...(input.source === undefined ? {} : { source: input.source }),
 		});
+		return { run: result.run, events: result.events };
 	}
 
 	commitTerminal(input: CommitRunTerminalInput): CommitRunTerminalOutput {
 		const runId = uuidV7Schema.parse(input.runId);
+		const terminalStatus = input.status;
+		const terminalError =
+			terminalStatus === "failed"
+				? appErrorSchema.parse(input.error)
+				: input.error === undefined
+					? undefined
+					: appErrorSchema.parse(input.error);
+		if (terminalStatus === "failed" && terminalError === undefined) {
+			throw new Error(`Run ${runId} failed terminal transition is missing its error.`);
+		}
+		if (terminalStatus !== "failed" && terminalError !== undefined) {
+			throw new Error(`Run ${runId} ${terminalStatus} transition cannot include an error.`);
+		}
 		return this.inTransaction(() => {
 			const row = this.selectRun(runId);
-			if (input.message.messageId !== row.assistantMessageId) {
-				throw new Error(`Run ${runId} terminal message ID does not match its assistant message.`);
-			}
-			const existingMessageRow = this.orm
-				.select()
-				.from(chatRunEventsTable)
-				.where(
-					and(
-						eq(chatRunEventsTable.runId, runId),
-						eq(chatRunEventsTable.type, "message.completed"),
-					),
-				)
-				.orderBy(desc(chatRunEventsTable.seq))
-				.get();
-			const existingMessage =
-				existingMessageRow === undefined ? undefined : buildEvent(existingMessageRow);
-			if (existingMessage !== undefined && existingMessage.type !== "message.completed") {
-				throw new Error(`Run ${runId} has an invalid terminal message event.`);
-			}
-			const message =
-				existingMessage?.type === "message.completed" ? existingMessage.payload : input.message;
-			if (message.messageId !== row.assistantMessageId) {
-				throw new Error(`Run ${runId} persisted terminal message ID is inconsistent.`);
-			}
-			const terminalStatus = runStatusForMessageStatus(message.status);
-			const terminalError = message.status === "failed" ? message.error : undefined;
-			if (terminalStatus === "failed" && terminalError === undefined) {
-				throw new Error(`Run ${runId} failed terminal message is missing its error.`);
-			}
 			if (terminalRunStatuses.has(row.status) && row.status !== terminalStatus) {
 				throw new Error(
-					`Run ${runId} terminal status ${row.status} conflicts with message status ${message.status}.`,
+					`Run ${runId} terminal status ${row.status} conflicts with ${terminalStatus}.`,
 				);
+			}
+			if (row.status === terminalStatus) {
+				return { run: buildRun(row), events: [], committed: false };
 			}
 
 			const nowMs = this.clock.now();
 			const source = input.source ?? { kind: "system" as const };
 			const events: ChatRunEvent[] = [];
-			if (existingMessage === undefined) {
-				events.push(
-					buildEvent(
-						this.insertEvent({
-							runId,
-							sessionId: row.sessionId,
-							type: "message.completed",
-							source: { kind: "assistant" },
-							visibility: "user",
-							payload: message,
-							createdAtMs: nowMs,
-						}),
-					),
-				);
-			}
 			if (
 				terminalStatus === "failed" &&
 				terminalError !== undefined &&
@@ -857,64 +1047,42 @@ export class SqliteRunJournalRepository implements RunJournalRepository {
 			}
 
 			let updatedRow = row;
-			if (!terminalRunStatuses.has(row.status)) {
-				this.orm
-					.update(chatRunsTable)
-					.set({
-						status: terminalStatus,
-						assistantContent: message.content,
-						lastErrorJson: terminalError === undefined ? null : serializeError(terminalError),
-						updatedAtMs: nowMs,
-						completedAtMs: nowMs,
-					})
-					.where(eq(chatRunsTable.id, runId))
-					.run();
-				events.push(
-					buildEvent(
-						this.insertEvent({
-							runId,
-							sessionId: row.sessionId,
-							type: "run.status",
-							source,
-							visibility: "user",
-							payload: { previousStatus: row.status, status: terminalStatus },
-							createdAtMs: nowMs,
-						}),
-					),
-				);
-				updatedRow = {
-					...row,
+			this.orm
+				.update(chatRunsTable)
+				.set({
 					status: terminalStatus,
-					assistantContent: message.content,
 					lastErrorJson: terminalError === undefined ? null : serializeError(terminalError),
 					updatedAtMs: nowMs,
 					completedAtMs: nowMs,
-				};
-				this.enqueueTerminalAttention(terminalStatus, runId, row.sessionId, nowMs);
-			} else if (row.assistantContent !== message.content) {
-				this.orm
-					.update(chatRunsTable)
-					.set({
-						assistantContent: message.content,
-						lastErrorJson: terminalError === undefined ? null : serializeError(terminalError),
-						updatedAtMs: nowMs,
-					})
-					.where(eq(chatRunsTable.id, runId))
-					.run();
-				updatedRow = {
-					...row,
-					assistantContent: message.content,
-					lastErrorJson: terminalError === undefined ? null : serializeError(terminalError),
-					updatedAtMs: nowMs,
-				};
-			}
-			if (events.length > 0) {
-				this.touchSession(row.sessionId, nowMs, true);
-			}
+				})
+				.where(eq(chatRunsTable.id, runId))
+				.run();
+			events.push(
+				buildEvent(
+					this.insertEvent({
+						runId,
+						sessionId: row.sessionId,
+						type: "run.status",
+						source,
+						visibility: "user",
+						payload: { previousStatus: row.status, status: terminalStatus },
+						createdAtMs: nowMs,
+					}),
+				),
+			);
+			updatedRow = {
+				...row,
+				status: terminalStatus,
+				lastErrorJson: terminalError === undefined ? null : serializeError(terminalError),
+				updatedAtMs: nowMs,
+				completedAtMs: nowMs,
+			};
+			this.enqueueTerminalAttention(terminalStatus, runId, row.sessionId, nowMs);
+			this.touchSession(row.sessionId, nowMs, true);
 			return {
 				run: buildRun(updatedRow),
 				events,
-				committed: events.length > 0 || updatedRow !== row,
+				committed: true,
 			};
 		});
 	}
@@ -1174,7 +1342,12 @@ export class SqliteRunJournalRepository implements RunJournalRepository {
 		if (this.attentionOutbox === undefined) {
 			return;
 		}
-		const attention = buildRunTerminalAttentionInput({ status, runId, sessionId, createdAtMs: nowMs });
+		const attention = buildRunTerminalAttentionInput({
+			status,
+			runId,
+			sessionId,
+			createdAtMs: nowMs,
+		});
 		if (attention !== undefined) {
 			this.attentionOutbox.enqueue(attention);
 		}
@@ -1231,6 +1404,282 @@ export class SqliteRunJournalRepository implements RunJournalRepository {
 		);
 	}
 
+	private prepareTimelineEvent(input: AppendRunEventInput): AppendRunEventInput {
+		switch (input.type) {
+			case "timeline.part.created": {
+				const part = chatRunPartSchema.parse(input.payload.part);
+				if (part.kind !== "tool") {
+					return input;
+				}
+				return {
+					...input,
+					payload: { part: this.applyToolPayloadBudget(part) },
+				};
+			}
+			case "timeline.tool.updated": {
+				const part = chatRunToolPartSchema.parse(input.payload.part);
+				const current = buildPart(this.selectPart(input.runId, part.id));
+				if (current.kind !== "tool") {
+					throw new Error("A ToolPart update cannot target a TextPart.");
+				}
+				return {
+					...input,
+					payload: { part: this.applyToolPayloadBudget(part, current) },
+				};
+			}
+			case "timeline.tool.progress": {
+				const current = buildPart(this.selectPart(input.runId, input.payload.partId));
+				if (current.kind !== "tool") {
+					throw new Error("Tool progress cannot target a TextPart.");
+				}
+				const next = this.applyToolPayloadBudget(
+					chatRunToolPartSchema.parse({
+						...current,
+						progress: input.payload.progress,
+						payloadsTruncated:
+							current.payloadsTruncated || input.payload.payloadsTruncated || undefined,
+						revision: input.payload.revision,
+					}),
+					current,
+				);
+				return {
+					...input,
+					payload: {
+						partId: input.payload.partId,
+						revision: input.payload.revision,
+						...(next.progress === undefined ? {} : { progress: next.progress }),
+						...(next.payloadsTruncated ? { payloadsTruncated: true } : {}),
+					},
+				};
+			}
+			default:
+				return input;
+		}
+	}
+
+	private applyToolPayloadBudget(
+		part: ChatRunToolPart,
+		current?: ChatRunToolPart,
+	): ChatRunToolPart {
+		const run = this.selectRun(part.runId);
+		let remainingBytes = chatRunToolPayloadBudgetBytes - run.publicToolPayloadBytes;
+		let reservedBytes = 0;
+		let payloadsTruncated =
+			(part.payloadsTruncated ?? false) || (current?.payloadsTruncated ?? false);
+		const keepWithinBudget = (
+			payload: ToolPublicPayload | undefined,
+			currentPayload: ToolPublicPayload | undefined,
+		): ToolPublicPayload | undefined => {
+			if (payload === undefined) {
+				return undefined;
+			}
+			const serialized = JSON.stringify(payload);
+			const currentSerialized =
+				currentPayload === undefined ? undefined : JSON.stringify(currentPayload);
+			if (serialized === currentSerialized) {
+				return payload;
+			}
+			const payloadBytes = utf8Bytes(serialized);
+			if (payloadBytes <= remainingBytes) {
+				remainingBytes -= payloadBytes;
+				reservedBytes += payloadBytes;
+				return payload;
+			}
+			payloadsTruncated = true;
+			const marker = createRunBudgetTruncationPayload(payload);
+			const serializedMarker = JSON.stringify(marker);
+			if (serializedMarker === currentSerialized) {
+				return currentPayload;
+			}
+			const markerBytes = utf8Bytes(serializedMarker);
+			if (markerBytes > remainingBytes) {
+				return undefined;
+			}
+			remainingBytes -= markerBytes;
+			reservedBytes += markerBytes;
+			return marker;
+		};
+		const input = keepWithinBudget(part.input, current?.input);
+		const progress = keepWithinBudget(part.progress, current?.progress);
+		const output = keepWithinBudget(part.output, current?.output);
+		const limited = chatRunToolPartSchema.parse({
+			...part,
+			input,
+			progress,
+			output,
+			payloadsTruncated: payloadsTruncated || undefined,
+		});
+		if (reservedBytes > 0) {
+			this.orm
+				.update(chatRunsTable)
+				.set({ publicToolPayloadBytes: run.publicToolPayloadBytes + reservedBytes })
+				.where(eq(chatRunsTable.id, part.runId))
+				.run();
+		}
+		return limited;
+	}
+
+	private projectTimelineEvent(event: ChatRunEvent, nowMs: number): void {
+		switch (event.type) {
+			case "timeline.part.created": {
+				const part = chatRunPartSchema.parse(event.payload.part);
+				if (part.runId !== event.runId) {
+					throw new Error("Timeline Part Run ID does not match its event.");
+				}
+				if (part.revision !== 1) {
+					throw new Error("A newly created Timeline Part must start at revision 1.");
+				}
+				this.orm
+					.insert(chatRunPartsTable)
+					.values(buildPartInsert(part, event.sessionId, event.seq))
+					.run();
+				return;
+			}
+			case "timeline.text.delta": {
+				const row = this.selectPart(event.runId, event.payload.partId);
+				const current = buildPart(row);
+				if (current.kind !== "text") {
+					throw new Error("A text delta cannot target a ToolPart.");
+				}
+				if (current.status !== "streaming") {
+					throw new Error("A text delta cannot target a terminal TextPart.");
+				}
+				this.assertNextPartRevision(current, event.payload.revision);
+				const next = chatRunTextPartSchema.parse({
+					...current,
+					revision: event.payload.revision,
+					content: current.content + event.payload.delta,
+					updatedAt: toIsoDateTime(nowMs),
+				});
+				this.orm
+					.update(chatRunPartsTable)
+					.set({
+						status: next.status,
+						revision: next.revision,
+						textContent: next.content,
+						lastEventSeq: event.seq,
+						updatedAtMs: nowMs,
+					})
+					.where(eq(chatRunPartsTable.id, row.id))
+					.run();
+				return;
+			}
+			case "timeline.text.completed": {
+				const next = chatRunTextPartSchema.parse(event.payload.part);
+				if (next.runId !== event.runId) {
+					throw new Error("Completed TextPart Run ID does not match its event.");
+				}
+				if (next.status === "streaming") {
+					throw new Error("A completed TextPart event cannot keep streaming status.");
+				}
+				const row = this.selectPart(event.runId, next.id);
+				const current = buildPart(row);
+				if (current.kind !== "text") {
+					throw new Error("A text completion cannot target a ToolPart.");
+				}
+				this.assertStablePartIdentity(current, next);
+				this.assertNextPartRevision(current, next.revision);
+				this.orm
+					.update(chatRunPartsTable)
+					.set({
+						status: next.status,
+						revision: next.revision,
+						textContent: next.content,
+						lastEventSeq: event.seq,
+						updatedAtMs: toEpochMs(next.updatedAt),
+					})
+					.where(eq(chatRunPartsTable.id, row.id))
+					.run();
+				return;
+			}
+			case "timeline.tool.updated": {
+				const next = chatRunToolPartSchema.parse(event.payload.part);
+				if (next.runId !== event.runId) {
+					throw new Error("Updated ToolPart Run ID does not match its event.");
+				}
+				const row = this.selectPart(event.runId, next.id);
+				const current = buildPart(row);
+				if (current.kind !== "tool") {
+					throw new Error("A ToolPart update cannot target a TextPart.");
+				}
+				this.assertStablePartIdentity(current, next);
+				this.assertNextPartRevision(current, next.revision);
+				this.orm
+					.update(chatRunPartsTable)
+					.set({
+						status: next.status,
+						revision: next.revision,
+						summary: next.summary,
+						inputJson: serializeOptional(next.input),
+						progressJson: serializeOptional(next.progress),
+						outputJson: serializeOptional(next.output),
+						payloadsTruncated: next.payloadsTruncated ?? null,
+						errorJson: serializeOptional(next.error),
+						approvalId: next.approvalId ?? null,
+						startedAtMs: next.startedAt === undefined ? null : toEpochMs(next.startedAt),
+						completedAtMs: next.completedAt === undefined ? null : toEpochMs(next.completedAt),
+						durationMs: next.durationMs ?? null,
+						lastEventSeq: event.seq,
+						updatedAtMs: toEpochMs(next.updatedAt),
+					})
+					.where(eq(chatRunPartsTable.id, row.id))
+					.run();
+				return;
+			}
+			case "timeline.tool.progress": {
+				const row = this.selectPart(event.runId, event.payload.partId);
+				const current = buildPart(row);
+				if (current.kind !== "tool") {
+					throw new Error("Tool progress cannot target a TextPart.");
+				}
+				this.assertNextPartRevision(current, event.payload.revision);
+				this.orm
+					.update(chatRunPartsTable)
+					.set({
+						revision: event.payload.revision,
+						progressJson: serializeOptional(event.payload.progress),
+						payloadsTruncated: event.payload.payloadsTruncated ?? null,
+						lastEventSeq: event.seq,
+						updatedAtMs: nowMs,
+					})
+					.where(eq(chatRunPartsTable.id, row.id))
+					.run();
+				return;
+			}
+			default:
+				return;
+		}
+	}
+
+	private assertNextPartRevision(current: ChatRunPart, nextRevision: number): void {
+		if (nextRevision !== current.revision + 1) {
+			throw new Error(
+				`Timeline Part ${current.id} revision must advance from ${current.revision} to ${current.revision + 1}.`,
+			);
+		}
+	}
+
+	private assertStablePartIdentity(current: ChatRunPart, next: ChatRunPart): void {
+		if (
+			current.id !== next.id ||
+			current.runId !== next.runId ||
+			current.position !== next.position ||
+			current.assistantTurnId !== next.assistantTurnId ||
+			current.createdAt !== next.createdAt ||
+			current.kind !== next.kind
+		) {
+			throw new Error(`Timeline Part ${current.id} attempted to change stable identity fields.`);
+		}
+		if (
+			current.kind === "tool" &&
+			next.kind === "tool" &&
+			(current.toolCallId !== next.toolCallId ||
+				JSON.stringify(current.tool) !== JSON.stringify(next.tool))
+		) {
+			throw new Error(`ToolPart ${current.id} attempted to change its Tool identity.`);
+		}
+	}
+
 	private getLastEventSeq(runId: string): number {
 		return (
 			this.orm
@@ -1247,6 +1696,44 @@ export class SqliteRunJournalRepository implements RunJournalRepository {
 			throw new ChatRunNotFoundError(runId);
 		}
 		return row;
+	}
+
+	private selectPart(runId: string, partId: string): PartRow {
+		const row = this.orm
+			.select()
+			.from(chatRunPartsTable)
+			.where(
+				and(
+					eq(chatRunPartsTable.runId, uuidV7Schema.parse(runId)),
+					eq(chatRunPartsTable.id, uuidV7Schema.parse(partId)),
+				),
+			)
+			.get();
+		if (row === undefined) {
+			throw new Error(`Timeline Part ${partId} was not found in Run ${runId}.`);
+		}
+		return row;
+	}
+
+	private selectToolPartByCallId(runId: string, toolCallId: string): ChatRunToolPart {
+		const row = this.orm
+			.select()
+			.from(chatRunPartsTable)
+			.where(
+				and(
+					eq(chatRunPartsTable.runId, uuidV7Schema.parse(runId)),
+					eq(chatRunPartsTable.toolCallId, toolCallId),
+				),
+			)
+			.get();
+		if (row === undefined) {
+			throw new Error(`ToolPart ${toolCallId} was not found in Run ${runId}.`);
+		}
+		const part = buildPart(row);
+		if (part.kind !== "tool") {
+			throw new Error(`Timeline Part for Tool call ${toolCallId} is not a ToolPart.`);
+		}
+		return part;
 	}
 
 	private insertEvent(args: {

@@ -2,6 +2,7 @@ import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import Electrobun, { ApplicationMenu, BrowserWindow, Updater, Utils } from "electrobun/bun";
 import { logChatRpcDiagnostic } from "../shared/chat-rpc-diagnostics";
+import { toChatEventDelivery } from "../shared/rpc";
 import { macApplicationMenu } from "./application-menu";
 import { startCompanionRuntime } from "./companion-poc";
 import type { CompanionProcessSupervisor } from "./companion-process-supervisor";
@@ -36,7 +37,7 @@ const unsubscribeAgentsReady = agentsClient.subscribeReady(() => {
 });
 const unsubscribeChatEvents = agentsClient.subscribeChatEvents((event) => {
 	logChatRpcDiagnostic("bun", "send", "chatEvent", event);
-	desktopRpc.send.chatEvent(event);
+	desktopRpc.send.chatEvent(toChatEventDelivery(event));
 });
 const unsubscribeChatSessionInvalidations = agentsClient.subscribeChatSessionInvalidations(
 	(invalidation) => {

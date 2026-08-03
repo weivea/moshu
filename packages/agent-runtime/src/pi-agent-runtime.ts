@@ -8,10 +8,12 @@ import {
 	SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 import {
+	type ChatToolIdentity,
 	executorToolNames,
 	type SkillMetadata,
 	type SkillOwner,
 	type ThinkingLevel,
+	type ToolPublicPayload,
 } from "@moshu/contracts";
 import { lstatSync, mkdirSync, realpathSync, unlinkSync } from "node:fs";
 import { join, relative, resolve } from "node:path";
@@ -22,7 +24,18 @@ import {
 	createExecutorToolDefinitions,
 	type RuntimeBoxToolGateway,
 } from "./executor-tools";
-import { createMcpToolDefinitions, type AgentMcpResource, type McpToolGateway } from "./mcp-tools";
+import {
+	createAgentMcpToolName,
+	createMcpToolDefinitions,
+	type AgentMcpResource,
+	type McpToolGateway,
+} from "./mcp-tools";
+import {
+	projectToolInput,
+	projectToolOutput,
+	projectToolProgress,
+	summarizeToolCall,
+} from "./tool-public-projection";
 
 export interface AskChatMessage {
 	role: "user" | "assistant";
@@ -36,11 +49,55 @@ export interface AskChatUsage {
 	totalTokens?: number;
 }
 
-export interface AskChatMessageDeltaEvent {
-	type: "message.delta";
+interface AskChatRuntimeEventBase {
 	runId: string;
-	delta: string;
 }
+
+export type AskChatRuntimeEvent =
+	| (AskChatRuntimeEventBase & {
+			type: "assistant.text.started";
+			turnIndex: number;
+			contentIndex: number;
+	  })
+	| (AskChatRuntimeEventBase & {
+			type: "assistant.text.delta";
+			turnIndex: number;
+			contentIndex: number;
+			delta: string;
+	  })
+	| (AskChatRuntimeEventBase & {
+			type: "assistant.text.completed";
+			turnIndex: number;
+			contentIndex: number;
+			content: string;
+	  })
+	| (AskChatRuntimeEventBase & {
+			type: "tool.call.created";
+			turnIndex: number;
+			contentIndex: number;
+			toolCallId: string;
+			tool: ChatToolIdentity;
+			input: ToolPublicPayload;
+			summary: string;
+	  })
+	| (AskChatRuntimeEventBase & {
+			type: "tool.execution.started";
+			toolCallId: string;
+			tool: ChatToolIdentity;
+	  })
+	| (AskChatRuntimeEventBase & {
+			type: "tool.execution.updated";
+			toolCallId: string;
+			tool: ChatToolIdentity;
+			progress: ToolPublicPayload;
+	  })
+	| (AskChatRuntimeEventBase & {
+			type: "tool.execution.completed";
+			toolCallId: string;
+			tool: ChatToolIdentity;
+			output: ToolPublicPayload;
+			isError: boolean;
+	  });
 
 export interface AskChatRunInput {
 	runId: string;
@@ -52,7 +109,7 @@ export interface AskChatRunInput {
 	skills?: readonly AskChatSkillResource[];
 	mcpResources?: readonly AgentMcpResource[];
 	signal?: AbortSignal;
-	onEvent?: (event: AskChatMessageDeltaEvent) => void | Promise<void>;
+	onEvent?: (event: AskChatRuntimeEvent) => void | Promise<void>;
 }
 
 export type AskChatExecutionContext =
@@ -86,7 +143,7 @@ export interface AskChatRunResult {
 	usage?: AskChatUsage;
 }
 
-export interface AskChatRunStream extends AsyncIterable<AskChatMessageDeltaEvent> {
+export interface AskChatRunStream extends AsyncIterable<AskChatRuntimeEvent> {
 	readonly runId: string;
 	readonly result: Promise<AskChatRunResult>;
 	cancel(reason?: string): void;
@@ -201,7 +258,7 @@ export class PiAgentRuntime implements AskChatRuntime {
 	}
 
 	stream(input: AskChatRunInput): AskChatRunStream {
-		const queue = new AsyncEventQueue<AskChatMessageDeltaEvent>();
+		const queue = new AsyncEventQueue<AskChatRuntimeEvent>();
 		const result = this.#start(input, async (event) => {
 			queue.push(event);
 			await input.onEvent?.(event);
@@ -307,7 +364,7 @@ export class PiAgentRuntime implements AskChatRuntime {
 
 	async #start(
 		input: AskChatRunInput,
-		onEvent?: (event: AskChatMessageDeltaEvent) => void | Promise<void>,
+		onEvent?: (event: AskChatRuntimeEvent) => void | Promise<void>,
 	): Promise<AskChatRunResult> {
 		if (this.#shuttingDown) {
 			throw runtimeError("runtime_shutdown", "The agent runtime is shutting down.", false);
@@ -360,13 +417,114 @@ export class PiAgentRuntime implements AskChatRuntime {
 				session.setThinkingLevel(input.provider.thinkingLevel);
 			}
 			const before = session.messages.length;
-			let callbackTail = Promise.resolve();
-			const unsubscribe = session.subscribe((event) => {
-				if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
-					const delta = event.assistantMessageEvent.delta;
-					callbackTail = callbackTail.then(() =>
-						onEvent?.({ type: "message.delta", runId: input.runId, delta }),
-					);
+			let assistantTurnIndex = 0;
+			const toolIdentities = createToolIdentityMap(input.mcpResources ?? []);
+			const toolProjectionSecrets = createToolProjectionSecretMap(input.mcpResources ?? []);
+			const rootDirectory =
+				input.executionContext.kind === "project"
+					? input.executionContext.projectPath
+					: this.#workspaceDirectory;
+			const toolProjectionOptions = (toolName: string) => {
+				const secretValues = toolProjectionSecrets.get(toolName);
+				return {
+					rootDirectory,
+					...(secretValues === undefined ? {} : { secretValues }),
+				};
+			};
+			const unsubscribe = session.agent.subscribe(async (event) => {
+				if (onEvent === undefined) {
+					return;
+				}
+				if (event.type === "message_start" && event.message.role === "assistant") {
+					assistantTurnIndex += 1;
+					return;
+				}
+				if (event.type === "message_update" && event.message.role === "assistant") {
+					const update = event.assistantMessageEvent;
+					switch (update.type) {
+						case "text_start":
+							await onEvent({
+								type: "assistant.text.started",
+								runId: input.runId,
+								turnIndex: assistantTurnIndex,
+								contentIndex: update.contentIndex,
+							});
+							return;
+						case "text_delta":
+							await onEvent({
+								type: "assistant.text.delta",
+								runId: input.runId,
+								turnIndex: assistantTurnIndex,
+								contentIndex: update.contentIndex,
+								delta: update.delta,
+							});
+							return;
+						case "text_end":
+							await onEvent({
+								type: "assistant.text.completed",
+								runId: input.runId,
+								turnIndex: assistantTurnIndex,
+								contentIndex: update.contentIndex,
+								content: update.content,
+							});
+							return;
+						case "toolcall_end": {
+							const tool = resolveToolIdentity(toolIdentities, update.toolCall.name);
+							const publicInput = projectToolInput(
+								tool,
+								update.toolCall.arguments,
+								toolProjectionOptions(update.toolCall.name),
+							);
+							await onEvent({
+								type: "tool.call.created",
+								runId: input.runId,
+								turnIndex: assistantTurnIndex,
+								contentIndex: update.contentIndex,
+								toolCallId: update.toolCall.id,
+								tool,
+								input: publicInput,
+								summary: summarizeToolCall(tool, publicInput),
+							});
+							return;
+						}
+						default:
+							return;
+					}
+				}
+				if (event.type === "tool_execution_start") {
+					await onEvent({
+						type: "tool.execution.started",
+						runId: input.runId,
+						toolCallId: event.toolCallId,
+						tool: resolveToolIdentity(toolIdentities, event.toolName),
+					});
+					return;
+				}
+				if (event.type === "tool_execution_update") {
+					const tool = resolveToolIdentity(toolIdentities, event.toolName);
+					await onEvent({
+						type: "tool.execution.updated",
+						runId: input.runId,
+						toolCallId: event.toolCallId,
+						tool,
+						progress: projectToolProgress(
+							tool,
+							event.partialResult,
+							toolProjectionOptions(event.toolName),
+						),
+					});
+					return;
+				}
+				if (event.type === "tool_execution_end") {
+					const tool = resolveToolIdentity(toolIdentities, event.toolName);
+					await onEvent({
+						type: "tool.execution.completed",
+						runId: input.runId,
+						toolCallId: event.toolCallId,
+						tool,
+						output: projectToolOutput(tool, event.result, toolProjectionOptions(event.toolName)),
+						isError: event.isError,
+					});
 				}
 			});
 			try {
@@ -374,7 +532,6 @@ export class PiAgentRuntime implements AskChatRuntime {
 					expandPromptTemplates: false,
 					preflightResult: throwIfCancelled,
 				});
-				await callbackTail;
 			} finally {
 				unsubscribe();
 			}
@@ -551,6 +708,58 @@ export class PiAgentRuntime implements AskChatRuntime {
 			? undefined
 			: SessionManager.open(info.path, this.#sessionDirectory, this.#workspaceDirectory);
 	}
+}
+
+function createToolIdentityMap(
+	mcpResources: readonly AgentMcpResource[],
+): ReadonlyMap<string, ChatToolIdentity> {
+	const identities = new Map<string, ChatToolIdentity>();
+	for (const name of executorToolNames) {
+		identities.set(name, { kind: "builtin", name });
+	}
+	for (const resource of mcpResources) {
+		for (const tool of resource.tools) {
+			identities.set(
+				createAgentMcpToolName(resource.owner, resource.stableResourceId, tool.stableToolId),
+				{
+					kind: "mcp",
+					name: tool.name,
+					mcpServerId: resource.stableResourceId,
+					stableToolId: tool.stableToolId,
+				},
+			);
+		}
+	}
+	return identities;
+}
+
+function createToolProjectionSecretMap(
+	mcpResources: readonly AgentMcpResource[],
+): ReadonlyMap<string, readonly string[]> {
+	const secrets = new Map<string, readonly string[]>();
+	for (const resource of mcpResources) {
+		if (resource.projectionSecretValues === undefined) {
+			continue;
+		}
+		for (const tool of resource.tools) {
+			secrets.set(
+				createAgentMcpToolName(resource.owner, resource.stableResourceId, tool.stableToolId),
+				resource.projectionSecretValues,
+			);
+		}
+	}
+	return secrets;
+}
+
+function resolveToolIdentity(
+	identities: ReadonlyMap<string, ChatToolIdentity>,
+	name: string,
+): ChatToolIdentity {
+	const identity = identities.get(name);
+	if (identity === undefined) {
+		throw runtimeError("unexpected_tool_activity", `Unexpected Tool ${name}.`, false);
+	}
+	return identity;
 }
 
 function createResourceFingerprint(

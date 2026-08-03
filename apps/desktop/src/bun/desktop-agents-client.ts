@@ -64,6 +64,8 @@ import {
 	acknowledgeChatSessionInvalidationInputSchema,
 	type ChatSessionInvalidation,
 	chatSessionInvalidationSchema,
+	type DesktopChatEvent,
+	toDesktopChatEvent,
 } from "../shared/rpc";
 import {
 	AgentsUnavailableError,
@@ -82,7 +84,7 @@ import type {
 	DesktopAgentsConnectOptions,
 } from "./companion-process-supervisor";
 
-type ChatEventListener = (event: ChatRunEvent) => void | PromiseLike<void>;
+type ChatEventListener = (event: DesktopChatEvent) => void | PromiseLike<void>;
 type ChatSessionInvalidationListener = (invalidation: ChatSessionInvalidation) => void;
 type DesktopAgentsReadyListener = () => void;
 type RuntimeBoxesChangedListener = (snapshot: ListRuntimeBoxesOutput) => void;
@@ -116,13 +118,12 @@ interface ActiveRunCursor {
 	sessionId: string;
 	issuedAtMs: number;
 	lastSeq: number;
-	messageTerminal: boolean;
 	runTerminal: boolean;
 	reservation: SendReservation;
 }
 
 interface ProvisionalEventQueue {
-	events: ChatRunEvent[];
+	events: DesktopChatEvent[];
 	encodedBytes: number;
 }
 
@@ -288,7 +289,7 @@ export class DesktopAgentsClient {
 				peer?.close(1000, reason);
 			}
 		};
-		const deliver = (event: ChatRunEvent, deadline?: number): Promise<void> => {
+		const deliver = (event: DesktopChatEvent, deadline?: number): Promise<void> => {
 			const operation = deliveryTail.then(async () => {
 				if (connectionClosed) {
 					throw new AgentsUnavailableError("The local agents connection closed.");
@@ -887,15 +888,18 @@ export class DesktopAgentsClient {
 			throw new ChatSessionNotFoundError();
 		}
 		this.#bindReservationRun(reservation, accepted.run.id, accepted.run.sessionId);
-		if (accepted.assistantMessage.status !== "streaming") {
+		if (
+			accepted.run.status === "completed" ||
+			accepted.run.status === "failed" ||
+			accepted.run.status === "cancelled"
+		) {
 			reservation.terminal = true;
 		}
 		if (!reservation.terminal && !this.#activeRunCursors.has(accepted.run.id)) {
 			this.#activeRunCursors.set(accepted.run.id, {
 				sessionId: accepted.run.sessionId,
 				issuedAtMs: this.#estimatedServerTimeMs(),
-				lastSeq: 0,
-				messageTerminal: false,
+				lastSeq: accepted.run.lastEventSeq,
 				runTerminal: false,
 				reservation,
 			});
@@ -906,7 +910,7 @@ export class DesktopAgentsClient {
 		}
 	}
 
-	#bindEventDelivery(delivery: z.output<typeof chatEventDeliverySchema>): ChatRunEvent | null {
+	#bindEventDelivery(delivery: z.output<typeof chatEventDeliverySchema>): DesktopChatEvent | null {
 		if (this.#sessionRetirements.has(delivery.event.sessionId)) {
 			return null;
 		}
@@ -926,12 +930,11 @@ export class DesktopAgentsClient {
 				sessionId: delivery.event.sessionId,
 				issuedAtMs: this.#estimatedServerTimeMs(),
 				lastSeq: 0,
-				messageTerminal: false,
 				runTerminal: false,
 				reservation,
 			});
 		}
-		return delivery.event;
+		return toDesktopChatEvent(delivery);
 	}
 
 	#correlateDeliveryReservation(
@@ -1420,12 +1423,12 @@ export class DesktopAgentsClient {
 	async #flushProvisionalEvents(
 		queue: ProvisionalEventQueue,
 		deadline: number,
-		deliver: (event: ChatRunEvent, deadline?: number) => Promise<void>,
+		deliver: (event: DesktopChatEvent, deadline?: number) => Promise<void>,
 	): Promise<void> {
 		while (queue.events.length > 0) {
 			const events = queue.events.splice(0);
 			queue.encodedBytes = 0;
-			const uniqueEvents = new Map<string, ChatRunEvent>();
+			const uniqueEvents = new Map<string, DesktopChatEvent>();
 			for (const event of sortReplayEvents(events)) {
 				uniqueEvents.set(`${event.runId}\u0000${event.seq}`, event);
 			}
@@ -1436,7 +1439,7 @@ export class DesktopAgentsClient {
 	}
 
 	async #deliverThenCommit(
-		event: ChatRunEvent,
+		event: DesktopChatEvent,
 		deadline?: number,
 		deferTerminalDeletion = false,
 	): Promise<void> {
@@ -1465,9 +1468,6 @@ export class DesktopAgentsClient {
 			return;
 		}
 		cursor.lastSeq = event.seq;
-		if (event.type === "message.completed") {
-			cursor.messageTerminal = true;
-		}
 		if (
 			event.type === "run.status" &&
 			(event.payload.status === "completed" ||
@@ -1476,7 +1476,7 @@ export class DesktopAgentsClient {
 		) {
 			cursor.runTerminal = true;
 		}
-		if (cursor.messageTerminal && cursor.runTerminal) {
+		if (cursor.runTerminal) {
 			const reservation = this.#runReservations.get(event.runId);
 			if (reservation !== undefined) {
 				reservation.terminal = true;
@@ -1490,7 +1490,7 @@ export class DesktopAgentsClient {
 
 	#deleteCommittedTerminalCursors(): void {
 		for (const [runId, cursor] of this.#activeRunCursors) {
-			if (cursor.messageTerminal && cursor.runTerminal) {
+			if (cursor.runTerminal) {
 				const reservation = this.#runReservations.get(runId);
 				if (reservation !== undefined) {
 					reservation.terminal = true;
@@ -1860,7 +1860,7 @@ function resolveRecoveryLimits(
 
 function enqueueProvisionalEvent(
 	queue: ProvisionalEventQueue,
-	event: ChatRunEvent,
+	event: DesktopChatEvent,
 	limits: ResolvedDesktopAgentsRecoveryLimits,
 ): void {
 	const encodedBytes = new TextEncoder().encode(JSON.stringify(event)).byteLength;
@@ -1874,7 +1874,7 @@ function enqueueProvisionalEvent(
 	queue.encodedBytes += encodedBytes;
 }
 
-function sortReplayEvents(events: readonly ChatRunEvent[]): ChatRunEvent[] {
+function sortReplayEvents<T extends ChatRunEvent>(events: readonly T[]): T[] {
 	return [...events].sort(
 		(left, right) =>
 			left.runId.localeCompare(right.runId) ||

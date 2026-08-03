@@ -1,8 +1,6 @@
 import type {
 	CancelChatRunOutput,
-	ChatRunEvent,
 	ChatSendAcceptedOutput,
-	ChatMessage as ContractChatMessage,
 	CreateChatSessionOutput,
 	CreateProviderInput,
 	DeleteChatSessionOutput,
@@ -38,7 +36,6 @@ import {
 } from "../../../../shared/session-retirement-cache";
 import type {
 	AvailableModel,
-	ChatMessage,
 	ChatSession,
 	ChatSessionInvalidation,
 	ChatSessionInvalidationSubscriptionOptions,
@@ -97,16 +94,11 @@ export interface RpcChatClient {
 		content: string;
 	}): Promise<ChatSendAcceptedOutput>;
 	cancelChatRun(sessionId: string, runId: string, reason?: string): Promise<CancelChatRunOutput>;
-	subscribeChatEvents(listener: (event: ChatRunEvent) => void): () => void;
+	subscribeChatEvents(listener: (event: ChatTransportEvent) => void): () => void;
 	subscribeChatSessionInvalidations?(
 		listener: (invalidation: ChatSessionInvalidation) => void | PromiseLike<void>,
 		options?: ChatSessionInvalidationSubscriptionOptions,
 	): () => void;
-}
-
-interface ActiveRequest {
-	sessionId: string;
-	messageId: string;
 }
 
 export function createRpcChatTransport(
@@ -114,7 +106,6 @@ export function createRpcChatTransport(
 	options: { now?: () => number } = {},
 ): ChatTransport {
 	const listeners = new Set<ChatTransportListener>();
-	const activeRequests = new Map<string, ActiveRequest>();
 	const retiredSessions = new SessionRetirementCache<undefined>({ now: options.now });
 	let backpressuredRetirementSessionId: string | undefined;
 	const assertSessionSnapshotAllowed = (sessionId: string): void => {
@@ -130,21 +121,8 @@ export function createRpcChatTransport(
 		if (backpressuredRetirementSessionId !== undefined || retiredSessions.has(event.sessionId)) {
 			return;
 		}
-		const mappedEvent = mapRunEvent(event, activeRequests);
-		if (mappedEvent === undefined) {
-			return;
-		}
-
-		if (
-			mappedEvent.type === "response.completed" ||
-			mappedEvent.type === "response.cancelled" ||
-			mappedEvent.type === "response.error"
-		) {
-			activeRequests.delete(mappedEvent.requestId);
-		}
-
 		for (const listener of listeners) {
-			listener(mappedEvent);
+			listener(event);
 		}
 	});
 
@@ -249,7 +227,7 @@ export function createRpcChatTransport(
 				updatedAt: session.updatedAt,
 				...(session.model === undefined ? {} : { model: session.model }),
 				askMode: "Ask",
-				messages: [],
+				runs: [],
 			};
 		},
 		async getSession(sessionId: string) {
@@ -272,21 +250,13 @@ export function createRpcChatTransport(
 					: { archivedAt: snapshot.session.archivedAt }),
 				...(snapshot.session.model === undefined ? {} : { model: snapshot.session.model }),
 				askMode: "Ask",
-				messages: snapshot.messages.map(mapMessage),
-				eventCursors: Object.fromEntries(
-					snapshot.eventCursors.map((cursor) => [cursor.runId, cursor.lastSeq]),
-				),
+				runs: snapshot.runs,
 			};
 
-			if (activeRun?.assistantMessageId !== undefined) {
+			if (activeRun !== undefined) {
 				session.activeResponse = {
 					requestId: activeRun.id,
-					messageId: activeRun.assistantMessageId,
 				};
-				activeRequests.set(activeRun.id, {
-					sessionId: snapshot.session.id,
-					messageId: activeRun.assistantMessageId,
-				});
 			}
 
 			return session;
@@ -312,17 +282,9 @@ export function createRpcChatTransport(
 				sessionId: input.sessionId,
 				content: input.message,
 			});
-			if (accepted.assistantMessage.status === "streaming") {
-				activeRequests.set(accepted.run.id, {
-					sessionId: input.sessionId,
-					messageId: accepted.assistantMessage.id,
-				});
-			}
-
 			return {
 				requestId: accepted.run.id,
-				userMessage: mapMessage(accepted.userMessage),
-				assistantMessage: mapMessage(accepted.assistantMessage),
+				run: accepted.run,
 			};
 		},
 		async cancel(input: { sessionId: string; requestId: string }) {
@@ -343,11 +305,6 @@ export function createRpcChatTransport(
 					backpressuredRetirementSessionId = sessionId;
 				}
 				throw error;
-			}
-			for (const [requestId, request] of activeRequests) {
-				if (request.sessionId === sessionId) {
-					activeRequests.delete(requestId);
-				}
 			}
 		},
 		subscribe(listener: ChatTransportListener) {
@@ -376,100 +333,4 @@ function mapSessionSummary(session: ListChatSessionsOutput["items"][number]): Ch
 		...(session.lastMessageAt === undefined ? {} : { lastMessageAt: session.lastMessageAt }),
 		...(session.archivedAt === undefined ? {} : { archivedAt: session.archivedAt }),
 	};
-}
-
-function mapMessage(message: ContractChatMessage): ChatMessage {
-	const mapped: ChatMessage = {
-		id: message.id,
-		role: message.role,
-		content: message.content,
-		createdAt: message.createdAt,
-		status:
-			message.status === "complete"
-				? "completed"
-				: message.status === "failed"
-					? "error"
-					: message.status,
-	};
-
-	if (message.status === "failed") {
-		mapped.errorMessage = message.error.safeMessage;
-	}
-
-	return mapped;
-}
-
-function mapRunEvent(
-	event: ChatRunEvent,
-	activeRequests: Map<string, ActiveRequest>,
-): ChatTransportEvent | undefined {
-	if (event.type === "message.delta") {
-		return {
-			type: "response.delta",
-			sessionId: event.sessionId,
-			requestId: event.runId,
-			messageId: event.payload.messageId,
-			delta: event.payload.delta,
-			sequence: event.seq,
-		};
-	}
-
-	if (event.type === "message.completed") {
-		if (event.payload.status === "complete") {
-			return {
-				type: "response.completed",
-				sessionId: event.sessionId,
-				requestId: event.runId,
-				messageId: event.payload.messageId,
-				content: event.payload.content,
-				sequence: event.seq,
-			};
-		}
-
-		if (event.payload.status === "cancelled") {
-			return {
-				type: "response.cancelled",
-				sessionId: event.sessionId,
-				requestId: event.runId,
-				messageId: event.payload.messageId,
-				content: event.payload.content,
-				sequence: event.seq,
-			};
-		}
-		return {
-			type: "response.error",
-			sessionId: event.sessionId,
-			requestId: event.runId,
-			messageId: event.payload.messageId,
-			content: event.payload.content,
-			message: event.payload.error.safeMessage,
-			sequence: event.seq,
-		};
-	}
-
-	if (event.type === "run.warning") {
-		return {
-			type: "run.warning",
-			sessionId: event.sessionId,
-			requestId: event.runId,
-			code: event.payload.code,
-			reason: event.payload.reason,
-			sequence: event.seq,
-		};
-	}
-
-	if (event.type === "run.status" && event.payload.status === "cancelled") {
-		const activeRequest = activeRequests.get(event.runId);
-		if (activeRequest !== undefined) {
-			return {
-				type: "response.cancelled",
-				sessionId: activeRequest.sessionId,
-				requestId: event.runId,
-				messageId: activeRequest.messageId,
-				sequence: event.seq,
-			};
-		}
-	}
-
-	return undefined;
 }

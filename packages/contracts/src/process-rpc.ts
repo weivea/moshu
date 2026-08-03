@@ -18,10 +18,9 @@ import {
 import {
 	cancelChatRunInputSchema,
 	cancelChatRunOutputSchema,
-	chatMessageSchema,
 	chatRunEventCursorSchema,
 	chatRunEventSchema,
-	chatRunSchema,
+	chatRunSnapshotSchema,
 	chatSendAcceptedOutputSchema,
 	chatSessionSchema,
 	createChatSessionInputSchema,
@@ -497,9 +496,7 @@ export const getChatSessionPageInputSchema = z
 export const getChatSessionPageOutputSchema = z
 	.object({
 		session: chatSessionSchema,
-		messages: z.array(chatMessageSchema).max(maxSessionRunsPerPage * 2),
-		runs: z.array(chatRunSchema).max(maxSessionRunsPerPage),
-		eventCursors: z.array(chatRunEventCursorSchema).max(maxSessionRunsPerPage),
+		runs: z.array(chatRunSnapshotSchema).max(maxSessionRunsPerPage),
 		nextCursor: z.string().min(1).max(512).optional(),
 	})
 	.strict();

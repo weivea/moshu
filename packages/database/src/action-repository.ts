@@ -7,9 +7,12 @@ import {
 	runtimeBoxActionResultSchema,
 	runtimeBoxInvocationEvidenceSchema,
 	type RuntimeBoxInvocationEvidence,
+	type ToolPublicPayload,
+	toolPublicPayloadSchema,
 } from "@moshu/contracts";
 import { and, eq, inArray, isNull, or } from "drizzle-orm";
 import type { AppDrizzleDatabase } from "./database";
+import type { RunTimelineOutboxWriter } from "./run-timeline-outbox-repository";
 import { actionIntentsTable, chatRunsTable, executionGrantsTable } from "./schema";
 
 export type ActionIntentState =
@@ -81,8 +84,17 @@ export interface ActionRepository {
 	markFailed(invocationId: string, safeError: string): void;
 	markCancelled(invocationId: string, safeError: string): void;
 	markOutcomeUnknown(invocationId: string, safeError: string): void;
-	complete(runtimeBoxId: string, evidence: RuntimeBoxInvocationEvidence): void;
-	completeLocal(targetId: string, invocationId: string, result: RuntimeBoxActionResult): void;
+	complete(
+		runtimeBoxId: string,
+		evidence: RuntimeBoxInvocationEvidence,
+		publicOutput?: ToolPublicPayload,
+	): void;
+	completeLocal(
+		targetId: string,
+		invocationId: string,
+		result: RuntimeBoxActionResult,
+		publicOutput?: ToolPublicPayload,
+	): void;
 	markServerAcked(invocationIds: readonly string[]): void;
 	markReceiptConfirmed(runtimeBoxId: string, invocationIds: readonly string[]): void;
 	cancelUndispatched(invocationId: string, safeError: string): void;
@@ -96,6 +108,7 @@ export class SqliteActionRepository implements ActionRepository {
 	constructor(
 		private readonly orm: AppDrizzleDatabase,
 		private readonly clock: { now(): number } = { now: Date.now },
+		private readonly timelineOutbox?: RunTimelineOutboxWriter,
 	) {}
 
 	createGrant(input: CreateActionGrantInput): void {
@@ -185,6 +198,7 @@ export class SqliteActionRepository implements ActionRepository {
 				.set({ state: "running", updatedAtMs: now })
 				.where(eq(actionIntentsTable.id, actionId))
 				.run();
+			this.#enqueueTimeline(action, "running", undefined, now);
 		});
 	}
 
@@ -204,26 +218,46 @@ export class SqliteActionRepository implements ActionRepository {
 	}
 
 	markOutcomeUnknown(invocationId: string, safeError: string): void {
-		const action = this.#select(invocationId);
-		if (isTerminal(action.state)) {
-			return;
-		}
-		const now = this.clock.now();
-		this.orm
-			.update(actionIntentsTable)
-			.set({
-				state: "outcome_unknown",
-				safeError: boundSafeError(safeError),
-				updatedAtMs: now,
-				completedAtMs: now,
-				...(action.targetKind === "agent-server" ? { serverAckedAtMs: now } : {}),
-			})
-			.where(eq(actionIntentsTable.invocationId, invocationId))
-			.run();
+		this.orm.transaction(() => {
+			const action = this.#select(invocationId);
+			if (isTerminal(action.state)) {
+				return;
+			}
+			const now = this.clock.now();
+			const boundedError = boundSafeError(safeError);
+			this.orm
+				.update(actionIntentsTable)
+				.set({
+					state: "outcome_unknown",
+					safeError: boundedError,
+					updatedAtMs: now,
+					completedAtMs: now,
+					...(action.targetKind === "agent-server" ? { serverAckedAtMs: now } : {}),
+				})
+				.where(eq(actionIntentsTable.invocationId, invocationId))
+				.run();
+			this.#enqueueTimeline(action, "outcome_unknown", boundedError, now);
+		});
 	}
 
-	complete(runtimeBoxId: string, evidenceValue: RuntimeBoxInvocationEvidence): void {
+	complete(
+		runtimeBoxId: string,
+		evidenceValue: RuntimeBoxInvocationEvidence,
+		publicOutputValue?: ToolPublicPayload,
+	): void {
+		this.orm.transaction(() => this.#complete(runtimeBoxId, evidenceValue, publicOutputValue));
+	}
+
+	#complete(
+		runtimeBoxId: string,
+		evidenceValue: RuntimeBoxInvocationEvidence,
+		publicOutputValue?: ToolPublicPayload,
+	): void {
 		const evidence = runtimeBoxInvocationEvidenceSchema.parse(evidenceValue);
+		const publicOutput =
+			publicOutputValue === undefined
+				? undefined
+				: toolPublicPayloadSchema.parse(publicOutputValue);
 		const action = this.#select(evidence.invocationId);
 		if (
 			action.targetKind !== "runtime-box" ||
@@ -290,10 +324,39 @@ export class SqliteActionRepository implements ActionRepository {
 			})
 			.where(eq(actionIntentsTable.id, action.id))
 			.run();
+		if (action.state !== evidence.state) {
+			this.#enqueueTimeline(
+				action,
+				toToolStatus(evidence.state),
+				evidence.safeError,
+				Date.parse(evidence.completedAt),
+				publicOutput,
+			);
+		}
 	}
 
-	completeLocal(targetId: string, invocationId: string, resultValue: RuntimeBoxActionResult): void {
+	completeLocal(
+		targetId: string,
+		invocationId: string,
+		resultValue: RuntimeBoxActionResult,
+		publicOutputValue?: ToolPublicPayload,
+	): void {
+		this.orm.transaction(() =>
+			this.#completeLocal(targetId, invocationId, resultValue, publicOutputValue),
+		);
+	}
+
+	#completeLocal(
+		targetId: string,
+		invocationId: string,
+		resultValue: RuntimeBoxActionResult,
+		publicOutputValue?: ToolPublicPayload,
+	): void {
 		const action = this.#select(invocationId);
+		const publicOutput =
+			publicOutputValue === undefined
+				? undefined
+				: toolPublicPayloadSchema.parse(publicOutputValue);
 		if (action.targetKind !== "agent-server" || action.targetId !== targetId) {
 			throw new ActionEvidenceConflictError(
 				"Agent Server MCP result did not match its Action target.",
@@ -345,6 +408,7 @@ export class SqliteActionRepository implements ActionRepository {
 			})
 			.where(eq(actionIntentsTable.id, action.id))
 			.run();
+		this.#enqueueTimeline(action, "completed", undefined, now, publicOutput);
 	}
 
 	markServerAcked(invocationIds: readonly string[]): void {
@@ -395,23 +459,27 @@ export class SqliteActionRepository implements ActionRepository {
 	}
 
 	cancelUndispatched(invocationId: string, safeError: string): void {
-		const action = this.#select(invocationId);
-		if (isTerminal(action.state)) {
-			return;
-		}
-		const now = this.clock.now();
-		this.orm
-			.update(actionIntentsTable)
-			.set({
-				state: "cancelled",
-				safeError: boundSafeError(safeError),
-				updatedAtMs: now,
-				completedAtMs: now,
-				serverAckedAtMs: now,
-				boxReceiptConfirmedAtMs: now,
-			})
-			.where(eq(actionIntentsTable.invocationId, invocationId))
-			.run();
+		this.orm.transaction(() => {
+			const action = this.#select(invocationId);
+			if (isTerminal(action.state)) {
+				return;
+			}
+			const now = this.clock.now();
+			const boundedError = boundSafeError(safeError);
+			this.orm
+				.update(actionIntentsTable)
+				.set({
+					state: "cancelled",
+					safeError: boundedError,
+					updatedAtMs: now,
+					completedAtMs: now,
+					serverAckedAtMs: now,
+					boxReceiptConfirmedAtMs: now,
+				})
+				.where(eq(actionIntentsTable.invocationId, invocationId))
+				.run();
+			this.#enqueueTimeline(action, "cancelled", boundedError, now);
+		});
 	}
 
 	recoverOnStartup(): { cancelled: number; outcomeUnknown: number } {
@@ -420,6 +488,8 @@ export class SqliteActionRepository implements ActionRepository {
 				id: actionIntentsTable.id,
 				state: actionIntentsTable.state,
 				targetKind: actionIntentsTable.targetKind,
+				runId: actionIntentsTable.runId,
+				toolCallId: actionIntentsTable.toolCallId,
 			})
 			.from(actionIntentsTable)
 			.where(inArray(actionIntentsTable.state, ["granted", "running"]))
@@ -443,6 +513,12 @@ export class SqliteActionRepository implements ActionRepository {
 						})
 						.where(eq(actionIntentsTable.id, row.id))
 						.run();
+					this.#enqueueTimeline(
+						row,
+						"cancelled",
+						"Agent Server restarted before the execution grant was dispatched.",
+						now,
+					);
 				} else {
 					outcomeUnknown += 1;
 					transaction
@@ -456,6 +532,12 @@ export class SqliteActionRepository implements ActionRepository {
 						})
 						.where(eq(actionIntentsTable.id, row.id))
 						.run();
+					this.#enqueueTimeline(
+						row,
+						"outcome_unknown",
+						"Agent Server restarted before the Action outcome was confirmed.",
+						now,
+					);
 				}
 			}
 		});
@@ -547,22 +629,44 @@ export class SqliteActionRepository implements ActionRepository {
 	}
 
 	#markTerminal(invocationId: string, state: "failed" | "cancelled", safeError: string): void {
-		const action = this.#select(invocationId);
-		if (isTerminal(action.state)) {
-			return;
-		}
-		const now = this.clock.now();
-		this.orm
-			.update(actionIntentsTable)
-			.set({
-				state,
-				safeError: boundSafeError(safeError),
-				updatedAtMs: now,
-				completedAtMs: now,
-				...(action.targetKind === "agent-server" ? { serverAckedAtMs: now } : {}),
-			})
-			.where(eq(actionIntentsTable.invocationId, invocationId))
-			.run();
+		this.orm.transaction(() => {
+			const action = this.#select(invocationId);
+			if (isTerminal(action.state)) {
+				return;
+			}
+			const now = this.clock.now();
+			const boundedError = boundSafeError(safeError);
+			this.orm
+				.update(actionIntentsTable)
+				.set({
+					state,
+					safeError: boundedError,
+					updatedAtMs: now,
+					completedAtMs: now,
+					...(action.targetKind === "agent-server" ? { serverAckedAtMs: now } : {}),
+				})
+				.where(eq(actionIntentsTable.invocationId, invocationId))
+				.run();
+			this.#enqueueTimeline(action, state, boundedError, now);
+		});
+	}
+
+	#enqueueTimeline(
+		action: { runId: string; toolCallId: string },
+		status: "running" | "completed" | "failed" | "cancelled" | "outcome_unknown",
+		safeError: string | undefined,
+		createdAtMs: number,
+		publicOutput?: ToolPublicPayload,
+	): void {
+		this.timelineOutbox?.enqueue({
+			runId: action.runId,
+			toolCallId: action.toolCallId,
+			authority: "action",
+			status,
+			...(safeError === undefined ? {} : { safeError }),
+			...(publicOutput === undefined ? {} : { publicOutput }),
+			createdAtMs,
+		});
 	}
 
 	#select(invocationId: string) {
@@ -580,6 +684,12 @@ export class SqliteActionRepository implements ActionRepository {
 
 function isTerminal(state: ActionIntentState): state is "succeeded" | "failed" | "cancelled" {
 	return state === "succeeded" || state === "failed" || state === "cancelled";
+}
+
+function toToolStatus(
+	state: RuntimeBoxInvocationEvidence["state"],
+): "completed" | "failed" | "cancelled" | "outcome_unknown" {
+	return state === "succeeded" ? "completed" : state;
 }
 
 function requireHash(value: string, label: string): string {

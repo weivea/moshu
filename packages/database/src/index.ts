@@ -14,6 +14,7 @@ export * from "./mobile-pairing-repository";
 export * from "./project-repository";
 export * from "./remote-access-repository";
 export * from "./run-journal-repository";
+export * from "./run-timeline-outbox-repository";
 export * from "./runtime-box-inventory-repository";
 export * from "./runtime-box-pairing-repository";
 export * from "./runtime-box-repository";

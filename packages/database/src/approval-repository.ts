@@ -13,6 +13,7 @@ import { and, desc, eq, inArray, lte } from "drizzle-orm";
 import type { AppDrizzleDatabase } from "./database";
 import { buildApprovalPendingAttentionInput } from "./mobile-attention-copy";
 import type { MobileAttentionOutboxWriter } from "./mobile-attention-outbox-repository";
+import type { RunTimelineOutboxWriter } from "./run-timeline-outbox-repository";
 import { actionApprovalRequestsTable, sessionApprovalPoliciesTable } from "./schema";
 
 // ---------------------------------------------------------------------------
@@ -99,6 +100,10 @@ export interface UpdateSessionApprovalPolicyDbInput {
 	expectedRevision: number;
 	idempotencyKey: string;
 	updatedBy: DecisionSource;
+	approveRequest?: {
+		approvalId: string;
+		expectedRevision: number;
+	};
 	nowMs?: number;
 }
 
@@ -107,6 +112,8 @@ export type UpdateSessionApprovalPolicyOutcome = "applied" | "idempotent";
 export interface UpdateSessionApprovalPolicyResult {
 	outcome: UpdateSessionApprovalPolicyOutcome;
 	policy: SessionApprovalPolicyRecord;
+	requestOutcome?: DecideApprovalOutcome;
+	request?: ApprovalRequestRecord;
 }
 
 export class ApprovalRequestNotFoundError extends Error {
@@ -159,6 +166,7 @@ export class SqliteApprovalRepository implements ApprovalRepository {
 		// Mobile attention row in the SAME transaction as the approval insert, so a crash between the
 		// two can never permanently lose the phone's unread signal.
 		private readonly attentionOutbox?: MobileAttentionOutboxWriter,
+		private readonly timelineOutbox?: RunTimelineOutboxWriter,
 	) {}
 
 	create(input: CreateApprovalRequestInput): ApprovalRequestRecord {
@@ -211,6 +219,14 @@ export class SqliteApprovalRepository implements ApprovalRepository {
 					}),
 				);
 			}
+			this.timelineOutbox?.enqueue({
+				runId: input.runId,
+				toolCallId: input.toolCallId,
+				authority: "approval",
+				status: approved ? "queued" : "waiting_approval",
+				approvalId: input.id,
+				createdAtMs: input.createdAtMs,
+			});
 			return this.getOrThrow(input.id);
 		});
 	}
@@ -417,21 +433,73 @@ export class SqliteApprovalRepository implements ApprovalRepository {
 	updatePolicy(input: UpdateSessionApprovalPolicyDbInput): UpdateSessionApprovalPolicyResult {
 		const now = input.nowMs ?? this.clock.now();
 		return this.orm.transaction((transaction) => {
-			const row = transaction
+			const policyRow = transaction
 				.select()
 				.from(sessionApprovalPoliciesTable)
 				.where(eq(sessionApprovalPoliciesTable.sessionId, input.sessionId))
 				.get();
-			if (row !== undefined && row.lastIdempotencyKey === input.idempotencyKey) {
-				return { outcome: "idempotent", policy: mapPolicyRow(row) };
+			if (policyRow !== undefined && policyRow.lastIdempotencyKey === input.idempotencyKey) {
+				const request =
+					input.approveRequest === undefined
+						? undefined
+						: transaction
+								.select()
+								.from(actionApprovalRequestsTable)
+								.where(eq(actionApprovalRequestsTable.id, input.approveRequest.approvalId))
+								.get();
+				if (
+					input.approveRequest !== undefined &&
+					(request === undefined || request.sessionId !== input.sessionId)
+				) {
+					throw new ApprovalRequestNotFoundError(input.approveRequest.approvalId);
+				}
+				return {
+					outcome: "idempotent",
+					policy: mapPolicyRow(policyRow),
+					...(request === undefined
+						? {}
+						: {
+								requestOutcome:
+									request.decisionIdempotencyKey === input.idempotencyKey
+										? ("idempotent" as const)
+										: ("superseded" as const),
+								request: mapApprovalRow(request),
+							}),
+				};
 			}
-			const currentRevision = row?.revision ?? 0;
+			const currentRevision = policyRow?.revision ?? 0;
 			if (input.expectedRevision !== currentRevision) {
 				throw new SessionApprovalPolicyRevisionConflictError(currentRevision);
 			}
+			const approvalRow =
+				input.approveRequest === undefined
+					? undefined
+					: transaction
+							.select()
+							.from(actionApprovalRequestsTable)
+							.where(eq(actionApprovalRequestsTable.id, input.approveRequest.approvalId))
+							.get();
+			if (
+				input.approveRequest !== undefined &&
+				(approvalRow === undefined || approvalRow.sessionId !== input.sessionId)
+			) {
+				throw new ApprovalRequestNotFoundError(input.approveRequest.approvalId);
+			}
+			if (approvalRow !== undefined) {
+				if (!input.allowAll || approvalRow.riskOverridable === 0) {
+					throw new TypeError("Allow all cannot approve this request.");
+				}
+				if (
+					approvalRow.state === "pending" &&
+					approvalRow.expiresAtMs > now &&
+					input.approveRequest?.expectedRevision !== approvalRow.revision
+				) {
+					throw new ApprovalRevisionConflictError(approvalRow.revision);
+				}
+			}
 			const nextRevision = currentRevision + 1;
 			const updatedByJson = JSON.stringify(input.updatedBy);
-			if (row === undefined) {
+			if (policyRow === undefined) {
 				transaction
 					.insert(sessionApprovalPoliciesTable)
 					.values({
@@ -456,15 +524,57 @@ export class SqliteApprovalRepository implements ApprovalRepository {
 					.where(eq(sessionApprovalPoliciesTable.sessionId, input.sessionId))
 					.run();
 			}
+			const policy: SessionApprovalPolicyRecord = {
+				sessionId: input.sessionId,
+				allowAll: input.allowAll,
+				revision: nextRevision,
+				updatedAtMs: now,
+				updatedBy: input.updatedBy,
+			};
+			if (approvalRow === undefined) {
+				return { outcome: "applied", policy };
+			}
+			if (approvalRow.state !== "pending") {
+				return {
+					outcome: "applied",
+					policy,
+					requestOutcome: "superseded",
+					request: mapApprovalRow(approvalRow),
+				};
+			}
+			if (approvalRow.expiresAtMs <= now) {
+				return {
+					outcome: "applied",
+					policy,
+					requestOutcome: "superseded",
+					request: this.#applyTerminal(
+						transaction,
+						approvalRow,
+						"expired",
+						now,
+						undefined,
+						undefined,
+					),
+				};
+			}
+			const decision: ApprovalDecision = {
+				kind: "approve_once",
+				source: { kind: "policy" },
+				decidedAt: new Date(now).toISOString(),
+			};
 			return {
 				outcome: "applied",
-				policy: {
-					sessionId: input.sessionId,
-					allowAll: input.allowAll,
-					revision: nextRevision,
-					updatedAtMs: now,
-					updatedBy: input.updatedBy,
-				},
+				policy,
+				requestOutcome: "applied",
+				request: this.#applyTerminal(
+					transaction,
+					approvalRow,
+					"approved",
+					now,
+					decision,
+					input.idempotencyKey,
+					{ allowAllRevision: nextRevision },
+				),
 			};
 		});
 	}
@@ -499,6 +609,7 @@ export class SqliteApprovalRepository implements ApprovalRepository {
 		nowMs: number,
 		decision: ApprovalDecision | undefined,
 		idempotencyKey: string | undefined,
+		policyEvidence?: { allowAllRevision: number },
 	): ApprovalRequestRecord {
 		const nextRevision = row.revision + 1;
 		transaction
@@ -509,9 +620,34 @@ export class SqliteApprovalRepository implements ApprovalRepository {
 				decidedAtMs: nowMs,
 				...(decision === undefined ? {} : { decisionJson: JSON.stringify(decision) }),
 				...(idempotencyKey === undefined ? {} : { decisionIdempotencyKey: idempotencyKey }),
+				...(policyEvidence === undefined
+					? {}
+					: { policyEvidenceJson: JSON.stringify(policyEvidence) }),
 			})
 			.where(eq(actionApprovalRequestsTable.id, row.id))
 			.run();
+		const toolStatus =
+			state === "rejected" || state === "expired"
+				? "denied"
+				: state === "cancelled"
+					? "cancelled"
+					: undefined;
+		if (toolStatus !== undefined) {
+			this.timelineOutbox?.enqueue({
+				runId: row.runId,
+				toolCallId: row.toolCallId,
+				authority: "approval",
+				status: toolStatus,
+				approvalId: row.id,
+				safeError:
+					state === "expired"
+						? "Tool approval expired."
+						: state === "cancelled"
+							? "Tool approval was cancelled."
+							: "Tool approval was denied.",
+				createdAtMs: nowMs,
+			});
+		}
 		return mapApprovalRow({
 			...row,
 			state,
@@ -520,6 +656,8 @@ export class SqliteApprovalRepository implements ApprovalRepository {
 			decisionJson: decision === undefined ? row.decisionJson : JSON.stringify(decision),
 			decisionIdempotencyKey:
 				idempotencyKey === undefined ? row.decisionIdempotencyKey : idempotencyKey,
+			policyEvidenceJson:
+				policyEvidence === undefined ? row.policyEvidenceJson : JSON.stringify(policyEvidence),
 		});
 	}
 

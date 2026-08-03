@@ -1,9 +1,8 @@
 import type {
-	ChatMessage,
-	ChatRun,
 	ChatRunEvent,
-	ChatRunEventCursor,
+	ChatRunSnapshot,
 	GetChatSessionPageOutput,
+	ReplayChatEventsOutput,
 	SessionModelSelection,
 } from "@moshu/contracts";
 import { RpcRemoteError } from "@moshu/process-rpc-core";
@@ -13,7 +12,6 @@ import {
 	type ChatConversationState,
 	type ChatMessageView,
 	createChatConversationState,
-	ingestSnapshotMessages,
 	ingestSnapshotRuns,
 	isConversationResponding,
 	isConversationStopping,
@@ -47,7 +45,7 @@ export interface ChatSessionView {
 // drain controllable and fail closed instead of looping or growing without limit.
 const SNAPSHOT_PAGE_LIMIT = 2;
 const MAX_SNAPSHOT_PAGES = 200;
-const MAX_SNAPSHOT_BYTES = 4 * 1024 * 1024;
+const MAX_REPLAY_PAGES = 1_000;
 
 // Chat-send outcomes that definitively prove no run was created, so the reservation can be released
 // (a fresh attempt gets a new requestId). Everything else — a dropped socket, a timeout, a lost
@@ -98,6 +96,7 @@ export class ChatSessionController {
 	#provisional: ChatRunEvent[] = [];
 	#cursors = new Map<string, number>();
 	#unsubscribe: (() => void) | null = null;
+	#liveDrain: Promise<void> | undefined;
 	#epoch = 0;
 	#disposed = false;
 	#pendingSend: SendReservation | null = null;
@@ -150,7 +149,21 @@ export class ChatSessionController {
 				return;
 			}
 			if (this.#ready) {
-				this.#deliver(delivery.event);
+				if (!this.#state.runs.has(delivery.event.runId)) {
+					this.#provisional.push(delivery.event);
+					this.#startLiveDrain(epoch);
+					return;
+				}
+				const cursor = this.#cursors.get(delivery.event.runId) ?? 0;
+				if (delivery.event.seq <= cursor) {
+					return;
+				}
+				if (this.#liveDrain === undefined && delivery.event.seq === cursor + 1) {
+					this.#deliver(delivery.event);
+					return;
+				}
+				this.#provisional.push(delivery.event);
+				this.#startLiveDrain(epoch);
 			} else {
 				this.#provisional.push(delivery.event);
 			}
@@ -162,13 +175,7 @@ export class ChatSessionController {
 			if (this.#isStale(epoch)) {
 				return;
 			}
-			this.#title = snapshot.session.title;
-			this.#model = snapshot.session.model ?? null;
-			ingestSnapshotMessages(this.#state, snapshot.messages);
-			ingestSnapshotRuns(this.#state, snapshot.runs);
-			for (const cursor of snapshot.eventCursors) {
-				this.#cursors.set(cursor.runId, cursor.lastSeq);
-			}
+			this.#replaceWithSnapshot(snapshot);
 			await this.#drainProvisional(epoch);
 			if (this.#isStale(epoch)) {
 				return;
@@ -188,22 +195,16 @@ export class ChatSessionController {
 
 	/**
 	 * Loads the full run history by following `nextCursor` to the last page (which holds the active
-	 * run). Bounded by page count and accumulated bytes; a repeated/echoed cursor fails closed rather
-	 * than looping forever.
+	 * run). A repeated/echoed cursor fails closed rather than looping forever.
 	 */
 	async #loadFullSnapshot(): Promise<{
 		session: GetChatSessionPageOutput["session"];
-		messages: ChatMessage[];
-		runs: ChatRun[];
-		eventCursors: ChatRunEventCursor[];
+		runs: ChatRunSnapshot[];
 	}> {
-		const messages: ChatMessage[] = [];
-		const runs: ChatRun[] = [];
-		const eventCursors: ChatRunEventCursor[] = [];
+		const runs: ChatRunSnapshot[] = [];
 		let session: GetChatSessionPageOutput["session"] | undefined;
 		let cursor: string | undefined;
 		let pages = 0;
-		let bytes = 0;
 		const seen = new Set<string>();
 
 		do {
@@ -216,14 +217,8 @@ export class ChatSessionController {
 				...(cursor === undefined ? {} : { cursor }),
 			});
 			session = page.session;
-			messages.push(...page.messages);
 			runs.push(...page.runs);
-			eventCursors.push(...page.eventCursors);
 			pages += 1;
-			bytes += JSON.stringify(page.messages).length + JSON.stringify(page.runs).length;
-			if (bytes > MAX_SNAPSHOT_BYTES) {
-				throw new Error("Session history exceeds the supported size limit.");
-			}
 			const next = page.nextCursor;
 			if (next !== undefined && (next === cursor || seen.has(next))) {
 				// The server must always advance the cursor; a repeat means a broken/looping page.
@@ -237,9 +232,7 @@ export class ChatSessionController {
 
 		return {
 			session: session ?? fail("Session page did not return a session."),
-			messages,
 			runs,
-			eventCursors,
 		};
 	}
 
@@ -260,6 +253,16 @@ export class ChatSessionController {
 	}
 
 	async #deliverWithGapFill(event: ChatRunEvent, epoch: number): Promise<void> {
+		if (!this.#state.runs.has(event.runId)) {
+			const snapshot = await this.#loadFullSnapshot();
+			if (this.#isStale(epoch)) {
+				return;
+			}
+			this.#replaceWithSnapshot(snapshot);
+			if (!this.#state.runs.has(event.runId)) {
+				throw new Error("A live event referenced a Run that was absent from its Session snapshot.");
+			}
+		}
 		const cursor = this.#cursors.get(event.runId) ?? 0;
 		if (event.seq <= cursor) {
 			return;
@@ -271,29 +274,135 @@ export class ChatSessionController {
 		// Gap between the snapshot cursor and this live event — fill it with a durable replay so no
 		// intermediate event is skipped, then deliver the triggering event in order.
 		try {
-			const filled = await this.#replayRun(event.runId, cursor);
+			const recovery = await this.#replayRun(event.runId, cursor);
 			if (this.#isStale(epoch)) {
 				return;
 			}
-			for (const replayed of filled) {
-				this.#deliver(replayed);
+			if (recovery.resnapshot) {
+				const snapshot = await this.#loadFullSnapshot();
+				if (this.#isStale(epoch)) {
+					return;
+				}
+				this.#replaceWithSnapshot(snapshot);
+			} else {
+				for (const replayed of recovery.events) {
+					this.#deliver(replayed);
+				}
 			}
-		} catch {
-			// If replay fails, fall back to applying the event; the reducer's upserts are idempotent so
-			// content still converges even if an intermediate delta was missed.
+		} catch (error) {
+			if (error instanceof SessionRetiredDuringReplayError) {
+				throw error;
+			}
+			const snapshot = await this.#loadFullSnapshot();
+			if (this.#isStale(epoch)) {
+				return;
+			}
+			this.#replaceWithSnapshot(snapshot);
+		}
+		const recoveredCursor = this.#cursors.get(event.runId) ?? 0;
+		if (event.seq <= recoveredCursor) {
+			return;
+		}
+		if (event.seq !== recoveredCursor + 1) {
+			throw new Error("Chat timeline could not recover a missing event range.");
 		}
 		this.#deliver(event);
 	}
 
-	async #replayRun(runId: string, lastSeq: number): Promise<ChatRunEvent[]> {
-		const output = await this.#client.chatReplay({
-			cursors: [
-				{ runId, lastSeq, sessionId: this.#sessionId, issuedAtMs: Date.now() },
-			],
-		});
-		return [...output.events]
-			.filter((event) => event.runId === runId)
-			.sort((left, right) => left.seq - right.seq);
+	#replaceWithSnapshot(snapshot: {
+		session: GetChatSessionPageOutput["session"];
+		runs: ChatRunSnapshot[];
+	}): void {
+		this.#title = snapshot.session.title;
+		this.#model = snapshot.session.model ?? null;
+		this.#state = createChatConversationState(this.#sessionId);
+		this.#cursors = new Map();
+		ingestSnapshotRuns(this.#state, snapshot.runs);
+		for (const run of snapshot.runs) {
+			this.#cursors.set(run.id, run.lastEventSeq);
+		}
+	}
+
+	#startLiveDrain(epoch: number): void {
+		if (this.#liveDrain !== undefined) {
+			return;
+		}
+		const execution = this.#drainProvisional(epoch)
+			.catch((error: unknown) => {
+				if (this.#isStale(epoch)) {
+					return;
+				}
+				this.#ready = false;
+				this.#phase = "error";
+				this.#errorMessage =
+					error instanceof Error ? error.message : "Failed to recover chat events.";
+				this.#emit();
+			})
+			.finally(() => {
+				if (this.#liveDrain !== execution) {
+					return;
+				}
+				this.#liveDrain = undefined;
+				if (!this.#isStale(epoch) && this.#ready && this.#provisional.length > 0) {
+					this.#startLiveDrain(epoch);
+				}
+			});
+		this.#liveDrain = execution;
+	}
+
+	async #replayRun(
+		runId: string,
+		lastSeq: number,
+	): Promise<{ events: ChatRunEvent[]; resnapshot: boolean }> {
+		const events: ChatRunEvent[] = [];
+		let replayCursor = lastSeq;
+		for (let page = 0; page < MAX_REPLAY_PAGES; page += 1) {
+			const output: ReplayChatEventsOutput = await this.#client.chatReplay({
+				cursors: [
+					{
+						runId,
+						lastSeq: replayCursor,
+						sessionId: this.#sessionId,
+						issuedAtMs: Date.now(),
+					},
+				],
+			});
+			this.#validateReplayRecovery(output);
+			if (output.retiredSessionIds.includes(this.#sessionId)) {
+				throw new SessionRetiredDuringReplayError();
+			}
+			if (output.resnapshotSessionIds.includes(this.#sessionId)) {
+				return { events: [], resnapshot: true };
+			}
+			const pageEvents = [...output.events].sort((left, right) => left.seq - right.seq);
+			for (const replayed of pageEvents) {
+				if (replayed.runId !== runId || replayed.sessionId !== this.#sessionId) {
+					throw new Error("Chat replay returned an event outside the requested Run.");
+				}
+				if (replayed.seq > replayCursor) {
+					events.push(replayed);
+					replayCursor = replayed.seq;
+				}
+			}
+			if (!output.hasMore) {
+				return { events, resnapshot: false };
+			}
+			if (pageEvents.length === 0 || replayCursor === lastSeq) {
+				throw new Error("Chat replay pagination did not advance.");
+			}
+			lastSeq = replayCursor;
+		}
+		throw new Error("Chat replay exceeds the supported page limit.");
+	}
+
+	#validateReplayRecovery(output: ReplayChatEventsOutput): void {
+		const recoverySessionIds = [...output.retiredSessionIds, ...output.resnapshotSessionIds];
+		if (output.retiredSessionIds.length > 0 && output.resnapshotSessionIds.length > 0) {
+			throw new Error("Chat replay returned contradictory recovery instructions.");
+		}
+		if (recoverySessionIds.some((sessionId) => sessionId !== this.#sessionId)) {
+			throw new Error("Chat replay returned a recovery instruction for another Session.");
+		}
 	}
 
 	#deliver(event: ChatRunEvent): void {
@@ -323,11 +432,14 @@ export class ChatSessionController {
 			});
 			// Definitive success: the send is accepted and owns a run. Release the reservation.
 			this.#pendingSend = null;
-			// Seed the user + assistant messages immediately so the UI reflects the send without waiting
-			// for the first event; subsequent events reconcile by id.
-			ingestSnapshotMessages(this.#state, [accepted.userMessage, accepted.assistantMessage]);
-			ingestSnapshotRuns(this.#state, [accepted.run]);
-			this.#cursors.set(accepted.run.id, this.#cursors.get(accepted.run.id) ?? 0);
+			const current = this.#state.runs.get(accepted.run.id);
+			if (current === undefined || current.lastEventSeq < accepted.run.lastEventSeq) {
+				ingestSnapshotRuns(this.#state, [accepted.run]);
+			}
+			this.#cursors.set(
+				accepted.run.id,
+				Math.max(this.#cursors.get(accepted.run.id) ?? 0, accepted.run.lastEventSeq),
+			);
 			this.#emit();
 		} catch (error) {
 			if (isDefinitiveSendRejection(error)) {
@@ -397,6 +509,13 @@ export class ChatSessionController {
 		} catch {
 			// Best-effort; the socket may already be gone.
 		}
+	}
+}
+
+class SessionRetiredDuringReplayError extends Error {
+	constructor() {
+		super("This chat Session was retired during event recovery.");
+		this.name = "SessionRetiredDuringReplayError";
 	}
 }
 

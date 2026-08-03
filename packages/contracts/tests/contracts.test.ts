@@ -2,17 +2,22 @@ import { describe, expect, test } from "bun:test";
 
 import {
 	agentsRuntimeInfoSchema,
+	approvalRequestSchema,
+	chatRunToolPartSchema,
 	chatRunSchema,
 	createProviderInputSchema,
 	createExecutorToolParameterPayload,
 	executorExecutionContextSchema,
 	listChatSessionsInputSchema,
+	maxToolCallIdBytes,
 	projectPathPreviewSchema,
 	projectSchema,
 	providerAuthAttemptOutputSchema,
 	runtimeBoxToolAuthorizationSchema,
+	runtimeBoxToolInvokeInputSchema,
 	runProviderConfigInputSchema,
 	sessionModelSelectionSchema,
+	updateSessionApprovalPolicyInputSchema,
 } from "../src";
 
 describe("Pi-neutral backend contracts", () => {
@@ -171,7 +176,6 @@ describe("Pi-neutral backend contracts", () => {
 				status: "ready",
 			},
 			userMessageId: "018f47a2-9bcd-7def-8abc-1234567890ae",
-			assistantMessageId: "018f47a2-9bcd-7def-8abc-1234567890af",
 			createdAt: now,
 			updatedAt: now,
 		});
@@ -218,5 +222,108 @@ describe("Pi-neutral backend contracts", () => {
 				projectPathRevision: 2,
 			}),
 		);
+	});
+
+	test("uses one provider-sized Tool call ID bound across runtime, timeline, and approvals", () => {
+		const now = new Date().toISOString();
+		const runId = "018f47a2-9bcd-7def-8abc-1234567890ab";
+		const sessionId = "018f47a2-9bcd-7def-8abc-1234567890ac";
+		const toolCallId = `call_${"x".repeat(437)}`;
+		expect(toolCallId).toHaveLength(442);
+
+		expect(
+			runtimeBoxToolInvokeInputSchema.parse({
+				schemaVersion: 1,
+				invocationId: crypto.randomUUID(),
+				runId,
+				toolCallId,
+				cwd: "/workspace",
+				call: {
+					tool: "edit",
+					arguments: { path: "README.md", edits: [{ oldText: "a", newText: "b" }] },
+				},
+			}).toolCallId,
+		).toBe(toolCallId);
+		expect(
+			chatRunToolPartSchema.parse({
+				schemaVersion: 1,
+				id: "018f47a2-9bcd-7def-8abc-1234567890ad",
+				runId,
+				position: 1,
+				assistantTurnId: "018f47a2-9bcd-7def-8abc-1234567890ae",
+				revision: 1,
+				createdAt: now,
+				updatedAt: now,
+				kind: "tool",
+				toolCallId,
+				tool: { kind: "builtin", name: "edit" },
+				status: "waiting_approval",
+				summary: "Edit README.md",
+			}).toolCallId,
+		).toBe(toolCallId);
+		expect(
+			approvalRequestSchema.parse({
+				schemaVersion: 1,
+				id: crypto.randomUUID(),
+				sessionId,
+				runId,
+				actionId: crypto.randomUUID(),
+				toolCallId,
+				action: {
+					tool: "edit",
+					operation: "edit",
+					target: { kind: "runtime-box", id: "local" },
+					path: "README.md",
+					redactedParams: {},
+				},
+				risk: { tier: "medium", overridable: true, reasons: ["file mutation"] },
+				state: "pending",
+				revision: 1,
+				createdAt: now,
+				expiresAt: new Date(Date.now() + 60_000).toISOString(),
+			}).toolCallId,
+		).toBe(toolCallId);
+		expect(
+			approvalRequestSchema.safeParse({
+				schemaVersion: 1,
+				id: crypto.randomUUID(),
+				sessionId,
+				runId,
+				actionId: crypto.randomUUID(),
+				toolCallId: "x".repeat(maxToolCallIdBytes + 1),
+				action: {
+					tool: "edit",
+					operation: "edit",
+					target: { kind: "runtime-box", id: "local" },
+					path: "README.md",
+					redactedParams: {},
+				},
+				risk: { tier: "medium", overridable: true, reasons: ["file mutation"] },
+				state: "pending",
+				revision: 1,
+				createdAt: now,
+				expiresAt: new Date(Date.now() + 60_000).toISOString(),
+			}).success,
+		).toBe(false);
+	});
+
+	test("binds Allow all to the current approval in one request", () => {
+		const input = {
+			sessionId: "018f47a2-9bcd-7def-8abc-1234567890ab",
+			allowAll: true,
+			expectedRevision: 0,
+			idempotencyKey: crypto.randomUUID(),
+			approveRequest: {
+				approvalId: crypto.randomUUID(),
+				expectedRevision: 1,
+			},
+		};
+		expect(updateSessionApprovalPolicyInputSchema.parse(input)).toEqual(input);
+		expect(
+			updateSessionApprovalPolicyInputSchema.safeParse({
+				...input,
+				allowAll: false,
+			}).success,
+		).toBe(false);
 	});
 });

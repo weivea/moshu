@@ -1,6 +1,6 @@
 import type { ChatEventDelivery } from "@moshu/contracts";
 import { RpcRemoteError } from "@moshu/process-rpc-core";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { ChatSessionController } from "../src/rpc/chat-session-controller";
 import { MobileEventBus } from "../src/rpc/events";
 import {
@@ -9,9 +9,9 @@ import {
 	makePagedSnapshot,
 	makeRun,
 	makeSessionPage,
-	makeUserMessage,
 	messageCompletedEvent,
 	messageDeltaEvent,
+	messageStartedEvent,
 	v7,
 } from "./helpers";
 
@@ -70,10 +70,51 @@ describe("ChatSessionController recovery drain", () => {
 
 		const view = controller.getView();
 		expect(view.phase).toBe("ready");
-		expect(view.messages).toHaveLength(1);
-		expect(view.messages[0]?.content).toBe("ABCDE");
-		expect(view.messages[0]?.status).toBe("complete");
+		const assistant = view.messages.find((message) => message.role === "assistant");
+		expect(assistant?.content).toBe("ABCDE");
+		expect(assistant?.status).toBe("complete");
 		expect(changes).toBeGreaterThan(0);
+	});
+
+	it("resnapshots instead of applying a live event when gap replay fails", async () => {
+		const sessionId = v7();
+		const runId = v7();
+		const msgId = v7();
+		const initial = makeSessionPage(sessionId, {
+			messages: [makeAssistantMessage(msgId, sessionId, 1, "AB", "streaming")],
+			runs: [makeRun(runId, sessionId, "running")],
+			eventCursors: [{ runId, lastSeq: 2 }],
+		});
+		const recovered = makeSessionPage(sessionId, {
+			messages: [makeAssistantMessage(msgId, sessionId, 1, "ABCDE", "complete")],
+			runs: [makeRun(runId, sessionId, "completed")],
+			eventCursors: [{ runId, lastSeq: 5 }],
+		});
+		let snapshotReads = 0;
+		const { client, script } = makeFakeChatClient({
+			sessionId,
+			snapshot: initial,
+			getPage: () => {
+				snapshotReads += 1;
+				return snapshotReads === 1 ? initial : recovered;
+			},
+			replay: () => {
+				throw new Error("Replay unavailable.");
+			},
+		});
+		const bus = new MobileEventBus();
+		const controller = new ChatSessionController({ client, bus, sessionId, onChange: () => {} });
+
+		const started = controller.start();
+		emitChat(bus, messageCompletedEvent(runId, sessionId, 5, msgId, "ABCDE"));
+		await started;
+
+		expect(script.replayCalls).toEqual([{ runId, lastSeq: 2 }]);
+		expect(snapshotReads).toBe(2);
+		expect(controller.getView().phase).toBe("ready");
+		expect(
+			controller.getView().messages.find((message) => message.role === "assistant")?.content,
+		).toBe("ABCDE");
 	});
 
 	it("applies live events directly once ready", async () => {
@@ -89,8 +130,122 @@ describe("ChatSessionController recovery drain", () => {
 		const controller = new ChatSessionController({ client, bus, sessionId, onChange: () => {} });
 		await controller.start();
 
-		emitChat(bus, messageDeltaEvent(runId, sessionId, 1, msgId, "live"));
-		expect(controller.getView().messages[0]?.content).toBe("live");
+		emitChat(bus, messageStartedEvent(runId, sessionId, 1, msgId));
+		emitChat(bus, messageDeltaEvent(runId, sessionId, 2, msgId, "live"));
+		expect(
+			controller.getView().messages.find((message) => message.role === "assistant")?.content,
+		).toBe("live");
+	});
+
+	it("resnapshots before applying an event for a Run created by another client", async () => {
+		const sessionId = v7();
+		const runId = v7();
+		const msgId = v7();
+		const initial = makeSessionPage(sessionId);
+		const recovered = makeSessionPage(sessionId, {
+			messages: [makeAssistantMessage(msgId, sessionId, 1, "A", "streaming")],
+			runs: [makeRun(runId, sessionId, "running")],
+			eventCursors: [{ runId, lastSeq: 1 }],
+		});
+		let reads = 0;
+		const { client, script } = makeFakeChatClient({
+			sessionId,
+			snapshot: initial,
+			getPage: () => {
+				reads += 1;
+				return reads === 1 ? initial : recovered;
+			},
+		});
+		const bus = new MobileEventBus();
+		const controller = new ChatSessionController({ client, bus, sessionId, onChange: () => {} });
+		await controller.start();
+
+		emitChat(bus, messageDeltaEvent(runId, sessionId, 2, msgId, "B"));
+		await vi.waitFor(() => {
+			expect(
+				controller.getView().messages.find((message) => message.role === "assistant")?.content,
+			).toBe("AB");
+		});
+		expect(script.replayCalls).toEqual([]);
+		expect(reads).toBe(2);
+	});
+
+	it("follows replay pagination until the live event gap is fully recovered", async () => {
+		const sessionId = v7();
+		const runId = v7();
+		const msgId = v7();
+		const snapshot = makeSessionPage(sessionId, {
+			runs: [makeRun(runId, sessionId, "running")],
+			eventCursors: [{ runId, lastSeq: 0 }],
+		});
+		const { client, script } = makeFakeChatClient({
+			sessionId,
+			snapshot,
+			replay: (_id, lastSeq) =>
+				lastSeq === 0
+					? {
+							events: [
+								messageStartedEvent(runId, sessionId, 1, msgId),
+								messageDeltaEvent(runId, sessionId, 2, msgId, "A"),
+							],
+							hasMore: true,
+						}
+					: {
+							events: [messageDeltaEvent(runId, sessionId, 3, msgId, "B")],
+							hasMore: false,
+						},
+		});
+		const bus = new MobileEventBus();
+		const controller = new ChatSessionController({ client, bus, sessionId, onChange: () => {} });
+		await controller.start();
+
+		emitChat(bus, messageCompletedEvent(runId, sessionId, 4, msgId, "ABC"));
+		await vi.waitFor(() => {
+			expect(
+				controller.getView().messages.find((message) => message.role === "assistant")?.content,
+			).toBe("ABC");
+		});
+		expect(script.replayCalls).toEqual([
+			{ runId, lastSeq: 0 },
+			{ runId, lastSeq: 2 },
+		]);
+	});
+
+	it("obeys a replay resnapshot instruction instead of applying an incomplete page", async () => {
+		const sessionId = v7();
+		const runId = v7();
+		const msgId = v7();
+		const initial = makeSessionPage(sessionId, {
+			messages: [makeAssistantMessage(msgId, sessionId, 1, "A", "streaming")],
+			runs: [makeRun(runId, sessionId, "running")],
+			eventCursors: [{ runId, lastSeq: 1 }],
+		});
+		const recovered = makeSessionPage(sessionId, {
+			messages: [makeAssistantMessage(msgId, sessionId, 1, "ABC", "complete")],
+			runs: [makeRun(runId, sessionId, "completed")],
+			eventCursors: [{ runId, lastSeq: 3 }],
+		});
+		let reads = 0;
+		const { client } = makeFakeChatClient({
+			sessionId,
+			snapshot: initial,
+			getPage: () => {
+				reads += 1;
+				return reads === 1 ? initial : recovered;
+			},
+			replay: () => ({ resnapshotSessionIds: [sessionId] }),
+		});
+		const bus = new MobileEventBus();
+		const controller = new ChatSessionController({ client, bus, sessionId, onChange: () => {} });
+		await controller.start();
+
+		emitChat(bus, messageCompletedEvent(runId, sessionId, 3, msgId, "ABC"));
+		await vi.waitFor(() => {
+			expect(
+				controller.getView().messages.find((message) => message.role === "assistant")?.content,
+			).toBe("ABC");
+		});
+		expect(reads).toBe(2);
 	});
 
 	it("owns a generated requestId for idempotent sends and unsubscribes on dispose", async () => {
@@ -117,6 +272,41 @@ describe("ChatSessionController recovery drain", () => {
 
 		await controller.dispose();
 		expect(script.unsubscribes).toEqual([sessionId]);
+	});
+
+	it("does not replace live-advanced content with a stale send acknowledgement", async () => {
+		const sessionId = v7();
+		const runId = v7();
+		const messageId = v7();
+		const acceptedRun = makeRun(runId, sessionId, "running", "hello");
+		const snapshot = makeSessionPage(sessionId, {
+			runs: [acceptedRun],
+			eventCursors: [{ runId, lastSeq: 0 }],
+		});
+		let acceptSend: ((result: { run: typeof acceptedRun }) => void) | undefined;
+		const sendResult = new Promise<{ run: typeof acceptedRun }>((resolve) => {
+			acceptSend = resolve;
+		});
+		const { client, script } = makeFakeChatClient({
+			sessionId,
+			snapshot,
+			send: () => sendResult,
+		});
+		const bus = new MobileEventBus();
+		const controller = new ChatSessionController({ client, bus, sessionId, onChange: () => {} });
+		await controller.start();
+
+		const sending = controller.send("hello");
+		await vi.waitFor(() => expect(script.sendCalls).toHaveLength(1));
+		emitChat(bus, messageStartedEvent(runId, sessionId, 1, messageId));
+		emitChat(bus, messageDeltaEvent(runId, sessionId, 2, messageId, "live"));
+		acceptSend?.({ run: acceptedRun });
+		await sending;
+
+		emitChat(bus, messageDeltaEvent(runId, sessionId, 3, messageId, "!"));
+		expect(
+			controller.getView().messages.find((message) => message.role === "assistant")?.content,
+		).toBe("live!");
 	});
 
 	it("cancels the latest active run", async () => {
@@ -158,7 +348,11 @@ describe("ChatSessionController history pagination (f6)", () => {
 				eventCursors: [{ runId: activeRun, lastSeq: 5 }],
 			},
 		]);
-		const { client, script } = makeFakeChatClient({ sessionId, snapshot: makeSessionPage(sessionId), getPage });
+		const { client, script } = makeFakeChatClient({
+			sessionId,
+			snapshot: makeSessionPage(sessionId),
+			getPage,
+		});
 		const bus = new MobileEventBus();
 		const controller = new ChatSessionController({ client, bus, sessionId, onChange: () => {} });
 		await controller.start();
@@ -181,7 +375,11 @@ describe("ChatSessionController history pagination (f6)", () => {
 				runs: [makeRun(runId, sessionId, "running")],
 				nextCursor: "stuck",
 			});
-		const { client } = makeFakeChatClient({ sessionId, snapshot: makeSessionPage(sessionId), getPage });
+		const { client } = makeFakeChatClient({
+			sessionId,
+			snapshot: makeSessionPage(sessionId),
+			getPage,
+		});
 		const bus = new MobileEventBus();
 		const controller = new ChatSessionController({ client, bus, sessionId, onChange: () => {} });
 		await controller.start();
@@ -215,9 +413,7 @@ describe("ChatSessionController send reservation (f7)", () => {
 
 	function successResult(sessionId: string, content: string) {
 		return {
-			run: makeRun(v7(), sessionId, "running"),
-			userMessage: makeUserMessage(v7(), sessionId, 1, content),
-			assistantMessage: makeAssistantMessage(v7(), sessionId, 2, "", "streaming"),
+			run: makeRun(v7(), sessionId, "running", content),
 		};
 	}
 

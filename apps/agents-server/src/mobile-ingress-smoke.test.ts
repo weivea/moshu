@@ -61,7 +61,6 @@ function makeProviderInput() {
 function seedRun(database: AppDatabase): {
 	sessionId: string;
 	runId: string;
-	assistantMessageId: string;
 } {
 	const session = database.sessions.create({ title: "Smoke Session" }).session;
 	const created = database.runs.create({
@@ -71,12 +70,10 @@ function seedRun(database: AppDatabase): {
 		provider: makeProviderInput(),
 		userMessageId: createUuidV7(),
 		userContent: "Smoke prompt",
-		assistantMessageId: createUuidV7(),
 	});
 	return {
 		sessionId: session.id,
 		runId: created.run.id,
-		assistantMessageId: created.run.assistantMessageId,
 	};
 }
 
@@ -97,11 +94,11 @@ function createPendingApproval(database: AppDatabase, sessionId: string, runId: 
 	return id;
 }
 
-function completeRun(database: AppDatabase, runId: string, assistantMessageId: string): void {
+function completeRun(database: AppDatabase, runId: string): void {
 	database.runs.updateStatus({ runId, status: "running" });
 	database.runs.commitTerminal({
 		runId,
-		message: { messageId: assistantMessageId, status: "complete", content: "done" },
+		status: "completed",
 	});
 }
 
@@ -277,9 +274,9 @@ describe("Mobile ingress transport smoke", () => {
 			// state; the production drainer projects them into the durable feed (desensitized). The phone
 			// lists unread, acks, and — critically — recovers missed unread after a disconnect from the
 			// server-owned feed, never from device storage.
-			const { sessionId, runId, assistantMessageId } = seedRun(database);
+			const { sessionId, runId } = seedRun(database);
 			createPendingApproval(database, sessionId, runId);
-			completeRun(database, runId, assistantMessageId);
+			completeRun(database, runId);
 
 			// Nothing is visible on the feed until the drainer projects the committed outbox rows.
 			expect(database.mobileAttention.latestSeq()).toBe(0);

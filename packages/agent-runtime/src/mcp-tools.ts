@@ -17,6 +17,8 @@ export interface AgentMcpResource {
 	version: string;
 	contentHash: string;
 	tools: readonly McpToolDescriptor[];
+	/** Values injected into this MCP connection and eligible for exact public-projection redaction. */
+	projectionSecretValues?: readonly string[];
 }
 
 export interface McpToolGateway {

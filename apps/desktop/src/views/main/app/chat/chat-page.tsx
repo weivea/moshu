@@ -6,7 +6,6 @@ import { Link } from "react-router-dom";
 import { useI18n } from "../i18n";
 import { useRuntimeBoxes } from "../runtime-boxes";
 import { useAppShellContext } from "../shell-context";
-import { SessionApprovalCards } from "./approval-card";
 import { ChatComposer } from "./chat-composer";
 import { MessageList } from "./message-list";
 import { SessionSidebar } from "./session-sidebar";
@@ -14,7 +13,6 @@ import type { ChatSession, ChatTransport } from "./transport";
 import { useChatController } from "./use-chat-controller";
 
 export type {
-	ChatMessage,
 	ChatSession,
 	ChatTransport,
 	ChatTransportEvent,
@@ -77,7 +75,7 @@ export function ChatPage({
 	});
 	const sessionRefreshKey = [
 		controller.session?.id ?? "",
-		controller.session?.messages.length ?? 0,
+		controller.session?.runs.length ?? 0,
 		controller.isResponding ? "responding" : "idle",
 	].join(":");
 	const isArchived = controller.session?.archivedAt !== undefined;
@@ -286,12 +284,9 @@ export function ChatPage({
 						<MessageList
 							compact={shell !== null}
 							isLoading={controller.isSessionLoading && controller.session === null}
-							messages={controller.session?.messages ?? []}
+							runs={controller.session?.runs ?? []}
 							sessionId={activeSessionId}
-						/>
-						<SessionApprovalCards
-							sessionId={activeSessionId}
-							disabled={disabledReason !== undefined}
+							approvalsDisabled={disabledReason !== undefined}
 						/>
 						{controller.hasConfiguredProvider ? (
 							<ChatComposer
