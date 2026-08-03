@@ -1,7 +1,8 @@
-# 质量与发布计划
+# 质量与发布
 
-> 本文验证批准的三应用角色目标架构。
-> 当前 Pi Ask、compiled companion 与三进程 smoke 已形成 A0/A1 gate；Tool/MCP/Skill gate 尚未实现。
+> 本文验证当前三角色实现及首次外部分发门槛。
+> Runtime Box、Tool/Action、MCP/Skill、Remote ingress 和 Mobile 的仓库内 gate 已实现；真实 Tunnel 与正式平台签名仍需外部发布环境。
+> 更新日期：2026-08-03
 
 ## 1. 质量目标
 
@@ -27,23 +28,19 @@
 | Security/chaos | nightly/发布前 | 未授权连接、旧实例、grant、kill points、Secret |
 | Live compatibility | nightly/发布前 | Provider API 和发布支持的远程 MCP |
 
-测试必须区分：
+跨角色 gate 必须真的启动独立 agents server/Runtime Box，并经 WebSocket RPC 通过；禁止用 in-memory adapter
+或同进程 service call 代替。尚未实现的产品能力可以保留目标测试说明，但不能计入当前发布 gate。
 
-- **当前实现测试**：证明现有 Ask slice 没有回归。
-- **目标架构测试**：必须真的启动独立 agents server/Runtime Box，并经 WebSocket RPC 通过。
-
-禁止用 in-memory adapter 或同进程 service call 给跨角色 gate 记为通过。
-
-## 3. A0–A5 质量门
+## 3. 能力质量门
 
 | Gate | 必须通过 |
 | --- | --- |
-| QG-A0 RPC/binary | 两 companion compile/package、dynamic loopback、registration、version、role allowlist、shutdown/restart cap |
-| QG-A1 server extraction | Pi Ask parity、server 单写产品 DB/Pi Session JSONL、Provider/runtime 不在 client、event replay |
-| QG-A2 registry | stable ID、instance/generation、Agent N:1、注册 full capability sync、syncing/offline Run gate |
-| QG-A3 execution | policy/approval/intent/grant 顺序、grant negative suite、Tool process tree、Action recovery |
-| QG-A4 MCP/Skills | Runtime Box-owned persistence、epoch/revision delta reconciliation、routed UI、stable resource ref、private secret store、逐 Tool grant、fail-closed restore |
-| QG-A5 release | kill matrix、capped recovery UX、cooperative quit、signed/notarized package、Updater atomicity |
+| QG-RPC | 两 companion compile/package、dynamic Product RPC、独立 ingress、registration、version、role allowlist、shutdown/restart cap |
+| QG-SERVER | Pi Agent parity、server 单写产品 DB/Pi Session JSONL、Provider/runtime 不在 client、event replay |
+| QG-REGISTRY | stable ID、持久 generation、Local/Remote registry、full inventory sync、syncing/offline Run gate |
+| QG-EXECUTION | policy/approval/intent/grant 顺序、grant negative suite、Tool process tree、Action recovery |
+| QG-EXTENSIONS | 双 owner MCP/Skills、delta reconciliation、stable ref、private secret store、逐 Tool grant、fail-closed restore |
+| QG-RELEASE | kill matrix、capped recovery UX、cooperative quit、signed/notarized package、Updater atomicity |
 
 前一 gate 未通过时，后一阶段可以做 isolated spike，但不得把产品能力默认开启。
 
@@ -57,7 +54,7 @@
 - heartbeat/lease 的 online、offline、superseded 转换。
 - persisted `inventoryEpoch`/monotonic revision 的 restart 保留和 store reset 换 epoch。
 - syncing -> online、offline -> stale，以及 full snapshot 未完成时 Agent 不 runnable。
-- 多 Agent 绑定同 Runtime Box；删除/停用 Runtime Box 的引用规则。
+- Agent Runtime Profile 与 Runtime Box 的引用规则；归档/吊销 Box 后历史归属保持可读。
 - offline Runtime Box 的 `runs.start` 返回 `RUNTIME_BOX_OFFLINE`。
 
 ### 4.2 Protocol
@@ -90,7 +87,8 @@
 
 ### 5.1 Bootstrap 与注册
 
-- server 绑定 `127.0.0.1`/`::1` 动态端口，不监听公网接口。
+- Product RPC 绑定 `127.0.0.1`/`::1` 动态端口；Runtime/Mobile ingress 使用独立固定 loopback 端口。
+  三者都不直接监听公网接口。
 - role-bound bootstrap token 不出现在 argv、普通日志或固定配置。
 - token 过期、重放、client/Runtime Box 互换和未知 binary 被拒绝。
 - 未注册连接不能调用业务 method。
@@ -128,8 +126,9 @@
 ### 6.2 Runtime Box
 
 - 不打开产品 DB/Pi Session JSONL，不持有 Provider adapter。
-- 文件路径、软链接、TOCTOU、hash CAS、原子替换和撤销。
-- 命令 cwd、最小 env、timeout、输出截断、进程组和取消。
+- 文件路径、软链接、TOCTOU、大小限制、串行化和原子替换。
+- 命令 cwd、timeout、输出限制、进程组和取消。Local `bash` 当前继承 Desktop 环境；这不是最小环境或
+  shell sandbox，必须作为明确风险单独覆盖。
 - Runtime Box shutdown 清理所有受管进程树。
 - invocation registry 在终态/取消/断线对账后回收。
 
@@ -157,7 +156,7 @@
 
 ### 7.2 Kill points
 
-对文件、命令、Git、MCP 和 Skill script 自动注入：
+对当前已实现的文件、命令和 MCP Action 自动注入；Git Tool 与 Skill script 接入后复用同一矩阵：
 
 1. Policy 决定前后。
 2. Approval 决定前后。
@@ -174,7 +173,7 @@
 | --- | --- |
 | 读文件/搜索 | 可重新签发 grant 后重试 |
 | 固定内容写入 | 根据 before/after hash 验证 |
-| Patch/move | 状态不匹配进入 conflict |
+| edit/write | 参数、路径或目标状态不匹配时 fail closed |
 | 命令 | 无法确认时 `outcome_unknown`，不自动重跑 |
 | 远程 MCP 副作用 | `outcome_unknown`，人工验证 |
 | Skill script | 按实际命令幂等类别处理，不因“来自 Skill”放宽 |
@@ -298,7 +297,7 @@ Provider/model canary 只允许存在于测试 server `SecretVault`，进入 Run
 - client 启动两个 companion 并显示 online。
 - 保存 fake Provider，经 server 完成普通 Chat。
 - client reload/reconnect 后恢复同 Session 与 event cursor。
-- registry 显示一个 local Runtime Box 和多个 Agent。
+- registry 显示 Local Runtime Box，并可同时管理已配对 Remote Runtime Box。
 - 停止 Runtime Box 后 cache 标 stale、相关 Agent 无法启动新 Run；重启 full sync 完成后才恢复可用。
 - 一次低风险 Tool 经 intent/grant/Runtime Box/result 完成。
 - client 正常退出后 companion 和 Tool 子进程均退出。
@@ -309,7 +308,7 @@ Provider/model canary 只允许存在于测试 server `SecretVault`，进入 Run
 - 分别 kill server、Runtime Box、client/WebView。
 - grant 全部 negative cases。
 - Action kill-point matrix。
-- MCP/Skill fake fixtures、inventory hint/drop/gap/epoch-reset/read-own-write matrix（A4 后）。
+- MCP/Skill fake fixtures、inventory hint/drop/gap/epoch-reset/read-own-write matrix。
 - restart cap/recovery UX。
 - signed/package artifact 的同一流程。
 
@@ -321,8 +320,8 @@ Provider/model canary 只允许存在于测试 server `SecretVault`，进入 Run
 
 ## 13. Provider、Pi Session 与产品回归
 
-- public Pi compatibility gate 覆盖 imports、headless no-tools Session、offline fake stream、restore、abort 和
-  compiled binary。
+- public Pi compatibility gate 覆盖 imports、headless Session、Moshu custom Tool 装配、offline fake stream、
+  restore、abort 和 compiled binary。
 - Provider 覆盖动态 builtin 枚举、四种 custom API、选中 Provider 刷新、auth attempt 全部 prompt/event、
   credential redaction、logout 和 invalid `ThinkingLevel`。
 - Provider 调用只在 server 测试进程中发生；client/Runtime Box 测试中出现 Provider Key 即失败。
@@ -394,10 +393,12 @@ clean tagged commit
 
 ## 16. 打包、签名与更新
 
-- 两个 companion 与 client 来自同一 release；不能独立下载或混用未知版本。
+- Desktop 内的 agents-server 与 Local Runtime Box companion 和 client 来自同一 release。Remote Runtime Box
+  可独立升级，但必须通过 Runtime protocol compatibility gate。
 - package 必须保留 companion 可执行权限，并验证目标架构、动态库和签名链。
 - terminal user 无 Bun/Node 时所有 E2E 仍通过。
-- 更新要么整体切换 client/server/Runtime Box，要么保持旧完整版本；不允许部分 binary 更新。
+- Desktop 更新要么整体切换 client/server/Local Runtime Box，要么保持旧完整版本；Remote Runtime Box 通过
+  独立 protocol version range 和 `upgrade_required` 处理版本差异。
 - 有活动 Run/Action 时不强制更新退出。
 - stable package 不含源 Secret、bootstrap token、测试 driver 或开发 endpoint。
 
@@ -462,7 +463,7 @@ clean tagged commit
 
 ### 架构
 
-- [ ] 对应 A0–A5 gate 通过。
+- [ ] 对应能力 gate 通过。
 - [ ] 角色 ownership assertion 和依赖扫描通过。
 - [ ] stable/instance/generation、registry、full inventory sync 和 syncing/offline UX 验收完成。
 
@@ -538,39 +539,17 @@ VoIP/background-processing 伪保活、设备不落业务数据、Desktop 必须
 - `dist` ↔ iOS `public` 同步不只看 `index.html`：gate 递归比较文件集合、大小和 SHA-256，忽略
   `.DS_Store` / `capacitor.config.json` / `config.xml` / `cordova*.js` 等 Capacitor/native metadata。
 
-### 21.7 验证命令（本层，实际运行结果）
+### 21.7 验证命令
 
-- `bun run --cwd apps/mobile test`（**117 Vitest**，含 notification-tap / attention route (>100 events) /
-  **gap→`safeActivity` 安全路由 + 异步走查后 re-validate（前台化/换连接不补发）** /
-  production-root tap→navigate + safe-activity gap tap→Activity + surviving-socket foreground resnapshot / release-gate）、
-  `typecheck`（clean）、`build`（vite production）、`cap:sync`（copy dist→`ios/App/App/public`，含
-  `@capacitor/local-notifications`）。
-- `swift test`（`apps/mobile/native/MoshuMobile`，**70 XCTest**，含 `BackgroundActivityCoordinator` 陈旧/
-  late-A-vs-B/同步 expiration no-op）。
-- server 侧隔离测试：`bun test packages/contracts packages/database`（**125 + 87 pass**，含 mobile attention
-  contracts + `mobile-attention-repository` + `mobile-attention-outbox` DB 测试）与
-  `apps/agents-server/src/mobile-attention-drainer.test.ts` / `mobile-ingress-smoke.test.ts` /
-  `mobile-ingress-composition.test.ts` / `mobile-ingress-auth.test.ts` /
-  `mobile-ingress-generation-fence.test.ts`（**22 pass**）。
-  smoke 通过真实 **`createMobileIngressComposition`**（生产装配单一来源）→ `openAppDatabase` + Approval/Run
-  仓储 → 事务 outbox → 真实 drainer 投影 → 共享 list/ack handler → 真实 revoke，**不再自建 `createRpcServer`/
-  bespoke handler map**；`mobile-ingress-composition.test.ts` 的 wiring contract 保证 composition 拥有的
-  ingress method 全部落在 strict allowlist + merged handler map，且被 smoke 覆盖。
-  > 环境限制：`@earendil-works/pi-*` 未安装，故无法导入 `@moshu/agent-runtime`（即 `product-rpc.ts` /
-  > `create-agents-server.ts`）跑完整 agents-server 套件；以上隔离测试覆盖 mobile 增量（composition 为
-  > pi-free 模块，故可隔离运行）。
-- `bun run --cwd apps/mobile release:gate`（dev 模式 **10 checks 全绿**）。真实发布模式
-  `MOSHU_MOBILE_RELEASE=1 MOSHU_MOBILE_RELEASE_BUNDLE_ID=... release:gate` 已验证会用
-  `xcodebuild -showBuildSettings -configuration Release` 解析 `PRODUCT_BUNDLE_IDENTIFIER` 并精确比对：
-  当前 committed 项目仍是 `dev.moshu.mobile`，故真实模式**正确 FAIL**（发布方必须先把项目 bundle id
-  改为永久 id 并对齐 `MOSHU_MOBILE_RELEASE_BUNDLE_ID`）。
-- iOS simulator `xcodebuild build`（**实际运行**，iPhone 17 Pro / iOS 26.5，Xcode 26.5，
-  `CODE_SIGNING_ALLOWED=NO`）：**BUILD SUCCEEDED**。App 工程只有 `App` target（无 XCTest bundle），故 native
-  单元测试走 SPM `swift test`；App/plugin 层由此 simulator build 编译校验。
-  > 环境限制：Copilot runtime 注入 `GIT_CONFIG_KEY_0=safe.bareRepository=explicit`，会让 xcodebuild 内部
-  > git 无法解析 SwiftPM 缓存。运行 xcodebuild（含 release gate 的 live bundle-id 路径）需清除该注入：
-  > `env -u GIT_CONFIG_COUNT -u GIT_CONFIG_KEY_0 -u GIT_CONFIG_VALUE_0 -u GIT_CONFIG_KEY_1 -u GIT_CONFIG_VALUE_1 ...`。
-- 真实 Dev Tunnel probe（`scripts/probe-live-dev-tunnel.ts`）保持 **opt-in**、记录命令、不要求 CI secret。
+- `bun run --cwd apps/mobile test`、`typecheck`、`build`、`cap:sync`。
+- `swift test --package-path apps/mobile/native/MoshuMobile`。
+- `bun test packages/contracts packages/database`，以及 agents-server 的 attention drainer、ingress composition、
+  authentication、generation fence 和 Mobile smoke suites。smoke 必须使用生产
+  `createMobileIngressComposition`，不能另建宽松 handler map。
+- `bun run --cwd apps/mobile release:gate`；真实发布模式额外设置
+  `MOSHU_MOBILE_RELEASE=1` 与永久 `MOSHU_MOBILE_RELEASE_BUNDLE_ID`。
+- iOS simulator `xcodebuild build` 使用 `CODE_SIGNING_ALLOWED=NO`；真机与 App Store 构建使用正式签名配置。
+- 真实 Dev Tunnel probe（`scripts/probe-live-dev-tunnel.ts`）保持 opt-in，不要求仓库或普通 CI 保存外部 Secret。
 
 ### 21.8 发布检查表（Mobile Layer 5）
 
@@ -580,7 +559,7 @@ VoIP/background-processing 伪保活、设备不落业务数据、Desktop 必须
 - [ ] `PrivacyInfo.xcprivacy` 与实际依赖一致；Info.plist 无多余权限/background mode。
 - [ ] Export compliance 问卷由发布方确认；未武断写 `ITSAppUsesNonExemptEncryption`。
 - [ ] reviewer 路径（在线 Desktop + 配对二维码或安全 demo）已备妥；无生产云账号/假成功。
-- [ ] 102 Vitest + 68 Swift XCTest + 125 contracts/database + 14 隔离 agents-server mobile 测试通过。
-- [ ] iOS simulator `xcodebuild build`（禁签名）BUILD SUCCEEDED。
+- [ ] Mobile Vitest、Swift XCTest、contracts/database 与隔离 agents-server Mobile suites 全部通过。
+- [ ] iOS simulator `xcodebuild build`（禁签名）通过。
 - [ ] 真机签名 / `DEVELOPMENT_TEAM`、真实发布 bundle id 覆盖、真实 Dev Tunnel probe、App Store 提交与
       export-compliance 问卷为发布方人工步骤（记录在案）。

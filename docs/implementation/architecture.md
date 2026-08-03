@@ -1,7 +1,8 @@
 # 技术架构
 
-> 状态：本地三角色与七个 Runtime Box-only Tool 已实现；Runtime Box 目标架构已批准，Remote 连接尚未实现
-> 当前实现证据见[实施进度](./progress.md)
+> 状态：Desktop、Local/Remote Runtime Box、真实审批、独立 Mobile ingress 与 iOS Mobile App 已实现
+> 当前实现证据见[实现状态](./progress.md)
+> 更新日期：2026-08-03
 
 ## 1. 架构目标
 
@@ -10,85 +11,133 @@
 - 进程断线、重启和迟到消息不能污染新的执行实例。
 - 权限与审批在模型之外决定，Runtime Box 在执行前独立验证授权。
 - Provider、MCP、Skills、Knowledge 和 Canvas 复用稳定协议、事件、权限和 Secret 基础设施。
-- Local Runtime Box 随 desktop 交付；Remote Runtime Box 通过 Agent Server 管理的 Dev Tunnel 分阶段实现。
+- Desktop 与 iOS Client 共享 Agent Server 的业务事实，但使用独立入口、身份和最小权限 allowlist。
+- Local Runtime Box 随 desktop 交付；Remote Runtime Box 与 iOS Client 通过 Agent Server 管理的 Dev Tunnel 接入。
 
 ## 2. 术语与实现状态
 
-本文中的“三进程”指三个**应用角色/可执行程序**：
+本文保留“三角色”这一职责模型；Client 角色目前有 Desktop 与 Mobile 两种可执行实现：
 
 | 角色 | 可执行程序 | 核心职责 |
 | --- | --- | --- |
-| Electrobun client | 桌面应用 | UI、系统集成、companion supervisor |
+| Desktop client | Electrobun 应用 | UI、系统集成、companion supervisor |
+| Mobile client | Capacitor iOS App | iPhone UI、Keychain 设备身份、安全远程操作 |
 | agents server | Bun compiled binary | 业务数据、Provider、Agent runtime、Run、Policy/approval、Server-owned MCP |
 | Runtime Box | Bun compiled binary | 设备级 Tool、Box-owned MCP、Skill；内部 Executor 管理实际进程 |
 
-Electrobun 可另有 launcher、application worker 和 WebView 等框架进程，因此不能用 PID 数量判断架构是否正确。
+Desktop 与 Mobile 都属于 Client 角色，不新增业务事实来源。Electrobun 可另有 launcher、application worker
+和 WebView 等框架进程，因此不能用 PID 数量判断架构是否正确。
 
-当前 desktop 已监管 agents-server 和 Runtime Box 两个 compiled companion。Agent、Provider、产品 DB 和 Pi Session
-在 agents server；`read`、`bash`、`edit`、`write`、`grep`、`find`、`ls` 只在 Runtime Box 执行。下图中的
-Policy、Action Broker、execution grant、MCP 和 Skill 仍是目标能力；当前七工具使用第 9 节记录的临时可信本机桥接。
+当前 Desktop 监管 agents-server 和 Local Runtime Box 两个 compiled companion。Agent、Provider、产品 DB、
+Pi Session、Approval 与 Mobile attention 在 agents server；`read`、`bash`、`edit`、`write`、`grep`、`find`、
+`ls` 只在 Runtime Box 执行。iOS App 只持有 Keychain 设备身份和内存 UI 状态。
 
 ## 3. 总体架构
 
 ```mermaid
 flowchart LR
-    subgraph C[Electrobun client]
+    subgraph C[Desktop Client]
         UI[React WebView]
         DESKTOP[Window / Menu / Updater]
         SUP[Companion Supervisor]
         UI <-->|typed Electrobun RPC| DESKTOP
     end
 
-    subgraph S[agents server]
-        RPCS[Versioned JSON RPC]
-        APP[Application Services]
-        AGENT[Pi ModelRuntime / AgentSession]
-        PROVIDER[Provider Adapters]
-        POLICY[Policy / Approval]
-        BROKER[Action Broker]
-        DB[(Business DB)]
-        CP[(SessionManager JSONL)]
-        VAULT[Provider Secret Vault]
+    subgraph M[iOS Mobile Client]
+        MUI[Capacitor React UI]
+        MT[MoshuMobileTransport]
+        KEY[(Keychain)]
+        MUI <-->|process-rpc text frames| MT
+        MT --> KEY
     end
 
-    subgraph E[Runtime Box]
-        RPCE[Versioned JSON RPC]
-        TOOLS[Tool Bridge]
-        MCP[MCP Lifecycle]
-        SKILLS[Skill Store / Resources / Scripts]
-        PROC[Cancellation / Process Trees]
+    subgraph H[Desktop host]
+        subgraph S[Agent Server process]
+            PRPC[Product RPC<br/>dynamic loopback]
+            MRPC[Mobile ingress<br/>fixed loopback]
+            RIRPC[Runtime ingress<br/>fixed loopback]
+            APP[Application Services]
+            REG[Runtime Box Registry]
+            AGENT[Pi ModelRuntime / AgentSession]
+            PROVIDER[Provider Adapters]
+            POLICY[Policy / Approval]
+            BROKER[Action Broker]
+            TUNMGR[DevTunnelService]
+            DB[(Product DB)]
+            CP[(Pi Session JSONL)]
+            VAULT[Provider / Server MCP Secrets]
+        end
+
+        subgraph L[Local Runtime Box process]
+            LRPC[Runtime RPC client]
+            LTOOLS[Tool Bridge / Process Trees]
+            LEXT[MCP / Skills]
+            LDATA[(Private resources + journal)]
+            LRPC --> LTOOLS
+            LTOOLS --> LEXT
+            LTOOLS --> LDATA
+        end
     end
 
-    C <-->|WebSocket| S
-    S <-->|WebSocket| E
+    subgraph T[Anonymous Microsoft Dev Tunnel]
+        TR[Runtime ingress port]
+        TM[Mobile ingress port]
+    end
+
+    subgraph R[Remote device]
+        SERVICE[User service<br/>systemd / LaunchAgent / Task Scheduler]
+        RRPC[Remote Runtime RPC client]
+        RTOOLS[Tool Bridge / Process Trees]
+        REXT[MCP / Skills]
+        RDATA[(Private resources / workspace / journal)]
+        SERVICE --> RRPC
+        RRPC --> RTOOLS
+        RTOOLS --> REXT
+        RTOOLS --> RDATA
+    end
+
+    DESKTOP <-->|loopback WebSocket| PRPC
+    MT <-->|WSS + Ed25519 device auth| TM
+    TM <-->|port forwarding| MRPC
+    RRPC <-->|WSS + signed challenge| TR
+    TR <-->|port forwarding| RIRPC
+    LRPC <-->|loopback WebSocket + bootstrap binding| RIRPC
     SUP -->|start / stop / bounded restart| S
-    SUP -->|start / stop / bounded restart| E
+    SUP -->|start / stop / bounded restart| L
+    TUNMGR -->|manage| TR
+    TUNMGR -->|manage| TM
 
+    PRPC <--> APP
+    MRPC <--> APP
+    RIRPC <--> REG
+    APP <--> REG
     APP --> AGENT
     APP --> PROVIDER
     APP --> POLICY
     POLICY --> BROKER
+    BROKER -->|one-time execution grant| REG
     APP --> DB
     AGENT --> CP
     PROVIDER --> VAULT
-    BROKER -->|one-time execution grant| TOOLS
-    AGENT -.->|当前临时可信本机桥接| TOOLS
-    TOOLS --> MCP
-    TOOLS --> SKILLS
-    TOOLS --> PROC
 ```
 
-应用协议只允许：
+Desktop supervisor 只管理本机 Agent Server 与 Local Runtime Box；Remote Runtime Box 是远端用户服务，
+拥有独立数据目录和重连生命周期。Agent Server 的同一个 `DevTunnelService` 管理一个 Tunnel 内的 Runtime 与
+Mobile 两个端口；两条公网路径落到不同 loopback listener、认证器、角色和 method allowlist。
+
+业务调用始终经过 Agent Server：
 
 ```text
-client <-> agents server <-> Runtime Box
+Desktop client  <->  Agent Server  <->  Runtime Box
+iOS client      <->  Agent Server  <->  Runtime Box
 ```
 
-client 不提供绕过 agents server 的 Runtime Box RPC，Runtime Box 也不直接读取 client 状态、产品 DB 或 Pi Session JSONL。
+Client 不提供绕过 Agent Server 的 Runtime Box RPC，Runtime Box 也不直接读取 client 状态、产品 DB 或
+Pi Session JSONL。Product、Mobile 和 Runtime 三个入口物理隔离，并分别执行角色 allowlist。
 
 ## 4. 角色职责
 
-### 4.1 Electrobun client
+### 4.1 Desktop client
 
 负责：
 
@@ -105,7 +154,24 @@ client 不提供绕过 agents server 的 Runtime Box RPC，Runtime Box 也不直
 - 文件、命令、Git、MCP 或 Skill 脚本的实际执行。
 - 永久保存或向 WebView 返回 Secret 明文。
 
-### 4.2 agents server
+### 4.2 iOS Mobile client
+
+负责：
+
+- iPhone Chat、Project、Activity、Approval 与 client-scoped Runtime Box UI；
+- 本地打包的 Capacitor Web UI、前后台连接和 best-effort 本地通知；
+- 原生二维码扫描、Keychain Ed25519 private key、单 Agent Server binding 和 authenticated WSS；
+- subscribe/replay 恢复、严格 Mobile allowlist 和断线后内存业务状态清理。
+
+不负责：
+
+- 启停 Agent Server/Runtime Box，或保存 Product DB、Session/Project/Message/Approval；
+- Provider、MCP、Skill、Remote Access 和 Project path 管理；
+- APNs remote push、后台伪保活或 suspended/terminated 的可靠通知。
+
+完整实现见 [iOS Mobile Client 实现](./mobile-client.md)。
+
+### 4.3 agents server
 
 agents server 是业务事实来源，独占：
 
@@ -119,14 +185,15 @@ agents server 是业务事实来源，独占：
 - Agent 对 Runtime Box resource 的稳定引用，以及从 Runtime Box 同步得到的可替换、非权威、可丢弃 inventory/capability cache。
 - Agent Server-owned MCP config、credential、Tool inventory、连接/子进程生命周期和 Agent global refs。
 - Agent Server-owned prompt-only Skill installation、immutable `SKILL.md`、metadata 和 Agent global refs。
+- Mobile ingress、配对/设备/generation、client-scoped Runtime preference 与 durable attention/outbox/ack cursor。
 
 agents server 不保存可恢复的 **Runtime Box-owned** MCP/Skill config、credential/OAuth state 或 Skill 内容副本，也不直接执行文件、命令、Git 或 Skill 脚本。Server-owned MCP Tool 只能通过本地 Action dispatcher 调用。
 
-### 4.3 Runtime Box 与内部 Executor
+### 4.4 Runtime Box 与内部 Executor
 
 Runtime Box 是其安装设备上的执行与扩展资源事实来源，内部 Executor 独占：
 
-- 内置 Tool 的实际文件、命令、Git、网络或其他 host 操作。
+- 七个内置文件/搜索/命令 Tool 的实际 host 操作；未来 Git/网络 Tool 也必须归此执行边界。
 - Box-owned MCP config、credential/token/OAuth state、stdio/HTTP/SSE 连接和子进程生命周期。
 - Box-owned Skill installation、immutable versions、content/hash、metadata、资源和脚本。
 - Runtime Box private DB、Skill data root、`ExecutorSecretStore` 和相关设备数据。
@@ -139,22 +206,22 @@ credential 或 Policy/approval。它拥有自身 Box-owned MCP credential 并可
 内存或目标 MCP child 的最小环境；每次 Tool action 仍需 server 的一次性 execution grant。
 
 Remote Runtime Box、Tunnel、配对、切换和跨设备恢复以
-[Runtime Box 技术与实施方案](./runtime-box.md)为准。
+[Runtime Box 架构与实现](./runtime-box.md)为准。
 
 ## 5. Desktop 部署与生命周期
 
 ### 5.1 当前批准的 desktop 模式
 
-当前 desktop 模式已经实现 companion 生命周期、认证连接和唯一 local Runtime Box 的七工具执行；持久
-Agent N:1 binding 与 inventory 尚未实现：
+当前 desktop 模式已经实现 companion 生命周期、认证连接、Local/Remote Runtime Box registry、inventory
+reconciliation 和七工具执行：
 
 - client 启动并监管一个本地 agents server。
 - client 启动并监管一个由当前 host environment 支持的本地 Runtime Box。
-- agents server 只绑定 loopback 动态端口。
+- Product RPC 绑定动态 loopback 端口；Runtime/Mobile ingress 分别绑定持久固定的 loopback 端口。
 - client 与 Runtime Box 都作为 WebSocket client 连接并注册到 agents server。
-- agents server 只向当前已认证且已注册的唯一 Runtime Box peer 路由 Tool invocation；断线或连接替换会取消旧 peer
-  上的活动调用，迟到 progress/result 不会路由到新连接。
-- client 可通过 agents server 列出已注册 Runtime Box；desktop 首版通常只有一个。
+- agents server 按 Session/Run 持久化的 `runtimeBoxId` 路由 Tool invocation；断线或连接替换不会把迟到
+  progress/result 路由到新连接。
+- Desktop 与 Mobile 可列出 Runtime Box，并分别保存 client-scoped 当前选择。
 - Agent 与 Provider 全局共享；每个 `agentId + runtimeBoxId` 形成 Runtime Profile，多个 profile 可引用同一 Box。
 
 ### 5.2 启动
@@ -163,7 +230,8 @@ Agent N:1 binding 与 inventory 尚未实现：
 2. agents server 取得动态 loopback 端口，通过受控 bootstrap 返回 endpoint、protocol range 和分别绑定 client/Runtime Box 的一次性注册材料。
 3. agents server 打开产品 DB 和 `agentDataDirectory`，恢复 Provider registry、Pi Session 与产品投影。
 4. client 连接并用稳定 `clientId` 注册。
-5. client 启动 Runtime Box；Runtime Box 生成新的 `instanceId`/`generation`，连接并用稳定 `runtimeBoxId` 注册能力。
+5. client supervisor 分配新的 Local Box `instanceId`/`generation` 并通过受控 bootstrap 传入；Runtime Box
+   连接后使用稳定 `runtimeBoxId` 注册能力。Remote Box 则从自己的配对状态推进 generation。
 6. agents server 先将 Runtime Box 标为 `syncing`，立即调用 `inventory.getSnapshot()` 并原子替换本地 cache。
 7. full sync 成功后 agents server 才将 Runtime Box 标为 online/runnable；绑定它的 Agent 才可启动新 Run。
 
@@ -196,7 +264,9 @@ client 不应在退出时把仍有副作用结果未对账的 Run 伪装为正�
 
 | 字段 | 生命周期 | 用途 |
 | --- | --- | --- |
-| `clientId` | 安装级稳定 | client 逻辑身份，重连/重启保留 |
+| `clientId` | Desktop 安装级稳定 | Desktop 逻辑身份，重连/重启保留 |
+| `mobileClientId` | iOS 配对级稳定 | Mobile preference、attention 与设备绑定 |
+| `deviceKeyId` | Mobile key 版本 | Ed25519 key 吊销与轮换 |
 | `runtimeBoxId` | Runtime Box 配置级稳定 | Session/Project、能力、资源和历史关联 |
 | `instanceId` | 每次进程启动/连接注册新建 | 区分并发或迟到实例 |
 | `generation` | 稳定身份下单调递增 | 解决新旧实例竞争 |
@@ -219,9 +289,9 @@ client 注册声明 UI/API capability；Runtime Box 注册声明 host platform�
 ### 6.3 Agent 与 Runtime Box
 
 - Agent 与 Provider 全局持久化；`agentId + runtimeBoxId` 形成 Runtime Profile。
-- 当前 desktop 自动创建 Local Runtime Box；目标 registry 可同时管理多个 Local/Remote Box。
+- 当前 Desktop 自动创建 Local Runtime Box；同一 registry 也管理已配对的多个 Remote Box。
 - Box syncing/offline 时可以查看 Session、Project 和历史 Run，但不能启动新 Run。
-- Remote 调度、配对和网络信任模型见[Runtime Box 技术与实施方案](./runtime-box.md)。
+- Remote 调度、配对和网络信任模型见[Runtime Box 架构与实现](./runtime-box.md)。
 
 ### 6.4 Inventory 同步与对账
 
@@ -247,44 +317,48 @@ Run start/restore 仍通过 live Runtime Box RPC 验证每个 assigned resource 
 
 - application transport 使用 WebSocket。
 - payload 使用 versioned JSON RPC；请求、响应、notification 和 stream event 都由共享 Zod schema 校验。
-- Product RPC 只监听 loopback 动态端口；Runtime ingress 使用独立 loopback 固定端口，并只由 Agent Server
-  管理的 Dev Tunnel 暴露。
+- Product RPC 只监听 loopback 动态端口。Runtime ingress 与 Mobile ingress 使用独立固定 loopback port，
+  由 Agent Server 管理的同一 Dev Tunnel 分别暴露。
+- Mobile ingress 使用 `mobile-client` 身份、设备 challenge 和独立最小 allowlist，不复用 Runtime ingress。
 - 长 Run 由快速 `accepted` 响应加事件流表示，不用无限 RPC timeout。
 - 每条连接有最大 frame、in-flight、队列和 backpressure 限制。
 
 ### 7.2 信封
 
 ```ts
-interface RpcEnvelope<T> {
-  protocolVersion: number;
-  requestId?: string;
+interface RpcPeerIdentity {
+  role: "agents" | "client" | "mobile-client" | "runtime-box";
+  peerId: string;
+  instanceId: string;
+  generation: number;
+  deviceKeyId?: string;
+}
+
+interface RpcRequestEnvelope<T> {
+  schemaVersion: 1;
+  protocol: { major: number; minor: number };
+  type: "request";
+  requestId: string;
+  traceId: string;
   method: string;
-  sender: {
-    role: "client" | "agents_server" | "runtime-box";
-    stableId: string;
-    instanceId: string;
-    generation: number;
-  };
+  deadlineAt: number;
   payload: T;
 }
 ```
 
-所有跨角色消息显式携带 correlation ID；Run/Tool/Action 消息还必须携带 `runId`、`toolCallId`、`actionId` 或 `invocationId`。角色不能依赖 UI 当前选择或连接顺序推断业务身份。
+Peer identity 在认证 Upgrade 与 hello/hello-ack 中 exact match，后续 request/response/event/cancel/heartbeat
+共享协商后的连接身份。所有请求显式携带 `traceId`；Run/Tool/Action payload 还必须携带 `runId`、
+`toolCallId`、`actionId` 或 `invocationId`。角色不能依赖 UI 当前选择或连接顺序推断业务身份。
 
-### 7.3 Remote Runtime Box 与未来扩展缝
+### 7.3 Remote Runtime Box、Mobile Client 与未来扩展缝
 
-协议允许未来：
-
-- Runtime Box 独立启动后向既有 agents server 注册。
-- Client 可列出并切换多个 Runtime Box。
-- Docker、cloud VM 或 remote-server transport adapter。
-
-当前范围包含基于 Anonymous Dev Tunnel 的 Remote Runtime Box 和 Moshu 设备配对；Mobile Client、多租户、
-云调度和容器编排仍后置。Runtime ingress 不能弱化 Product RPC 的 loopback 和最小权限默认值。
+当前 Remote Runtime Box 已独立启动并向既有 Agent Server 注册；Desktop 与 Mobile Client 可列出 Runtime Box，
+并以各自的 client-scoped preference 独立选择新 Session/Project 的默认 Box。Docker/cloud VM transport、
+多 Agent Server 聚合、多租户、云调度和容器编排仍后置。远程入口不能弱化 Product RPC 的 loopback 和最小权限默认值。
 
 ### 7.4 Browser-safe RPC core（Mobile stack Layer 1）
 
-为给未来 Mobile Client（WKWebView / Capacitor）预留 transport，RPC 实现拆成两层，保持现有 Bun
+为支持 Mobile Client（WKWebView / Capacitor），RPC 实现拆成两层，保持现有 Bun
 server/client 行为与 API 完全兼容：
 
 - `@moshu/process-rpc-core`：transport-neutral、**无任何 Node/Bun 依赖**的核心。包含 protocol/envelope
@@ -296,8 +370,8 @@ server/client 行为与 API 完全兼容：
   client、Bun `serve` server，并从 core re-export 全部公共符号，因此所有现有 consumer 仍从
   `@moshu/process-rpc` import，零改动。
 - `RpcSocketTransport` 是 core 与具体传输之间的唯一缝：Bun server、Node/Bun raw client 各自实现它；
-  未来 Swift/Capacitor bridge 只需实现同一个 `send/close/terminate/isOpen` 契约即可承载 RPC 帧，无需
-  引入原生 socket/crypto/WebSocket 库。本层**不**实现 iOS plugin。
+  Swift/Capacitor bridge 实现同一个 `send/close/terminate/isOpen` 契约承载 RPC 帧；原生 plugin 见
+  [iOS Mobile Client 实现](./mobile-client.md)。
 
 ## 8. Agent runtime、Provider 与持久化
 
@@ -328,24 +402,29 @@ server/client 行为与 API 完全兼容：
 ### 8.3 数据所有权
 
 ```text
-agentDataDirectory/
-├── product.db               # agents server Product DB
-├── sessions/                # Pi SessionManager JSONL
-├── credentials.json         # Provider credential vault，0600
-├── mcp-secrets/             # Agent Server-owned MCP SecretStore，0600
-├── mcp-workspaces/          # Agent Server-owned stdio MCP 默认 cwd，0700
-├── provider-registry.json   # secret-free builtin/custom preferences
-├── attachments/             # agents server 管理的产品资产
-├── change-blobs/            # agents server 管理的 Action 记录
-├── canvas/                  # client/server 受控产品资产
-├── runtime-boxes/<runtimeBoxId>/  # local Runtime Box private root，0700
-│   ├── runtime-box.db          # MCP/Skill state + inventory epoch/revision/change log
-│   ├── skills/              # immutable Skill version content/resources
-│   └── secrets/             # local ExecutorSecretStore files，0600
-└── logs/                    # 各角色独立写，诊断时汇总
+Agent Server app data/
+├── product.db                    # 结构化产品状态
+├── sessions/                     # Pi SessionManager conversation JSONL
+├── credentials.json              # Provider credential vault
+├── mcp-secrets/                  # Server-owned MCP SecretStore
+└── provider-registry.json         # secret-free Provider preferences
+
+Local Runtime Box data root/       # Desktop bootstrap 传入
+├── resources/runtime-box.db       # Box-owned MCP/Skill + inventory authority
+├── resources/skills/              # immutable Skill versions
+├── resources/secrets/             # ExecutorSecretStore
+└── journal/<epoch>/invocations.json
+
+Remote Runtime Box data root/      # Remote CLI / user service 独立持有
+├── remote-runtime-box.json        # Agent Server binding + connection generation
+├── run.lock
+├── workspace/
+├── resources/{runtime-box.db,skills/,secrets/}
+└── journal/<agentServerId>/<runtimeBoxId>/<epoch>/invocations.json
 ```
 
-- Product DB 和 Pi Session JSONL 都只有 agents server writer。
+- Product DB 保存 Session/Project/Run/event/approval 等结构化业务状态；Pi JSONL 保存 conversation context。
+  两者由 agents server 管理，但不是同一数据的双写镜像。
 - Runtime Box 不打开产品 DB；`runtime-box.db` 只由 owning Runtime Box 写入，server 不把 inventory cache 当作恢复来源。
 - server 先持久化 event/Action result，再向 client 发布。
 - local Runtime Box root 使用 `0700`，credential file 使用 `0600`，写入采用临时文件 + atomic replace，并检查 owner；拒绝 symlink，平台支持时使用 no-follow。
@@ -354,13 +433,13 @@ agentDataDirectory/
 
 ## 9. Tool Bridge、Action Broker 与授权
 
-### 9.0 当前临时可信本机桥接
+### 9.0 当前 Action/Tool 执行链路
 
-当前七工具先完成了 Runtime Box-only 执行不变量。用户级 Tool/Action **审批**已由 Layer 2 落地（见 §9.0.1）；
-本节其余的最终 execution grant / Action intent / outcome recovery 流程仍在推进中：
+当前七工具、durable Action intent、一次性 execution grant、outcome reconciliation 和用户级 Tool/Action
+审批均已落地。仍未实现的是 shell sandbox；批准后的命令仍在 Runtime Box OS 用户上下文中执行：
 
-- agents-server 将 Pi custom Tool call 直接路由到当前已认证 Runtime Box peer；Runtime Box 只接受已认证
-  `agents` role 的严格版本化 RPC。
+- agents-server 对 Pi custom Tool call 执行风险/审批，持久化 Action intent 并签发绑定目标 instance/generation
+  的单次 grant；Runtime Box 只接受已认证 `agents` role 的严格版本化 RPC。
 - 请求和结果由七工具 discriminated union 校验；同一连接拒绝重复 `invocationId`，progress 必须从 0
   连续递增并绑定同一 peer、Tool 和 invocation。
 - Runtime Box 断线、连接替换、RPC cancel、Run cancel、shutdown 和 timeout 都会取消调用；`bash` 清理完整进程树。
@@ -375,16 +454,18 @@ agentDataDirectory/
   成功、timeout、非零退出和输出上限错误保留可诊断路径；取消或无法返回路径的失败删除文件并释放配额。
 - Unix 命令运行在独立 process group；Windows 命令分配到启用 `KILL_ON_JOB_CLOSE` 的 Job Object。正常退出、
   取消、timeout 和 Runtime Box shutdown 都终止残留后代。
-- 相对路径基于 `agentDataDirectory/workspace`；为保持 Pi 兼容，当前允许绝对路径和 `..`，没有路径沙箱。
-- desktop 启动 Runtime Box 时完整继承 `process.env`；`bash` 因而可读取 desktop 环境中的 credential。bundled
+- 默认 execution scope 按部署决定：Local Box 使用请求 `cwd`，Remote Box 使用自己的 `workspace`；
+  Project Run 显式使用带 path revision 的 `project-root`。Remote workspace 与 Project 文件 Tool 执行
+  containment 校验；`bash` 只使用相应目录作为 cwd，不受文件 containment 约束。
+- desktop 启动 Local Runtime Box 时完整继承 `process.env`；`bash` 因而可读取 desktop 环境中的 credential。bundled
   `rg`/`fd` 使用绝对路径，不依赖该 `PATH`。
-- 这是有意接受的开发期高权限边界，不是 approval 或授权实现。A3 Policy、durable intent、single-use grant、
-  outcome recovery 和审计完成后，必须替换这条直接桥接，不能在其旁边再保留绕过路径。
+- 这是审批与 grant 之下仍然存在的高权限 OS 边界；approval 不是 shell sandbox，也不能防御同账户 malware、
+  root 或用户主动批准的危险命令。
 
 ### 9.0.1 Layer 2 真实 Tool/Action 审批（已实现）
 
 > Mobile stack Layer 2 在 Layer 1 协议底座之上，落地了真实、durable、server-authoritative 的
-> 用户级 Tool/Action 审批闭环。Desktop 与未来 iOS 客户端都能看到并决策真实审批。
+> 用户级 Tool/Action 审批闭环。Desktop 与当前 iOS Client 都能看到并决策真实审批。
 
 - **执行门**：`DurableActionAuthorizationService.authorize` 注入可选 `ActionApprovalGate`。存在 gate 时，
   side-effecting / MCP Tool 在**签发或消费 execution grant、调用 Runtime Box 之前**先 `await gate.requireApproval(...)`；
@@ -426,9 +507,8 @@ agentDataDirectory/
 
 > Mobile stack Layer 3 在 Layer 1 的 browser-safe RPC/multi-client/multi-port 底座与 Layer 2 的 durable
 > approvals 之上，落地了**独立的 Mobile 接入面**：专属 ingress、二维码配对、Ed25519 设备认证与严格 allowlist。
-> **iOS App 本体（Layer 4：Capacitor Web UI + 原生 Swift 安全传输）已实现（见 §9.0.3）；移动通知后台/suspended
-> 可靠投递（Layer 5）尚未实现**；本层交付的是移动端可
-> 安全接入所需的 server + Desktop 侧全部合同与实现。
+> **iOS App 本体、durable attention、生命周期和 best-effort 本地通知均已实现**（见 §9.0.3、§9.0.4 与
+> [iOS Mobile Client 实现](./mobile-client.md)）。
 
 - **独立 Mobile ingress**：Agent Server 启动一个固定 loopback listener，路径 `/mobile`，作为独立 `RpcServer`
   与 Product RPC、Runtime ingress **物理/逻辑隔离**，不复用其入口，也**绝不 fallback**。它拥有独立的
@@ -474,8 +554,8 @@ agentDataDirectory/
 
 > Mobile stack Layer 4 在 Layer 3 的 Mobile ingress/配对/设备认证之上，落地了**真正可构建的 iPhone App**：
 > Capacitor Web UI + 原生 Swift 安全传输。交付物是同 monorepo 的 `apps/mobile` workspace 加原生
-> `MoshuMobileTransport` plugin。**移动通知后台/suspended 可靠投递与发布加固仍属 Layer 5**；App active/foreground
-> 的基本连接生命周期可用。
+> `MoshuMobileTransport` plugin。Layer 5 已补充 durable attention、生命周期、best-effort 本地通知和发布加固；
+> suspended/terminated 可靠通知按无云 Push 边界明确不支持。
 
 - **Web 应用（`apps/mobile`）**：React + Vite + TypeScript strict + HeroUI + React Router HashRouter，
   独立 mobile shell（底部 Chats/Projects/Activity/Settings tabs），不复制 Desktop 三栏/760px shell。
@@ -509,19 +589,17 @@ agentDataDirectory/
   runId/seq dedupe→flush→ready。chat.send requestId 幂等；断线不自动重发未知 send、不离线 queue；
   cancel/approval 决策使用既有 CAS/idempotency。**业务数据仅存 React 内存**：Session/Project/message/approval
   绝不写 localStorage/Preferences/Keychain；仅 appearance/language 可持久化，binding 仅在 native Keychain。
-- **验证**：63 Vitest（native plugin mock、pairing 状态、单绑定、断线清业务态、无持久化、RPC schema/allowlist、
-  subscribe/replay 边界、stream/cancel、approval race/allow-all、Projects、RuntimeBox 独立选择、responsive/
-  safe-area/键盘、i18n parity、hello 握手 accepted、fatal-auth 关闭无盲重连、pre-bind 溢出、历史分页、
-  ambiguous-send 幂等、4MiB 帧限额/大帧接受）、59 Swift XCTest、`tsc` strict typecheck、`vite build`、`cap sync ios` 与
-  iOS simulator `xcodebuild`（禁签名）构建通过。生产 bundle 无 node builtins、无 secret、无 remote UI URL。
-- **PR #8 审查加固**：hello identity 必含 `deviceKeyId` 与 server canonical identity exact match；致命关闭按
+- **验证门**：Mobile Vitest、Swift XCTest、strict typecheck、Vite/Capacitor build 和禁签名 simulator build
+  覆盖配对、单绑定、RPC allowlist、重连/replay、审批竞争、Projects、Client-scoped Runtime 选择、帧限额和
+  无业务状态落盘。release gate 另检查生产 bundle 无 Node builtin、Secret 或 remote UI URL。
+- **认证与重连加固**：hello identity 必含 `deviceKeyId` 与 server canonical identity exact match；致命关闭按
   WS close code / HTTP upgrade 状态数值分类（`1008→AUTH_REVOKED`、`401/403→AUTH_FAILED`、`426→PROTOCOL_MISMATCH`）
   并停止盲重连清业务态（不匹配本地化 error 串）；任何失败/中止路径 dispose provisional connection、pre-bind
   frame buffer count+bytes 有界 fail-closed；Keychain `set` 用 `SecItemUpdate`（缺失才 `SecItemAdd`，不
   delete-then-add）、generation read→increment→persist 串行化并发 distinct/单调；入站 WS 帧 bridge 前按 UTF-8
   字节限帧、binary 一律 protocol-close；Chat 历史按 `getSessionPage` `nextCursor` 分页到含 active run 的最后一页；
   `chat.send` 由 controller 持有 `requestId` reservation，ambiguous 重试复用同 id、definitive 拒绝/编辑内容才换新 id。
-- **PR #8 复审加固（transport 帧限额/关闭码）**：native inbound guard / outbound queue / JS pre-bind 三处帧上限统一
+- **Transport 帧限额与关闭码**：native inbound guard / outbound queue / JS pre-bind 三处帧上限统一
   为 Product-RPC `productRpcMaxFrameBytes`＝4 MiB（原 stale 1 MiB 会误拒合法 1–4 MiB 帧），值取自 `@moshu/contracts`
   并由共享 canonical 测试向量固定，Vitest 与 Swift 同时断言防漂移；queued bytes 保守有界且 ≥ 单帧。teardown 将拟发
   数字关闭码安全映射到 `URLSessionWebSocketTask.CloseCode`（oversize→`messageTooBig`/1009、binary→`unsupportedData`/1003、
@@ -585,19 +663,10 @@ agentDataDirectory/
   或 `--release`）要求发布方设 `MOSHU_MOBILE_RELEASE_BUNDLE_ID`（或 `release.config.json` `bundleId.release`）为永久非 dev id，
   拒绝空值/`dev.moshu.mobile`，并用 `xcodebuild -showBuildSettings -configuration Release` 解析的 `PRODUCT_BUNDLE_IDENTIFIER`
   精确比对；export compliance（CryptoKit Ed25519 + TLS）问卷/豁免由发布方确认，工程不武断写 `ITSAppUsesNonExemptEncryption`。详见 quality-release。
-- **验证（实际运行）**：**117 Vitest**（含 attention 恢复无 replay、badge、ack 单调、resyncRequired、notification 短后台 gating、opaque
-  route 只带白名单 id、**gap/走查耗尽→ `safeActivity` 安全路由 + 异步走查后 re-validate（前台化/换连接不补发通知）**、**attention hint 任务入队瞬间绑定 owning client/generation，start 及每个 await 后校验，旧 A 队列绝不消费 B feed 或在 B baseline 前 schedule**、notification tap
-  offline→connect→refresh→navigate / unpaired-fatal 安全态 / **safe-activity gap tap→Activity** / dispose、production root
-  tap→navigate + surviving-socket foreground resnapshot、`UNSUPPORTED_PROTOCOL` fatal 无重连、background close→offline）、**70 Swift XCTest**
-  （含 background task 幂等/有界/expiration cleanup、**stale/late-A vs B/synchronous expiration no-op**、稳定 notification id、generic 键、
-  opaque route id）、`tsc` strict、`vite build`、`cap sync ios`、release gate 全绿（dev 10 checks；real-release 正确 FAIL 于 dev/缺失 bundle id）；
-  server 侧 `mobile-attention-drainer`（crash/restart/幂等/retention/timer stop）+ **真实 production 组合**的 `mobile-ingress-smoke`
-  （`createMobileIngressComposition` → `openAppDatabase` + Approval/Run 仓储 → 事务 outbox → 真实 drainer 投影 → 共享 list/ack → 真实 revoke）
-  与 `mobile-ingress-composition`（wiring contract：owned method 全在 allowlist + merged map + smoke 覆盖）、`packages/database` attention
-  repository/outbox（pagination/retention/ack 单调/幂等/revoke 清 cursor）通过（合计 contracts+database 125+87、隔离 agents-server mobile 22）。
-  **iOS simulator `xcodebuild build`（iPhone 17 Pro / iOS 26.5，禁签名）BUILD SUCCEEDED**。真机签名、真实发布 bundle id 覆盖、真实
-  Dev Tunnel probe（opt-in）、App Store review 提交为发布方人工步骤。
-
+- **验证门**：Mobile Web/Swift、contracts/database、attention drainer 和 production ingress composition suites
+  覆盖 attention 恢复、ack/retention/resync、旧 connection/generation 隔离、通知安全路由、background task
+  cleanup、transactional outbox、revoke 与 strict allowlist wiring。typecheck、Vite/Capacitor build、release gate
+  和禁签名 simulator build 属仓库 gate；真机签名、永久 bundle id、真实 Tunnel probe 和 App Store 提交由发布环境完成。
 
 ### 9.1 请求流程
 
@@ -682,12 +751,14 @@ Runtime Box 必须拒绝过期、重复、目标不匹配、参数摘要变化�
 ## 12. 构建、打包与版本
 
 - `agents-server` 和 `Runtime Box` 都使用 TypeScript strict + Bun，编译为目标架构二进制。
-- 两个 companion 与 Electrobun client 来自同一 release，随应用打包、签名、校验和更新。
+- Desktop 内的 agents-server 与 Local Runtime Box companion 和 Electrobun client 来自同一 release，随应用
+  打包、签名、校验和更新。Remote Runtime Box 使用 standalone binary，可独立升级。
 - `ripgrep` 15.2.0 与 `fd` 10.3.0 按 OS/arch manifest、固定 URL 和 SHA-256 准备并随 Runtime Box 打包；
   Photon 0.3.4 WASM 与第三方许可也进入 package。
 - packaged `rg`/`fd` 必须是独立可执行文件；macOS 对它们分别 codesign，最终 app 的 nested-code/resource
   allowlist 和 package verification 同时验证 companion、工具和 Photon WASM。
-- 启动注册必须比较 client/server/Runtime Box build 与 protocol compatibility；未知组合 fail closed。
+- 启动注册必须比较 client/server/Runtime Box build 与 protocol compatibility；Remote Box 通过独立 Runtime
+  protocol range 协商，未知组合 fail closed 并进入 `upgrade_required`。
 - stable 产物不得依赖用户安装 Bun/Node，也不得运行时下载 companion。
 - package smoke 必须证明 companion 可执行权限、路径、签名、动态库、loopback 和协作退出均正常。
 
@@ -695,8 +766,8 @@ Runtime Box 必须拒绝过期、重复、目标不匹配、参数摘要变化�
 
 - 三角色均为受信任应用代码；拆进程提供故障和职责隔离，不等于完整 OS sandbox。
 - WebView 仍按不可信处理，只能通过 client 的领域 RPC。
-- 当前七工具桥接尚无 Policy/approval/grant，且 Runtime Box 完整继承 desktop 环境、允许绝对路径和 `..`；
-  因此当前 Agent 拥有该 OS 用户上下文下的高权限本机执行能力。这是第 9.0 节的显式临时风险。
+- 当前已实现 Policy/approval/durable grant，但尚无 shell sandbox；Runtime Box 仍在其 OS 用户上下文中执行，
+  `bash` 不受文件 containment 限制。这是第 9.0 节的显式风险。
 - agents server 的 Policy/approval 是授权事实来源；Runtime Box 的 grant validation 是执行前最后一道强制门。
 - Runtime Box-owned MCP credential/config 与 execution grant 是正交状态：前者维持连接认证，后者逐次授权 Tool execution。
 - Runtime Box 的文件根、命令解析、环境、网络、输出和进程树约束不能仅依赖 grant 字符串。
@@ -710,19 +781,23 @@ Runtime Box 必须拒绝过期、重复、目标不匹配、参数摘要变化�
 | ID | 验收 |
 | --- | --- |
 | ARC-001 | packaged desktop 同时包含可启动的 client、agents-server 和 Runtime Box；框架额外 PID 不影响角色识别 |
-| ARC-002 | 业务应用 RPC 只有 `client <-> server <-> Runtime Box`，不存在 client 直连 Runtime Box 的特权路径 |
-| ARC-003 | desktop server 只绑定动态 loopback；未认证本机进程不能注册或调用 |
+| ARC-002 | 业务应用 RPC 只有 `Desktop/iOS client <-> server <-> Runtime Box`，不存在 client 直连 Runtime Box 的特权路径 |
+| ARC-003 | Product RPC 使用动态 loopback，Runtime/Mobile ingress 使用独立固定 loopback；未认证 peer 不能注册或调用 |
 | ARC-004 | stable ID 在重连/重启后保持，旧 instance/generation 的消息、result 和 grant 被拒绝 |
 | ARC-005 | agents server 是产品 DB/Pi Session JSONL、Provider/model、Agent、Run/event、Policy/approval/Action 的唯一写入所有者 |
 | ARC-006 | MCP config/credential/lifecycle 归显式 owner；每个 Runtime Box 仍是其 Box-owned MCP、Skill immutable content/resources、Tool/进程树和 private data 的唯一 source of truth |
-| ARC-007 | 一个本地 Runtime Box 可承载多个 Agent；offline 时相关 Agent 不能启动新 Run |
+| ARC-007 | 同一 registry 可管理 Local/Remote Runtime Box；Session/Project/Run 持久绑定 Box，offline 时不能启动新 Run |
 | ARC-008 | policy/approval/intent 先持久化，Runtime Box 只执行有效的一次性 grant，重复或篡改 grant 被拒绝 |
 | ARC-009 | Agent 只引用 assigned Runtime Box 的稳定 MCP/Skill resource；server 按 version/hash 获取 Skill metadata/`SKILL.md`，missing/mismatch fail closed |
 | ARC-010 | client 协作关闭两个 companion；异常退出使用 capped backoff，达到上限后进入 recovery UX |
 | ARC-012 | server/Runtime Box 分别被 kill 后，Run/Action 能进入确定的 completed/interrupted/outcome_unknown 状态，不盲目重复副作用 |
 | ARC-013 | 两个 TypeScript + Bun companion 在签名产物中可执行、可握手、可更新，终端用户无需安装 runtime |
-| ARC-014 | 当前实现与目标差距始终在 progress 文档中明确，不用当前可信直连七工具测试替代未来 Policy/grant/MCP 架构验收 |
+| ARC-014 | 当前实现边界始终在 progress 文档中明确；未实现的 shell sandbox、Noise、云部署或发布凭据不得写成已交付 |
 | ARC-015 | Provider/model credential 从不进入 Runtime Box；MCP credential 只在 owner private store/目标 process memory 中使用，永不经 query/UI/prompt/log/diagnostic/export 暴露 |
 | ARC-016 | client MCP/Skill command 经 server 校验后路由；Runtime Box offline 或持久化失败时不返回成功，server snapshot 不能恢复 Runtime Box config |
 | ARC-017 | 每次 Runtime Box 注册/重连先 full inventory sync；epoch/revision、hint、60 秒 ±20% poll、delta/tombstone 和 snapshot fallback 可收敛且 cache 可丢弃 |
 | ARC-018 | syncing/offline cache 标为 stale 且失败 poll 不代表删除；Run start/restore 仍 live 验证 resource/version/hash，inventory 不构成授权 |
+| ARC-019 | Mobile ingress 与 Runtime/Product RPC 物理隔离；`mobile-client` 只能调用独立 allowlist，设备签名、吊销和 generation fence 均 fail closed |
+| ARC-020 | iOS private key 只在 Keychain；业务数据不落盘、不离线排队，断线后重新 snapshot |
+| ARC-021 | attention 通过业务事务内 outbox 持久化；无云 Push 时 suspended/terminated 不宣称可靠通知 |
+| ARC-022 | Remote Runtime Box 经 Runtime Tunnel port、Ed25519 challenge 和持久 generation fence 接入；Desktop supervisor 不负责其进程生命周期 |

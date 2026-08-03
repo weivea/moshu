@@ -29,9 +29,10 @@
 - Electrobun client、agents server、Runtime Box 都是受信应用代码；角色拆分提供职责和故障隔离，不等于完整 OS sandbox。
 - 主 React WebView 只注册最小 Electrobun RPC；client 校验 View ID、窗口角色、origin、参数和 capability。
 - 应用协议只有 `client <-> agents server <-> Runtime Box`。client 不直连 Runtime Box，Runtime Box 不提供 DB、Provider、Policy 或 approval API。
-- desktop agents server 只绑定动态 loopback，但 loopback 本身不可信；连接仍需一次性 bootstrap、角色认证、版本和 method allowlist。
+- Agent Server 的 Product RPC 使用动态 loopback，Runtime/Mobile ingress 使用独立固定 loopback listener；loopback
+  本身仍不可信，每个入口都需要对应的 bootstrap/device authentication、版本和 method allowlist。
 - `clientId`/`runtimeBoxId` 是稳定身份；每次启动/注册使用新的 `instanceId` 和 `generation`。旧实例的消息、result 和 grant 必须被拒绝。
-- agents server 独占产品 DB/Pi Session JSONL、Provider、Agent runtime；未来也独占 Policy/approval 和
+- agents server 独占产品 DB/Pi Session JSONL、Provider、Agent runtime、Policy/approval 和
   Action intent/result。
 - Runtime Box 独占设备 Tool、Box-owned MCP/Skill、取消和进程树；Agent Server-owned MCP 由 server 的独立 dispatcher/SecretStore 执行，两类都不能绕过 Policy/Action。
 - WebSocket/RPC 的传输保护不代替身份、Schema、capability、参数摘要、状态和授权校验。
@@ -52,7 +53,7 @@ Runtime Box 在实际执行前验证 grant。Allow all 只改变 server 的审�
 
 > **Layer 5 实现状态（已落地，final）**：移动栈最终层，加 **Agent Server 持有的 durable attention/未读 feed** + iOS 生命周期/重连 + best-effort 本地通知 + 发布加固。**硬边界：无云 Push Relay、无 APNs remote/silent push、无 VoIP/background-processing 伪保活、设备不落业务数据、Desktop 必须在线；suspended/terminated 不保证通知。** ①**durable 未读 feed**：server 在 approval 进入 `pending`、Run 终态时 durably append **脱敏** `MobileAttentionEvent`（仅 opaque `sessionId`/`runId`/`approvalId` + stable `eventId`/单调 `seq` + generic 本地化键，**绝不含 prompt/tool args/path 正文/shell command/secret**），`dedupeKey` 幂等、事务、重启不丢；每 `mobileClientId` 维护 server 侧单调 ack cursor（iOS 不存业务事件）。`mobile.attention.list`（cursor 分页 + unreadCount/nextCursor/latestSeq/resyncRequired）与 `mobile.attention.ack`（CAS/幂等/单调、不回退）走 mobile-client strict allowlist；**peer identity 由 auth context 决定，禁止伪造 clientId/回退**。bounded retention（30 天 + per-feed 上限），cursor 过旧显式 `resyncRequired` 不伪装无未读；设备 revoke 不可读、unpair 清 cursor 不泄漏旧 feed；live 只发最小 `attention.changed` hint（无业务正文），Desktop Product RPC 不暴露 mobile 未读。②**生命周期/重连**：`@capacitor/app` foreground 连接/恢复 + 立即一次重试，background **暂停**重连（仅让既有 socket 在系统短窗口存活）、系统 expiration 关闭 socket；有界指数退避 + jitter，stable/retry reset，fatal 不重试；单一有界 `beginBackgroundTask`（幂等、end/expiration 都保证 cleanup、**无 UIBackgroundModes**）。③**本地通知**：官方 `@capacitor/local-notifications`，首次配对后**用户显式开启**（冷启动不突袭），仅当 App 非 active 且短后台 socket 实际收到事件时 schedule generic 通知（无 raw 内容、id 由 `seq` 稳定派生防重复），tap 只携 opaque id 且 App active 后**先认证/重连/snapshot 再导航**；suspended/terminated 无通知，重连从 server feed 恢复 missed 未读并显示 badge，**不批量补发历史系统通知，不注册 APNs token/不请求 remote notification entitlement**。④**发布加固**：`release.config.json` 单一版本源 + `sync-version.ts`、`PrivacyInfo.xcprivacy`（无采集/无 tracking、仅 `NSPrivacyAccessedAPICategoryUserDefaults` reason `CA92.1`）、fail-closed `release-gate.ts`（无 remote UI/node builtins/Buffer/ws/secret/宽泛 ATS/违规 background mode/APNs/Local Network/hardcoded Team、version + vectors + bundle 同步）；dev/release bundle id override、export compliance（CryptoKit Ed25519 + TLS）由发布方确认（不武断写 `ITSAppUsesNonExemptEncryption`）、reviewer 走在线 Desktop + 配对二维码。详见 implementation `architecture §9.0.4`、`data-contracts §9.5`、`quality-release §21`。
 >
-> **Layer 4 加固（PR #8 审查修复，已落地）**：hello identity 必含 `deviceKeyId`，与 Layer 3 authenticated canonical identity exact match。致命关闭仅按 WS close code / HTTP upgrade 状态数值分类（**绝不匹配本地化 error 串**）：1008→`AUTH_REVOKED`、401/403→`AUTH_FAILED`、426→`PROTOCOL_MISMATCH`，controller 停止盲目重连、清业务 state、提示需 Desktop 重新授权/本机 unpair。任何失败/中止路径都 dispose provisional connection（移除 listeners、关 native socket）；pre-bind frame buffer 有 count+bytes 上界并 overflow fail-closed。Keychain `set` 用 `SecItemUpdate`（缺失才 `SecItemAdd`），**不 delete-then-add**，generation read→increment→persist 串行化，并发取值 distinct/单调、写失败不回退旧值。入站 WS 帧在 bridge 前按 UTF-8 字节数限帧、binary 一律 protocol-close（pre/post-handshake 一致）。Chat 历史按 `getSessionPage` 的 `nextCursor` 分页到含 active run 的最后一页，受 page/bytes 上界约束、cursor 不前进即 fail-closed。chat send 由 controller 持有 `requestId` reservation：同草稿重试复用同 id（server 幂等去重成一个 run），definitive 拒绝或编辑内容才换新 id。
+> **Layer 4 认证与恢复加固（已落地）**：hello identity 必含 `deviceKeyId`，与 Layer 3 authenticated canonical identity exact match。致命关闭仅按 WS close code / HTTP upgrade 状态数值分类（**绝不匹配本地化 error 串**）：1008→`AUTH_REVOKED`、401/403→`AUTH_FAILED`、426→`PROTOCOL_MISMATCH`，controller 停止盲目重连、清业务 state、提示需 Desktop 重新授权/本机 unpair。任何失败/中止路径都 dispose provisional connection（移除 listeners、关 native socket）；pre-bind frame buffer 有 count+bytes 上界并 overflow fail-closed。Keychain `set` 用 `SecItemUpdate`（缺失才 `SecItemAdd`），**不 delete-then-add**，generation read→increment→persist 串行化，并发取值 distinct/单调、写失败不回退旧值。入站 WS 帧在 bridge 前按 UTF-8 字节数限帧、binary 一律 protocol-close（pre/post-handshake 一致）。Chat 历史按 `getSessionPage` 的 `nextCursor` 分页到含 active run 的最后一页，受 page/bytes 上界约束、cursor 不前进即 fail-closed。chat send 由 controller 持有 `requestId` reservation：同草稿重试复用同 id（server 幂等去重成一个 run），definitive 拒绝或编辑内容才换新 id。
 >
 > **Layer 4 复审加固（帧限额/关闭码，已落地）**：native 入站/出站与 JS pre-bind 帧上限统一对齐 Product-RPC `productRpcMaxFrameBytes`＝4 MiB（原 stale 1 MiB 会误拒合法 1–4 MiB 帧），该值取自 `@moshu/contracts` 并写入共享 canonical 测试向量，Vitest 与 Swift 双端断言防漂移；queued bytes 保守有界且 ≥ 单帧。teardown 关闭 socket 时将拟发数字关闭码安全映射到合法 `URLSessionWebSocketTask.CloseCode`（oversize→1009、binary→1003、其余标准协议码原值），保留/未知/不可发送码回退安全码，close reason 按 UTF-8 标量边界截断到 123 字节——不再一律以 `.goingAway`(1001) 关闭。
 
@@ -63,8 +64,8 @@ Runtime Box 在实际执行前验证 grant。Allow all 只改变 server 的审�
 | 读取敏感文件 | 确认/拒绝 | 确认/拒绝 | 确认/拒绝 | 仍需确认 |
 | 修改 Project 文件 | 禁止 | 禁止 | 按策略审批 | 允许低/中风险 |
 | 删除/移动大量文件 | 禁止 | 禁止 | 强制确认 | 仍需确认 |
-| 运行只读安全命令 | 禁止 | 禁止 | 按策略审批或允许 | 允许 |
-| 运行构建/测试 | 禁止 | 禁止 | 默认确认 | 允许 |
+| 运行只读命令 | 禁止 | 禁止 | 每次确认 | 仍需确认 |
+| 运行构建/测试 | 禁止 | 禁止 | 每次确认 | 仍需确认 |
 | 安装依赖 | 禁止 | 禁止 | 强制确认 | 高风险仍确认 |
 | Project 外访问 | 禁止 | 禁止 | 单次强制确认或拒绝 | 仍需确认 |
 | 有副作用 MCP | 禁止 | 禁止 | 按 Tool 风险审批 | 高风险仍确认 |
@@ -80,7 +81,7 @@ Runtime Box 在实际执行前验证 grant。Allow all 只改变 server 的审�
 - 仅对开启后的新动作生效，不追溯批准待处理动作。
 - 切换关闭立即恢复默认策略。
 - 应用重启、Session 复制或 Project 重新授权后自动关闭。
-- 有效性绑定当前 client instance/generation；stable `clientId` 不会让 grant 跨重启延续。
+- Allow-all 不是 Runtime Box execution grant；Agent Server 重启会持久地将其重置为关闭。
 - 状态在输入框和会话头持续可见。
 
 > **Layer 2 实现边界**：Allow-all 策略为 session-scoped、revisioned、server-owned（`session_approval_policies`），随 Session retire（删除/退休）reset，**不跨 Session 泄漏**。它只对 `overridable` 的普通 action 自动 `approve_once` 并记录 policy evidence；server 判定的 **不可覆盖 action 永不被绕过**——这包括**全部 shell/bash 动作**（fail-closed：shell 效果无法被静态证明安全，故一律 non-overridable）与其他 critical 高危动作，仍需单独 approve/reject。Desktop 卡片在开启时展示提示并说明该边界。Agent Server 重启恢复会在事务内将所有 allowAll=true 策略 reset 为 false（revision +1、记录 system-restart 归属，SEC-003 已落地且幂等），旧 Allow-all 不会在重启后自动批准新 Action；跨设备/instance 的 generation 绑定属后续层。
@@ -89,7 +90,7 @@ Runtime Box 在实际执行前验证 grant。Allow all 只改变 server 的审�
 
 确认页说明：
 
-- Agent 可在当前 Project 内修改文件并运行低/中风险命令。
+- Agent 可在当前 Project 内自动执行允许覆盖的低/中风险文件动作；shell 仍逐次确认。
 - 可能产生 API、网络和计算费用。
 - 不会绕过高风险确认、Project 边界和秘密保护。
 - 用户可随时关闭或停止任务。
@@ -108,59 +109,51 @@ Runtime Box 在实际执行前验证 grant。Allow all 只改变 server 的审�
 
 ### 6.1 默认边界
 
-- Project Agent 的普通文件权限限制在 Project 根目录；server 在 grant 中绑定 scope，Runtime Box 在执行时重新校验。
-- Runtime Box 使用真实路径解析和符号链接检查，阻止通过 `..`、软链接或路径大小写绕过。
-- 内部工作文件、会话附件、Memory 和 Skills 使用独立虚拟路径，不与项目内容混放。
-- 默认保护 `.env*`、密钥文件、凭证目录和应用自己的安全存储。
-- 文件权限规则采用明确的 allow/deny 顺序，并在 UI 中显示最终结果。
+- Project 文件 Tool 限制在 Project 根目录；Remote 非 Project 文件 Tool 限制在 Box workspace。server 在 grant
+  中绑定 scope，Runtime Box 在执行时重新校验 canonical path 与 containment。
+- Local 非 Project 文件 Tool 使用请求 `cwd` scope。`bash` 只把对应目录作为 cwd，不受文件 Tool containment
+  约束；这也是 shell 必须逐次审批且仍不构成 sandbox 的原因。
+- Runtime Box 使用真实路径解析和符号链接检查，阻止文件 Tool 通过 `..` 或软链接绕过。
+- Runtime Box 自身的 resource、Skill、Secret 和 journal 使用独立 private data root，不与 Project 内容混放。
 
 ### 6.2 修改与冲突
 
-- 写入前校验基线哈希。
-- 使用原子写入，避免半文件状态。
-- 外部修改冲突时停止并显示 Diff。
-- 大文件、二进制和不可逆格式修改要求额外确认。
-- 删除优先进入可恢复区；无法恢复时明确提示。
+- `write`/`edit` 按 canonical pathname 串行化，并使用同目录临时文件 + atomic rename，避免半文件状态。
+- `edit` 使用调用参数中的旧文本做冲突检查并限制输入/结果大小；`write` 同样执行大小和 scope 校验。
+- 当前尚无独立 Diff journal、删除/移动 Tool 或通用撤销机制；这些能力不能由原子写入推断出来。
 
 ### 6.3 Pi runtime 边界
 
-当前 Pi `AgentSession` 使用 `noTools: "all"`，extensions、Skills、prompt templates、themes、context files、
-default tools 和 TUI 全部禁用；意外 Tool activity 直接失败。未来文件/Shell 能力不会直接开放 Pi 默认 Tool，
-而是通过 Moshu-owned Policy、Action、grant 和 Runtime Box 强制执行。
+当前 Pi `AgentSession` 使用 `noTools: "builtin"`，并禁用 extensions、Pi Skills、prompt templates、themes、
+context files 和 TUI。只注册 Moshu 的七个 custom proxy（以及按 owner live 装配的 MCP Tool）；proxy 不直接执行，
+而是经过 Policy、Approval、Action、grant 和 owning Runtime Box/Server MCP dispatcher。
 
 ## 7. 命令执行
 
 ### 7.1 强制策略层
 
-不得将原始 `LocalShellBackend.execute` 直接暴露给模型。命令由 agents server 形成 Action、完成审批并签发 grant，再由 Runtime Box 的命令执行器：
+不得将 shell backend 直接暴露给模型。命令由 agents server 形成 Action、完成审批并签发 grant，再由 Runtime
+Box 的命令执行器：
 
 - 固定工作目录并记录规范化路径。
-- 使用最小环境变量，不继承 client/agents server 全量环境。
-- 解析可执行文件、参数、管道、重定向和子命令。
-- 执行风险分类和审批。
+- 使用明确 cwd；Local Box 当前继承 Desktop 启动环境，Remote Box 使用用户服务环境。
+- 不尝试通过静态解析 shell 字符串证明安全；所有 `bash` 都是 non-overridable，不能被 Session Allow all 跳过。
 - 设置超时、输出上限和进程树终止。
 - 记录退出码、耗时和安全截断日志。
 - 限制并发和后台子进程。
 - 拒绝过期、重复、篡改或目标 instance/generation 不匹配的 grant。
 
-### 7.2 风险等级
+### 7.2 当前风险边界
 
-| 等级 | 示例 | 默认策略 |
-| --- | --- | --- |
-| 低 | `git status`、`git diff`、项目内只读查询 | 可配置自动允许 |
-| 中 | 构建、测试、格式化、项目内生成文件 | 审批；Allow all 可放行 |
-| 高 | 安装依赖、网络上传、删除、改权限、启动长期服务 | 始终确认 |
-| 禁止/特殊授权 | `sudo`、磁盘工具、系统安全设置、读取系统凭证 | 默认拒绝或专用流程 |
-
-字符串黑名单不能作为唯一判断方式；策略应结合可执行文件、参数、工作目录、文件影响和网络目标。
+agents server 从 Tool identity 与校验后的结构化参数计算风险，不信任模型、Tool wrapper 或 Runtime Box 自报。
+文件类 Action 可以按风险和 Session policy 决策；shell 字符串不做“安全命令”白名单推断，当前全部要求单独审批。
+批准后的 shell 仍以 Runtime Box OS 用户权限执行，因此不是权限下降、网络隔离或系统调用 sandbox。
 
 ### 7.3 环境与秘密
 
-- PATH 使用受控值。
-- 用户可按 Project 添加环境变量；敏感值写入安全存储。
-- 审批卡显示变量名，不显示敏感值。
-- 模型只知道可用变量名和用途，不获得值。
-- 命令输出进入模型前进行秘密模式扫描和截断。
+- bundled `rg`/`fd` 使用已校验绝对路径，不依赖环境 `PATH`；任意 `bash` 仍可访问其进程环境。
+- Local Box 当前完整继承 Desktop 环境，可能包含 credential；这是已知限制，不能描述为“最小环境”。
+- 审批和事件不广播原始 shell command、argv、env 或 Secret；输出执行大小限制，但当前没有通用秘密扫描器。
 
 ## 8. MCP 与 Skills 安全
 
@@ -269,7 +262,8 @@ local desktop Runtime Box data root 使用 `0700`，credential file 使用 `0600
 - macOS 包必须签名、公证并验证更新签名。
 - Electrobun client、agents-server binary、Runtime Box binary、public Pi `0.82.1` bundle 和更新 metadata 必须来自
   同一受信 release；未知版本/protocol 组合时 fail closed。
-- 更新必须整体切换三个角色，不能留下新 client 配旧 companion 的部分更新。
+- Desktop 更新必须整体切换 client、agents-server 与 Local Runtime Box。Remote Runtime Box 可独立更新，但必须
+  通过独立 Runtime protocol compatibility range，版本不兼容时进入 `upgrade_required`。
 - 自动更新失败不能阻止用户访问本地数据。
 - 依赖锁文件、SBOM 和漏洞扫描纳入发布流程。
 - Provider、MCP 和 Skill 的远程内容不得拥有应用更新权限。
@@ -282,7 +276,7 @@ local desktop Runtime Box data root 使用 `0700`，credential file 使用 `0600
 | SEC-002 | Ask/Plan/Agent 权限在工具层强制执行 | P0 |
 | SEC-003 | Allow all 仅当前 Session 且重启关闭 | P0 |
 | SEC-004 | 高风险操作不能被 Allow all 绕过 | P0 |
-| SEC-005 | Shell 使用独立策略层和最小环境 | P0 |
+| SEC-005 | Shell 使用独立策略层、逐次审批，并明确环境继承与无 sandbox 风险 | P0 |
 | SEC-006 | 文件路径防穿越、符号链接绕过和并发覆盖 | P0 |
 | SEC-007 | 所有副作用关联 Run、审批和结果 | P0 |
 | SEC-008 | Provider credential 只在 server SecretVault；MCP credential 只在显式 owner 的 MCP SecretStore，均不进入 WebView/query/log/export | P0 |

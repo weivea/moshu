@@ -87,8 +87,8 @@ Project Session/Run、Runtime Box path inspector 与 `project-root` Tool 边界�
 | `/projects/:projectId/chat/new` | 新建 Project Session，复用现有新 Chat 流程 |
 | `/projects/:projectId/chat/:sessionId` | Project Chat，校验 URL Project 与 Session 归属一致 |
 
-深链不依赖当前 active Runtime Box。Server 先按 `projectId` 读取 Project，再使用其固有 Runtime Box。深链不会
-静默切换全局 active Runtime Box，也不会把 Session 路由到当前 Box。
+深链不依赖发起 Client 的 active Runtime preference。Server 先按 `projectId` 读取 Project，再使用其固有
+Runtime Box；深链不会静默切换 Client preference，也不会把 Session 路由到当前选择的 Box。
 
 ### 3.2 左侧栏
 
@@ -537,4 +537,4 @@ Chat 复用当前 controller：
 6. 新增完整性绑定的 `project-root` grant 和 per-invocation Runtime Box cwd policy。
 7. 实现 Desktop picker、Projects list/sidebar/overview/settings 与 Project Chat route adapter。
 8. 补齐 contract、database、server、Runtime Box、Desktop 和三角色 integration tests。
-9. 仅在实现与验证完成后更新[实施进度](./progress.md)。
+9. 仅在实现与验证完成后更新[实现状态](./progress.md)。

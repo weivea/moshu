@@ -13,10 +13,12 @@ Remote Runtime Box
 
 - Tunnel 由 Agent Server 管理，Desktop 只提供操作界面。
 - Tunnel 虽然允许匿名访问，但 Runtime Box 必须经过一次性配对、Ed25519 设备签名、Server 身份固定和 generation 防重放认证。
-- Tunnel 只公开 Runtime ingress，不公开 Product RPC、Session、Provider 或数据库接口。
+- 同一个 Tunnel 可同时公开彼此隔离的 Runtime 与 Mobile 端口；Remote Runtime Box 只连接 Runtime ingress。
+  Product RPC、Provider 和数据库接口不进入 Tunnel。
 - Desktop 退出后 Agent Server 和 Tunnel Host 会停止；Remote Runtime Box 会等待下次连接。
 
-> 当前 POC 中，完成认证的 Remote Runtime Box 完全信任已绑定的 Agent Server，包括执行 `bash`。用户级命令审批将在后续版本提供。
+> 用户级 Tool/Action 审批已实现；Remote Runtime Box 只执行 Agent Server 签发的有效一次性 grant。所有
+> `bash` 仍需单独审批且不可被 Session Allow all 绕过，但当前没有 shell sandbox，批准后仍以远程设备用户权限执行。
 
 ## 2. 准备工作
 
@@ -344,4 +346,4 @@ uninstall [--data-dir <path>]
 unpair [--data-dir <path>]
 ```
 
-技术细节参见[Runtime Box 技术与实施方案](../implementation/runtime-box.md)。
+技术细节参见[Runtime Box 架构与实现](../implementation/runtime-box.md)。

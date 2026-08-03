@@ -1,11 +1,11 @@
-# Runtime Box 技术与实施方案
+# Runtime Box 架构与实现
 
-> 状态：已批准，分阶段实施
-> 更新日期：2026-07-28
-> 范围：Local Runtime Box、Remote Runtime Box、Agent Server 管理的 Dev Tunnel
-> 非目标：Mobile Client、团队共享、云端 Agent Server、多 Agent Server 绑定
+> 状态：Local/Remote Runtime Box 已实现；外部发布凭据与真实 Tunnel gate 待发布环境执行
+> 更新日期：2026-08-03
+> 范围：Local/Remote Runtime Box、Agent Server 管理的 Dev Tunnel，以及与 Mobile ingress 的端口隔离
+> 非目标：iOS App 内部实现（见 [`mobile-client.md`](./mobile-client.md)）、团队共享、云端 Agent Server、多 Agent Server 绑定
 
-本文定义 `apps/runtime-box` 的产品边界、远程连接、安全模型、数据所有权和实施依赖。`Executor` 只表示
+本文定义 `apps/runtime-box` 的产品边界、远程连接、安全模型、数据所有权和当前实现。`Executor` 只表示
 Runtime Box 内部 Tool/进程执行组件；产品级稳定身份统一使用 `runtimeBoxId`。
 
 本文中的 MCP 均指 **Runtime Box-owned MCP**。Agent Server-owned MCP 的全局连接、Agent 绑定和本地 Action
@@ -25,27 +25,33 @@ Runtime Box 内部 Tool/进程执行组件；产品级稳定身份统一使用 `
 | Host 生命周期 | Desktop 退出时 Agent Server、Tunnel Host 一起停止；Remote Box 保持安装并重连 |
 | Tunnel 访问 | Anonymous Dev Tunnel；Moshu 自己承担设备身份、吊销、防重放和入口限流 |
 | 首版加密 | 信任 Dev Tunnels TLS；应用层 Noise 端到端加密后置 |
-| Session/Project | Agent Server 持久化并永久归属一个 `runtimeBoxId`；迁移以后显式实现 |
+| Session/Project | Agent Server 持久化并永久归属一个 `runtimeBoxId`；当前不支持跨 Box 迁移 |
 | MCP/Skill | recoverable config/content/credential/lifecycle 归 Box；作用域绑定和稳定引用归 Agent Server |
 | Agent/Provider | 全局共享；每个 `agentId + runtimeBoxId` 有独立 Runtime Profile |
-| 当前 Runtime | Agent Server 全局持久状态，向所有 Client 广播 |
+| 当前 Runtime | 每个 authenticated Client 持有独立 revisioned preference；`app_settings` 只提供无偏好时的全局默认 |
 | 切换语义 | 只影响列表和新建默认值；既有 Run 继续在原 Box |
 | 离线语义 | 保持选中、数据只读、inventory stale；禁止新 Run 和 Box mutation，不自动回退 Local Box |
 | Box 解绑 | 吊销并归档；Session/Project 保留只读，重新配对后可恢复 |
 | Tunnel 丢失 | 连续 30 天无活动导致 Tunnel 被删除时，首版重新配对所有 Remote Box |
 
-## 2. 目标架构
+## 2. 当前架构
 
 ```mermaid
 flowchart LR
-    subgraph H[Host device]
+    subgraph H[Desktop host]
         D[Desktop UI]
         AS[Agent Server]
-        PRPC[Local Product RPC]
-        RI[Runtime Ingress]
-        TM[Dev Tunnel Manager]
+        PRPC[Product RPC]
+        RI[Runtime ingress]
+        MI[Mobile ingress]
+        MGR[DevTunnelService]
         DB[(Product DB)]
         LB[Local Runtime Box]
+    end
+
+    subgraph T[Anonymous Microsoft Dev Tunnel]
+        RTP[Runtime port]
+        MTP[Mobile port]
     end
 
     subgraph R[Remote device]
@@ -54,15 +60,21 @@ flowchart LR
         EXT[MCP / Skills / Secrets]
     end
 
-    D <-->|local RPC| PRPC
-    PRPC --> AS
+    MC[iOS Mobile Client]
+
+    D <-->|loopback| PRPC
+    PRPC <--> AS
     AS --> DB
-    AS --> TM
-    AS --> RI
-    LB -->|loopback WebSocket| RI
-    RB -->|WSS| DT[Anonymous Dev Tunnel]
-    DT --> TM
-    TM --> RI
+    AS <--> RI
+    AS <--> MI
+    LB <-->|loopback WebSocket| RI
+    RB <-->|WSS + signed challenge| RTP
+    RTP <-->|forward| RI
+    MC <-->|WSS + device auth| MTP
+    MTP <-->|forward| MI
+    AS --> MGR
+    MGR --> RTP
+    MGR --> MTP
     RB --> RDB
     RB --> EXT
 ```
@@ -78,23 +90,23 @@ credential、公开 URL、Runtime ingress 端口和 Remote Box 状态不能由 D
 | Tunnel 配置、Microsoft Host credential、Host 连接 | Agent Server | credential 存 Agent Server Secret Vault |
 | Product DB、Session、Project、Run/event | Agent Server | 所有记录绑定 `runtimeBoxId` |
 | Agent、Provider、Policy、Approval、Action intent/result | Agent Server | Provider Secret 永不发送 Box |
-| 每个 Client 的 active Runtime 偏好 | Agent Server | 由稳定 client identity（Desktop `clientId`，未来 `mobileClientId`）持有的 revision/CAS 偏好；Session/Project/Run 仍持久归属 `runtimeBoxId` |
+| 每个 Client 的 active Runtime 偏好 | Agent Server | 由稳定 client identity（Desktop `clientId`、iOS `mobileClientId`）持有的 revision/CAS 偏好；Session/Project/Run 仍持久归属 `runtimeBoxId` |
 | MCP config/credential/OAuth/lifecycle | owning Runtime Box | Agent Server 只有脱敏投影与稳定引用 |
 | Box-owned Skill installation/version/content/resources/scripts | owning Runtime Box | Agent Server 不保存可恢复正文 |
-| 文件、命令、Git、MCP Tool、Skill script | Runtime Box 内部 Executor | 每次副作用需要 Server grant |
+| 七个内置 Tool 与 Box-owned MCP Tool | Runtime Box 内部 Executor | 每次副作用需要 Server grant；Git Tool/Skill script 尚未接入 |
 | Invocation journal 与进程树 | Runtime Box | 重连后提交结果证据并等待 Server ack |
 
 ## 4. 网络入口与 Tunnel 生命周期
 
-### 4.1 双入口
+### 4.1 三个隔离入口
 
-Agent Server 使用两个独立监听器：
+Agent Server 使用三个独立监听器：
 
 | 入口 | 角色 | 地址 | 暴露 |
 | --- | --- | --- | --- |
 | Product RPC | Desktop Client | loopback 动态端口 | 不进入 Tunnel |
 | Runtime Ingress | Local/Remote Runtime Box | loopback 固定持久端口 | 唯一经 Tunnel 暴露的 Runtime 端口 |
-| Mobile Ingress | Mobile Client（iOS） | loopback 固定持久端口 + `/mobile` | Layer 3 已实现的独立第二端口，经 Tunnel 暴露 |
+| Mobile Ingress | Mobile Client（iOS） | loopback 固定持久端口 + `/mobile` | 独立第二端口，经 Tunnel 暴露 |
 
 Runtime Ingress 使用独立 method allowlist，不接受 Session、Provider、Policy decision、任意数据库查询或 Client
 管理方法。Mobile Client 已按此约束落地**独立**入口（固定 loopback listener + `/mobile` 路径、独立
@@ -119,32 +131,23 @@ interface DevTunnelService {
 Agent Server 持久化 `tunnelId`、cluster、Runtime ingress port、public URL、enabled、lastHostedAt 和
 lastError。Microsoft 登录 token 只能写入 Agent Server Secret Vault。
 
-`DevTunnelService`/`DevTunnelAdapter` 管理一个**期望端口集合（typed ingress descriptors）**而非单一 scalar 端口：
-`ensureTunnel` 按期望端口集合 reconcile，只增删属于本 Service 期望之外的端口，**不再删除同属 Moshu 的其他 ingress**
-（历史根因：旧 `ensureTunnel(tunnelId, port)` 会删除所有其他端口）。每个端口按需单独配置 anonymous access，并各自
-收集 public URL / readiness / traffic。单个 host 进程转发全部期望端口，`waitForPort(port)` 按端口解析各自的
-public URL；每个端口一旦 ready 就**增量**发布自己的 `publicUrl`（逐端口可观测：一个 ready、另一个 pending 时状态如实反映），
-但**只有当所有 required ingress 都 ready 后 Service 才进入 `online`**，任一端口迟迟不 ready 会让整个 Service 保持非
-online。逐端口 readiness 绑定**拥有该 host 的身份/generation**：当 owning host 因失败、取消、detach、disable 或被
-replace 而终止时，按 host 身份清空对应 ingress readiness（`ready=false`、不留陈旧 URL），因此 partial-startup 失败不会让
-已 ready 的死端口继续显示 online；**该清空在 await 终止之前同步完成**，故即使 owning host 的 `stop()`/terminate 超时或 reject，也不会残留把死端口报成 ready 的陈旧 readiness；清理只针对被终止的 host，**不会误清**接管的 replacement host readiness。此外，因为在 await 终止前会同步释放 `#host` 句柄，一次 reject/timeout 的终止**不会丢失该 host 句柄**：待终止但退出未确认的 host 被登记到独立的 `#terminatingHosts` 集合（与 live `#host` 解耦），后续 `disable`/`shutdown` 会**重试终止该 exact orphan** 直到其 `exited` 确认，从而既不阻塞 replacement 启动的 state guard，也不会遗留无法回收的存活公开 host。**对外 status 线协议保持 v1**：`getStatus()` 仍是既有 v1 形状（scalar `runtimeIngressPort` + 顶层
-`publicUrl`），**不**在严格的 `remoteAccessStatusOutputSchema` 上新增 `ingresses` 字段——旧 Client 继续无改动解析。
-per-ingress readiness 只经**内部（非线协议）** getter `DevTunnelService.getIngressReadiness()` 暴露，返回 typed
-descriptor（`kind`/`port`/`ready`/仅在 live 时携带的 `publicUrl`，pending 端口不回退到陈旧/持久 URL）。顶层 `publicUrl`
-继续向后兼容地映射到 Runtime ingress URL。Layer 3 已将 `mobile` descriptor 从前瞻性建模变为**实际实例化**：
-Mobile ingress 作为 DevTunnel 的**第二个端口**通过 `mobileIngressPort` 接入同一 tunnel，逐端口
-reconcile/readiness/public URL 均复用既有根因逻辑，无需改动；多 ingress readiness 通过显式 versioned status
-method（新增 `moshu.v2.mobileAccess.status`）暴露，而**不放宽当前 v1 严格 schema**——旧 v1 Client 继续无改动解析
-（见 architecture §9.0.2、data-contracts §9.3）。
+`DevTunnelService`/`DevTunnelAdapter` 管理 typed ingress descriptor 集合，目前包含 Runtime 与 Mobile 两个端口。
+`ensureTunnel` 只对该 Service 拥有的期望端口做 reconcile；一个 Host 进程转发全部端口，每个端口独立记录
+readiness、public URL 和流量。Service 只有在所有 required ingress ready 后才进入 `online`。
+
+readiness 绑定 owning Host identity/generation；Host 失败、取消、disable 或 replacement 时会先清除对应
+readiness，并持续追踪尚未确认退出的旧 Host，避免陈旧 URL 或孤儿公开入口。v1 `remoteAccess.status` 保留
+Runtime ingress 的 scalar 字段；Mobile 端口状态由 versioned `moshu.v2.mobileAccess.status` 返回。
 
 启动顺序：
 
 1. 打开 Product DB 和 Secret Vault。
 2. 启动 Product RPC。
 3. 在固定端口启动 Runtime Ingress。
-4. 恢复持久 Tunnel 配置。
-5. Remote Access 已启用时恢复同一 Tunnel 并启动 Host。
-6. 接受 Runtime Box 重连、认证、注册和同步。
+4. 在独立固定端口启动 Mobile Ingress。
+5. 恢复持久 Tunnel 配置。
+6. Remote Access 已启用时恢复同一 Tunnel 的两个端口并启动 Host。
+7. 接受 Runtime Box 与 Mobile Client 的重连、认证、注册和同步。
 
 关闭顺序：
 
@@ -152,7 +155,7 @@ method（新增 `moshu.v2.mobileAccess.status`）暴露，而**不放宽当前 v
 2. 通知所有 Box 进入 drain，取消或收敛 invocation。
 3. 持久化 Run、Action 和 Box 连接状态。
 4. 停止 Tunnel Host。
-5. 关闭 Runtime Ingress、Product RPC、Session 和数据库。
+5. 关闭 Runtime/Mobile ingress、Product RPC、Session 和数据库。
 
 Desktop 退出时执行以上流程。Remote Box 不删除配对数据，进入 `disconnected` 并继续有上限重连。
 
@@ -266,7 +269,7 @@ Remote heartbeat/lease 使用独立于 loopback 的参数；初始建议 heartbe
 
 ## 7. 多 Runtime 调度与切换
 
-将当前单 peer `ExecutorReadiness` 演进为：
+当前实现使用按 `runtimeBoxId` 索引的 registry：
 
 ```ts
 interface RuntimeBoxGatewayResolver {
@@ -291,7 +294,7 @@ invocation IDs、lastSeen 和 lastError。
 - Run、cancel、Tool、恢复都按 Session 持久化的 `runtimeBoxId` 路由。
 - 切换 active Runtime 只影响该 Client 后续的默认放置，不停止、不迁移、不拒绝其他 Box 上的既有 Run。
 - Runtime Box offline 时不能创建可执行 Run。
-- 内置 Tool 在注册成功后即可具备基础 readiness；依赖 MCP/Skill 的 Run 才要求 inventory full sync。
+- 每次注册/重连都必须完成 inventory full sync 才进入 online/runnable；Run 启动还会 live 验证所引用资源。
 
 Client-scoped 选择使用 CAS，按稳定 client identity 持有：
 
@@ -301,33 +304,34 @@ interface ActiveRuntimeBoxSelection {
   revision: number;
 }
 
-// client identity 由 authenticated peer 解析（Desktop clientId，未来 mobileClientId），
+// client identity 由 authenticated peer 解析（Desktop clientId 或 iOS mobileClientId），
 // 不信任调用方传入任意 clientId。
 runtimeBoxes.switch({ runtimeBoxId, expectedRevision })
 ```
 
 Server 成功持久化后广播带 revision 的 `runtimeBoxes.activeChanged`（针对该 Client 自身的偏好）。Client 只应用更高
-revision，避免同一 Client 的多个窗口或未来 Client 的乱序更新。不同 Client 的偏好相互独立。
+revision，避免同一 Client 多窗口/连接的乱序更新。不同 Client 的偏好相互独立。
 
-任务中心全局展示所有 Box 的 Run；Sessions/Projects 主列表只展示 active Box。从任务中心打开其他 Box 的
-Session 时，先原子切换 active Box，再导航。
+Sessions/Projects 主列表按发起 Client 的 active preference 过滤；直接打开既有 Session/Project 时始终使用其
+持久 Box 归属，不按当前 preference 改写路由。
 
 ## 8. 数据模型
 
-Agent Server 增加：
+Agent Server 当前使用：
 
 ```text
 runtime_boxes
 runtime_box_device_keys
-runtime_box_instances
 runtime_box_generation_fences
 runtime_box_pairing_sessions
 runtime_box_inventory_state
 runtime_box_inventory_cache
 client_runtime_box_preferences
 app_settings
+remote_access_settings
 projects
 agent_runtime_profiles
+agent_global_profiles
 ```
 
 `client_runtime_box_preferences` 按稳定 client identity 保存该 Client 当前 active Runtime Box 与 revision（取代
@@ -357,23 +361,26 @@ Project 由 Agent Server 管理，保存 `runtimeBoxId` 和远程绝对路径。
 Box 负责规范化并返回目录可访问性、名称和 Git 元数据，Server 成功校验后才创建记录。Box 离线时禁止路径校验
 和 Project mutation。
 
-Runtime Box 私有数据：
+Local 与 Remote Box 使用同一 `RuntimeResourceStore` 和 `RuntimeBoxInvocationJournal` 实现，但根目录与
+连接身份来源不同。当前私有数据布局为：
 
 ```text
-runtime-box.db
-├── mcp_configs
-├── mcp_inventory
-├── skill_installations
-├── skill_versions
-├── inventory_state
-├── inventory_changes
-└── invocation_journal
+resources/
+├── runtime-box.db
+├── skills/
+└── secrets/
 
-skills/
-secrets/
-logs/
-cache/
+journal/
+└── .../<actionJournalEpoch>/invocations.json
+
+workspace/      # Remote Box 默认文件 Tool scope
+run.lock        # 仅 Remote daemon 使用
 ```
+
+`runtime-box.db` 保存 MCP/Skill authority、inventory epoch/revision 和 change log；invocation journal 是
+独立、原子持久化的 `invocations.json`，不在 SQLite 中。Local journal 按
+`journal/<actionJournalEpoch>` 隔离；Remote journal 额外按
+`agentServerId/runtimeBoxId/actionJournalEpoch` 隔离。
 
 对 Box-owned 资源，Agent Server 只保存作用域绑定、稳定 resource ref、Runtime Profile 和可丢弃 inventory
 projection。Server-owned prompt-only Skill 另由 Agent Server private content store 管理，不进入本目录：
@@ -391,9 +398,10 @@ Box；Agent Server-owned Skill 仍可管理，但当前 Run gate 仍要求 Sessi
 Remote 副作用执行必须依赖 durable Action intent、一次性 execution grant 和结果 reconciliation，
 不能复用无持久记录的本地直连路径。
 
-当前 POC 在设备与 Agent Server 双向认证成功后，Remote Runtime Box 完全信任其绑定的 Agent Server，
-包括执行 `bash`。本阶段的 intent/grant/journal 用于持久调度、单次派发和结果对账，不提供用户级命令审批；
-交互式 Policy/Approval 后置到后续版本。
+当前实现由 Agent Server 先完成 server-authoritative 风险分级与用户审批，再持久化 Action intent 并签发
+一次性 execution grant；Runtime Box 校验来源 identity、目标 instance/generation、参数摘要、过期时间和单次消费。
+所有 `bash` 都不可被 Session Allow all 绕过。该流程仍不是 shell sandbox：用户批准后的命令在 Runtime Box
+所在 OS 用户上下文中执行。
 
 Runtime Box 在执行前写本地 journal：
 
@@ -423,7 +431,7 @@ Action：它继续到原 RPC deadline；显式 cancel、deadline 或 daemon shut
 
 ## 11. Remote Runtime Box 单二进制
 
-目标输出：
+当前输出：
 
 ```text
 moshu-runtime-box
@@ -450,8 +458,8 @@ moshu-runtime-box uninstall
 | macOS | LaunchAgent |
 | Windows | Task Scheduler at logon |
 
-当前 executor 依赖 `rg`、`fd` 和 Photon WASM。实现单文件交付时应把资源压缩嵌入主二进制，首次运行提取到
-版本化 private cache，校验 SHA-256 后使用。禁止运行时下载未知 binary。
+当前 executor 将固定版本的 `rg`、`fd` 和 Photon WASM 作为已校验资源随二进制交付，运行时提取到版本化
+private cache 并校验 SHA-256；不从网络下载未知 binary。
 
 ## 12. RPC 表面
 
@@ -497,78 +505,26 @@ Box 随后用已配对 Ed25519 key 提交带 timestamp/report ID/generation fenc
 - 添加、配对、指纹确认、重命名、诊断、吊销、归档和重新配对。
 - Agent Server 的 Remote Access 登录、Tunnel 状态、公开 URL、最近错误和流量估算。
 
-全局切换器影响 Sessions/Projects 和新建上下文。Task Center 保持全局，并在 Run 上展示 Box 标签。
+每个 Client 的切换器只影响自己的 Sessions/Projects 视图和新建上下文默认值；既有 Session/Project/Run
+继续按持久 `runtimeBoxId` 路由。
 
-## 14. 工作包与依赖
+## 14. 实现位置
 
-```mermaid
-flowchart LR
-    R0[RB-00 Docs and spikes]
-    R1[RB-01 Domain and local compatibility]
-    R2[RB-02 Persistence and routing]
-    R3[RB-03 Ingress and pairing]
-    R4[RB-04 Remote service]
-    R5[RB-05 Dev Tunnel]
-    R6[RB-06 Switch, UI and Projects]
-    R7[RB-07 Grants and recovery]
-    R8[RB-08 MCP and Skills]
-    R9[RB-09 Hardening and release]
+| 能力 | 主要实现 |
+| --- | --- |
+| Local companion / Remote CLI | `apps/runtime-box/src/index.ts`、`cli.ts`、`remote-client.ts` |
+| Remote binding、generation、data-dir lock | `apps/runtime-box/src/remote-state.ts` |
+| 三平台用户服务 | `apps/runtime-box/src/service-manager.ts` |
+| Tool、scope、journal、进程树 | `tool-handler.ts`、`invocation-journal.ts`、`tools/` |
+| MCP/Skill authority 与 inventory | `runtime-resource-store.ts`、`resource-handler.ts`、`mcp-lifecycle-manager.ts` |
+| Server registry、poll 与 invocation routing | `apps/agents-server/src/runtime-box-registry.ts` |
+| Pairing / Upgrade authentication | `apps/agents-server/src/runtime-ingress-auth.ts` |
+| Tunnel 多端口管理 | `apps/agents-server/src/dev-tunnel-service.ts` |
+| 持久目录、generation fence、projection | `packages/database/src/schema.ts` 与对应 repository |
 
-    R0 --> R1 --> R2 --> R3
-    R3 --> R4
-    R3 --> R5
-    R2 --> R6
-    R5 --> R6
-    R2 --> R7
-    R4 --> R7
-    R2 --> R8
-    R7 --> R8
-    R5 --> R9
-    R6 --> R9
-    R7 --> R9
-    R8 --> R9
-```
-
-| ID | 交付 | 关键出口 |
-| --- | --- | --- |
-| RB-00 | 本文、ADR、Dev Tunnels/Bun compile、Anonymous WSS、资源嵌入 spike | 真实双设备 WSS 和稳定 Tunnel URL 可重复验证 |
-| RB-01 | Runtime Box contracts、稳定 ID、本地 Box registration、keyed registry 骨架 | 现有 Local Tool 行为不回退 |
-| RB-02 | Box 表、active revision、Session/Run 归属、持久 generation、按 Session 路由 | 切换不影响其他 Box 既有 Run |
-| RB-03 | 双入口、pairing、Ed25519 双向认证、吊销、防重放、限流 | 匿名攻击者不能抢占 identity/generation |
-| RB-04 | 三平台 Remote daemon、CLI、用户服务、私有目录、重连 | Host 重启后 Box 自动恢复 |
-| RB-05 | Agent Server `DevTunnelService`、Microsoft 登录、持久 Tunnel | Desktop 不保存 Tunnel 业务状态 |
-| RB-06 | 设置页、切换、Task Center、Projects/path validation | 离线只读与全局切换语义通过 |
-| RB-07 | Action/grant、journal、断线取消、旧结果证据对账 | 非幂等 Action 不自动重放 |
-| RB-08 | Box DB、MCP/Skill、inventory、Runtime Profile、live validation | Server 无 recoverable Secret/Skill 副本 |
-| RB-09 | 真实 Tunnel 故障矩阵、配额、版本、签名更新、Noise seam | 三平台 packaged E2E 通过 |
-
-实施状态：RB-00–RB-09 的代码和自动化门已完成；真实 Dev Tunnel、macOS Developer ID/公证以及
-Windows Authenticode 仍必须在持有外部凭据的对应 release runner 上执行，不能由本地 canary 结果替代。
-RB-05 已实现 Microsoft device-code 登录、
-cluster-qualified Tunnel ID、精确单 HTTP 端口与 Anonymous ACL reconciliation、持久状态、端口冲突修复、
-有界重试/取消、并发 mutation fencing，以及随 Agent Server 父进程退出的 Tunnel Host watchdog。
-RB-06 已实现 revisioned Runtime snapshot 广播、全局切换器、Runtime/Remote Access/配对设置页、
-按 Box 过滤的 Sessions/Projects、owning Box 路径与 Git 元数据校验、离线只读和持久设备 key 吊销。
-RB-07 已实现 durable Action intent、单次 execution grant、Box fsync journal、transport-loss deadline lease、
-`outcome_unknown`、evidence/receipt 双阶段确认、reset epoch 隔离和 Remote data-directory 单实例锁。
-RB-08 已实现 Runtime Box 私有 MCP/Skill/Secret store、epoch/revision/delta inventory、Server stale projection、
-Runtime Profile、live version/hash/schema validation、Skill 内存 prompt，以及 MCP stdio/HTTP/SSE 生命周期和
-复用 Action grant/journal/reconciliation 的 Tool bridge。
-RB-09 已实现 protocol v2/HTTP 426、`online/syncing/offline/upgrade_required` 投影、Runtime RPC 月度流量估算、
-5 GiB 告警、公开 Dev Tunnels 限制、脱敏诊断、丢 hint/压缩/网络/磁盘/进程故障矩阵，以及同 release
-companion 哈希清单。stable 构建 fail closed：macOS 要求 Developer ID、公证、staple 与 Gatekeeper，
-Windows 要求 Authenticode SHA-256/RFC 3161，所有平台要求 Ed25519 签名的完整更新产物清单。
-Windows 在 postBuild 签完整应用 bundle，并在 postPackage 解开最终 installer ZIP、签名和验证
-`Setup.exe` 后重新封装，再计算 Ed25519 artifact manifest。
-
-真实 Tunnel 探针使用：
-
-```bash
-MOSHU_LIVE_RUNTIME_BASE_URL=https://<tunnel>.devtunnels.ms bun run smoke:live-tunnel
-```
-
-它验证 Product RPC 隔离、未知 challenge/pairing fail closed、协议 426 和未知 route。流量值只统计
-Runtime RPC application payload，是保守的产品侧估算，不冒充 Microsoft Relay 账单。
+真实 Tunnel 探针使用
+`MOSHU_LIVE_RUNTIME_BASE_URL=https://<tunnel>.devtunnels.ms bun run smoke:live-tunnel`；正式签名、公证和
+installer 验证仍必须在持有外部凭据的 release runner 上执行。
 
 ## 15. 验收门槛
 
@@ -591,8 +547,8 @@ Runtime RPC application payload，是保守的产品侧估算，不冒充 Micros
 - 当前公开配额包括每用户每月 5 GB、每用户 10 个 Tunnel、每 Tunnel 10 个端口和最高约 20 MB/s。
 - Anonymous Tunnel 把预认证入口暴露到公网，限流只能缓解 DoS。
 - 首版没有 Moshu 应用层端到端加密，Microsoft Relay 是明确信任边界。
-- Desktop 退出即停止 Agent Server，期间 Remote Box 和未来 Client 都不可用。
-- 首版不支持团队共享、多 Agent Server 绑定、云 Agent Server、自动 Box 迁移或 Mobile Client。
+- Desktop 退出即停止 Agent Server，期间 Remote Box 和 Mobile Client 都不可用。
+- 首版不支持团队共享、多 Agent Server 绑定、云 Agent Server 或自动 Box 迁移。
 
 ## 17. 参考
 

@@ -1,5 +1,9 @@
 # 核心体验与信息架构
 
+> 本文描述完整产品体验目标。当前已实现范围和明确缺口以
+> [实现状态](../implementation/progress.md)为准；Tasks、Plan、自定义 Agent、Diff/撤销等目标页面或流程不能据此
+> 视为已经交付。
+
 ## 1. 设计目标
 
 核心体验围绕三个问题设计：
@@ -238,7 +242,8 @@ Project Chat 属于一个 Project。Project 指向一个本地文件夹，可以
 - 达到上限的新 Run 进入 FIFO 队列；用户可调整优先级或取消。
 - 同一 Session 同一时刻只允许一个产生副作用的 Run，避免文件竞态。
 - 同一 Project 的多个 Run 可并行，但检测到操作同一文件时必须串行或提示冲突。
-- 当前 desktop 的多个 Agent 可绑定同一个 local Runtime Box；Runtime Box offline 时相关 Agent 不能启动新 Run。
+- Agent/Runtime Profile 设计允许多个 Agent 使用同一 Box；当前代码只有 `moshu.default` Agent。Box offline 时，
+  归属该 Box 的 Session 不能启动新 Run。
 
 ### 10.2 后台任务
 
@@ -261,12 +266,12 @@ Project Chat 属于一个 Project。Project 指向一个本地文件夹，可以
 | 当前 public Pi 能力 | 产品表现 |
 | --- | --- |
 | `ModelRuntime` | 动态 builtin/custom Provider、模型、auth method 与 `ThinkingLevel` |
-| `createAgentSession` | headless no-tools Ask；全部动态 resource 与 TUI 禁用 |
+| `createAgentSession` | headless Agent Session；Pi built-in Tool/resource/TUI 禁用，Moshu 七工具与 live MCP Tool 显式装配 |
 | `SessionManager` | app-owned JSONL conversation context、restore 和 explicit disposal |
 | Agent event stream | 规范化文本 delta、final usage、取消和安全错误 |
 
-Plan、待办、Tool、MCP、Skills、审批和 subagent 不直接采用 SDK 产品合同；它们将在后续阶段通过
-Moshu-owned Agent/Policy/Action/Runtime Box contract 实现。当前 UI 不应暗示这些能力已经开放。
+Tool、MCP、Skills 和审批不直接采用 SDK 产品合同，而是通过 Moshu-owned Agent/Policy/Action/Runtime Box
+contract 实现。Plan、待办、subagent、任务中心和完整 Diff/撤销仍未实现，当前 UI 不应暗示这些能力已经开放。
 
 ## 12. 文件变更与 Git
 

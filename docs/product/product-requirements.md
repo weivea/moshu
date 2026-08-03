@@ -126,7 +126,7 @@ agents server 拥有 Agent、Run、Policy、审批和持久状态；Runtime Box 
 | Chat | 普通 Chat、附件、流式回复、引用、导出 | [核心体验](./core-experience.md) |
 | Project | 本地目录、项目上下文、文件操作、终端、Git Diff | [核心体验](./core-experience.md) |
 | Agent Runtime | Ask/Plan/Agent、待办、子 Agent、审批、Runtime Box 调度与恢复 | [核心体验](./core-experience.md) |
-| Runtime Box | Local/Remote 执行域、Project、MCP、Skills 与设备连接 | [技术与实施方案](../implementation/runtime-box.md) |
+| Runtime Box | Local/Remote 执行域、Project、MCP、Skills 与设备连接 | [架构与实现](../implementation/runtime-box.md) |
 | Custom Agent | 可视化配置、导入导出、范围与权限 | [Agent 与扩展](./agents-integrations.md) |
 | Provider | 国内外模型、兼容 Endpoint、能力与成本 | [Agent 与扩展](./agents-integrations.md) |
 | MCP | 本地/远程连接、OAuth、工具管理和配置导入 | [Agent 与扩展](./agents-integrations.md) |
@@ -144,7 +144,7 @@ agents server 拥有 Agent、Run、Policy、审批和持久状态；Runtime Box 
 | Session | 一条可持久化的会话线程，永久归属一个 Runtime Box，并可属于某个 Project |
 | Run | 用户消息触发的一次 Agent 执行，可包含多个模型和工具步骤 |
 | Agent | 全局提示词、模型策略、知识和权限配置；每个 Agent/Runtime Box 的 Runtime Profile 保存稳定资源引用 |
-| Runtime Box | Runtime Box 内部的 Tool 与进程执行组件，不再是产品级切换单位 |
+| Executor | Runtime Box 内部的 Tool 与进程执行组件，不是产品级切换单位 |
 | Tool | Agent 可调用的原子能力，来源可以是内置工具或 MCP |
 | Skill | 符合 Agent Skills 规范的可复用说明、脚本和资源目录 |
 | Knowledge Base | 经本地切分和索引、按需检索进入上下文的资料集合 |

@@ -1,9 +1,9 @@
 # 墨枢产品需求文档
 
 > 正式名称：墨枢
-> 文档版本：v0.3
-> 状态：需求基线与三应用角色架构已确认
-> 更新日期：2026-07-24
+> 文档版本：v0.4
+> 状态：需求基线已确认；Desktop、Remote Runtime Box 与 iOS Client 已形成 POC
+> 更新日期：2026-08-03
 
 ## 1. 文档导航
 
@@ -15,31 +15,32 @@
 | [Canvas](./canvas.md) | Canvas 类型、编辑/预览、版本、导出、Agent 协作与隔离运行 |
 | [安全、权限与本地数据](./security-data.md) | 权限模型、Allow all、命令与文件安全、密钥、隐私和 Electrobun 安全 |
 | [阶段路线图与验收](./roadmap.md) | 分阶段交付范围、依赖、验收场景、质量门槛和待决策事项 |
-| [Runtime Box 技术与实施方案](../implementation/runtime-box.md) | Local/Remote Runtime Box、切换、Tunnel、配对和实施边界 |
-| [工程实施计划](../implementation/README.md) | 技术架构、数据契约、工作包、测试和发布计划 |
+| [Runtime Box 架构与实现](../implementation/runtime-box.md) | Local/Remote Runtime Box、切换、Tunnel、配对和执行边界 |
+| [工程文档](../implementation/README.md) | 技术架构、实现状态、数据契约、测试和发布门槛 |
 
 文档中的 P0/P1/P2 表示某项能力在其**所属交付阶段内**的优先级：P0 为阶段发布阻塞项，P1 为应交付项，P2 为可后置项；它不等同于全产品阶段编号。
 
 ## 2. 一句话定义
 
-一款面向泛技术用户的、Local-first 的开源桌面 Agent 应用：用户可以自由选择国内外模型，在普通会话或本地项目中，以可观察、可审批、可恢复的方式让 Agent 完成编程、文档、研究和内容任务，并通过 Canvas 共同产出可编辑成果。
+一款面向泛技术用户的 Local-first 开源 Agent 应用：Desktop 承载完整管理体验，iPhone 提供安全远程操作界面；
+用户可以自由选择国内外模型，在普通会话或项目中，以可观察、可审批、可恢复的方式让 Agent 完成任务。
 
 ## 3. 已确认的产品决策
 
 | 主题 | 决策 |
 | --- | --- |
 | 目标用户 | 会使用 AI 工具的泛技术用户，兼顾编程与通用任务 |
-| 产品形态 | Electrobun + React 桌面应用，首发 macOS 14+ |
-| 应用角色 | Client、agents server、Runtime Box；Runtime Box 是 Runtime Box 内部执行组件 |
+| 产品形态 | Electrobun + React Desktop（首发 macOS 14+）与 Capacitor iOS Client |
+| 应用角色 | Client、Agent Server、Runtime Box；Executor 是 Runtime Box 内部执行组件 |
 | Desktop 部署 | Desktop 启停本地 agents server 和 Local Runtime Box；退出时协作关闭，Remote Box 保持安装并等待重连 |
-| RPC | `client <-> agents server <-> Runtime Box`；Product RPC 仅 loopback，独立 Runtime ingress 可由 Agent Server Dev Tunnel 暴露 |
+| RPC | `client <-> Agent Server <-> Runtime Box`；Product RPC 仅 loopback，Runtime/Mobile ingress 经同一 Dev Tunnel 的独立端口暴露 |
 | 身份 | `clientId`/`runtimeBoxId` 稳定；每次启动/注册使用新的 `instanceId` 和持久递增 `generation` |
 | Agent/Runtime | 一个 Agent Server 管理多个 Box；Agent/Provider 全局共享，`agentId + runtimeBoxId` 形成 Runtime Profile |
 | 数据策略 | Local-first，首版无需账号，数据和配置默认保存在本机 |
 | Project | 一个本地文件夹或 Git 仓库，可用于代码、文档或通用任务 |
 | Chat 类型 | 普通 Chat 不绑定目录；Project Chat 绑定项目并可操作项目环境 |
 | Agent 模式 | 当前默认 Agent 模式已接入 Runtime Box Tool；完整 Plan 审批工作流仍是后续目标 |
-| 本机能力 | 文件与命令通过 Moshu-owned Action/grant/Runtime Box 边界执行；用户级审批和 shell sandbox 后置 |
+| 本机能力 | 文件与命令通过 Action/Approval/grant/Runtime Box 边界执行；用户级审批已实现，shell sandbox 后置 |
 | Allow all | 输入框可开启，仅当前会话生效；重启后关闭；系统级高风险操作仍需确认 |
 | 并发 | 默认最多 3 个活跃会话，可配置为 1–5 个，超出后排队 |
 | Pi runtime | public Pi `0.82.1` 提供 `ModelRuntime`、headless `AgentSession`、stream/usage、取消和 Session JSONL |
@@ -57,7 +58,7 @@
 | 后台运行 | 多会话并行，完成或待审批时发送桌面通知 |
 | 国际化 | 中英双语，默认跟随系统语言 |
 | 发布模式 | 应用开源，用户自备 API Key；后续可增加付费增值服务 |
-| 远程范围 | Remote Runtime Box 进入当前实施范围；Mobile Client、团队共享、云端 Agent Server 和多 Server 绑定后置 |
+| 远程范围 | Remote Runtime Box 与 iOS Client 已实现；团队共享、云端 Agent Server 和多 Server 绑定后置 |
 
 ## 4. 产品边界
 
@@ -73,7 +74,7 @@
 6. 重启应用后读取产品 Session、历史 Run/event 和 Pi conversation context。
 7. 搜索、重命名、归档、恢复或永久删除 Session；管理、重新关联、归档或删除 Project。
 
-完整 Plan 审批工作流、用户级 Tool 审批、Diff/撤销、subagent 和 shell sandbox 仍是后续阶段目标。
+完整 Plan 工作流、Diff/撤销、subagent 和 shell sandbox 仍是后续阶段目标；Tool/Action 审批已经进入当前闭环。
 
 ### 首版不追求
 
@@ -93,29 +94,29 @@
 | UI | React + React Router |
 | 组件库 | HeroUI；统一主题 Token、浅色/深色模式和无障碍行为 |
 | 图标 | `@gravity-ui/icons`；应用提供统一 Icon 包装层处理尺寸、颜色、标签和 tree-shaking |
-| Agents server | 当前独占产品 DB、Pi Session JSONL、Provider/model credential、Session/Run/event、Provider access 和 Pi Agent runtime；未来再承载 Policy/approval 和 Action intent/result |
+| Agents server | 独占产品 DB、Pi Session JSONL、Provider/model credential、Session/Run/event、Pi Agent runtime、Policy/approval 和 Action intent/result |
 | Runtime Box | 独占自身 MCP config/credential/OAuth/lifecycle、Skill install/immutable version/content/hash/resources、实际 Tool、取消、进程树和 private local data |
-| Agent | public Pi `0.82.1` 只在 agents server 运行；当前是禁用全部动态资源和 Tool 的 headless Ask |
+| Agent | public Pi `0.82.1` 只在 Agent Server 运行；禁用 Pi built-in/dynamic Tool，使用 Moshu 七工具与 live MCP proxy |
 | 持久化 | agents server 单写产品 DB；public Pi `SessionManager` 在显式 `agentDataDirectory/sessions` 保存 JSONL |
 | RPC | 应用协议为 `client <-> agents server <-> Runtime Box` 的 WebSocket + versioned JSON RPC；WebView 仍只使用最小 Electrobun RPC |
 | Authorization | agents server 决定并持久化 Policy/approval，再签发一次性 execution grant；Runtime Box 验证后执行 |
-| Secret | Provider/model credential 永远留在 agents server；MCP credential 只在 owning Runtime Box 的 `ExecutorSecretStore` 与目标 connection/process 使用，不复制到 server 或暴露给 query/UI/prompt/log/export |
+| Secret | Provider/model credential 永远留在 Agent Server；MCP credential 留在显式 owner 的独立 SecretStore，只对目标 connection/process 可达 |
 | Canvas | 不可信 Web Canvas 使用无应用 RPC 的 sandbox `BrowserView`；默认断网能力必须通过阻断性 POC |
 
 ## 6. 架构落地边界
 
 - 批准的是三个应用角色，不是“Electrobun 永远只有三个 OS 进程”。Electrobun launcher/WebView 等 framework process 不改变职责划分。
-- 当前代码只实现本地 supervisor 路径；已批准的下一目标包含 Agent Server 管理的 Anonymous Dev Tunnel、
-  Remote Runtime Box 配对和设备认证。Mobile Client、多租户、Docker 和 cloud VM 后置。
+- 当前代码已实现本地 supervisor、Agent Server 管理的 Anonymous Dev Tunnel、Remote Runtime Box 配对认证、
+  独立 Mobile ingress 与 iOS Client。多租户、Docker/cloud VM 和云端 Agent Server 后置。
 - stable ID 用于逻辑绑定；新的 `instanceId`/`generation` 用于拒绝 restart/reconnect 后的迟到消息。
 - agents server 是产品业务、授权和 Server-owned MCP 的事实来源；每个 Runtime Box 是自身 Box-owned MCP/Skill 数据和实际 host execution 的事实来源。拆分角色不是完整 OS sandbox，仍需路径、命令、网络和 grant 校验。
 - 每次 Runtime Box 注册/重连先 full sync redacted inventory；成功前状态为 syncing。运行期使用 revision hint、60 秒 ±20% jitter poll 和 delta/snapshot fallback；cache stale/failed poll 不代表删除。
 - Agent 只保存 assigned Runtime Box stable resource ref；server 按 version/hash 获取 Skill metadata 与 `SKILL.md`，resources/scripts 仍通过 Runtime Box。
 - Runtime Box-owned MCP credential 与 execution grant 分离：连接可保持认证，但每次 Tool 仍需 server 的一次性授权；runtime teardown 不宣称 JavaScript 可可靠清零 string memory。
 - 两个 companion 必须随 desktop 整体打包、签名和更新，不能要求用户安装 runtime，也不能运行时下载未知 binary。
-- 当前已实现 compiled companion supervision、动态 loopback/authenticated RPC、Provider/auth、no-tools Pi Ask、
-  产品 DB 与 Pi Session JSONL。Runtime Box Tool/MCP/Skill、Policy/grant 和 Agent binding 尚未实现，详见
-  [实施进度](../implementation/progress.md)。
+- 当前已实现 compiled companion supervision、三类 authenticated RPC、Provider/auth、Pi Agent、产品 DB/Pi JSONL、
+  Local/Remote Runtime Box Tool、双 owner MCP/Skill、Policy/Approval/grant、Projects 和 iOS Mobile Client；边界见
+  [实现状态](../implementation/progress.md)。
 - 本次开发阶段重构无需迁移旧 runtime/Provider 开发数据；不兼容时明确 reset。首次外部发布后再冻结正式
   migration gate。
 

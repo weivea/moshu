@@ -7,7 +7,7 @@
 
 ## 1. 背景与结论
 
-仓库当前并非完全没有 MCP 代码，而是已经实现了一条 **Runtime Box-owned MCP POC**：
+本设计启动时，仓库已经有一条 **Runtime Box-owned MCP POC**：
 
 - Runtime Box 持久化 MCP config、静态 credential、Tool inventory 和 lifecycle state。
 - Runtime Box 支持 stdio、Streamable HTTP 和兼容 SSE。
@@ -15,7 +15,7 @@
 - Pi Agent runtime 将 Runtime Box MCP Tool 转换为 SDK `ToolDefinition`。
 - Desktop 已有随 active Runtime Box 切换的 MCP 设置页。
 
-接入前模型只有一种所有权：所有 MCP 都属于某个 Runtime Box。当前实现已在保留该链路的基础上增加第二种所有权：
+改造前模型只有一种所有权：所有 MCP 都属于某个 Runtime Box。当前实现已在保留该链路的基础上增加第二种所有权：
 
 1. **Agent Server-owned MCP**
    - config、credential、Tool inventory、连接和子进程均由 Agent Server 管理。
@@ -61,7 +61,10 @@
 - 不在首期实现 MCP OAuth、MCP Sampling、Resources、Prompts 或 server-to-client roots。
 - 不借 MCP 接入同时替换当前 MCP 协议实现或引入新的 SDK；先完成所有权重构，再单独评估官方 SDK。
 
-## 4. 现有实现分析
+## 4. 改造前实现分析
+
+本节保留双归属改造开始时的基线，用来解释后续设计选择；它不是当前实现状态。当前能力以第 5 节之后和
+[实现状态](./progress.md)为准。
 
 ### 4.1 Runtime Box 权威状态
 
@@ -151,7 +154,7 @@ enabled && assigned && ready && resource ref 匹配 && Tool schema 匹配
 
 ### 5.2 Runtime Box 切换
 
-- active Runtime Box 只影响列表默认筛选、新建 Session/Project 和 Box-owned MCP 管理面。
+- 发起 Client 的 active Runtime preference 只影响列表默认筛选、新建 Session/Project 和 Box-owned MCP 管理面。
 - Server-owned MCP manager 不订阅 active Runtime Box change。
 - 已有 Session 仍绑定原 `runtimeBoxId`。
 - 新 Run 的有效 MCP Tool 为：
@@ -571,7 +574,7 @@ Policy/intent -> Runtime Box grant -> Box journal -> MCP call
 -> evidence -> server ack -> Box receipt
 ```
 
-grant 必须继续绑定 owning Runtime Box instance/generation。切换 active Runtime Box 不改变已启动调用的 target。
+grant 必须继续绑定 owning Runtime Box instance/generation。切换发起 Client 的 preference 不改变已启动调用的 target。
 
 ### 11.5 Tool 风险
 
@@ -581,7 +584,7 @@ MCP Tool descriptor 自身不能决定授权。当前 POC 对未知 MCP Tool 统
 - 默认未知 MCP Tool：`high + remote + non_idempotent`。
 - 可由可信内置规则或用户覆盖为更低风险，保留 `source`。
 - override 必须绑定 owner/resource/tool/schema hash；schema 变化后旧 override 不自动继承。
-- 双所有权链路不得绕开未来 approval 接口。
+- 双所有权链路不得绕开当前 Policy/Approval/Action 授权接口。
 
 ## 12. RPC 设计
 

@@ -1,5 +1,8 @@
 # 阶段路线图与验收
 
+> 本文描述产品能力的分阶段目标，不是当前实现清单。已交付能力、明确限制和发布阻塞项以
+> [实现状态](../implementation/progress.md)为准。
+
 ## 1. 路线图原则
 
 - 每个阶段以可验证能力门槛结束，不以页面数量或日历时间结束。
@@ -11,8 +14,8 @@
 
 ## 2. 阶段 0：技术底座与高风险验证
 
-**目标：** 建立 Electrobun client、agents server、Runtime Box 三应用角色的可打包基础，并把 no-tools Ask
-迁移到正确所有者。A0/A1 已完成，A2 只完成 Runtime Box 注册/readiness 基础。
+**目标：** 建立 Electrobun client、agents server、Runtime Box 三应用角色的可打包基础，并把 Agent runtime
+迁移到正确所有者。A0–A5 的仓库内实现已完成；真实 Tunnel、正式签名/公证和安装级 E2E 仍属于外部发布 gate。
 
 ### 2.1 架构交付主线
 
@@ -20,13 +23,13 @@
 | --- | --- |
 | A0 RPC / binary POC | 两个 TypeScript + Bun compiled companion 可由 client 启停、注册、RPC、关闭和打包 |
 | A1 agents-server extraction | dynamic Provider/auth、public Pi Ask、产品 DB/Pi Session JSONL 和 Run 状态迁入 server（已完成） |
-| A2 Runtime Box / Agent registry | 一个 local Runtime Box、多个 Agent、stable identity、注册 full capability sync、syncing/offline Run gate |
+| A2 Runtime Box / Agent registry | Local/Remote Runtime Box、stable identity、Client preference、注册 full capability sync、syncing/offline Run gate |
 | A3 Tool Bridge / Action Broker | server Policy/approval/intent/grant，Runtime Box Tool/process tree，result 回到 server |
 | A4 MCP / Skills | Runtime Box-owned persistence/secret/lifecycle，epoch/revision inventory reconciliation、routed UI、resource refs/prompt fetch |
 | A5 recovery/release hardening | capped restart、重连对账、协作退出、故障矩阵和签名 package |
 
 旧的 in-process/conditional-sidecar Go/No-Go 与 F0-16 不再适用。三角色是批准基线；compiled companion、
-authenticated RPC 和 Provider registry 已实现，Agent/Runtime Box inventory registry 尚未实现。
+authenticated RPC、Provider、Runtime Box registry 和 inventory reconciliation 均已实现。
 
 ### 2.2 范围
 
@@ -36,19 +39,19 @@ authenticated RPC 和 Provider registry 已实现，Agent/Runtime Box inventory 
 - 动态 loopback bootstrap、client/Runtime Box registration、stable ID、instance ID/generation 和注册后 full inventory sync。
 - client 对两个 companion 的 cooperative shutdown、capped backoff 和 recovery UX。
 - agents server 单写产品数据库/event，并用 public `SessionManager` 保存 Pi Session JSONL。
-- Pi/Provider/Run 位于 agents server；Policy/Tool/进程树是后续 server/Runtime Box 边界。
-- current host-backed local Runtime Box 已可注册和报告 readiness；Agent N:1 binding 尚未实现。
+- Pi/Provider/Run/Policy/Approval 位于 agents server；Tool、journal 和进程树位于 owning Runtime Box。
+- Local/Remote Runtime Box 共用 registry；每个 authenticated Client 有独立 active Runtime preference。
 - runtime 动态 builtin/custom Provider、异步 auth attempt、模型刷新和 no-network test gate。
 - server Policy/approval/Action intent -> one-time execution grant -> Runtime Box 文件/命令 Tool -> typed result POC。
-- server Provider `SecretVaultCredentialStore` 的 app-owned permission-safe file adapter；Keychain 与 local
-  Runtime Box `ExecutorSecretStore` 仍待 POC。
+- server Provider `SecretVaultCredentialStore` 与 Runtime Box `ExecutorSecretStore` 已有 permission-safe file
+  adapter；发布级平台 Secret adapter 仍待完成。
 - sandbox `BrowserView` 的 RPC、本地文件和子资源默认断网 POC。
 - 两个 Bun compiled companion 随 desktop 的签名、公证、Updater 和 packaged E2E POC。
 
 ### 2.3 出口条件
 
 - package 可启动 client、agents server、Runtime Box；终端用户无需安装 Bun/Node。
-- server 只绑定动态 loopback；未认证本机进程不能注册。
+- Product RPC 绑定动态 loopback；Runtime/Mobile ingress 绑定独立固定 loopback 端口。未认证 peer 不能注册。
 - `client <-> server <-> Runtime Box` 是唯一应用 RPC 拓扑，旧 generation 的消息被拒绝。
 - Provider/Pi runtime 错误不影响其他 Run；server/Runtime Box 分别强退后状态可对账。
 - WebView/client 无法直接读取 API Key、业务 DB、任意文件或 Runtime Box API。
@@ -104,10 +107,10 @@ authenticated RPC 和 Provider registry 已实现，Agent/Runtime Box inventory 
 - 队列、停止、恢复和任务中心。
 - 完成、失败、待审批和待用户输入的桌面通知。
 
-### 阶段 1 不包含
+### 阶段 1 原始范围不包含
 
 - 自定义 Agent 完整编辑器。
-- 面向用户的 MCP/Skills 管理页和公开功能；A4 backend gate 可提前完成但保持 feature flag 关闭。
+- MCP/Skills 原计划后置，但双归属 backend 与 Desktop 管理页已提前实现；OAuth、Git URL 更新等仍后置。
 - 知识库。
 - 正式 Canvas 功能。
 - 本地模型。
@@ -126,7 +129,8 @@ authenticated RPC 和 Provider registry 已实现，Agent/Runtime Box inventory 
 ### 4.1 工作流 A：Agent 与扩展
 
 - 自定义 Agent 可视化配置、版本快照、复制、停用和导入导出。
-- Agent 绑定已注册 Runtime Box；当前 desktop 默认一个 local Runtime Box，未来可从 registry 选择。
+- Agent 使用全局配置和 `agentId + runtimeBoxId` Runtime Profile；Desktop 与 iOS 已可从 Local/Remote registry
+  选择各自的 active Runtime preference。
 - MCP stdio、Streamable HTTP、SSE。
 - MCP Bearer/API Key、OAuth 2.1、连接测试和配置导入。
 - MCP Server/Tool 的全局、Project 和 Agent 作用域。
@@ -220,8 +224,8 @@ authenticated RPC 和 Provider registry 已实现，Agent/Runtime Box inventory 
 ### E2E-05：Allow all 边界
 
 1. 用户在当前 Session 开启 Allow all。
-2. 项目内低/中风险写入和命令无需重复弹窗。
-3. Project 外访问、秘密文件、删除大量文件或 Git push 仍要求确认或被拒绝。
+2. 可覆盖的项目内低/中风险文件动作无需重复弹窗。
+3. 所有 shell，以及 Project 外访问、秘密文件、删除大量文件或 Git push，仍要求确认或被拒绝。
 4. 重启应用后开关恢复关闭。
 
 ### E2E-06：并行与排队
@@ -322,7 +326,9 @@ authenticated RPC 和 Provider registry 已实现，Agent/Runtime Box inventory 
 - 升级数据库前自动备份，迁移失败可回滚。
 - 离线时仍可查看本地历史、Canvas 和设置。
 
-## 9. 功能阶段矩阵
+## 9. 规划阶段矩阵
+
+下表保留原始产品分期，不表示当前代码状态；部分 Runtime Box、MCP、Skill 和 Mobile 能力已提前交付。
 
 | 功能 | 阶段 0 | 阶段 1 | 阶段 2 | 阶段 3+ |
 | --- | --- | --- | --- | --- |
@@ -363,5 +369,6 @@ authenticated RPC 和 Provider registry 已实现，Agent/Runtime Box inventory 
 | Agent 导出包扩展名和最终 Schema | 阶段 2 |
 | 是否建立 opt-in 遥测服务 | 阶段 2 |
 | 市场签名、审核和信任模型 | 阶段 4 |
-| Remote Runtime Box 的配对、Tunnel、设备认证和恢复 | RB-00–RB-09；见 Runtime Box 技术与实施方案 |
-| Mobile Client、Docker/cloud Box、团队共享与多租户 | 当前范围外，独立立项前 |
+| Remote Runtime Box 的配对、Tunnel、设备认证和恢复 | 已完成仓库内实现；见 Runtime Box 架构与实现，真实 Tunnel 仍需发布环境 gate |
+| Mobile Client | 已完成 iOS POC；见 iOS Mobile Client 实现 |
+| Docker/cloud Box、团队共享与多租户 | 当前范围外，独立立项前 |

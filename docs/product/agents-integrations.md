@@ -2,8 +2,9 @@
 
 ## 1. 能力模型
 
-当前 shipped slice 只有动态 Provider + no-tools Ask。以下 Tool、MCP、Skill、Knowledge、Policy 和 subagent
-组合描述未来 Moshu-owned 产品边界，不表示 public Pi resource loading 已开启。
+当前代码已交付动态 Provider、Moshu 七工具、Policy/Approval/grant，以及 Server/Runtime Box 双归属 MCP/Skill。
+自定义 Agent、Knowledge、subagent、MCP OAuth 和 Skill script/resource 执行仍是目标能力；精确边界见
+[实现状态](../implementation/progress.md)。本文件同时描述当前基础和后续产品要求，不应把目标条目视为已实现。
 
 一个可运行 Agent 由以下配置组合而成：
 
@@ -30,7 +31,8 @@ Agent
 - 每次 Runtime Box 注册/重连时 server 先 full sync redacted inventory；运行期以 revision hint + 60 秒 ±20% jitter poll 拉取 delta，cache 可丢弃且不构成授权。
 - Agent global profile 可引用 Server-owned MCP/Skill；Runtime Profile 只可引用 assigned Runtime Box 的资源。server 合并两类 owner，并从各自 authority 获取 Skill metadata 与 `SKILL.md`。
 - server 决定并持久化 Policy/approval，随后签发一次性 execution grant；Runtime Box 验证后才执行。
-- 当前 desktop 由 client 监管一个 host-backed Local Runtime Box；Agent 全局共享，并为每个 Box 建立 Runtime Profile。
+- Desktop 监管一个 host-backed Local Runtime Box；同一 Agent Server registry 还可管理多个独立 Remote Box。
+  Agent/Provider 全局共享，并为每个 Box 建立 Runtime Profile。
 
 ## 2. 自定义 Agent
 
@@ -94,14 +96,15 @@ Agent
 
 ### 2.6 Runtime Box 注册与选择
 
-- 当前 desktop client 启动并监管一个 local Runtime Box，并通过 agents server registry 展示其状态。
+- Desktop client 启动并监管一个 Local Runtime Box；Remote Runtime Box 作为远端用户服务主动连接同一 registry，
+  不受 Desktop supervisor 管理。
 - `runtimeBoxId` 跨重连/重启稳定；每次启动/连接使用新的 `instanceId` 和 `generation`。
 - 每次 connection/registration/reconnect 后状态先为 syncing；server full inventory sync 成功后才显示 online/runnable。
 - Agent definition/version 全局共享；`agentId + runtimeBoxId` 形成 Runtime Profile。
 - Runtime Profile 的 MCP/Skill 项只保存该 Box 的 stable resource ID 与 version/hash，不复制 config、credential 或 Skill content。
 - client 只能通过 agents server 列出 Runtime Box，不直接连接或探测 Runtime Box。
-- Remote Runtime Box 通过独立 Runtime ingress、设备配对和 Agent Server-owned Dev Tunnel 接入；Mobile
-  Client、Docker/cloud packaging、团队共享和多租户仍不属于当前范围。
+- Remote Runtime Box 通过独立 Runtime ingress、设备配对和 Agent Server-owned Dev Tunnel 接入；iOS
+  Mobile Client 通过同一 Tunnel 的独立 Mobile ingress 接入。Docker/cloud packaging、团队共享和多租户仍不属于当前范围。
 
 ## 3. LLM Provider
 

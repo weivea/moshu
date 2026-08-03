@@ -8,7 +8,7 @@
 
 ## 1. 背景与结论
 
-当前 Skill 只有一种所有权：所有 installation、immutable version、content、metadata 和文件都属于某个
+本设计启动时，Skill 只有一种所有权：所有 installation、immutable version、content、metadata 和文件都属于某个
 Runtime Box。Agent Server 只保存 Runtime Profile ref，并在 Run 前从 Session 所属 Runtime Box 获取
 `SKILL.md`。
 
@@ -72,7 +72,10 @@ Runtime Box。Agent Server 只保存 Runtime Profile ref，并在 Run 前从 Ses
 - 不在 Runtime Box 离线时放宽现有 Run gate。
 - 不把 Skill 正文写入 Run event、Pi Session JSONL、diagnostic 或 Runtime Box inventory cache。
 
-## 4. 现有实现分析
+## 4. 改造前实现分析
+
+本节保留双归属改造开始时的基线，用来解释后续设计选择；它不是当前实现状态。当前能力以第 5 节之后和
+[实现状态](./progress.md)为准。
 
 ### 4.1 Runtime Box 权威状态
 
@@ -164,7 +167,7 @@ enabled
 
 ### 5.2 Runtime Box 切换
 
-- active Runtime Box 只影响 Box-owned Skill 的默认列表和新建 Session/Project 默认值。
+- 发起 Client 的 active Runtime preference 只影响 Box-owned Skill 的默认列表和新建 Session/Project 默认值。
 - Server-owned Skill 管理面不订阅 active Runtime Box change。
 - 已有 Session 永久使用自身 `runtimeBoxId`。
 - 新 Run 的有效 Skill 候选集合为：
